@@ -4,5 +4,5 @@
 Topic: Mutation Testing
 
 Group Members:
-  - Raies Saboerali (@Raies100)
-  - bgeorgsson
+  - Brynjólfur Már Georgsson (@binnimar)
+  - Raies Saboerali (@Raies1000)
