@@ -6,3 +6,4 @@ Topic: Mutation Testing
 Group Members:
   - Brynjólfur Már Georgsson (@binnimar)
   - Raies Saboerali (@Raies1000)
+  - Samuel Austin (@samuel)
