@@ -1,0 +1,790 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>OperatorPublish.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.internal.operators</a> &gt; <span class="el_source">OperatorPublish.java</span></div><h1>OperatorPublish.java</h1><pre class="source lang-java linenums">/**
+ * Copyright 2014 Netflix, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package rx.internal.operators;
+
+import java.util.Queue;
+import java.util.concurrent.atomic.*;
+
+import rx.*;
+import rx.exceptions.*;
+import rx.functions.*;
+import rx.internal.util.*;
+import rx.internal.util.unsafe.*;
+import rx.observables.ConnectableObservable;
+import rx.subscriptions.Subscriptions;
+
+/**
+ * A connectable observable which shares an underlying source and dispatches source values to subscribers in a backpressure-aware
+ * manner. 
+ * @param &lt;T&gt; the value type
+ */
+public final class OperatorPublish&lt;T&gt; extends ConnectableObservable&lt;T&gt; {
+    /** The source observable. */
+    final Observable&lt;? extends T&gt; source;
+    /** Holds the current subscriber that is, will be or just was subscribed to the source observable. */
+    final AtomicReference&lt;PublishSubscriber&lt;T&gt;&gt; current;
+
+    /**
+     * Creates a OperatorPublish instance to publish values of the given source observable.
+     * @param source the source observable
+     * @return the connectable observable
+     */
+    public static &lt;T&gt; ConnectableObservable&lt;T&gt; create(Observable&lt;? extends T&gt; source) {
+        // the current connection to source needs to be shared between the operator and its onSubscribe call
+<span class="fc" id="L47">        final AtomicReference&lt;PublishSubscriber&lt;T&gt;&gt; curr = new AtomicReference&lt;PublishSubscriber&lt;T&gt;&gt;();</span>
+<span class="fc" id="L48">        OnSubscribe&lt;T&gt; onSubscribe = new OnSubscribe&lt;T&gt;() {</span>
+            @Override
+            public void call(Subscriber&lt;? super T&gt; child) {
+                // concurrent connection/disconnection may change the state, 
+                // we loop to be atomic while the child subscribes
+                for (;;) {
+                    // get the current subscriber-to-source
+<span class="fc" id="L55">                    PublishSubscriber&lt;T&gt; r = curr.get();</span>
+                    // if there isn't one or it is unsubscribed
+<span class="pc bpc" id="L57" title="1 of 4 branches missed.">                    if (r == null || r.isUnsubscribed()) {</span>
+                        // create a new subscriber to source
+<span class="fc" id="L59">                        PublishSubscriber&lt;T&gt; u = new PublishSubscriber&lt;T&gt;(curr);</span>
+                        // perform extra initialization to avoid 'this' to escape during construction
+<span class="fc" id="L61">                        u.init();</span>
+                        // let's try setting it as the current subscriber-to-source
+<span class="pc bpc" id="L63" title="1 of 2 branches missed.">                        if (!curr.compareAndSet(r, u)) {</span>
+                            // didn't work, maybe someone else did it or the current subscriber 
+                            // to source has just finished
+<span class="nc" id="L66">                            continue;</span>
+                        }
+                        // we won, let's use it going onwards
+<span class="fc" id="L69">                        r = u;</span>
+                    }
+                    
+                    // create the backpressure-managing producer for this child
+<span class="fc" id="L73">                    InnerProducer&lt;T&gt; inner = new InnerProducer&lt;T&gt;(r, child);</span>
+                    /*
+                     * Try adding it to the current subscriber-to-source, add is atomic in respect 
+                     * to other adds and the termination of the subscriber-to-source.
+                     */
+<span class="pc bpc" id="L78" title="1 of 2 branches missed.">                    if (!r.add(inner)) {</span>
+                        /*
+                         * The current PublishSubscriber has been terminated, try with a newer one.
+                         */
+<span class="nc" id="L82">                        continue;</span>
+                        /*
+                         * Note: although technically correct, concurrent disconnects can cause 
+                         * unexpected behavior such as child subscribers never receiving anything 
+                         * (unless connected again). An alternative approach, similar to 
+                         * PublishSubject would be to immediately terminate such child 
+                         * subscribers as well:
+                         * 
+                         * Object term = r.terminalEvent;
+                         * if (r.nl.isCompleted(term)) {
+                         *     child.onCompleted();
+                         * } else {
+                         *     child.onError(r.nl.getError(term));
+                         * }
+                         * return;
+                         * 
+                         * The original concurrent behavior was non-deterministic in this regard as well.
+                         * Allowing this behavior, however, may introduce another unexpected behavior:
+                         * after disconnecting a previous connection, one might not be able to prepare
+                         * a new connection right after a previous termination by subscribing new child 
+                         * subscribers asynchronously before a connect call.
+                         */
+                    }
+                    // the producer has been registered with the current subscriber-to-source so 
+                    // at least it will receive the next terminal event
+<span class="fc" id="L107">                    child.add(inner);</span>
+                    // setting the producer will trigger the first request to be considered by 
+                    // the subscriber-to-source.
+<span class="fc" id="L110">                    child.setProducer(inner);</span>
+<span class="fc" id="L111">                    break;</span>
+                }
+<span class="fc" id="L113">            }</span>
+        };
+<span class="fc" id="L115">        return new OperatorPublish&lt;T&gt;(onSubscribe, source, curr);</span>
+    }
+
+    public static &lt;T, R&gt; Observable&lt;R&gt; create(final Observable&lt;? extends T&gt; source, 
+            final Func1&lt;? super Observable&lt;T&gt;, ? extends Observable&lt;R&gt;&gt; selector) {
+<span class="fc" id="L120">        return create(source, selector, false);</span>
+    }
+    
+    public static &lt;T, R&gt; Observable&lt;R&gt; create(final Observable&lt;? extends T&gt; source, 
+            final Func1&lt;? super Observable&lt;T&gt;, ? extends Observable&lt;R&gt;&gt; selector, final boolean delayError) {
+<span class="fc" id="L125">        return create(new OnSubscribe&lt;R&gt;() {</span>
+            @Override
+            public void call(final Subscriber&lt;? super R&gt; child) {
+<span class="fc" id="L128">                final OnSubscribePublishMulticast&lt;T&gt; op = new OnSubscribePublishMulticast&lt;T&gt;(RxRingBuffer.SIZE, delayError);</span>
+                
+<span class="fc" id="L130">                Subscriber&lt;R&gt; subscriber = new Subscriber&lt;R&gt;() {</span>
+                    @Override
+                    public void onNext(R t) {
+<span class="fc" id="L133">                        child.onNext(t);</span>
+<span class="fc" id="L134">                    }</span>
+                    
+                    @Override
+                    public void onError(Throwable e) {
+<span class="fc" id="L138">                        op.unsubscribe();</span>
+<span class="fc" id="L139">                        child.onError(e);</span>
+<span class="fc" id="L140">                    }</span>
+                    
+                    @Override
+                    public void onCompleted() {
+<span class="fc" id="L144">                        op.unsubscribe();</span>
+<span class="fc" id="L145">                        child.onCompleted();</span>
+<span class="fc" id="L146">                    }</span>
+                    
+                    @Override
+                    public void setProducer(Producer p) {
+<span class="fc" id="L150">                        child.setProducer(p);</span>
+<span class="fc" id="L151">                    }</span>
+                };
+
+<span class="fc" id="L154">                child.add(op);</span>
+<span class="fc" id="L155">                child.add(subscriber);</span>
+                
+<span class="fc" id="L157">                selector.call(Observable.create(op)).unsafeSubscribe(subscriber);</span>
+                
+<span class="fc" id="L159">                source.unsafeSubscribe(op.subscriber());</span>
+<span class="fc" id="L160">            }</span>
+        });
+    }
+
+    private OperatorPublish(OnSubscribe&lt;T&gt; onSubscribe, Observable&lt;? extends T&gt; source, 
+            final AtomicReference&lt;PublishSubscriber&lt;T&gt;&gt; current) {
+<span class="fc" id="L166">        super(onSubscribe);</span>
+<span class="fc" id="L167">        this.source = source;</span>
+<span class="fc" id="L168">        this.current = current;</span>
+<span class="fc" id="L169">    }</span>
+
+    @Override
+    public void connect(Action1&lt;? super Subscription&gt; connection) {
+<span class="fc" id="L173">        boolean doConnect = false;</span>
+        PublishSubscriber&lt;T&gt; ps;
+        // we loop because concurrent connect/disconnect and termination may change the state
+        for (;;) {
+            // retrieve the current subscriber-to-source instance
+<span class="fc" id="L178">            ps = current.get();</span>
+            // if there is none yet or the current has unsubscribed
+<span class="pc bpc" id="L180" title="1 of 4 branches missed.">            if (ps == null || ps.isUnsubscribed()) {</span>
+                // create a new subscriber-to-source
+<span class="fc" id="L182">                PublishSubscriber&lt;T&gt; u = new PublishSubscriber&lt;T&gt;(current);</span>
+                // initialize out the constructor to avoid 'this' to escape
+<span class="fc" id="L184">                u.init();</span>
+                // try setting it as the current subscriber-to-source
+<span class="pc bpc" id="L186" title="1 of 2 branches missed.">                if (!current.compareAndSet(ps, u)) {</span>
+                    // did not work, perhaps a new subscriber arrived 
+                    // and created a new subscriber-to-source as well, retry
+<span class="nc" id="L189">                    continue;</span>
+                }
+<span class="fc" id="L191">                ps = u;</span>
+            }
+            // if connect() was called concurrently, only one of them should actually 
+            // connect to the source
+<span class="pc bpc" id="L195" title="1 of 4 branches missed.">            doConnect = !ps.shouldConnect.get() &amp;&amp; ps.shouldConnect.compareAndSet(false, true);</span>
+<span class="fc" id="L196">            break;</span>
+        }
+        /* 
+         * Notify the callback that we have a (new) connection which it can unsubscribe
+         * but since ps is unique to a connection, multiple calls to connect() will return the
+         * same Subscription and even if there was a connect-disconnect-connect pair, the older
+         * references won't disconnect the newer connection.
+         * Synchronous source consumers have the opportunity to disconnect via unsubscribe on the
+         * Subscription as unsafeSubscribe may never return in its own.
+         * 
+         * Note however, that asynchronously disconnecting a running source might leave 
+         * child-subscribers without any terminal event; PublishSubject does not have this 
+         * issue because the unsubscription was always triggered by the child-subscribers 
+         * themselves.
+         */
+<span class="fc" id="L211">        connection.call(ps);</span>
+<span class="fc bfc" id="L212" title="All 2 branches covered.">        if (doConnect) {</span>
+<span class="fc" id="L213">            source.unsafeSubscribe(ps);</span>
+        }
+<span class="fc" id="L215">    }</span>
+    
+    @SuppressWarnings(&quot;rawtypes&quot;)
+    static final class PublishSubscriber&lt;T&gt; extends Subscriber&lt;T&gt; implements Subscription {
+        /** Holds notifications from upstream. */
+        final Queue&lt;Object&gt; queue;
+        /** The notification-lite factory. */
+        final NotificationLite&lt;T&gt; nl;
+        /** Holds onto the current connected PublishSubscriber. */
+        final AtomicReference&lt;PublishSubscriber&lt;T&gt;&gt; current;
+        /** Contains either an onCompleted or an onError token from upstream. */
+        volatile Object terminalEvent;
+        
+        /** Indicates an empty array of inner producers. */
+<span class="fc" id="L229">        static final InnerProducer[] EMPTY = new InnerProducer[0];</span>
+        /** Indicates a terminated PublishSubscriber. */
+<span class="fc" id="L231">        static final InnerProducer[] TERMINATED = new InnerProducer[0];</span>
+        
+        /** Tracks the subscribed producers. */
+        final AtomicReference&lt;InnerProducer[]&gt; producers;
+        /** 
+         * Atomically changed from false to true by connect to make sure the 
+         * connection is only performed by one thread. 
+         */
+        final AtomicBoolean shouldConnect;
+        
+        /** Guarded by this. */
+        boolean emitting;
+        /** Guarded by this. */
+        boolean missed;
+        
+<span class="fc" id="L246">        public PublishSubscriber(AtomicReference&lt;PublishSubscriber&lt;T&gt;&gt; current) {</span>
+<span class="pc bpc" id="L247" title="1 of 2 branches missed.">            this.queue = UnsafeAccess.isUnsafeAvailable() </span>
+                    ? new SpscArrayQueue&lt;Object&gt;(RxRingBuffer.SIZE) 
+                    : new SynchronizedQueue&lt;Object&gt;(RxRingBuffer.SIZE);
+            
+<span class="fc" id="L251">            this.nl = NotificationLite.instance();</span>
+<span class="fc" id="L252">            this.producers = new AtomicReference&lt;InnerProducer[]&gt;(EMPTY);</span>
+<span class="fc" id="L253">            this.current = current;</span>
+<span class="fc" id="L254">            this.shouldConnect = new AtomicBoolean();</span>
+<span class="fc" id="L255">        }</span>
+        
+        /** Should be called after the constructor finished to setup nulling-out the current reference. */
+        void init() {
+<span class="fc" id="L259">            add(Subscriptions.create(new Action0() {</span>
+                @Override
+                public void call() {
+<span class="fc" id="L262">                    PublishSubscriber.this.producers.getAndSet(TERMINATED);</span>
+<span class="fc" id="L263">                    current.compareAndSet(PublishSubscriber.this, null);</span>
+                    // we don't care if it fails because it means the current has 
+                    // been replaced in the meantime
+<span class="fc" id="L266">                }</span>
+            }));
+<span class="fc" id="L268">        }</span>
+        
+        @Override
+        public void onStart() {
+            // since subscribers may have different amount of requests, we try to 
+            // optimize by buffering values up-front and replaying it on individual demand
+<span class="fc" id="L274">            request(RxRingBuffer.SIZE);</span>
+<span class="fc" id="L275">        }</span>
+        @Override
+        public void onNext(T t) {
+            // we expect upstream to honor backpressure requests
+            // nl is required because JCTools queue doesn't accept nulls.
+<span class="pc bpc" id="L280" title="1 of 2 branches missed.">            if (!queue.offer(nl.next(t))) {</span>
+<span class="nc" id="L281">                onError(new MissingBackpressureException());</span>
+            } else {
+                // since many things can happen concurrently, we have a common dispatch 
+                // loop to act on the current state serially
+<span class="fc" id="L285">                dispatch();</span>
+            }
+<span class="fc" id="L287">        }</span>
+        @Override
+        public void onError(Throwable e) {
+            // The observer front is accessed serially as required by spec so
+            // no need to CAS in the terminal value
+<span class="pc bpc" id="L292" title="1 of 2 branches missed.">            if (terminalEvent == null) {</span>
+<span class="fc" id="L293">                terminalEvent = nl.error(e);</span>
+                // since many things can happen concurrently, we have a common dispatch 
+                // loop to act on the current state serially
+<span class="fc" id="L296">                dispatch();</span>
+            }
+<span class="fc" id="L298">        }</span>
+        @Override
+        public void onCompleted() {
+            // The observer front is accessed serially as required by spec so
+            // no need to CAS in the terminal value
+<span class="pc bpc" id="L303" title="1 of 2 branches missed.">            if (terminalEvent == null) {</span>
+<span class="fc" id="L304">                terminalEvent = nl.completed();</span>
+                // since many things can happen concurrently, we have a common dispatch loop 
+                // to act on the current state serially
+<span class="fc" id="L307">                dispatch();</span>
+            }
+<span class="fc" id="L309">        }</span>
+        
+        /**
+         * Atomically try adding a new InnerProducer to this Subscriber or return false if this
+         * Subscriber was terminated.
+         * @param producer the producer to add
+         * @return true if succeeded, false otherwise
+         */
+        boolean add(InnerProducer&lt;T&gt; producer) {
+<span class="pc bpc" id="L318" title="1 of 2 branches missed.">            if (producer == null) {</span>
+<span class="nc" id="L319">                throw new NullPointerException();</span>
+            }
+            // the state can change so we do a CAS loop to achieve atomicity
+            for (;;) {
+                // get the current producer array
+<span class="fc" id="L324">                InnerProducer[] c = producers.get();</span>
+                // if this subscriber-to-source reached a terminal state by receiving 
+                // an onError or onCompleted, just refuse to add the new producer
+<span class="pc bpc" id="L327" title="1 of 2 branches missed.">                if (c == TERMINATED) {</span>
+<span class="nc" id="L328">                    return false;</span>
+                }
+                // we perform a copy-on-write logic
+<span class="fc" id="L331">                int len = c.length;</span>
+<span class="fc" id="L332">                InnerProducer[] u = new InnerProducer[len + 1];</span>
+<span class="fc" id="L333">                System.arraycopy(c, 0, u, 0, len);</span>
+<span class="fc" id="L334">                u[len] = producer;</span>
+                // try setting the producers array
+<span class="pc bpc" id="L336" title="1 of 2 branches missed.">                if (producers.compareAndSet(c, u)) {</span>
+<span class="fc" id="L337">                    return true;</span>
+                }
+                // if failed, some other operation succeeded (another add, remove or termination)
+                // so retry
+<span class="nc" id="L341">            }</span>
+        }
+        
+        /**
+         * Atomically removes the given producer from the producers array.
+         * @param producer the producer to remove
+         */
+        void remove(InnerProducer&lt;T&gt; producer) {
+            // the state can change so we do a CAS loop to achieve atomicity
+            for (;;) {
+                // let's read the current producers array
+<span class="fc" id="L352">                InnerProducer[] c = producers.get();</span>
+                // if it is either empty or terminated, there is nothing to remove so we quit
+<span class="pc bpc" id="L354" title="1 of 4 branches missed.">                if (c == EMPTY || c == TERMINATED) {</span>
+<span class="fc" id="L355">                    return;</span>
+                }
+                // let's find the supplied producer in the array
+                // although this is O(n), we don't expect too many child subscribers in general
+<span class="fc" id="L359">                int j = -1;</span>
+<span class="fc" id="L360">                int len = c.length;</span>
+<span class="pc bpc" id="L361" title="1 of 2 branches missed.">                for (int i = 0; i &lt; len; i++) {</span>
+<span class="fc bfc" id="L362" title="All 2 branches covered.">                    if (c[i].equals(producer)) {</span>
+<span class="fc" id="L363">                        j = i;</span>
+<span class="fc" id="L364">                        break;</span>
+                    }
+                }
+                // we didn't find it so just quit
+<span class="pc bpc" id="L368" title="1 of 2 branches missed.">                if (j &lt; 0) {</span>
+<span class="nc" id="L369">                    return;</span>
+                }
+                // we do copy-on-write logic here
+                InnerProducer[] u;
+                // we don't create a new empty array if producer was the single inhabitant
+                // but rather reuse an empty array
+<span class="fc bfc" id="L375" title="All 2 branches covered.">                if (len == 1) {</span>
+<span class="fc" id="L376">                    u = EMPTY;</span>
+                } else {
+                    // otherwise, create a new array one less in size
+<span class="fc" id="L379">                    u = new InnerProducer[len - 1];</span>
+                    // copy elements being before the given producer
+<span class="fc" id="L381">                    System.arraycopy(c, 0, u, 0, j);</span>
+                    // copy elements being after the given producer
+<span class="fc" id="L383">                    System.arraycopy(c, j + 1, u, j, len - j - 1);</span>
+                }
+                // try setting this new array as
+<span class="pc bpc" id="L386" title="1 of 2 branches missed.">                if (producers.compareAndSet(c, u)) {</span>
+<span class="fc" id="L387">                    return;</span>
+                }
+                // if we failed, it means something else happened
+                // (a concurrent add/remove or termination), we need to retry
+<span class="nc" id="L391">            }</span>
+        }
+        
+        /**
+         * Perform termination actions in case the source has terminated in some way and
+         * the queue has also become empty.
+         * @param term the terminal event (a NotificationLite.error or completed)
+         * @param empty set to true if the queue is empty
+         * @return true if there is indeed a terminal condition
+         */
+        boolean checkTerminated(Object term, boolean empty) {
+            // first of all, check if there is actually a terminal event
+<span class="fc bfc" id="L403" title="All 2 branches covered.">            if (term != null) {</span>
+                // is it a completion event (impl. note, this is much cheaper than checking for isError)
+<span class="fc bfc" id="L405" title="All 2 branches covered.">                if (nl.isCompleted(term)) {</span>
+                    // but we also need to have an empty queue
+<span class="fc bfc" id="L407" title="All 2 branches covered.">                    if (empty) {</span>
+                        // this will prevent OnSubscribe spinning on a terminated but 
+                        // not yet unsubscribed PublishSubscriber
+<span class="fc" id="L410">                        current.compareAndSet(this, null);</span>
+                        try {
+                            /*
+                             * This will swap in a terminated array so add() in OnSubscribe will reject
+                             * child subscribers to associate themselves with a terminated and thus
+                             * never again emitting chain.
+                             * 
+                             * Since we atomically change the contents of 'producers' only one
+                             * operation wins at a time. If an add() wins before this getAndSet,
+                             * its value will be part of the returned array by getAndSet and thus
+                             * will receive the terminal notification. Otherwise, if getAndSet wins,
+                             * add() will refuse to add the child producer and will trigger the
+                             * creation of subscriber-to-source.
+                             */
+<span class="fc bfc" id="L424" title="All 2 branches covered.">                            for (InnerProducer&lt;?&gt; ip : producers.getAndSet(TERMINATED)) {</span>
+<span class="fc" id="L425">                                ip.child.onCompleted();</span>
+                            }
+                        } finally {
+                            // we explicitly unsubscribe/disconnect from the upstream
+                            // after we sent out the terminal event to child subscribers
+<span class="pc" id="L430">                            unsubscribe();</span>
+<span class="fc" id="L431">                        }</span>
+                        // indicate we reached the terminal state
+<span class="fc" id="L433">                        return true;</span>
+                    }
+                } else {
+<span class="fc" id="L436">                    Throwable t = nl.getError(term);</span>
+                    // this will prevent OnSubscribe spinning on a terminated 
+                    // but not yet unsubscribed PublishSubscriber
+<span class="fc" id="L439">                    current.compareAndSet(this, null);</span>
+                    try {
+                        // this will swap in a terminated array so add() in OnSubscribe will reject
+                        // child subscribers to associate themselves with a terminated and thus
+                        // never again emitting chain
+<span class="fc bfc" id="L444" title="All 2 branches covered.">                        for (InnerProducer&lt;?&gt; ip : producers.getAndSet(TERMINATED)) {</span>
+<span class="fc" id="L445">                            ip.child.onError(t);</span>
+                        }
+                    } finally {
+                        // we explicitly unsubscribe/disconnect from the upstream
+                        // after we sent out the terminal event to child subscribers
+<span class="pc" id="L450">                        unsubscribe();</span>
+<span class="fc" id="L451">                    }</span>
+                    // indicate we reached the terminal state
+<span class="fc" id="L453">                    return true;</span>
+                }
+            }
+            // there is still work to be done
+<span class="fc" id="L457">            return false;</span>
+        }
+        
+        /**
+         * The common serialization point of events arriving from upstream and child-subscribers
+         * requesting more.
+         */
+        void dispatch() {
+            // standard construct of emitter loop (blocking)
+            // if there is an emission going on, indicate that more work needs to be done
+            // the exact nature of this work needs to be determined from other data structures
+<span class="fc" id="L468">            synchronized (this) {</span>
+<span class="fc bfc" id="L469" title="All 2 branches covered.">                if (emitting) {</span>
+<span class="fc" id="L470">                    missed = true;</span>
+<span class="fc" id="L471">                    return;</span>
+                }
+                // there was no emission going on, we won and will start emitting
+<span class="fc" id="L474">                emitting = true;</span>
+<span class="fc" id="L475">                missed = false;</span>
+<span class="pc" id="L476">            }</span>
+            /*
+             * In case an exception is thrown in the loop, we need to set emitting back to false
+             * on the way out (the exception will propagate up) so if it bounces back and
+             * onError is called, its dispatch() call will have the opportunity to emit it.
+             * However, if we want to exit regularly, we will set the emitting to false (+ other operations)
+             * atomically so we want to prevent the finally part to accidentally unlock some other
+             * emissions happening between the two synchronized blocks.
+             */
+<span class="fc" id="L485">            boolean skipFinal = false;</span>
+            try {
+                for (;;) {
+                    /*
+                     * We need to read terminalEvent before checking the queue for emptyness because
+                     * all enqueue happens before setting the terminal event.
+                     * If it were the other way around, when the emission is paused between
+                     * checking isEmpty and checking terminalEvent, some other thread might
+                     * have produced elements and set the terminalEvent and we'd quit emitting
+                     * prematurely.
+                     */
+<span class="fc" id="L496">                    Object term = terminalEvent;</span>
+                    /*
+                     * See if the queue is empty; since we need this information multiple
+                     * times later on, we read it one.
+                     * Although the queue can become non-empty in the mean time, we will
+                     * detect it through the missing flag and will do another iteration.
+                     */
+<span class="fc" id="L503">                    boolean empty = queue.isEmpty();</span>
+                    // if the queue is empty and the terminal event was received, quit
+                    // and don't bother restoring emitting to false: no further activity is
+                    // possible at this point
+<span class="fc bfc" id="L507" title="All 2 branches covered.">                    if (checkTerminated(term, empty)) {</span>
+<span class="fc" id="L508">                        skipFinal = true;</span>
+                        return;
+                    }
+                    
+                    // We have elements queued. Note that due to the serialization nature of dispatch()
+                    // this loop is the only one which can turn a non-empty queue into an empty one
+                    // and as such, no need to ask the queue itself again for that.
+<span class="fc bfc" id="L515" title="All 2 branches covered.">                    if (!empty) {</span>
+                        // We take a snapshot of the current child-subscribers.
+                        // Concurrent subscribers may miss this iteration, but it is to be expected
+                        @SuppressWarnings(&quot;unchecked&quot;)
+<span class="fc" id="L519">                        InnerProducer&lt;T&gt;[] ps = producers.get();</span>
+                        
+<span class="fc" id="L521">                        int len = ps.length;</span>
+                        // Let's assume everyone requested the maximum value.
+<span class="fc" id="L523">                        long maxRequested = Long.MAX_VALUE;</span>
+                        // count how many have triggered unsubscription
+<span class="fc" id="L525">                        int unsubscribed = 0;</span>
+                    
+                        // Now find the minimum amount each child-subscriber requested
+                        // since we can only emit that much to all of them without violating
+                        // backpressure constraints
+<span class="fc bfc" id="L530" title="All 2 branches covered.">                        for (InnerProducer&lt;T&gt; ip : ps) {</span>
+<span class="fc" id="L531">                            long r = ip.get();</span>
+                            // if there is one child subscriber that hasn't requested yet
+                            // we can't emit anything to anyone
+<span class="pc bpc" id="L534" title="1 of 2 branches missed.">                            if (r &gt;= 0L) {</span>
+<span class="fc" id="L535">                                maxRequested = Math.min(maxRequested, r);</span>
+                            } else
+                            // unsubscription is indicated by a special value
+<span class="nc bnc" id="L538" title="All 2 branches missed.">                            if (r == InnerProducer.UNSUBSCRIBED) {</span>
+<span class="nc" id="L539">                                unsubscribed++;</span>
+                            }
+                            // we ignore those with NOT_REQUESTED as if they aren't even there
+                        }
+                        
+                        // it may happen everyone has unsubscribed between here and producers.get()
+                        // or we have no subscribers at all to begin with
+<span class="fc bfc" id="L546" title="All 2 branches covered.">                        if (len == unsubscribed) {</span>
+<span class="fc" id="L547">                            term = terminalEvent;</span>
+                            // so let's consume a value from the queue
+<span class="fc" id="L549">                            Object v = queue.poll();</span>
+                            // or terminate if there was a terminal event and the queue is empty
+<span class="pc bpc" id="L551" title="2 of 4 branches missed.">                            if (checkTerminated(term, v == null)) {</span>
+<span class="nc" id="L552">                                skipFinal = true;</span>
+                                return;
+                            }
+                            // otherwise, just ask for a new value
+<span class="fc" id="L556">                            request(1);</span>
+                            // and retry emitting to potential new child-subscribers
+<span class="fc" id="L558">                            continue;</span>
+                        }
+                        // if we get here, it means there are non-unsubscribed child-subscribers
+                        // and we count the number of emitted values because the queue
+                        // may contain less than requested
+<span class="fc" id="L563">                        int d = 0;</span>
+<span class="fc bfc" id="L564" title="All 2 branches covered.">                        while (d &lt; maxRequested) {</span>
+<span class="fc" id="L565">                            term = terminalEvent;</span>
+<span class="fc" id="L566">                            Object v = queue.poll();</span>
+<span class="fc bfc" id="L567" title="All 2 branches covered.">                            empty = v == null;</span>
+                            // let's check if there is a terminal event and the queue became empty just now
+<span class="fc bfc" id="L569" title="All 2 branches covered.">                            if (checkTerminated(term, empty)) {</span>
+<span class="fc" id="L570">                                skipFinal = true;</span>
+                                return;
+                            }
+                            // the queue is empty but we aren't terminated yet, finish this emission loop
+<span class="fc bfc" id="L574" title="All 2 branches covered.">                            if (empty) {</span>
+<span class="fc" id="L575">                                break;</span>
+                            }
+                            // we need to unwrap potential nulls
+<span class="fc" id="L578">                            T value = nl.getValue(v);</span>
+                            // let's emit this value to all child subscribers
+<span class="fc bfc" id="L580" title="All 2 branches covered.">                            for (InnerProducer&lt;T&gt; ip : ps) {</span>
+                                // if ip.get() is negative, the child has either unsubscribed in the
+                                // meantime or hasn't requested anything yet
+                                // this eager behavior will skip unsubscribed children in case
+                                // multiple values are available in the queue
+<span class="fc bfc" id="L585" title="All 2 branches covered.">                                if (ip.get() &gt; 0L) {</span>
+                                    try {
+<span class="fc" id="L587">                                        ip.child.onNext(value);</span>
+<span class="nc" id="L588">                                    } catch (Throwable t) {</span>
+                                        // we bounce back exceptions and kick out the child subscriber
+<span class="nc" id="L590">                                        ip.unsubscribe();</span>
+<span class="nc" id="L591">                                        Exceptions.throwOrReport(t, ip.child, value);</span>
+<span class="nc" id="L592">                                        continue;</span>
+<span class="fc" id="L593">                                    }</span>
+                                    // indicate this child has received 1 element
+<span class="fc" id="L595">                                    ip.produced(1);</span>
+                                }
+                            }
+                            // indicate we emitted one element
+<span class="fc" id="L599">                            d++;</span>
+<span class="fc" id="L600">                        }</span>
+                        
+                        // if we did emit at least one element, request more to replenish the queue
+<span class="fc bfc" id="L603" title="All 2 branches covered.">                        if (d &gt; 0) {</span>
+<span class="fc" id="L604">                            request(d);</span>
+                        }
+                        // if we have requests but not an empty queue after emission
+                        // let's try again to see if more requests/child-subscribers are 
+                        // ready to receive more
+<span class="fc bfc" id="L609" title="All 4 branches covered.">                        if (maxRequested != 0L &amp;&amp; !empty) {</span>
+<span class="fc" id="L610">                            continue;</span>
+                        }
+                    }
+                    
+                    // we did what we could: either the queue is empty or child subscribers
+                    // haven't requested more (or both), let's try to finish dispatching
+<span class="fc" id="L616">                    synchronized (this) {</span>
+                        // since missed is changed atomically, if we see it as true
+                        // it means some state has changed and we need to loop again
+                        // and handle that case
+<span class="fc bfc" id="L620" title="All 2 branches covered.">                        if (!missed) {</span>
+                            // but if no missed dispatch happened, let's stop emitting
+<span class="fc" id="L622">                            emitting = false;</span>
+                            // and skip the emitting = false in the finally block as well
+<span class="fc" id="L624">                            skipFinal = true;</span>
+<span class="fc" id="L625">                            return;</span>
+                        }
+                        // we acknowledge the missed changes so far
+<span class="fc" id="L628">                        missed = false;</span>
+<span class="pc" id="L629">                    }</span>
+<span class="fc" id="L630">                }</span>
+            } finally {
+                // unless returned cleanly (i.e., some method above threw)
+<span class="pc bpc" id="L633" title="7 of 10 branches missed.">                if (!skipFinal) {</span>
+                    // we stop emitting so the error can propagate back down through onError
+<span class="nc" id="L635">                    synchronized (this) {</span>
+<span class="nc" id="L636">                        emitting = false;</span>
+<span class="pc" id="L637">                    }</span>
+                }
+            }
+        }
+    }
+    /**
+     * A Producer and Subscription that manages the request and unsubscription state of a
+     * child subscriber in thread-safe manner.
+     * We use AtomicLong as a base class to save on extra allocation of an AtomicLong and also
+     * save the overhead of the AtomicIntegerFieldUpdater.
+     * @param &lt;T&gt; the value type
+     */
+    static final class InnerProducer&lt;T&gt; extends AtomicLong implements Producer, Subscription {
+        /** */
+        private static final long serialVersionUID = -4453897557930727610L;
+        /** 
+         * The parent subscriber-to-source used to allow removing the child in case of
+         * child unsubscription.
+         */
+        final PublishSubscriber&lt;T&gt; parent;
+        /** The actual child subscriber. */
+        final Subscriber&lt;? super T&gt; child;
+        /** 
+         * Indicates this child has been unsubscribed: the state is swapped in atomically and
+         * will prevent the dispatch() to emit (too many) values to a terminated child subscriber.
+         */
+        static final long UNSUBSCRIBED = Long.MIN_VALUE;
+        /**
+         * Indicates this child has not yet requested any value. We pretend we don't
+         * see such child subscribers in dispatch() to allow other child subscribers who
+         * have requested to make progress. In a concurrent subscription scenario,
+         * one can't be sure when a subscription happens exactly so this virtual shift
+         * should not cause any problems.
+         */
+        static final long NOT_REQUESTED = Long.MIN_VALUE / 2;
+        
+<span class="fc" id="L673">        public InnerProducer(PublishSubscriber&lt;T&gt; parent, Subscriber&lt;? super T&gt; child) {</span>
+<span class="fc" id="L674">            this.parent = parent;</span>
+<span class="fc" id="L675">            this.child = child;</span>
+<span class="fc" id="L676">            this.lazySet(NOT_REQUESTED);</span>
+<span class="fc" id="L677">        }</span>
+        
+        @Override
+        public void request(long n) {
+            // ignore negative requests
+<span class="pc bpc" id="L682" title="1 of 2 branches missed.">            if (n &lt; 0) {</span>
+<span class="nc" id="L683">                return;</span>
+            }
+            // In general, RxJava doesn't prevent concurrent requests (with each other or with
+            // an unsubscribe) so we need a CAS-loop, but we need to handle
+            // request overflow and unsubscribed/not requested state as well.
+            for (;;) {
+                // get the current request amount
+<span class="fc" id="L690">                long r = get();</span>
+                // if child called unsubscribe() do nothing
+<span class="fc bfc" id="L692" title="All 2 branches covered.">                if (r == UNSUBSCRIBED) {</span>
+<span class="fc" id="L693">                    return;</span>
+                }
+                // ignore zero requests except any first that sets in zero
+<span class="pc bpc" id="L696" title="1 of 4 branches missed.">                if (r &gt;= 0L &amp;&amp; n == 0) {</span>
+<span class="nc" id="L697">                    return;</span>
+                }
+                long u;
+                // if this child has not requested yet
+<span class="fc bfc" id="L701" title="All 2 branches covered.">                if (r == NOT_REQUESTED) {</span>
+                    // let the new request value this (no overflow check needed)
+<span class="fc" id="L703">                    u = n;</span>
+                } else {
+                    // otherwise, increase the request count
+<span class="fc" id="L706">                    u = r + n;</span>
+                    // and check for long overflow
+<span class="fc bfc" id="L708" title="All 2 branches covered.">                    if (u &lt; 0) {</span>
+                        // cap at max value, which is essentially unlimited
+<span class="fc" id="L710">                        u = Long.MAX_VALUE;</span>
+                    }
+                }
+                // try setting the new request value
+<span class="fc bfc" id="L714" title="All 2 branches covered.">                if (compareAndSet(r, u)) {</span>
+                    // if successful, notify the parent dispatcher this child can receive more
+                    // elements
+<span class="fc" id="L717">                    parent.dispatch();</span>
+<span class="fc" id="L718">                    return;</span>
+                }
+                // otherwise, someone else changed the state (perhaps a concurrent 
+                // request or unsubscription so retry
+<span class="fc" id="L722">            }</span>
+        }
+        
+        /**
+         * Indicate that values have been emitted to this child subscriber by the dispatch() method.
+         * @param n the number of items emitted
+         * @return the updated request value (may indicate how much can be produced or a terminal state)
+         */
+        public long produced(long n) {
+            // we don't allow producing zero or less: it would be a bug in the operator
+<span class="pc bpc" id="L732" title="1 of 2 branches missed.">            if (n &lt;= 0) {</span>
+<span class="nc" id="L733">                throw new IllegalArgumentException(&quot;Cant produce zero or less&quot;);</span>
+            }
+            for (;;) {
+                // get the current request value
+<span class="fc" id="L737">                long r = get();</span>
+                // if no request has been made yet, we shouldn't have emitted to this child
+                // subscriber so there is a bug in this operator
+<span class="pc bpc" id="L740" title="1 of 2 branches missed.">                if (r == NOT_REQUESTED) {</span>
+<span class="nc" id="L741">                    throw new IllegalStateException(&quot;Produced without request&quot;);</span>
+                }
+                // if the child has unsubscribed, simply return and indicate this
+<span class="fc bfc" id="L744" title="All 2 branches covered.">                if (r == UNSUBSCRIBED) {</span>
+<span class="fc" id="L745">                    return UNSUBSCRIBED;</span>
+                }
+                // reduce the requested amount
+<span class="fc" id="L748">                long u = r - n;</span>
+                // if the new amount is less than zero, we have a bug in this operator
+<span class="pc bpc" id="L750" title="1 of 2 branches missed.">                if (u &lt; 0) {</span>
+<span class="nc" id="L751">                    throw new IllegalStateException(&quot;More produced (&quot; + n + &quot;) than requested (&quot; + r + &quot;)&quot;);</span>
+                }
+                // try updating the request value
+<span class="fc bfc" id="L754" title="All 2 branches covered.">                if (compareAndSet(r, u)) {</span>
+                    // and return the updated value
+<span class="fc" id="L756">                    return u;</span>
+                }
+                // otherwise, some concurrent activity happened and we need to retry
+<span class="fc" id="L759">            }</span>
+        }
+        
+        @Override
+        public boolean isUnsubscribed() {
+<span class="pc bpc" id="L764" title="1 of 2 branches missed.">            return get() == UNSUBSCRIBED;</span>
+        }
+        @Override
+        public void unsubscribe() {
+<span class="fc" id="L768">            long r = get();</span>
+            // let's see if we are unsubscribed
+<span class="pc bpc" id="L770" title="1 of 2 branches missed.">            if (r != UNSUBSCRIBED) {</span>
+                // if not, swap in the terminal state, this is idempotent
+                // because other methods using CAS won't overwrite this value,
+                // concurrent calls to unsubscribe will atomically swap in the same
+                // terminal value
+<span class="fc" id="L775">                r = getAndSet(UNSUBSCRIBED);</span>
+                // and only one of them will see a non-terminated value before the swap
+<span class="pc bpc" id="L777" title="1 of 2 branches missed.">                if (r != UNSUBSCRIBED) {</span>
+                    // remove this from the parent
+<span class="fc" id="L779">                    parent.remove(this);</span>
+                    // After removal, we might have unblocked the other child subscribers:
+                    // let's assume this child had 0 requested before the unsubscription while
+                    // the others had non-zero. By removing this 'blocking' child, the others
+                    // are now free to receive events
+<span class="fc" id="L784">                    parent.dispatch();</span>
+                }
+            }
+<span class="fc" id="L787">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

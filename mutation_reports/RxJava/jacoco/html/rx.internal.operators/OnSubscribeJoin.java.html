@@ -1,0 +1,322 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>OnSubscribeJoin.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.internal.operators</a> &gt; <span class="el_source">OnSubscribeJoin.java</span></div><h1>OnSubscribeJoin.java</h1><pre class="source lang-java linenums">/**
+ * Copyright 2014 Netflix, Inc.
+ * 
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package rx.internal.operators;
+
+import java.util.*;
+
+import rx.*;
+import rx.Observable;
+import rx.Observable.OnSubscribe;
+import rx.exceptions.Exceptions;
+import rx.functions.*;
+import rx.observers.SerializedSubscriber;
+import rx.subscriptions.*;
+
+/**
+ * Correlates the elements of two sequences based on overlapping durations.
+ * 
+ * @param &lt;TLeft&gt; the left value type
+ * @param &lt;TRight&gt; the right value type
+ * @param &lt;TLeftDuration&gt; the left duration value type
+ * @param &lt;TRightDuration&gt; the right duration type
+ * @param &lt;R&gt; the result type
+ */
+public final class OnSubscribeJoin&lt;TLeft, TRight, TLeftDuration, TRightDuration, R&gt; implements OnSubscribe&lt;R&gt; {
+    final Observable&lt;TLeft&gt; left;
+    final Observable&lt;TRight&gt; right;
+    final Func1&lt;TLeft, Observable&lt;TLeftDuration&gt;&gt; leftDurationSelector;
+    final Func1&lt;TRight, Observable&lt;TRightDuration&gt;&gt; rightDurationSelector;
+    final Func2&lt;TLeft, TRight, R&gt; resultSelector;
+
+    public OnSubscribeJoin(
+            Observable&lt;TLeft&gt; left,
+            Observable&lt;TRight&gt; right,
+            Func1&lt;TLeft, Observable&lt;TLeftDuration&gt;&gt; leftDurationSelector,
+            Func1&lt;TRight, Observable&lt;TRightDuration&gt;&gt; rightDurationSelector,
+<span class="fc" id="L49">            Func2&lt;TLeft, TRight, R&gt; resultSelector) {</span>
+<span class="fc" id="L50">        this.left = left;</span>
+<span class="fc" id="L51">        this.right = right;</span>
+<span class="fc" id="L52">        this.leftDurationSelector = leftDurationSelector;</span>
+<span class="fc" id="L53">        this.rightDurationSelector = rightDurationSelector;</span>
+<span class="fc" id="L54">        this.resultSelector = resultSelector;</span>
+<span class="fc" id="L55">    }</span>
+
+    @Override
+    public void call(Subscriber&lt;? super R&gt; t1) {
+<span class="fc" id="L59">        ResultSink result = new ResultSink(new SerializedSubscriber&lt;R&gt;(t1));</span>
+<span class="fc" id="L60">        result.run();</span>
+<span class="fc" id="L61">    }</span>
+
+    /** Manage the left and right sources. */
+    final class ResultSink {
+        final CompositeSubscription group;
+        final Subscriber&lt;? super R&gt; subscriber;
+<span class="fc" id="L67">        final Object guard = new Object();</span>
+        /** Guarded by guard. */
+        boolean leftDone;
+        /** Guarded by guard. */
+        int leftId;
+        /** Guarded by guard. */
+        final Map&lt;Integer, TLeft&gt; leftMap;
+        /** Guarded by guard. */
+        boolean rightDone;
+        /** Guarded by guard. */
+        int rightId;
+        /** Guarded by guard. */
+        final Map&lt;Integer, TRight&gt; rightMap;
+
+<span class="fc" id="L81">        public ResultSink(Subscriber&lt;? super R&gt; subscriber) {</span>
+<span class="fc" id="L82">            this.subscriber = subscriber;</span>
+<span class="fc" id="L83">            this.group = new CompositeSubscription();</span>
+<span class="fc" id="L84">            this.leftMap = new HashMap&lt;Integer, TLeft&gt;();</span>
+<span class="fc" id="L85">            this.rightMap = new HashMap&lt;Integer, TRight&gt;();</span>
+<span class="fc" id="L86">        }</span>
+
+        public void run() {
+<span class="fc" id="L89">            subscriber.add(group);</span>
+            
+<span class="fc" id="L91">            Subscriber&lt;TLeft&gt; s1 = new LeftSubscriber();</span>
+<span class="fc" id="L92">            Subscriber&lt;TRight&gt; s2 = new RightSubscriber();</span>
+            
+<span class="fc" id="L94">            group.add(s1);</span>
+<span class="fc" id="L95">            group.add(s2);</span>
+
+<span class="fc" id="L97">            left.unsafeSubscribe(s1);</span>
+<span class="fc" id="L98">            right.unsafeSubscribe(s2);</span>
+<span class="fc" id="L99">        }</span>
+
+        /** Observes the left values. */
+<span class="fc" id="L102">        final class LeftSubscriber extends Subscriber&lt;TLeft&gt; {</span>
+
+            protected void expire(int id, Subscription resource) {
+<span class="fc" id="L105">                boolean complete = false;</span>
+<span class="fc" id="L106">                synchronized (guard) {</span>
+<span class="pc bpc" id="L107" title="2 of 6 branches missed.">                    if (leftMap.remove(id) != null &amp;&amp; leftMap.isEmpty() &amp;&amp; leftDone) {</span>
+<span class="nc" id="L108">                        complete = true;</span>
+                    }
+<span class="pc" id="L110">                }</span>
+<span class="pc bpc" id="L111" title="1 of 2 branches missed.">                if (complete) {</span>
+<span class="nc" id="L112">                    subscriber.onCompleted();</span>
+<span class="nc" id="L113">                    subscriber.unsubscribe();</span>
+                } else {
+<span class="fc" id="L115">                    group.remove(resource);</span>
+                }
+<span class="fc" id="L117">            }</span>
+
+            @Override
+            public void onNext(TLeft args) {
+                int id;
+                int highRightId;
+
+<span class="fc" id="L124">                synchronized (guard) {</span>
+<span class="fc" id="L125">                    id = leftId++;</span>
+<span class="fc" id="L126">                    leftMap.put(id, args);</span>
+<span class="fc" id="L127">                    highRightId = rightId;</span>
+<span class="pc" id="L128">                }</span>
+
+                Observable&lt;TLeftDuration&gt; duration;
+                try {
+<span class="fc" id="L132">                    duration = leftDurationSelector.call(args);</span>
+
+<span class="fc" id="L134">                    Subscriber&lt;TLeftDuration&gt; d1 = new LeftDurationSubscriber(id);</span>
+<span class="fc" id="L135">                    group.add(d1);</span>
+
+<span class="fc" id="L137">                    duration.unsafeSubscribe(d1);</span>
+
+<span class="fc" id="L139">                    List&lt;TRight&gt; rightValues = new ArrayList&lt;TRight&gt;();</span>
+<span class="fc" id="L140">                    synchronized (guard) {</span>
+<span class="fc bfc" id="L141" title="All 2 branches covered.">                        for (Map.Entry&lt;Integer, TRight&gt; entry : rightMap.entrySet()) {</span>
+<span class="pc bpc" id="L142" title="1 of 2 branches missed.">                            if (entry.getKey() &lt; highRightId) {</span>
+<span class="fc" id="L143">                                rightValues.add(entry.getValue());</span>
+                            }
+<span class="fc" id="L145">                        }</span>
+<span class="pc" id="L146">                    }</span>
+<span class="fc bfc" id="L147" title="All 2 branches covered.">                    for (TRight r : rightValues) {</span>
+<span class="fc" id="L148">                        R result = resultSelector.call(args, r);</span>
+<span class="fc" id="L149">                        subscriber.onNext(result);</span>
+<span class="fc" id="L150">                    }</span>
+<span class="fc" id="L151">                } catch (Throwable t) {</span>
+<span class="fc" id="L152">                    Exceptions.throwOrReport(t, this);</span>
+<span class="fc" id="L153">                }</span>
+<span class="fc" id="L154">            }</span>
+
+            @Override
+            public void onError(Throwable e) {
+<span class="fc" id="L158">                subscriber.onError(e);</span>
+<span class="fc" id="L159">                subscriber.unsubscribe();</span>
+<span class="fc" id="L160">            }</span>
+
+            @Override
+            public void onCompleted() {
+<span class="fc" id="L164">                boolean complete = false;</span>
+<span class="fc" id="L165">                synchronized (guard) {</span>
+<span class="fc" id="L166">                    leftDone = true;</span>
+<span class="pc bpc" id="L167" title="2 of 4 branches missed.">                    if (rightDone || leftMap.isEmpty()) {</span>
+<span class="nc" id="L168">                        complete = true;</span>
+                    }
+<span class="pc" id="L170">                }</span>
+<span class="pc bpc" id="L171" title="1 of 2 branches missed.">                if (complete) {</span>
+<span class="nc" id="L172">                    subscriber.onCompleted();</span>
+<span class="nc" id="L173">                    subscriber.unsubscribe();</span>
+                } else {
+<span class="fc" id="L175">                    group.remove(this);</span>
+                }
+<span class="fc" id="L177">            }</span>
+
+            /** Observes the left duration. */
+<span class="fc" id="L180">            final class LeftDurationSubscriber extends Subscriber&lt;TLeftDuration&gt; {</span>
+                final int id;
+<span class="fc" id="L182">                boolean once = true;</span>
+
+<span class="fc" id="L184">                public LeftDurationSubscriber(int id) {</span>
+<span class="fc" id="L185">                    this.id = id;</span>
+<span class="fc" id="L186">                }</span>
+
+                @Override
+                public void onNext(TLeftDuration args) {
+<span class="fc" id="L190">                    onCompleted();</span>
+<span class="fc" id="L191">                }</span>
+
+                @Override
+                public void onError(Throwable e) {
+<span class="fc" id="L195">                    LeftSubscriber.this.onError(e);</span>
+<span class="fc" id="L196">                }</span>
+
+                @Override
+                public void onCompleted() {
+<span class="pc bpc" id="L200" title="1 of 2 branches missed.">                    if (once) {</span>
+<span class="fc" id="L201">                        once = false;</span>
+<span class="fc" id="L202">                        expire(id, this);</span>
+                    }
+<span class="fc" id="L204">                }</span>
+
+            }
+        }
+
+        /** Observes the right values. */
+<span class="fc" id="L210">        final class RightSubscriber extends Subscriber&lt;TRight&gt; {</span>
+
+            void expire(int id, Subscription resource) {
+<span class="nc" id="L213">                boolean complete = false;</span>
+<span class="nc" id="L214">                synchronized (guard) {</span>
+<span class="nc bnc" id="L215" title="All 6 branches missed.">                    if (rightMap.remove(id) != null &amp;&amp; rightMap.isEmpty() &amp;&amp; rightDone) {</span>
+<span class="nc" id="L216">                        complete = true;</span>
+                    }
+<span class="nc" id="L218">                }</span>
+<span class="nc bnc" id="L219" title="All 2 branches missed.">                if (complete) {</span>
+<span class="nc" id="L220">                    subscriber.onCompleted();</span>
+<span class="nc" id="L221">                    subscriber.unsubscribe();</span>
+                } else {
+<span class="nc" id="L223">                    group.remove(resource);</span>
+                }
+<span class="nc" id="L225">            }</span>
+
+            @Override
+            public void onNext(TRight args) {
+                int id; 
+                int highLeftId;
+<span class="fc" id="L231">                synchronized (guard) {</span>
+<span class="fc" id="L232">                    id = rightId++;</span>
+<span class="fc" id="L233">                    rightMap.put(id, args);</span>
+<span class="fc" id="L234">                    highLeftId = leftId;</span>
+<span class="pc" id="L235">                }</span>
+<span class="fc" id="L236">                SerialSubscription md = new SerialSubscription();</span>
+<span class="fc" id="L237">                group.add(md);</span>
+
+                Observable&lt;TRightDuration&gt; duration;
+                try {
+<span class="fc" id="L241">                    duration = rightDurationSelector.call(args);</span>
+
+<span class="fc" id="L243">                    Subscriber&lt;TRightDuration&gt; d2 = new RightDurationSubscriber(id);</span>
+<span class="fc" id="L244">                    group.add(d2);</span>
+                    
+<span class="fc" id="L246">                    duration.unsafeSubscribe(d2);</span>
+                    
+
+<span class="fc" id="L249">                    List&lt;TLeft&gt; leftValues = new ArrayList&lt;TLeft&gt;();</span>
+<span class="fc" id="L250">                    synchronized (guard) {</span>
+<span class="fc bfc" id="L251" title="All 2 branches covered.">                        for (Map.Entry&lt;Integer, TLeft&gt; entry : leftMap.entrySet()) {</span>
+<span class="pc bpc" id="L252" title="1 of 2 branches missed.">                            if (entry.getKey() &lt; highLeftId) {</span>
+<span class="fc" id="L253">                                leftValues.add(entry.getValue());</span>
+                            }
+<span class="fc" id="L255">                        }</span>
+<span class="pc" id="L256">                    }</span>
+                    
+<span class="fc bfc" id="L258" title="All 2 branches covered.">                    for (TLeft lv : leftValues) {</span>
+<span class="fc" id="L259">                        R result = resultSelector.call(lv, args);</span>
+<span class="fc" id="L260">                        subscriber.onNext(result);</span>
+<span class="fc" id="L261">                    }</span>
+                    
+<span class="fc" id="L263">                } catch (Throwable t) {</span>
+<span class="fc" id="L264">                    Exceptions.throwOrReport(t, this);</span>
+<span class="fc" id="L265">                }</span>
+<span class="fc" id="L266">            }</span>
+
+            @Override
+            public void onError(Throwable e) {
+<span class="fc" id="L270">                subscriber.onError(e);</span>
+<span class="fc" id="L271">                subscriber.unsubscribe();</span>
+<span class="fc" id="L272">            }</span>
+
+            @Override
+            public void onCompleted() {
+<span class="fc" id="L276">                boolean complete = false;</span>
+<span class="fc" id="L277">                synchronized (guard) {</span>
+<span class="fc" id="L278">                    rightDone = true;</span>
+<span class="pc bpc" id="L279" title="3 of 4 branches missed.">                    if (leftDone || rightMap.isEmpty()) {</span>
+<span class="fc" id="L280">                        complete = true;</span>
+                    }
+<span class="pc" id="L282">                }</span>
+<span class="pc bpc" id="L283" title="1 of 2 branches missed.">                if (complete) {</span>
+<span class="fc" id="L284">                    subscriber.onCompleted();</span>
+<span class="fc" id="L285">                    subscriber.unsubscribe();</span>
+                } else {
+<span class="nc" id="L287">                    group.remove(this);</span>
+                }
+<span class="fc" id="L289">            }</span>
+
+            /** Observe the right duration. */
+<span class="fc" id="L292">            final class RightDurationSubscriber extends Subscriber&lt;TRightDuration&gt; {</span>
+                final int id;
+<span class="fc" id="L294">                boolean once = true;</span>
+
+<span class="fc" id="L296">                public RightDurationSubscriber(int id) {</span>
+<span class="fc" id="L297">                    this.id = id;</span>
+<span class="fc" id="L298">                }</span>
+
+                @Override
+                public void onNext(TRightDuration args) {
+<span class="nc" id="L302">                    onCompleted();</span>
+<span class="nc" id="L303">                }</span>
+
+                @Override
+                public void onError(Throwable e) {
+<span class="fc" id="L307">                    RightSubscriber.this.onError(e);</span>
+<span class="fc" id="L308">                }</span>
+
+                @Override
+                public void onCompleted() {
+<span class="nc bnc" id="L312" title="All 2 branches missed.">                    if (once) {</span>
+<span class="nc" id="L313">                        once = false;</span>
+<span class="nc" id="L314">                        expire(id, this);</span>
+                    }
+<span class="nc" id="L316">                }</span>
+
+            }
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

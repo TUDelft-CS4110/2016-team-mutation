@@ -1,0 +1,153 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>CompletableOnSubscribeConcat.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.internal.operators</a> &gt; <span class="el_source">CompletableOnSubscribeConcat.java</span></div><h1>CompletableOnSubscribeConcat.java</h1><pre class="source lang-java linenums">/**
+ * Copyright 2014 Netflix, Inc.
+ * 
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package rx.internal.operators;
+
+import java.util.concurrent.atomic.*;
+
+import rx.*;
+import rx.Completable.*;
+import rx.exceptions.MissingBackpressureException;
+import rx.internal.util.unsafe.SpscArrayQueue;
+import rx.plugins.RxJavaPlugins;
+import rx.subscriptions.SerialSubscription;
+
+public final class CompletableOnSubscribeConcat implements CompletableOnSubscribe {
+    final Observable&lt;? extends Completable&gt; sources;
+    final int prefetch;
+    
+<span class="fc" id="L32">    public CompletableOnSubscribeConcat(Observable&lt;? extends Completable&gt; sources, int prefetch) {</span>
+<span class="fc" id="L33">        this.sources = sources;</span>
+<span class="fc" id="L34">        this.prefetch = prefetch;</span>
+<span class="fc" id="L35">    }</span>
+    
+    @Override
+    public void call(CompletableSubscriber s) {
+<span class="fc" id="L39">        CompletableConcatSubscriber parent = new CompletableConcatSubscriber(s, prefetch);</span>
+<span class="fc" id="L40">        s.onSubscribe(parent);</span>
+<span class="fc" id="L41">        sources.subscribe(parent);</span>
+<span class="fc" id="L42">    }</span>
+    
+    static final class CompletableConcatSubscriber
+    extends Subscriber&lt;Completable&gt; {
+        final CompletableSubscriber actual;
+        final int prefetch;
+        final SerialSubscription sr;
+        
+        final SpscArrayQueue&lt;Completable&gt; queue;
+        
+        volatile boolean done;
+
+        volatile int once;
+<span class="fc" id="L55">        static final AtomicIntegerFieldUpdater&lt;CompletableConcatSubscriber&gt; ONCE =</span>
+                AtomicIntegerFieldUpdater.newUpdater(CompletableConcatSubscriber.class, &quot;once&quot;);
+        
+        final ConcatInnerSubscriber inner;
+        
+        final AtomicInteger wip;
+        
+<span class="fc" id="L62">        public CompletableConcatSubscriber(CompletableSubscriber actual, int prefetch) {</span>
+<span class="fc" id="L63">            this.actual = actual;</span>
+<span class="fc" id="L64">            this.prefetch = prefetch;</span>
+<span class="fc" id="L65">            this.queue = new SpscArrayQueue&lt;Completable&gt;(prefetch);</span>
+<span class="fc" id="L66">            this.sr = new SerialSubscription();</span>
+<span class="fc" id="L67">            this.inner = new ConcatInnerSubscriber();</span>
+<span class="fc" id="L68">            this.wip = new AtomicInteger();</span>
+<span class="fc" id="L69">            add(sr);</span>
+<span class="fc" id="L70">            request(prefetch);</span>
+<span class="fc" id="L71">        }</span>
+        
+        @Override
+        public void onNext(Completable t) {
+<span class="pc bpc" id="L75" title="1 of 2 branches missed.">            if (!queue.offer(t)) {</span>
+<span class="nc" id="L76">                onError(new MissingBackpressureException());</span>
+<span class="nc" id="L77">                return;</span>
+            }
+<span class="pc bpc" id="L79" title="1 of 2 branches missed.">            if (wip.getAndIncrement() == 0) {</span>
+<span class="fc" id="L80">                next();</span>
+            }
+<span class="fc" id="L82">        }</span>
+        
+        @Override
+        public void onError(Throwable t) {
+<span class="pc bpc" id="L86" title="1 of 2 branches missed.">            if (ONCE.compareAndSet(this, 0, 1)) {</span>
+<span class="fc" id="L87">                actual.onError(t);</span>
+<span class="fc" id="L88">                return;</span>
+            }
+<span class="nc" id="L90">            RxJavaPlugins.getInstance().getErrorHandler().handleError(t);</span>
+<span class="nc" id="L91">        }</span>
+        
+        @Override
+        public void onCompleted() {
+<span class="pc bpc" id="L95" title="1 of 2 branches missed.">            if (done) {</span>
+<span class="nc" id="L96">                return;</span>
+            }
+<span class="fc" id="L98">            done = true;</span>
+<span class="pc bpc" id="L99" title="1 of 2 branches missed.">            if (wip.getAndIncrement() == 0) {</span>
+<span class="fc" id="L100">                next();</span>
+            }
+<span class="fc" id="L102">        }</span>
+        
+        void innerError(Throwable e) {
+<span class="fc" id="L105">            unsubscribe();</span>
+<span class="fc" id="L106">            onError(e);</span>
+<span class="fc" id="L107">        }</span>
+        
+        void innerComplete() {
+<span class="pc bpc" id="L110" title="1 of 2 branches missed.">            if (wip.decrementAndGet() != 0) {</span>
+<span class="nc" id="L111">                next();</span>
+            }
+<span class="pc bpc" id="L113" title="1 of 2 branches missed.">            if (!done) {</span>
+<span class="fc" id="L114">                request(1);</span>
+            }
+<span class="fc" id="L116">        }</span>
+        
+        void next() {
+<span class="fc" id="L119">            boolean d = done;</span>
+<span class="fc" id="L120">            Completable c = queue.poll();</span>
+<span class="fc bfc" id="L121" title="All 2 branches covered.">            if (c == null) {</span>
+<span class="pc bpc" id="L122" title="1 of 2 branches missed.">                if (d) {</span>
+<span class="pc bpc" id="L123" title="1 of 2 branches missed.">                    if (ONCE.compareAndSet(this, 0, 1)) {</span>
+<span class="fc" id="L124">                        actual.onCompleted();</span>
+                    }
+<span class="fc" id="L126">                    return;</span>
+                }
+<span class="nc" id="L128">                RxJavaPlugins.getInstance().getErrorHandler().handleError(new IllegalStateException(&quot;Queue is empty?!&quot;));</span>
+<span class="nc" id="L129">                return;</span>
+            }
+            
+<span class="fc" id="L132">            c.subscribe(inner);</span>
+<span class="fc" id="L133">        }</span>
+        
+<span class="fc" id="L135">        final class ConcatInnerSubscriber implements CompletableSubscriber {</span>
+            @Override
+            public void onSubscribe(Subscription d) {
+<span class="fc" id="L138">                sr.set(d);</span>
+<span class="fc" id="L139">            }</span>
+            
+            @Override
+            public void onError(Throwable e) {
+<span class="fc" id="L143">                innerError(e);</span>
+<span class="fc" id="L144">            }</span>
+            
+            @Override
+            public void onCompleted() {
+<span class="fc" id="L148">                innerComplete();</span>
+<span class="fc" id="L149">            }</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

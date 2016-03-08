@@ -1,0 +1,319 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>OperatorEagerConcatMap.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.internal.operators</a> &gt; <span class="el_source">OperatorEagerConcatMap.java</span></div><h1>OperatorEagerConcatMap.java</h1><pre class="source lang-java linenums">/**
+ * Copyright 2014 Netflix, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+
+package rx.internal.operators;
+
+import java.util.*;
+import java.util.concurrent.atomic.*;
+
+import rx.*;
+import rx.Observable;
+import rx.Observable.Operator;
+import rx.exceptions.Exceptions;
+import rx.functions.*;
+import rx.internal.util.atomic.SpscAtomicArrayQueue;
+import rx.internal.util.unsafe.*;
+import rx.subscriptions.Subscriptions;
+
+public final class OperatorEagerConcatMap&lt;T, R&gt; implements Operator&lt;R, T&gt; {
+    final Func1&lt;? super T, ? extends Observable&lt;? extends R&gt;&gt; mapper;
+    final int bufferSize;
+<span class="fc" id="L34">    public OperatorEagerConcatMap(Func1&lt;? super T, ? extends Observable&lt;? extends R&gt;&gt; mapper, int bufferSize) {</span>
+<span class="fc" id="L35">        this.mapper = mapper;</span>
+<span class="fc" id="L36">        this.bufferSize = bufferSize;</span>
+<span class="fc" id="L37">    }</span>
+    
+    @Override
+    public Subscriber&lt;? super T&gt; call(Subscriber&lt;? super R&gt; t) {
+<span class="fc" id="L41">        EagerOuterSubscriber&lt;T, R&gt; outer = new EagerOuterSubscriber&lt;T, R&gt;(mapper, bufferSize, t);</span>
+<span class="fc" id="L42">        outer.init();</span>
+<span class="fc" id="L43">        return outer;</span>
+    }
+    
+    static final class EagerOuterProducer extends AtomicLong implements Producer {
+        /** */
+        private static final long serialVersionUID = -657299606803478389L;
+        
+        final EagerOuterSubscriber&lt;?, ?&gt; parent;
+        
+<span class="fc" id="L52">        public EagerOuterProducer(EagerOuterSubscriber&lt;?, ?&gt; parent) {</span>
+<span class="fc" id="L53">            this.parent = parent;</span>
+<span class="fc" id="L54">        }</span>
+
+        @Override
+        public void request(long n) {
+<span class="pc bpc" id="L58" title="1 of 2 branches missed.">            if (n &lt; 0) {</span>
+<span class="nc" id="L59">                throw new IllegalStateException(&quot;n &gt;= 0 required but it was &quot; + n);</span>
+            }
+            
+<span class="fc bfc" id="L62" title="All 2 branches covered.">            if (n &gt; 0) {</span>
+<span class="fc" id="L63">                BackpressureUtils.getAndAddRequest(this, n);</span>
+<span class="fc" id="L64">                parent.drain();</span>
+            }
+<span class="fc" id="L66">        }</span>
+    }
+    
+    static final class EagerOuterSubscriber&lt;T, R&gt; extends Subscriber&lt;T&gt; {
+        final Func1&lt;? super T, ? extends Observable&lt;? extends R&gt;&gt; mapper;
+        final int bufferSize;
+        final Subscriber&lt;? super R&gt; actual;
+        
+        final LinkedList&lt;EagerInnerSubscriber&lt;R&gt;&gt; subscribers;
+        
+        volatile boolean done;
+        Throwable error;
+        
+        volatile boolean cancelled;
+        
+        final AtomicInteger wip;
+        private EagerOuterProducer sharedProducer;
+        
+        public EagerOuterSubscriber(Func1&lt;? super T, ? extends Observable&lt;? extends R&gt;&gt; mapper, int bufferSize,
+<span class="fc" id="L85">                Subscriber&lt;? super R&gt; actual) {</span>
+<span class="fc" id="L86">            this.mapper = mapper;</span>
+<span class="fc" id="L87">            this.bufferSize = bufferSize;</span>
+<span class="fc" id="L88">            this.actual = actual;</span>
+<span class="fc" id="L89">            this.subscribers = new LinkedList&lt;EagerInnerSubscriber&lt;R&gt;&gt;();</span>
+<span class="fc" id="L90">            this.wip = new AtomicInteger();</span>
+<span class="fc" id="L91">        }</span>
+        
+        void init() {
+<span class="fc" id="L94">            sharedProducer = new EagerOuterProducer(this);</span>
+<span class="fc" id="L95">            add(Subscriptions.create(new Action0() {</span>
+                @Override
+                public void call() {
+<span class="fc" id="L98">                    cancelled = true;</span>
+<span class="fc bfc" id="L99" title="All 2 branches covered.">                    if (wip.getAndIncrement() == 0) {</span>
+<span class="fc" id="L100">                        cleanup();</span>
+                    }
+<span class="fc" id="L102">                }</span>
+            }));
+<span class="fc" id="L104">            actual.add(this);</span>
+<span class="fc" id="L105">            actual.setProducer(sharedProducer);</span>
+<span class="fc" id="L106">        }</span>
+        
+        void cleanup() {
+            List&lt;Subscription&gt; list;
+<span class="fc" id="L110">            synchronized (subscribers) {</span>
+<span class="fc" id="L111">                list = new ArrayList&lt;Subscription&gt;(subscribers);</span>
+<span class="fc" id="L112">                subscribers.clear();</span>
+<span class="pc" id="L113">            }</span>
+            
+<span class="fc bfc" id="L115" title="All 2 branches covered.">            for (Subscription s : list) {</span>
+<span class="fc" id="L116">                s.unsubscribe();</span>
+<span class="fc" id="L117">            }</span>
+<span class="fc" id="L118">        }</span>
+        
+        @Override
+        public void onNext(T t) {
+            Observable&lt;? extends R&gt; observable;
+            
+            try {
+<span class="fc" id="L125">                observable = mapper.call(t);</span>
+<span class="fc" id="L126">            } catch (Throwable e) {</span>
+<span class="fc" id="L127">                Exceptions.throwOrReport(e, actual, t);</span>
+<span class="fc" id="L128">                return;</span>
+<span class="fc" id="L129">            }</span>
+            
+<span class="fc" id="L131">            EagerInnerSubscriber&lt;R&gt; inner = new EagerInnerSubscriber&lt;R&gt;(this, bufferSize);</span>
+<span class="pc bpc" id="L132" title="1 of 2 branches missed.">            if (cancelled) {</span>
+<span class="nc" id="L133">                return;</span>
+            }
+<span class="fc" id="L135">            synchronized (subscribers) {</span>
+<span class="pc bpc" id="L136" title="1 of 2 branches missed.">                if (cancelled) {</span>
+<span class="nc" id="L137">                    return;</span>
+                }
+<span class="fc" id="L139">                subscribers.add(inner);</span>
+<span class="pc" id="L140">            }</span>
+<span class="pc bpc" id="L141" title="1 of 2 branches missed.">            if (cancelled) {</span>
+<span class="nc" id="L142">                return;</span>
+            }
+<span class="fc" id="L144">            observable.unsafeSubscribe(inner);</span>
+<span class="fc" id="L145">            drain();</span>
+<span class="fc" id="L146">        }</span>
+        
+        @Override
+        public void onError(Throwable e) {
+<span class="fc" id="L150">            error = e;</span>
+<span class="fc" id="L151">            done = true;</span>
+<span class="fc" id="L152">            drain();</span>
+<span class="fc" id="L153">        }</span>
+        
+        @Override
+        public void onCompleted() {
+<span class="fc" id="L157">            done = true;</span>
+<span class="fc" id="L158">            drain();</span>
+<span class="fc" id="L159">        }</span>
+        
+        void drain() {
+<span class="fc bfc" id="L162" title="All 2 branches covered.">            if (wip.getAndIncrement() != 0) {</span>
+<span class="fc" id="L163">                return;</span>
+            }
+<span class="fc" id="L165">            int missed = 1;</span>
+            
+<span class="fc" id="L167">            final AtomicLong requested = sharedProducer;</span>
+<span class="fc" id="L168">            final Subscriber&lt;? super R&gt; actualSubscriber = this.actual;</span>
+<span class="fc" id="L169">            final NotificationLite&lt;R&gt; nl = NotificationLite.instance();</span>
+            
+            for (;;) {
+                
+<span class="pc bpc" id="L173" title="1 of 2 branches missed.">                if (cancelled) {</span>
+<span class="nc" id="L174">                    cleanup();</span>
+<span class="nc" id="L175">                    return;</span>
+                }
+                
+                EagerInnerSubscriber&lt;R&gt; innerSubscriber;
+                
+<span class="fc" id="L180">                boolean outerDone = done;</span>
+<span class="fc" id="L181">                synchronized (subscribers) {</span>
+<span class="fc" id="L182">                    innerSubscriber = subscribers.peek();</span>
+<span class="pc" id="L183">                }</span>
+<span class="fc bfc" id="L184" title="All 2 branches covered.">                boolean empty = innerSubscriber == null;</span>
+                
+<span class="fc bfc" id="L186" title="All 2 branches covered.">                if (outerDone) {</span>
+<span class="fc" id="L187">                    Throwable error = this.error;</span>
+<span class="fc bfc" id="L188" title="All 2 branches covered.">                    if (error != null) {</span>
+<span class="fc" id="L189">                        cleanup();</span>
+<span class="fc" id="L190">                        actualSubscriber.onError(error);</span>
+<span class="fc" id="L191">                        return;</span>
+                    } else
+<span class="fc bfc" id="L193" title="All 2 branches covered.">                    if (empty) {</span>
+<span class="fc" id="L194">                        actualSubscriber.onCompleted();</span>
+<span class="fc" id="L195">                        return;</span>
+                    }
+                }
+
+<span class="fc bfc" id="L199" title="All 2 branches covered.">                if (!empty) {</span>
+<span class="fc" id="L200">                    long requestedAmount = requested.get();</span>
+<span class="fc" id="L201">                    long emittedAmount = 0L;</span>
+<span class="fc bfc" id="L202" title="All 2 branches covered.">                    boolean unbounded = requestedAmount == Long.MAX_VALUE;</span>
+                    
+<span class="fc" id="L204">                    Queue&lt;Object&gt; innerQueue = innerSubscriber.queue;</span>
+<span class="fc" id="L205">                    boolean innerDone = false;</span>
+                    
+                    
+                    for (;;) {
+<span class="fc" id="L209">                        outerDone = innerSubscriber.done;</span>
+<span class="fc" id="L210">                        Object v = innerQueue.peek();</span>
+<span class="fc bfc" id="L211" title="All 2 branches covered.">                        empty = v == null;</span>
+                        
+<span class="fc bfc" id="L213" title="All 2 branches covered.">                        if (outerDone) {</span>
+<span class="fc" id="L214">                            Throwable innerError = innerSubscriber.error;</span>
+<span class="fc bfc" id="L215" title="All 2 branches covered.">                            if (innerError != null) {</span>
+<span class="fc" id="L216">                                cleanup();</span>
+<span class="fc" id="L217">                                actualSubscriber.onError(innerError);</span>
+<span class="fc" id="L218">                                return;</span>
+                            } else
+<span class="fc bfc" id="L220" title="All 2 branches covered.">                            if (empty) {</span>
+<span class="fc" id="L221">                                synchronized (subscribers) {</span>
+<span class="fc" id="L222">                                    subscribers.poll();</span>
+<span class="pc" id="L223">                                }</span>
+<span class="fc" id="L224">                                innerSubscriber.unsubscribe();</span>
+<span class="fc" id="L225">                                innerDone = true;</span>
+<span class="fc" id="L226">                                break;</span>
+                            }
+                        }
+                        
+<span class="fc bfc" id="L230" title="All 2 branches covered.">                        if (empty) {</span>
+<span class="fc" id="L231">                            break;</span>
+                        }
+                        
+<span class="fc bfc" id="L234" title="All 2 branches covered.">                        if (requestedAmount == 0L) {</span>
+<span class="fc" id="L235">                            break;</span>
+                        }
+                        
+<span class="fc" id="L238">                        innerQueue.poll();</span>
+                        
+                        try {
+<span class="fc" id="L241">                            actualSubscriber.onNext(nl.getValue(v));</span>
+<span class="nc" id="L242">                        } catch (Throwable ex) {</span>
+<span class="nc" id="L243">                            Exceptions.throwOrReport(ex, actualSubscriber, v);</span>
+<span class="nc" id="L244">                            return;</span>
+<span class="fc" id="L245">                        }</span>
+                        
+<span class="fc" id="L247">                        requestedAmount--;</span>
+<span class="fc" id="L248">                        emittedAmount--;</span>
+<span class="fc" id="L249">                    }</span>
+                    
+<span class="fc bfc" id="L251" title="All 2 branches covered.">                    if (emittedAmount != 0L) {</span>
+<span class="fc bfc" id="L252" title="All 2 branches covered.">                        if (!unbounded) {</span>
+<span class="fc" id="L253">                            requested.addAndGet(emittedAmount);</span>
+                        }
+<span class="fc bfc" id="L255" title="All 2 branches covered.">                        if (!innerDone) {</span>
+<span class="fc" id="L256">                            innerSubscriber.requestMore(-emittedAmount);</span>
+                        }
+                    }
+                    
+<span class="fc bfc" id="L260" title="All 2 branches covered.">                    if (innerDone) {</span>
+<span class="fc" id="L261">                        continue;</span>
+                    }
+                }
+                
+<span class="fc" id="L265">                missed = wip.addAndGet(-missed);</span>
+<span class="fc bfc" id="L266" title="All 2 branches covered.">                if (missed == 0) {</span>
+<span class="fc" id="L267">                    return;</span>
+                }
+<span class="fc" id="L269">            }</span>
+        }
+    }
+    
+    static final class EagerInnerSubscriber&lt;T&gt; extends Subscriber&lt;T&gt; {
+        final EagerOuterSubscriber&lt;?, T&gt; parent;
+        final Queue&lt;Object&gt; queue;
+        final NotificationLite&lt;T&gt; nl;
+        
+        volatile boolean done;
+        Throwable error;
+        
+        public EagerInnerSubscriber(EagerOuterSubscriber&lt;?, T&gt; parent, int bufferSize) {
+<span class="fc" id="L282">            super();</span>
+<span class="fc" id="L283">            this.parent = parent;</span>
+            Queue&lt;Object&gt; q;
+<span class="pc bpc" id="L285" title="1 of 2 branches missed.">            if (UnsafeAccess.isUnsafeAvailable()) {</span>
+<span class="fc" id="L286">                q = new SpscArrayQueue&lt;Object&gt;(bufferSize);</span>
+            } else {
+<span class="nc" id="L288">                q = new SpscAtomicArrayQueue&lt;Object&gt;(bufferSize);</span>
+            }
+<span class="fc" id="L290">            this.queue = q;</span>
+<span class="fc" id="L291">            this.nl = NotificationLite.instance();</span>
+<span class="fc" id="L292">            request(bufferSize);</span>
+<span class="fc" id="L293">        }</span>
+        
+        @Override
+        public void onNext(T t) {
+<span class="fc" id="L297">            queue.offer(nl.next(t));</span>
+<span class="fc" id="L298">            parent.drain();</span>
+<span class="fc" id="L299">        }</span>
+        
+        @Override
+        public void onError(Throwable e) {
+<span class="fc" id="L303">            error = e;</span>
+<span class="fc" id="L304">            done = true;</span>
+<span class="fc" id="L305">            parent.drain();</span>
+<span class="fc" id="L306">        }</span>
+        
+        @Override
+        public void onCompleted() {
+<span class="fc" id="L310">            done = true;</span>
+<span class="fc" id="L311">            parent.drain();</span>
+<span class="fc" id="L312">        }</span>
+        
+        void requestMore(long n) {
+<span class="fc" id="L315">            request(n);</span>
+<span class="fc" id="L316">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

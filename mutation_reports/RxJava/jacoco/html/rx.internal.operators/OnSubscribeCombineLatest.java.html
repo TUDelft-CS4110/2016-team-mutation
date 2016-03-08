@@ -1,0 +1,410 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>OnSubscribeCombineLatest.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.internal.operators</a> &gt; <span class="el_source">OnSubscribeCombineLatest.java</span></div><h1>OnSubscribeCombineLatest.java</h1><pre class="source lang-java linenums">/**
+ * Copyright 2015 Netflix, Inc.
+ * 
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except in
+ * compliance with the License. You may obtain a copy of the License at
+ * 
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software distributed under the License is
+ * distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See
+ * the License for the specific language governing permissions and limitations under the License.
+ */
+
+package rx.internal.operators;
+
+import java.util.*;
+import java.util.concurrent.atomic.*;
+
+import rx.*;
+import rx.Observable;
+import rx.Observable.OnSubscribe;
+import rx.exceptions.CompositeException;
+import rx.functions.FuncN;
+import rx.internal.util.RxRingBuffer;
+import rx.internal.util.atomic.SpscLinkedArrayQueue;
+import rx.plugins.RxJavaPlugins;
+
+public final class OnSubscribeCombineLatest&lt;T, R&gt; implements OnSubscribe&lt;R&gt; {
+    final Observable&lt;? extends T&gt;[] sources;
+    final Iterable&lt;? extends Observable&lt;? extends T&gt;&gt; sourcesIterable;
+    final FuncN&lt;? extends R&gt; combiner;
+    final int bufferSize;
+    final boolean delayError;
+    
+    public OnSubscribeCombineLatest(Iterable&lt;? extends Observable&lt;? extends T&gt;&gt; sourcesIterable,
+            FuncN&lt;? extends R&gt; combiner) {
+<span class="fc" id="L37">        this(null, sourcesIterable, combiner, RxRingBuffer.SIZE, false);</span>
+<span class="fc" id="L38">    }</span>
+    
+    public OnSubscribeCombineLatest(Observable&lt;? extends T&gt;[] sources,
+            Iterable&lt;? extends Observable&lt;? extends T&gt;&gt; sourcesIterable,
+            FuncN&lt;? extends R&gt; combiner, int bufferSize,
+<span class="fc" id="L43">            boolean delayError) {</span>
+<span class="fc" id="L44">        this.sources = sources;</span>
+<span class="fc" id="L45">        this.sourcesIterable = sourcesIterable;</span>
+<span class="fc" id="L46">        this.combiner = combiner;</span>
+<span class="fc" id="L47">        this.bufferSize = bufferSize;</span>
+<span class="fc" id="L48">        this.delayError = delayError;</span>
+<span class="fc" id="L49">    }</span>
+
+    
+    @Override
+    @SuppressWarnings({ &quot;unchecked&quot;, &quot;rawtypes&quot; })
+    public void call(Subscriber&lt;? super R&gt; s) {
+<span class="fc" id="L55">        Observable&lt;? extends T&gt;[] sources = this.sources;</span>
+<span class="fc" id="L56">        int count = 0;</span>
+<span class="pc bpc" id="L57" title="1 of 2 branches missed.">        if (sources == null) {</span>
+<span class="pc bpc" id="L58" title="1 of 2 branches missed.">            if (sourcesIterable instanceof List) {</span>
+                // unchecked &amp; raw: javac type inference problem otherwise
+<span class="fc" id="L60">                List list = (List)sourcesIterable;</span>
+<span class="fc" id="L61">                sources = (Observable[])list.toArray(new Observable[list.size()]);</span>
+<span class="fc" id="L62">                count = sources.length;</span>
+<span class="fc" id="L63">            } else {</span>
+<span class="nc" id="L64">                sources = new Observable[8];</span>
+<span class="nc bnc" id="L65" title="All 2 branches missed.">                for (Observable&lt;? extends T&gt; p : sourcesIterable) {</span>
+<span class="nc bnc" id="L66" title="All 2 branches missed.">                    if (count == sources.length) {</span>
+<span class="nc" id="L67">                        Observable&lt;? extends T&gt;[] b = new Observable[count + (count &gt;&gt; 2)];</span>
+<span class="nc" id="L68">                        System.arraycopy(sources, 0, b, 0, count);</span>
+<span class="nc" id="L69">                        sources = b;</span>
+                    }
+<span class="nc" id="L71">                    sources[count++] = p;</span>
+<span class="nc" id="L72">                }</span>
+            }
+        } else {
+<span class="nc" id="L75">            count = sources.length;</span>
+        }
+        
+<span class="fc bfc" id="L78" title="All 2 branches covered.">        if (count == 0) {</span>
+<span class="fc" id="L79">            s.onCompleted();</span>
+<span class="fc" id="L80">            return;</span>
+        }
+        
+<span class="fc" id="L83">        LatestCoordinator&lt;T, R&gt; lc = new LatestCoordinator&lt;T, R&gt;(s, combiner, count, bufferSize, delayError);</span>
+<span class="fc" id="L84">        lc.subscribe(sources);</span>
+<span class="fc" id="L85">    }</span>
+    
+    static final class LatestCoordinator&lt;T, R&gt; extends AtomicInteger implements Producer, Subscription {
+        /** */
+        private static final long serialVersionUID = 8567835998786448817L;
+        final Subscriber&lt;? super R&gt; actual;
+        final FuncN&lt;? extends R&gt; combiner;
+        final int count;
+        final CombinerSubscriber&lt;T, R&gt;[] subscribers;
+        final int bufferSize;
+        final Object[] latest;
+        final SpscLinkedArrayQueue&lt;Object&gt; queue;
+        final boolean delayError;
+        
+        volatile boolean cancelled;
+        
+        volatile boolean done;
+        
+        final AtomicLong requested;
+
+        final AtomicReference&lt;Throwable&gt; error;
+        
+        int active;
+        int complete;
+        
+        /** Indicates the particular source hasn't emitted any value yet. */
+<span class="fc" id="L111">        static final Object MISSING = new Object();</span>
+        
+        @SuppressWarnings(&quot;unchecked&quot;)
+        public LatestCoordinator(Subscriber&lt;? super R&gt; actual, 
+                FuncN&lt;? extends R&gt; combiner, 
+<span class="fc" id="L116">                int count, int bufferSize, boolean delayError) {</span>
+<span class="fc" id="L117">            this.actual = actual;</span>
+<span class="fc" id="L118">            this.combiner = combiner;</span>
+<span class="fc" id="L119">            this.count = count;</span>
+<span class="fc" id="L120">            this.bufferSize = bufferSize;</span>
+<span class="fc" id="L121">            this.delayError = delayError;</span>
+<span class="fc" id="L122">            this.latest = new Object[count];</span>
+<span class="fc" id="L123">            Arrays.fill(latest, MISSING);</span>
+<span class="fc" id="L124">            this.subscribers = new CombinerSubscriber[count];</span>
+<span class="fc" id="L125">            this.queue = new SpscLinkedArrayQueue&lt;Object&gt;(bufferSize);</span>
+<span class="fc" id="L126">            this.requested = new AtomicLong();</span>
+<span class="fc" id="L127">            this.error = new AtomicReference&lt;Throwable&gt;();</span>
+<span class="fc" id="L128">        }</span>
+        
+        public void subscribe(Observable&lt;? extends T&gt;[] sources) {
+<span class="fc" id="L131">            Subscriber&lt;T&gt;[] as = subscribers;</span>
+<span class="fc" id="L132">            int len = as.length;</span>
+<span class="fc bfc" id="L133" title="All 2 branches covered.">            for (int i = 0; i &lt; len; i++) {</span>
+<span class="fc" id="L134">                as[i] = new CombinerSubscriber&lt;T, R&gt;(this, i);</span>
+            }
+<span class="fc" id="L136">            lazySet(0); // release array contents</span>
+<span class="fc" id="L137">            actual.add(this);</span>
+<span class="fc" id="L138">            actual.setProducer(this);</span>
+<span class="fc bfc" id="L139" title="All 2 branches covered.">            for (int i = 0; i &lt; len; i++) {</span>
+<span class="pc bpc" id="L140" title="1 of 2 branches missed.">                if (cancelled) {</span>
+<span class="nc" id="L141">                    return;</span>
+                }
+<span class="fc" id="L143">                sources[i].subscribe(as[i]);</span>
+            }
+<span class="fc" id="L145">        }</span>
+        
+        @Override
+        public void request(long n) {
+<span class="pc bpc" id="L149" title="1 of 2 branches missed.">            if (n &lt; 0) {</span>
+<span class="nc" id="L150">                throw new IllegalArgumentException(&quot;n &gt;= required but it was &quot; + n);</span>
+            }
+<span class="pc bpc" id="L152" title="1 of 2 branches missed.">            if (n != 0) {</span>
+<span class="fc" id="L153">                BackpressureUtils.getAndAddRequest(requested, n);</span>
+<span class="fc" id="L154">                drain();</span>
+            }
+<span class="fc" id="L156">        }</span>
+        
+        @Override
+        public void unsubscribe() {
+<span class="fc bfc" id="L160" title="All 2 branches covered.">            if (!cancelled) {</span>
+<span class="fc" id="L161">                cancelled = true;</span>
+                
+<span class="pc bpc" id="L163" title="1 of 2 branches missed.">                if (getAndIncrement() == 0) {</span>
+<span class="nc" id="L164">                    cancel(queue);</span>
+                }
+            }
+<span class="fc" id="L167">        }</span>
+        
+        @Override
+        public boolean isUnsubscribed() {
+<span class="fc" id="L171">            return cancelled;</span>
+        }
+        
+        void cancel(Queue&lt;?&gt; q) {
+<span class="fc" id="L175">            q.clear();</span>
+<span class="fc bfc" id="L176" title="All 2 branches covered.">            for (CombinerSubscriber&lt;T, R&gt; s : subscribers) {</span>
+<span class="fc" id="L177">                s.unsubscribe();</span>
+            }
+<span class="fc" id="L179">        }</span>
+        
+        /**
+         * Combine the given notification value from the indexth source with the existing known
+         * latest values.
+         * @param value the notification to combine, null indicates the source terminated normally
+         * @param index the index of the source subscriber
+         */
+        void combine(Object value, int index) {
+<span class="fc" id="L188">            CombinerSubscriber&lt;T, R&gt; combinerSubscriber = subscribers[index];</span>
+            
+            int activeCount;
+            int completedCount;
+            int sourceCount;
+            boolean empty;
+            boolean allSourcesFinished;
+<span class="fc" id="L195">            synchronized (this) {</span>
+<span class="fc" id="L196">                sourceCount = latest.length;</span>
+<span class="fc" id="L197">                Object o = latest[index];</span>
+<span class="fc" id="L198">                activeCount = active;</span>
+<span class="fc bfc" id="L199" title="All 2 branches covered.">                if (o == MISSING) {</span>
+<span class="fc" id="L200">                    active = ++activeCount;</span>
+                }
+<span class="fc" id="L202">                completedCount = complete;</span>
+<span class="fc bfc" id="L203" title="All 2 branches covered.">                if (value == null) {</span>
+<span class="fc" id="L204">                    complete = ++completedCount;</span>
+                } else {
+<span class="fc" id="L206">                    latest[index] = combinerSubscriber.nl.getValue(value);</span>
+                }
+<span class="fc bfc" id="L208" title="All 2 branches covered.">                allSourcesFinished = activeCount == sourceCount;</span>
+                // see if either all sources completed
+<span class="fc bfc" id="L210" title="All 6 branches covered.">                empty = completedCount == sourceCount </span>
+                        || (value == null &amp;&amp; o == MISSING); // or this source completed without any value
+<span class="fc bfc" id="L212" title="All 2 branches covered.">                if (!empty) {</span>
+<span class="fc bfc" id="L213" title="All 4 branches covered.">                    if (value != null &amp;&amp; allSourcesFinished) {</span>
+<span class="fc" id="L214">                        queue.offer(combinerSubscriber, latest.clone());</span>
+                    } else
+<span class="fc bfc" id="L216" title="All 4 branches covered.">                    if (value == null &amp;&amp; error.get() != null) {</span>
+<span class="fc" id="L217">                        done = true; // if this source completed without a value</span>
+                    }
+                } else {
+<span class="fc" id="L220">                    done = true;</span>
+                }
+<span class="pc" id="L222">            }</span>
+<span class="fc bfc" id="L223" title="All 4 branches covered.">            if (!allSourcesFinished &amp;&amp; value != null) {</span>
+<span class="fc" id="L224">                combinerSubscriber.requestMore(1);</span>
+<span class="fc" id="L225">                return;</span>
+            }
+<span class="fc" id="L227">            drain();</span>
+<span class="fc" id="L228">        }</span>
+        void drain() {
+<span class="fc bfc" id="L230" title="All 2 branches covered.">            if (getAndIncrement() != 0) {</span>
+<span class="fc" id="L231">                return;</span>
+            }
+            
+<span class="fc" id="L234">            final Queue&lt;Object&gt; q = queue;</span>
+<span class="fc" id="L235">            final Subscriber&lt;? super R&gt; a = actual;</span>
+<span class="fc" id="L236">            final boolean delayError = this.delayError;</span>
+<span class="fc" id="L237">            final AtomicLong localRequested = this.requested;</span>
+            
+<span class="fc" id="L239">            int missed = 1;</span>
+            for (;;) {
+                
+<span class="fc bfc" id="L242" title="All 2 branches covered.">                if (checkTerminated(done, q.isEmpty(), a, q, delayError)) {</span>
+<span class="fc" id="L243">                    return;</span>
+                }
+                
+<span class="fc" id="L246">                long requestAmount = localRequested.get();</span>
+<span class="fc bfc" id="L247" title="All 2 branches covered.">                boolean unbounded = requestAmount == Long.MAX_VALUE;</span>
+<span class="fc" id="L248">                long emitted = 0L;</span>
+                
+<span class="fc bfc" id="L250" title="All 2 branches covered.">                while (requestAmount != 0L) {</span>
+                    
+<span class="fc" id="L252">                    boolean d = done;</span>
+                    @SuppressWarnings(&quot;unchecked&quot;)
+<span class="fc" id="L254">                    CombinerSubscriber&lt;T, R&gt; cs = (CombinerSubscriber&lt;T, R&gt;)q.peek();</span>
+<span class="fc bfc" id="L255" title="All 2 branches covered.">                    boolean empty = cs == null;</span>
+                    
+<span class="fc bfc" id="L257" title="All 2 branches covered.">                    if (checkTerminated(d, empty, a, q, delayError)) {</span>
+<span class="fc" id="L258">                        return;</span>
+                    }
+                    
+<span class="fc bfc" id="L261" title="All 2 branches covered.">                    if (empty) {</span>
+<span class="fc" id="L262">                        break;</span>
+                    }
+
+<span class="fc" id="L265">                    q.poll();</span>
+<span class="fc" id="L266">                    Object[] array = (Object[])q.poll();</span>
+                    
+<span class="pc bpc" id="L268" title="1 of 2 branches missed.">                    if (array == null) {</span>
+<span class="nc" id="L269">                        cancelled = true;</span>
+<span class="nc" id="L270">                        cancel(q);</span>
+<span class="nc" id="L271">                        a.onError(new IllegalStateException(&quot;Broken queue?! Sender received but not the array.&quot;));</span>
+<span class="nc" id="L272">                        return;</span>
+                    }
+                    
+                    R v;
+                    try {
+<span class="fc" id="L277">                        v = combiner.call(array);</span>
+<span class="fc" id="L278">                    } catch (Throwable ex) {</span>
+<span class="fc" id="L279">                        cancelled = true;</span>
+<span class="fc" id="L280">                        cancel(q);</span>
+<span class="fc" id="L281">                        a.onError(ex);</span>
+<span class="fc" id="L282">                        return;</span>
+<span class="fc" id="L283">                    }</span>
+                    
+<span class="fc" id="L285">                    a.onNext(v);</span>
+                    
+<span class="fc" id="L287">                    cs.requestMore(1);</span>
+                    
+<span class="fc" id="L289">                    requestAmount--;</span>
+<span class="fc" id="L290">                    emitted--;</span>
+<span class="fc" id="L291">                }</span>
+                
+<span class="fc bfc" id="L293" title="All 2 branches covered.">                if (emitted != 0L) {</span>
+<span class="fc bfc" id="L294" title="All 2 branches covered.">                    if (!unbounded) {</span>
+<span class="fc" id="L295">                        localRequested.addAndGet(emitted);</span>
+                    }
+                }
+                
+<span class="fc" id="L299">                missed = addAndGet(-missed);</span>
+<span class="fc bfc" id="L300" title="All 2 branches covered.">                if (missed == 0) {</span>
+<span class="fc" id="L301">                    break;</span>
+                }
+<span class="fc" id="L303">            }</span>
+<span class="fc" id="L304">        }</span>
+        
+        
+        boolean checkTerminated(boolean mainDone, boolean queueEmpty, Subscriber&lt;?&gt; childSubscriber, Queue&lt;?&gt; q, boolean delayError) {
+<span class="pc bpc" id="L308" title="1 of 2 branches missed.">            if (cancelled) {</span>
+<span class="nc" id="L309">                cancel(q);</span>
+<span class="nc" id="L310">                return true;</span>
+            }
+<span class="fc bfc" id="L312" title="All 2 branches covered.">            if (mainDone) {</span>
+<span class="pc bpc" id="L313" title="1 of 2 branches missed.">                if (delayError) {</span>
+<span class="nc bnc" id="L314" title="All 2 branches missed.">                    if (queueEmpty) {</span>
+<span class="nc" id="L315">                        Throwable e = error.get();</span>
+<span class="nc bnc" id="L316" title="All 2 branches missed.">                        if (e != null) {</span>
+<span class="nc" id="L317">                            childSubscriber.onError(e);</span>
+                        } else {
+<span class="nc" id="L319">                            childSubscriber.onCompleted();</span>
+                        }
+<span class="nc" id="L321">                        return true;</span>
+                    }
+                } else {
+<span class="fc" id="L324">                    Throwable e = error.get();</span>
+<span class="fc bfc" id="L325" title="All 2 branches covered.">                    if (e != null) {</span>
+<span class="fc" id="L326">                        cancel(q);</span>
+<span class="fc" id="L327">                        childSubscriber.onError(e);</span>
+<span class="fc" id="L328">                        return true;</span>
+                    } else
+<span class="fc bfc" id="L330" title="All 2 branches covered.">                    if (queueEmpty) {</span>
+<span class="fc" id="L331">                        childSubscriber.onCompleted();</span>
+<span class="fc" id="L332">                        return true;</span>
+                    }
+                }
+            }
+<span class="fc" id="L336">            return false;</span>
+        }
+        
+        void onError(Throwable e) {
+<span class="fc" id="L340">            AtomicReference&lt;Throwable&gt; localError = this.error;</span>
+            for (;;) {
+<span class="fc" id="L342">                Throwable curr = localError.get();</span>
+                Throwable next;
+<span class="pc bpc" id="L344" title="1 of 2 branches missed.">                if (curr != null) {</span>
+<span class="nc bnc" id="L345" title="All 2 branches missed.">                    if (curr instanceof CompositeException) {</span>
+<span class="nc" id="L346">                        CompositeException ce = (CompositeException) curr;</span>
+<span class="nc" id="L347">                        List&lt;Throwable&gt; es = new ArrayList&lt;Throwable&gt;(ce.getExceptions());</span>
+<span class="nc" id="L348">                        es.add(e);</span>
+<span class="nc" id="L349">                        next = new CompositeException(es);</span>
+<span class="nc" id="L350">                    } else {</span>
+<span class="nc" id="L351">                        next = new CompositeException(Arrays.asList(curr, e));</span>
+                    }
+                } else {
+<span class="fc" id="L354">                    next = e;</span>
+                }
+<span class="pc bpc" id="L356" title="1 of 2 branches missed.">                if (localError.compareAndSet(curr, next)) {</span>
+<span class="fc" id="L357">                    return;</span>
+                }
+<span class="nc" id="L359">            }</span>
+        }
+    }
+    
+    static final class CombinerSubscriber&lt;T, R&gt; extends Subscriber&lt;T&gt; {
+        final LatestCoordinator&lt;T, R&gt; parent;
+        final int index;
+        final NotificationLite&lt;T&gt; nl;
+        
+        boolean done;
+        
+<span class="fc" id="L370">        public CombinerSubscriber(LatestCoordinator&lt;T, R&gt; parent, int index) {</span>
+<span class="fc" id="L371">            this.parent = parent;</span>
+<span class="fc" id="L372">            this.index = index;</span>
+<span class="fc" id="L373">            this.nl = NotificationLite.instance();</span>
+<span class="fc" id="L374">            request(parent.bufferSize);</span>
+<span class="fc" id="L375">        }</span>
+        
+        @Override
+        public void onNext(T t) {
+<span class="pc bpc" id="L379" title="1 of 2 branches missed.">            if (done) {</span>
+<span class="nc" id="L380">                return;</span>
+            }
+<span class="fc" id="L382">            parent.combine(nl.next(t), index);</span>
+<span class="fc" id="L383">        }</span>
+        
+        @Override
+        public void onError(Throwable t) {
+<span class="pc bpc" id="L387" title="1 of 2 branches missed.">            if (done) {</span>
+<span class="nc" id="L388">                RxJavaPlugins.getInstance().getErrorHandler().handleError(t);</span>
+<span class="nc" id="L389">                return;</span>
+            }
+<span class="fc" id="L391">            parent.onError(t);</span>
+<span class="fc" id="L392">            done = true;</span>
+<span class="fc" id="L393">            parent.combine(null, index);</span>
+<span class="fc" id="L394">        }</span>
+        
+        @Override
+        public void onCompleted() {
+<span class="pc bpc" id="L398" title="1 of 2 branches missed.">            if (done) {</span>
+<span class="nc" id="L399">                return;</span>
+            }
+<span class="fc" id="L401">            done = true;</span>
+<span class="fc" id="L402">            parent.combine(null, index);</span>
+<span class="fc" id="L403">        }</span>
+        
+        public void requestMore(long n) {
+<span class="fc" id="L406">            request(n);</span>
+<span class="fc" id="L407">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

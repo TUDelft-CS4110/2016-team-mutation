@@ -1,0 +1,564 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>OperatorGroupBy.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.internal.operators</a> &gt; <span class="el_source">OperatorGroupBy.java</span></div><h1>OperatorGroupBy.java</h1><pre class="source lang-java linenums">/**
+ * Copyright 2014 Netflix, Inc.
+ * 
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package rx.internal.operators;
+
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+
+import rx.*;
+import rx.Observable.*;
+import rx.functions.*;
+import rx.internal.producers.ProducerArbiter;
+import rx.internal.util.*;
+import rx.observables.GroupedObservable;
+import rx.plugins.RxJavaPlugins;
+import rx.subscriptions.Subscriptions;
+
+/**
+ * Groups the items emitted by an Observable according to a specified criterion, and emits these
+ * grouped items as Observables, one Observable per group.
+ * &lt;p&gt;
+ * &lt;img width=&quot;640&quot; height=&quot;360&quot; src=&quot;https://raw.githubusercontent.com/wiki/ReactiveX/RxJava/images/rx-operators/groupBy.png&quot; alt=&quot;&quot;&gt;
+ *
+ * @param &lt;K&gt;
+ *            the key type
+ * @param &lt;T&gt;
+ *            the source and group value type
+ * @param &lt;R&gt;
+ *            the value type of the groups
+ */
+public final class OperatorGroupBy&lt;T, K, V&gt; implements Operator&lt;GroupedObservable&lt;K, V&gt;, T&gt;{
+    final Func1&lt;? super T, ? extends K&gt; keySelector;
+    final Func1&lt;? super T, ? extends V&gt; valueSelector;
+    final int bufferSize;
+    final boolean delayError;
+    
+    @SuppressWarnings({ &quot;unchecked&quot;, &quot;rawtypes&quot; })
+    public OperatorGroupBy(Func1&lt;? super T, ? extends K&gt; keySelector) {
+<span class="fc" id="L52">        this(keySelector, (Func1)UtilityFunctions.&lt;T&gt;identity(), RxRingBuffer.SIZE, false);</span>
+<span class="fc" id="L53">    }</span>
+
+    public OperatorGroupBy(Func1&lt;? super T, ? extends K&gt; keySelector, Func1&lt;? super T, ? extends V&gt; valueSelector) {
+<span class="fc" id="L56">        this(keySelector, valueSelector, RxRingBuffer.SIZE, false);</span>
+<span class="fc" id="L57">    }</span>
+
+<span class="fc" id="L59">    public OperatorGroupBy(Func1&lt;? super T, ? extends K&gt; keySelector, Func1&lt;? super T, ? extends V&gt; valueSelector, int bufferSize, boolean delayError) {</span>
+<span class="fc" id="L60">        this.keySelector = keySelector;</span>
+<span class="fc" id="L61">        this.valueSelector = valueSelector;</span>
+<span class="fc" id="L62">        this.bufferSize = bufferSize;</span>
+<span class="fc" id="L63">        this.delayError = delayError;</span>
+<span class="fc" id="L64">    }</span>
+    
+    @Override
+    public Subscriber&lt;? super T&gt; call(Subscriber&lt;? super GroupedObservable&lt;K, V&gt;&gt; t) {
+<span class="fc" id="L68">        final GroupBySubscriber&lt;T, K, V&gt; parent = new GroupBySubscriber&lt;T, K, V&gt;(t, keySelector, valueSelector, bufferSize, delayError);</span>
+
+<span class="fc" id="L70">        t.add(Subscriptions.create(new Action0() {</span>
+            @Override
+            public void call() {
+<span class="fc" id="L73">                parent.cancel();</span>
+<span class="fc" id="L74">            }</span>
+        }));
+
+<span class="fc" id="L77">        t.setProducer(parent.producer);</span>
+        
+<span class="fc" id="L79">        return parent;</span>
+    }
+
+    public static final class GroupByProducer implements Producer {
+        final GroupBySubscriber&lt;?, ?, ?&gt; parent;
+        
+<span class="fc" id="L85">        public GroupByProducer(GroupBySubscriber&lt;?, ?, ?&gt; parent) {</span>
+<span class="fc" id="L86">            this.parent = parent;</span>
+<span class="fc" id="L87">        }</span>
+        @Override
+        public void request(long n) {
+<span class="fc" id="L90">            parent.requestMore(n);</span>
+<span class="fc" id="L91">        }</span>
+    }
+    
+    public static final class GroupBySubscriber&lt;T, K, V&gt; 
+    extends Subscriber&lt;T&gt; {
+        final Subscriber&lt;? super GroupedObservable&lt;K, V&gt;&gt; actual;
+        final Func1&lt;? super T, ? extends K&gt; keySelector;
+        final Func1&lt;? super T, ? extends V&gt; valueSelector;
+        final int bufferSize;
+        final boolean delayError;
+        final Map&lt;Object, GroupedUnicast&lt;K, V&gt;&gt; groups;
+        final Queue&lt;GroupedObservable&lt;K, V&gt;&gt; queue;
+        final GroupByProducer producer;
+        
+<span class="fc" id="L105">        static final Object NULL_KEY = new Object();</span>
+        
+        final ProducerArbiter s;
+        
+        volatile int cancelled;
+        @SuppressWarnings(&quot;rawtypes&quot;)
+<span class="fc" id="L111">        static final AtomicIntegerFieldUpdater&lt;GroupBySubscriber&gt; CANCELLED =</span>
+                AtomicIntegerFieldUpdater.newUpdater(GroupBySubscriber.class, &quot;cancelled&quot;);
+
+        volatile long requested;
+        @SuppressWarnings(&quot;rawtypes&quot;)
+<span class="fc" id="L116">        static final AtomicLongFieldUpdater&lt;GroupBySubscriber&gt; REQUESTED =</span>
+                AtomicLongFieldUpdater.newUpdater(GroupBySubscriber.class, &quot;requested&quot;);
+        
+        volatile int groupCount;
+        @SuppressWarnings(&quot;rawtypes&quot;)
+<span class="fc" id="L121">        static final AtomicIntegerFieldUpdater&lt;GroupBySubscriber&gt; GROUP_COUNT =</span>
+                AtomicIntegerFieldUpdater.newUpdater(GroupBySubscriber.class, &quot;groupCount&quot;);
+        
+        Throwable error;
+        volatile boolean done;
+
+        volatile int wip;
+        @SuppressWarnings(&quot;rawtypes&quot;)
+<span class="fc" id="L129">        static final AtomicIntegerFieldUpdater&lt;GroupBySubscriber&gt; WIP =</span>
+                AtomicIntegerFieldUpdater.newUpdater(GroupBySubscriber.class, &quot;wip&quot;);
+        
+<span class="fc" id="L132">        public GroupBySubscriber(Subscriber&lt;? super GroupedObservable&lt;K, V&gt;&gt; actual, Func1&lt;? super T, ? extends K&gt; keySelector, Func1&lt;? super T, ? extends V&gt; valueSelector, int bufferSize, boolean delayError) {</span>
+<span class="fc" id="L133">            this.actual = actual;</span>
+<span class="fc" id="L134">            this.keySelector = keySelector;</span>
+<span class="fc" id="L135">            this.valueSelector = valueSelector;</span>
+<span class="fc" id="L136">            this.bufferSize = bufferSize;</span>
+<span class="fc" id="L137">            this.delayError = delayError;</span>
+<span class="fc" id="L138">            this.groups = new ConcurrentHashMap&lt;Object, GroupedUnicast&lt;K, V&gt;&gt;();</span>
+<span class="fc" id="L139">            this.queue = new ConcurrentLinkedQueue&lt;GroupedObservable&lt;K, V&gt;&gt;();</span>
+<span class="fc" id="L140">            GROUP_COUNT.lazySet(this, 1);</span>
+<span class="fc" id="L141">            this.s = new ProducerArbiter();</span>
+<span class="fc" id="L142">            this.s.request(bufferSize);</span>
+<span class="fc" id="L143">            this.producer = new GroupByProducer(this);</span>
+<span class="fc" id="L144">        }</span>
+        
+        @Override
+        public void setProducer(Producer s) {
+<span class="fc" id="L148">            this.s.setProducer(s);</span>
+<span class="fc" id="L149">        }</span>
+        
+        @Override
+        public void onNext(T t) {
+<span class="pc bpc" id="L153" title="1 of 2 branches missed.">            if (done) {</span>
+<span class="nc" id="L154">                return;</span>
+            }
+
+<span class="fc" id="L157">            final Queue&lt;GroupedObservable&lt;K, V&gt;&gt; q = this.queue;</span>
+<span class="fc" id="L158">            final Subscriber&lt;? super GroupedObservable&lt;K, V&gt;&gt; a = this.actual;</span>
+
+            K key;
+            try {
+<span class="fc" id="L162">                key = keySelector.call(t);</span>
+<span class="fc" id="L163">            } catch (Throwable ex) {</span>
+<span class="fc" id="L164">                unsubscribe();</span>
+<span class="fc" id="L165">                errorAll(a, q, ex);</span>
+<span class="fc" id="L166">                return;</span>
+<span class="fc" id="L167">            }</span>
+            
+<span class="fc" id="L169">            boolean notNew = true;</span>
+<span class="fc bfc" id="L170" title="All 2 branches covered.">            Object mapKey = key != null ? key : NULL_KEY;</span>
+<span class="fc" id="L171">            GroupedUnicast&lt;K, V&gt; group = groups.get(mapKey);</span>
+<span class="fc bfc" id="L172" title="All 2 branches covered.">            if (group == null) {</span>
+                // if the main has been cancelled, stop creating groups
+                // and skip this value
+<span class="fc bfc" id="L175" title="All 2 branches covered.">                if (cancelled == 0) {</span>
+<span class="fc" id="L176">                    group = GroupedUnicast.createWith(key, bufferSize, this, delayError);</span>
+<span class="fc" id="L177">                    groups.put(mapKey, group);</span>
+                    
+<span class="fc" id="L179">                    GROUP_COUNT.getAndIncrement(this);</span>
+                    
+<span class="fc" id="L181">                    notNew = false;</span>
+<span class="fc" id="L182">                    q.offer(group);</span>
+<span class="fc" id="L183">                    drain();</span>
+                } else {
+<span class="fc" id="L185">                    return;</span>
+                }
+            }
+            
+            V v;
+            try {
+<span class="fc" id="L191">                v = valueSelector.call(t);</span>
+<span class="fc" id="L192">            } catch (Throwable ex) {</span>
+<span class="fc" id="L193">                unsubscribe();</span>
+<span class="fc" id="L194">                errorAll(a, q, ex);</span>
+<span class="fc" id="L195">                return;</span>
+<span class="fc" id="L196">            }</span>
+
+<span class="fc" id="L198">            group.onNext(v);</span>
+
+<span class="fc bfc" id="L200" title="All 2 branches covered.">            if (notNew) {</span>
+<span class="fc" id="L201">                s.request(1);</span>
+            }
+<span class="fc" id="L203">        }</span>
+        
+        @Override
+        public void onError(Throwable t) {
+<span class="pc bpc" id="L207" title="1 of 2 branches missed.">            if (done) {</span>
+<span class="nc" id="L208">                RxJavaPlugins.getInstance().getErrorHandler().handleError(t);</span>
+<span class="nc" id="L209">                return;</span>
+            }
+<span class="fc" id="L211">            error = t;</span>
+<span class="fc" id="L212">            done = true;</span>
+<span class="fc" id="L213">            GROUP_COUNT.decrementAndGet(this);</span>
+<span class="fc" id="L214">            drain();</span>
+<span class="fc" id="L215">        }</span>
+        
+        @Override
+        public void onCompleted() {
+<span class="fc bfc" id="L219" title="All 2 branches covered.">            if (done) {</span>
+<span class="fc" id="L220">                return;</span>
+            }
+<span class="fc" id="L222">            done = true;</span>
+<span class="fc" id="L223">            GROUP_COUNT.decrementAndGet(this);</span>
+<span class="fc" id="L224">            drain();</span>
+<span class="fc" id="L225">        }</span>
+
+        public void requestMore(long n) {
+<span class="pc bpc" id="L228" title="1 of 2 branches missed.">            if (n &lt; 0) {</span>
+<span class="nc" id="L229">                throw new IllegalArgumentException(&quot;n &gt;= 0 required but it was &quot; + n);</span>
+            }
+            
+<span class="fc" id="L232">            BackpressureUtils.getAndAddRequest(REQUESTED, this, n);</span>
+<span class="fc" id="L233">            drain();</span>
+<span class="fc" id="L234">        }</span>
+        
+        public void cancel() {
+            // cancelling the main source means we don't want any more groups
+            // but running groups still require new values
+<span class="pc bpc" id="L239" title="1 of 2 branches missed.">            if (CANCELLED.compareAndSet(this, 0, 1)) {</span>
+<span class="fc bfc" id="L240" title="All 2 branches covered.">                if (GROUP_COUNT.decrementAndGet(this) == 0) {</span>
+<span class="fc" id="L241">                    unsubscribe();</span>
+                }
+            }
+<span class="fc" id="L244">        }</span>
+        
+        public void cancel(K key) {
+<span class="pc bpc" id="L247" title="1 of 2 branches missed.">            Object mapKey = key != null ? key : NULL_KEY;</span>
+<span class="fc bfc" id="L248" title="All 2 branches covered.">            if (groups.remove(mapKey) != null) {</span>
+<span class="fc bfc" id="L249" title="All 2 branches covered.">                if (GROUP_COUNT.decrementAndGet(this) == 0) {</span>
+<span class="fc" id="L250">                    unsubscribe();</span>
+                }
+            }
+<span class="fc" id="L253">        }</span>
+        
+        void drain() {
+<span class="fc bfc" id="L256" title="All 2 branches covered.">            if (WIP.getAndIncrement(this) != 0) {</span>
+<span class="fc" id="L257">                return;</span>
+            }
+            
+<span class="fc" id="L260">            int missed = 1;</span>
+            
+<span class="fc" id="L262">            final Queue&lt;GroupedObservable&lt;K, V&gt;&gt; q = this.queue;</span>
+<span class="fc" id="L263">            final Subscriber&lt;? super GroupedObservable&lt;K, V&gt;&gt; a = this.actual;</span>
+            
+            for (;;) {
+                
+<span class="fc bfc" id="L267" title="All 2 branches covered.">                if (checkTerminated(done, q.isEmpty(), a, q)) {</span>
+<span class="fc" id="L268">                    return;</span>
+                }
+                
+<span class="fc" id="L271">                long r = requested;</span>
+<span class="fc bfc" id="L272" title="All 2 branches covered.">                boolean unbounded = r == Long.MAX_VALUE;</span>
+<span class="fc" id="L273">                long e = 0L;</span>
+                
+<span class="fc bfc" id="L275" title="All 2 branches covered.">                while (r != 0) {</span>
+<span class="fc" id="L276">                    boolean d = done;</span>
+                    
+<span class="fc" id="L278">                    GroupedObservable&lt;K, V&gt; t = q.poll();</span>
+                    
+<span class="fc bfc" id="L280" title="All 2 branches covered.">                    boolean empty = t == null;</span>
+                    
+<span class="fc bfc" id="L282" title="All 2 branches covered.">                    if (checkTerminated(d, empty, a, q)) {</span>
+<span class="fc" id="L283">                        return;</span>
+                    }
+                    
+<span class="fc bfc" id="L286" title="All 2 branches covered.">                    if (empty) {</span>
+<span class="fc" id="L287">                        break;</span>
+                    }
+
+<span class="fc" id="L290">                    a.onNext(t);</span>
+                    
+<span class="fc" id="L292">                    r--;</span>
+<span class="fc" id="L293">                    e--;</span>
+<span class="fc" id="L294">                }</span>
+                
+<span class="fc bfc" id="L296" title="All 2 branches covered.">                if (e != 0L) {</span>
+<span class="fc bfc" id="L297" title="All 2 branches covered.">                    if (!unbounded) {</span>
+<span class="fc" id="L298">                        REQUESTED.addAndGet(this, e);</span>
+                    }
+<span class="fc" id="L300">                    s.request(-e);</span>
+                }
+                
+<span class="fc" id="L303">                missed = WIP.addAndGet(this, -missed);</span>
+<span class="fc bfc" id="L304" title="All 2 branches covered.">                if (missed == 0) {</span>
+<span class="fc" id="L305">                    break;</span>
+                }
+<span class="fc" id="L307">            }</span>
+<span class="fc" id="L308">        }</span>
+        
+        void errorAll(Subscriber&lt;? super GroupedObservable&lt;K, V&gt;&gt; a, Queue&lt;?&gt; q, Throwable ex) {
+<span class="fc" id="L311">            q.clear();</span>
+<span class="fc" id="L312">            List&lt;GroupedUnicast&lt;K, V&gt;&gt; list = new ArrayList&lt;GroupedUnicast&lt;K, V&gt;&gt;(groups.values());</span>
+<span class="fc" id="L313">            groups.clear();</span>
+            
+<span class="fc bfc" id="L315" title="All 2 branches covered.">            for (GroupedUnicast&lt;K, V&gt; e : list) {</span>
+<span class="fc" id="L316">                e.onError(ex);</span>
+<span class="fc" id="L317">            }</span>
+            
+<span class="fc" id="L319">            a.onError(ex);</span>
+<span class="fc" id="L320">        }</span>
+        
+        boolean checkTerminated(boolean d, boolean empty, 
+                Subscriber&lt;? super GroupedObservable&lt;K, V&gt;&gt; a, Queue&lt;?&gt; q) {
+<span class="fc bfc" id="L324" title="All 2 branches covered.">            if (d) {</span>
+<span class="fc" id="L325">                Throwable err = error;</span>
+<span class="fc bfc" id="L326" title="All 2 branches covered.">                if (err != null) {</span>
+<span class="fc" id="L327">                    errorAll(a, q, err);</span>
+<span class="fc" id="L328">                    return true;</span>
+                } else
+<span class="fc bfc" id="L330" title="All 2 branches covered.">                if (empty) {</span>
+<span class="fc" id="L331">                    List&lt;GroupedUnicast&lt;K, V&gt;&gt; list = new ArrayList&lt;GroupedUnicast&lt;K, V&gt;&gt;(groups.values());</span>
+<span class="fc" id="L332">                    groups.clear();</span>
+                    
+<span class="fc bfc" id="L334" title="All 2 branches covered.">                    for (GroupedUnicast&lt;K, V&gt; e : list) {</span>
+<span class="fc" id="L335">                        e.onComplete();</span>
+<span class="fc" id="L336">                    }</span>
+                    
+<span class="fc" id="L338">                    actual.onCompleted();</span>
+<span class="fc" id="L339">                    return true;</span>
+                }
+            }
+<span class="fc" id="L342">            return false;</span>
+        }
+    }
+    
+    static final class GroupedUnicast&lt;K, T&gt; extends GroupedObservable&lt;K, T&gt; {
+        
+        public static &lt;T, K&gt; GroupedUnicast&lt;K, T&gt; createWith(K key, int bufferSize, GroupBySubscriber&lt;?, K, T&gt; parent, boolean delayError) {
+<span class="fc" id="L349">            State&lt;T, K&gt; state = new State&lt;T, K&gt;(bufferSize, parent, key, delayError);</span>
+<span class="fc" id="L350">            return new GroupedUnicast&lt;K, T&gt;(key, state);</span>
+        }
+        
+        final State&lt;T, K&gt; state;
+        
+        protected GroupedUnicast(K key, State&lt;T, K&gt; state) {
+<span class="fc" id="L356">            super(key, state);</span>
+<span class="fc" id="L357">            this.state = state;</span>
+<span class="fc" id="L358">        }</span>
+        
+        public void onNext(T t) {
+<span class="fc" id="L361">            state.onNext(t);</span>
+<span class="fc" id="L362">        }</span>
+        
+        public void onError(Throwable e) {
+<span class="fc" id="L365">            state.onError(e);</span>
+<span class="fc" id="L366">        }</span>
+        
+        public void onComplete() {
+<span class="fc" id="L369">            state.onComplete();</span>
+<span class="fc" id="L370">        }</span>
+    }
+    
+    static final class State&lt;T, K&gt; extends AtomicInteger implements Producer, Subscription, OnSubscribe&lt;T&gt; {
+        /** */
+        private static final long serialVersionUID = -3852313036005250360L;
+
+        final K key;
+        final Queue&lt;Object&gt; queue;
+        final GroupBySubscriber&lt;?, K, T&gt; parent;
+        final boolean delayError;
+        
+        volatile long requested;
+        @SuppressWarnings(&quot;rawtypes&quot;)
+<span class="fc" id="L384">        static final AtomicLongFieldUpdater&lt;State&gt; REQUESTED =</span>
+                AtomicLongFieldUpdater.newUpdater(State.class, &quot;requested&quot;);
+        
+        volatile boolean done;
+        Throwable error;
+        
+        volatile int cancelled;
+        @SuppressWarnings(&quot;rawtypes&quot;)
+<span class="fc" id="L392">        static final AtomicIntegerFieldUpdater&lt;State&gt; CANCELLED =</span>
+                AtomicIntegerFieldUpdater.newUpdater(State.class, &quot;cancelled&quot;);
+        
+        volatile Subscriber&lt;? super T&gt; actual;
+        @SuppressWarnings(&quot;rawtypes&quot;)
+<span class="fc" id="L397">        static final AtomicReferenceFieldUpdater&lt;State, Subscriber&gt; ACTUAL =</span>
+                AtomicReferenceFieldUpdater.newUpdater(State.class, Subscriber.class, &quot;actual&quot;);
+
+        volatile int once;
+        @SuppressWarnings(&quot;rawtypes&quot;)
+<span class="fc" id="L402">        static final AtomicIntegerFieldUpdater&lt;State&gt; ONCE =</span>
+                AtomicIntegerFieldUpdater.newUpdater(State.class, &quot;once&quot;);
+
+        
+<span class="fc" id="L406">        public State(int bufferSize, GroupBySubscriber&lt;?, K, T&gt; parent, K key, boolean delayError) {</span>
+<span class="fc" id="L407">            this.queue = new ConcurrentLinkedQueue&lt;Object&gt;();</span>
+<span class="fc" id="L408">            this.parent = parent;</span>
+<span class="fc" id="L409">            this.key = key;</span>
+<span class="fc" id="L410">            this.delayError = delayError;</span>
+<span class="fc" id="L411">        }</span>
+        
+        @Override
+        public void request(long n) {
+<span class="pc bpc" id="L415" title="1 of 2 branches missed.">            if (n &lt; 0) {</span>
+<span class="nc" id="L416">                throw new IllegalArgumentException(&quot;n &gt;= required but it was &quot; + n);</span>
+            }
+<span class="fc bfc" id="L418" title="All 2 branches covered.">            if (n != 0L) {</span>
+<span class="fc" id="L419">                BackpressureUtils.getAndAddRequest(REQUESTED, this, n);</span>
+<span class="fc" id="L420">                drain();</span>
+            }
+<span class="fc" id="L422">        }</span>
+        
+        @Override
+        public boolean isUnsubscribed() {
+<span class="pc bpc" id="L426" title="1 of 2 branches missed.">            return cancelled != 0;</span>
+        }
+        
+        @Override
+        public void unsubscribe() {
+<span class="pc bpc" id="L431" title="1 of 2 branches missed.">            if (CANCELLED.compareAndSet(this, 0, 1)) {</span>
+<span class="fc bfc" id="L432" title="All 2 branches covered.">                if (getAndIncrement() == 0) {</span>
+<span class="fc" id="L433">                    parent.cancel(key);</span>
+                }
+            }
+<span class="fc" id="L436">        }</span>
+        
+        @Override
+        public void call(Subscriber&lt;? super T&gt; s) {
+<span class="fc bfc" id="L440" title="All 2 branches covered.">            if (ONCE.compareAndSet(this, 0, 1)) {</span>
+<span class="fc" id="L441">                s.add(this);</span>
+<span class="fc" id="L442">                s.setProducer(this);</span>
+<span class="fc" id="L443">                ACTUAL.lazySet(this, s);</span>
+<span class="fc" id="L444">                drain();</span>
+            } else {
+<span class="fc" id="L446">                s.onError(new IllegalStateException(&quot;Only one Subscriber allowed!&quot;));</span>
+            }
+<span class="fc" id="L448">        }</span>
+
+        public void onNext(T t) {
+<span class="pc bpc" id="L451" title="1 of 2 branches missed.">            if (t == null) {</span>
+<span class="nc" id="L452">                error = new NullPointerException();</span>
+<span class="nc" id="L453">                done = true;</span>
+            } else {
+<span class="fc" id="L455">                queue.offer(NotificationLite.instance().next(t));</span>
+            }
+<span class="fc" id="L457">            drain();</span>
+<span class="fc" id="L458">        }</span>
+        
+        public void onError(Throwable e) {
+<span class="fc" id="L461">            error = e;</span>
+<span class="fc" id="L462">            done = true;</span>
+<span class="fc" id="L463">            drain();</span>
+<span class="fc" id="L464">        }</span>
+        
+        public void onComplete() {
+<span class="fc" id="L467">            done = true;</span>
+<span class="fc" id="L468">            drain();</span>
+<span class="fc" id="L469">        }</span>
+
+        void drain() {
+<span class="fc bfc" id="L472" title="All 2 branches covered.">            if (getAndIncrement() != 0) {</span>
+<span class="fc" id="L473">                return;</span>
+            }
+<span class="fc" id="L475">            int missed = 1;</span>
+            
+<span class="fc" id="L477">            final Queue&lt;Object&gt; q = queue;</span>
+<span class="fc" id="L478">            final boolean delayError = this.delayError;</span>
+<span class="fc" id="L479">            Subscriber&lt;? super T&gt; a = actual;</span>
+<span class="fc" id="L480">            NotificationLite&lt;T&gt; nl = NotificationLite.instance();</span>
+            for (;;) {
+<span class="fc bfc" id="L482" title="All 2 branches covered.">                if (a != null) {</span>
+<span class="fc bfc" id="L483" title="All 2 branches covered.">                    if (checkTerminated(done, q.isEmpty(), a, delayError)) {</span>
+<span class="fc" id="L484">                        return;</span>
+                    }
+                    
+<span class="fc" id="L487">                    long r = requested;</span>
+<span class="fc bfc" id="L488" title="All 2 branches covered.">                    boolean unbounded = r == Long.MAX_VALUE;</span>
+<span class="fc" id="L489">                    long e = 0;</span>
+                    
+<span class="fc bfc" id="L491" title="All 2 branches covered.">                    while (r != 0L) {</span>
+<span class="fc" id="L492">                        boolean d = done;</span>
+<span class="fc" id="L493">                        Object v = q.poll();</span>
+<span class="fc bfc" id="L494" title="All 2 branches covered.">                        boolean empty = v == null;</span>
+                        
+<span class="fc bfc" id="L496" title="All 2 branches covered.">                        if (checkTerminated(d, empty, a, delayError)) {</span>
+<span class="fc" id="L497">                            return;</span>
+                        }
+                        
+<span class="fc bfc" id="L500" title="All 2 branches covered.">                        if (empty) {</span>
+<span class="fc" id="L501">                            break;</span>
+                        }
+                        
+<span class="fc" id="L504">                        a.onNext(nl.getValue(v));</span>
+                        
+<span class="fc" id="L506">                        r--;</span>
+<span class="fc" id="L507">                        e--;</span>
+<span class="fc" id="L508">                    }</span>
+                    
+<span class="fc bfc" id="L510" title="All 2 branches covered.">                    if (e != 0L) {</span>
+<span class="fc bfc" id="L511" title="All 2 branches covered.">                        if (!unbounded) {</span>
+<span class="fc" id="L512">                            REQUESTED.addAndGet(this, e);</span>
+                        }
+<span class="fc" id="L514">                        parent.s.request(-e);</span>
+                    }
+                }
+                
+<span class="fc" id="L518">                missed = addAndGet(-missed);</span>
+<span class="fc bfc" id="L519" title="All 2 branches covered.">                if (missed == 0) {</span>
+<span class="fc" id="L520">                    break;</span>
+                }
+<span class="fc bfc" id="L522" title="All 2 branches covered.">                if (a == null) {</span>
+<span class="fc" id="L523">                    a = actual;</span>
+                }
+            }
+<span class="fc" id="L526">        }</span>
+        
+        boolean checkTerminated(boolean d, boolean empty, Subscriber&lt;? super T&gt; a, boolean delayError) {
+<span class="fc bfc" id="L529" title="All 2 branches covered.">            if (cancelled != 0) {</span>
+<span class="fc" id="L530">                queue.clear();</span>
+<span class="fc" id="L531">                parent.cancel(key);</span>
+<span class="fc" id="L532">                return true;</span>
+            }
+            
+<span class="fc bfc" id="L535" title="All 2 branches covered.">            if (d) {</span>
+<span class="pc bpc" id="L536" title="1 of 2 branches missed.">                if (delayError) {</span>
+<span class="nc bnc" id="L537" title="All 2 branches missed.">                    if (empty) {</span>
+<span class="nc" id="L538">                        Throwable e = error;</span>
+<span class="nc bnc" id="L539" title="All 2 branches missed.">                        if (e != null) {</span>
+<span class="nc" id="L540">                            a.onError(e);</span>
+                        } else {
+<span class="nc" id="L542">                            a.onCompleted();</span>
+                        }
+<span class="nc" id="L544">                        return true;</span>
+                    }
+                } else {
+<span class="fc" id="L547">                    Throwable e = error;</span>
+<span class="fc bfc" id="L548" title="All 2 branches covered.">                    if (e != null) {</span>
+<span class="fc" id="L549">                        queue.clear();</span>
+<span class="fc" id="L550">                        a.onError(e);</span>
+<span class="fc" id="L551">                        return true;</span>
+                    } else
+<span class="fc bfc" id="L553" title="All 2 branches covered.">                    if (empty) {</span>
+<span class="fc" id="L554">                        a.onCompleted();</span>
+<span class="fc" id="L555">                        return true;</span>
+                    }
+                }
+            }
+            
+<span class="fc" id="L560">            return false;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

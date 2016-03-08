@@ -1,0 +1,180 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>ExecutorScheduler.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.schedulers</a> &gt; <span class="el_source">ExecutorScheduler.java</span></div><h1>ExecutorScheduler.java</h1><pre class="source lang-java linenums">/**
+ * Copyright 2014 Netflix, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package rx.schedulers;
+
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import rx.*;
+import rx.functions.Action0;
+import rx.internal.schedulers.*;
+import rx.plugins.RxJavaPlugins;
+import rx.subscriptions.*;
+
+/**
+ * Scheduler that wraps an Executor instance and establishes the Scheduler contract upon it.
+ * &lt;p&gt;
+ * Note that thread-hopping is unavoidable with this kind of Scheduler as we don't know about the underlying
+ * threading behavior of the executor.
+ */
+/* public */final class ExecutorScheduler extends Scheduler {
+    final Executor executor;
+<span class="fc" id="L35">    public ExecutorScheduler(Executor executor) {</span>
+<span class="fc" id="L36">        this.executor = executor;</span>
+<span class="fc" id="L37">    }</span>
+
+    /**
+     * @warn javadoc missing
+     * @return
+     */
+    @Override
+    public Worker createWorker() {
+<span class="fc" id="L45">        return new ExecutorSchedulerWorker(executor);</span>
+    }
+
+    /** Worker that schedules tasks on the executor indirectly through a trampoline mechanism. */
+    static final class ExecutorSchedulerWorker extends Scheduler.Worker implements Runnable {
+        final Executor executor;
+        // TODO: use a better performing structure for task tracking
+        final CompositeSubscription tasks;
+        // TODO: use MpscLinkedQueue once available
+        final ConcurrentLinkedQueue&lt;ScheduledAction&gt; queue; 
+        final AtomicInteger wip;
+        
+<span class="fc" id="L57">        public ExecutorSchedulerWorker(Executor executor) {</span>
+<span class="fc" id="L58">            this.executor = executor;</span>
+<span class="fc" id="L59">            this.queue = new ConcurrentLinkedQueue&lt;ScheduledAction&gt;();</span>
+<span class="fc" id="L60">            this.wip = new AtomicInteger();</span>
+<span class="fc" id="L61">            this.tasks = new CompositeSubscription();</span>
+<span class="fc" id="L62">        }</span>
+
+        @Override
+        public Subscription schedule(Action0 action) {
+<span class="fc bfc" id="L66" title="All 2 branches covered.">            if (isUnsubscribed()) {</span>
+<span class="fc" id="L67">                return Subscriptions.unsubscribed();</span>
+            }
+<span class="fc" id="L69">            ScheduledAction ea = new ScheduledAction(action, tasks);</span>
+<span class="fc" id="L70">            tasks.add(ea);</span>
+<span class="fc" id="L71">            queue.offer(ea);</span>
+<span class="fc bfc" id="L72" title="All 2 branches covered.">            if (wip.getAndIncrement() == 0) {</span>
+                try {
+                    // note that since we schedule the emission of potentially multiple tasks
+                    // there is no clear way to cancel this schedule from individual tasks
+                    // so even if executor is an ExecutorService, we can't associate the future
+                    // returned by submit() with any particular ScheduledAction
+<span class="fc" id="L78">                    executor.execute(this);</span>
+<span class="nc" id="L79">                } catch (RejectedExecutionException t) {</span>
+                    // cleanup if rejected
+<span class="nc" id="L81">                    tasks.remove(ea);</span>
+<span class="nc" id="L82">                    wip.decrementAndGet();</span>
+                    // report the error to the plugin
+<span class="nc" id="L84">                    RxJavaPlugins.getInstance().getErrorHandler().handleError(t);</span>
+                    // throw it to the caller
+<span class="nc" id="L86">                    throw t;</span>
+<span class="fc" id="L87">                }</span>
+            }
+            
+<span class="fc" id="L90">            return ea;</span>
+        }
+
+        @Override
+        public void run() {
+            do {
+<span class="fc" id="L96">                ScheduledAction sa = queue.poll();</span>
+<span class="fc bfc" id="L97" title="All 2 branches covered.">                if (!sa.isUnsubscribed()) {</span>
+<span class="fc" id="L98">                    sa.run();</span>
+                }
+<span class="fc bfc" id="L100" title="All 2 branches covered.">            } while (wip.decrementAndGet() &gt; 0);</span>
+<span class="fc" id="L101">        }</span>
+        
+        @Override
+        public Subscription schedule(final Action0 action, long delayTime, TimeUnit unit) {
+<span class="fc bfc" id="L105" title="All 2 branches covered.">            if (delayTime &lt;= 0) {</span>
+<span class="fc" id="L106">                return schedule(action);</span>
+            }
+<span class="fc bfc" id="L108" title="All 2 branches covered.">            if (isUnsubscribed()) {</span>
+<span class="fc" id="L109">                return Subscriptions.unsubscribed();</span>
+            }
+            ScheduledExecutorService service;
+<span class="pc bpc" id="L112" title="1 of 2 branches missed.">            if (executor instanceof ScheduledExecutorService) {</span>
+<span class="nc" id="L113">                service = (ScheduledExecutorService)executor;</span>
+            } else {
+<span class="fc" id="L115">                service = GenericScheduledExecutorService.getInstance();</span>
+            }
+            
+<span class="fc" id="L118">            final MultipleAssignmentSubscription first = new MultipleAssignmentSubscription();</span>
+<span class="fc" id="L119">            final MultipleAssignmentSubscription mas = new MultipleAssignmentSubscription();</span>
+<span class="fc" id="L120">            mas.set(first);</span>
+<span class="fc" id="L121">            tasks.add(mas);</span>
+<span class="fc" id="L122">            final Subscription removeMas = Subscriptions.create(new Action0() {</span>
+                @Override
+                public void call() {
+<span class="fc" id="L125">                    tasks.remove(mas);</span>
+<span class="fc" id="L126">                }</span>
+            });
+            
+<span class="fc" id="L129">            ScheduledAction ea = new ScheduledAction(new Action0() {</span>
+                @Override
+                public void call() {
+<span class="pc bpc" id="L132" title="1 of 2 branches missed.">                    if (mas.isUnsubscribed()) {</span>
+<span class="nc" id="L133">                        return;</span>
+                    }
+                    // schedule the real action untimed
+<span class="fc" id="L136">                    Subscription s2 = schedule(action);</span>
+<span class="fc" id="L137">                    mas.set(s2);</span>
+                    // unless the worker is unsubscribed, we should get a new ScheduledAction
+<span class="pc bpc" id="L139" title="1 of 2 branches missed.">                    if (s2.getClass() == ScheduledAction.class) {</span>
+                        // when this ScheduledAction completes, we need to remove the
+                        // MAS referencing the whole setup to avoid leaks
+<span class="fc" id="L142">                        ((ScheduledAction)s2).add(removeMas);</span>
+                    }
+<span class="fc" id="L144">                }</span>
+            });
+            // This will make sure if ea.call() gets executed before this line
+            // we don't override the current task in mas.
+<span class="fc" id="L148">            first.set(ea);</span>
+            // we don't need to add ea to tasks because it will be tracked through mas/first
+            
+            
+            try {
+<span class="fc" id="L153">                Future&lt;?&gt; f = service.schedule(ea, delayTime, unit);</span>
+<span class="fc" id="L154">                ea.add(f);</span>
+<span class="nc" id="L155">            } catch (RejectedExecutionException t) {</span>
+                // report the rejection to plugins
+<span class="nc" id="L157">                RxJavaPlugins.getInstance().getErrorHandler().handleError(t);</span>
+<span class="nc" id="L158">                throw t;</span>
+<span class="fc" id="L159">            }</span>
+            
+            /*
+             * This allows cancelling either the delayed schedule or the actual schedule referenced
+             * by mas and makes sure mas is removed from the tasks composite to avoid leaks.
+             */
+<span class="fc" id="L165">            return removeMas;</span>
+        }
+
+        @Override
+        public boolean isUnsubscribed() {
+<span class="fc" id="L170">            return tasks.isUnsubscribed();</span>
+        }
+
+        @Override
+        public void unsubscribe() {
+<span class="fc" id="L175">            tasks.unsubscribe();</span>
+<span class="fc" id="L176">        }</span>
+        
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

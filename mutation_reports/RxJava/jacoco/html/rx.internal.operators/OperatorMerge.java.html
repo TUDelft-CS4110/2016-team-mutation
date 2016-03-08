@@ -1,0 +1,851 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>OperatorMerge.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.internal.operators</a> &gt; <span class="el_source">OperatorMerge.java</span></div><h1>OperatorMerge.java</h1><pre class="source lang-java linenums">/**
+ * Copyright 2014 Netflix, Inc.
+ * 
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package rx.internal.operators;
+
+import java.util.*;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicLong;
+
+import rx.*;
+import rx.Observable;
+import rx.Observable.Operator;
+import rx.exceptions.*;
+import rx.internal.util.*;
+import rx.internal.util.atomic.*;
+import rx.internal.util.unsafe.*;
+import rx.subscriptions.CompositeSubscription;
+
+/**
+ * Flattens a list of {@link Observable}s into one {@code Observable}, without any transformation.
+ * &lt;p&gt;
+ * &lt;img width=&quot;640&quot; height=&quot;380&quot; src=&quot;https://raw.githubusercontent.com/wiki/ReactiveX/RxJava/images/rx-operators/merge.png&quot; alt=&quot;&quot;&gt;
+ * &lt;p&gt;
+ * You can combine the items emitted by multiple {@code Observable}s so that they act like a single {@code Observable}, by using the merge operation.
+ * &lt;p&gt;
+ * The {@code instance(true)} call behaves like {@link OperatorMerge} except that if any of the merged Observables notify of
+ * an error via {@code onError}, {@code mergeDelayError} will refrain from propagating that error
+ * notification until all of the merged Observables have finished emitting items.
+ * &lt;p&gt;
+ * &lt;img width=&quot;640&quot; src=&quot;https://github.com/ReactiveX/RxJava/wiki/images/rx-operators/mergeDelayError.png&quot; alt=&quot;&quot;&gt;
+ * &lt;p&gt;
+ * Even if multiple merged Observables send {@code onError} notifications, {@code mergeDelayError} will
+ * only invoke the {@code onError} method of its Observers once.
+ * &lt;p&gt;
+ * This operation allows an Observer to receive all successfully emitted items from all of the
+ * source Observables without being interrupted by an error notification from one of them.
+ * &lt;p&gt;
+ * &lt;em&gt;Note:&lt;/em&gt; If this is used on an Observable that never completes, it will never call {@code onError} and will effectively swallow errors.
+
+ * @param &lt;T&gt;
+ *            the type of the items emitted by both the source and merged {@code Observable}s
+ */
+public final class OperatorMerge&lt;T&gt; implements Operator&lt;T, Observable&lt;? extends T&gt;&gt; {
+    /** Lazy initialization via inner-class holder. */
+<span class="nc" id="L57">    private static final class HolderNoDelay {</span>
+        /** A singleton instance. */
+<span class="fc" id="L59">        static final OperatorMerge&lt;Object&gt; INSTANCE = new OperatorMerge&lt;Object&gt;(false, Integer.MAX_VALUE);</span>
+    }
+    /** Lazy initialization via inner-class holder. */
+<span class="nc" id="L62">    private static final class HolderDelayErrors {</span>
+        /** A singleton instance. */
+<span class="fc" id="L64">        static final OperatorMerge&lt;Object&gt; INSTANCE = new OperatorMerge&lt;Object&gt;(true, Integer.MAX_VALUE);</span>
+    }
+    /**
+     * @param delayErrors should the merge delay errors?
+     * @return a singleton instance of this stateless operator.
+     */
+    @SuppressWarnings(&quot;unchecked&quot;)
+    public static &lt;T&gt; OperatorMerge&lt;T&gt; instance(boolean delayErrors) {
+<span class="fc bfc" id="L72" title="All 2 branches covered.">        if (delayErrors) {</span>
+<span class="fc" id="L73">            return (OperatorMerge&lt;T&gt;)HolderDelayErrors.INSTANCE;</span>
+        }
+<span class="fc" id="L75">        return (OperatorMerge&lt;T&gt;)HolderNoDelay.INSTANCE;</span>
+    }
+    /**
+     * Creates a new instance of the operator with the given delayError and maxConcurrency settings.
+     * @param delayErrors
+     * @param maxConcurrent the maximum number of concurrent subscriptions or Integer.MAX_VALUE for unlimited
+     * @return
+     */
+    public static &lt;T&gt; OperatorMerge&lt;T&gt; instance(boolean delayErrors, int maxConcurrent) {
+<span class="fc bfc" id="L84" title="All 2 branches covered.">        if (maxConcurrent &lt;= 0) {</span>
+<span class="fc" id="L85">            throw new IllegalArgumentException(&quot;maxConcurrent &gt; 0 required but it was &quot; + maxConcurrent);</span>
+        }
+<span class="fc bfc" id="L87" title="All 2 branches covered.">        if (maxConcurrent == Integer.MAX_VALUE) {</span>
+<span class="fc" id="L88">            return instance(delayErrors);</span>
+        }
+<span class="fc" id="L90">        return new OperatorMerge&lt;T&gt;(delayErrors, maxConcurrent);</span>
+    }
+
+    final boolean delayErrors;
+    final int maxConcurrent;
+
+<span class="fc" id="L96">    OperatorMerge(boolean delayErrors, int maxConcurrent) {</span>
+<span class="fc" id="L97">        this.delayErrors = delayErrors;</span>
+<span class="fc" id="L98">        this.maxConcurrent = maxConcurrent;</span>
+<span class="fc" id="L99">    }</span>
+
+    @Override
+    public Subscriber&lt;Observable&lt;? extends T&gt;&gt; call(final Subscriber&lt;? super T&gt; child) {
+<span class="fc" id="L103">        MergeSubscriber&lt;T&gt; subscriber = new MergeSubscriber&lt;T&gt;(child, delayErrors, maxConcurrent);</span>
+<span class="fc" id="L104">        MergeProducer&lt;T&gt; producer = new MergeProducer&lt;T&gt;(subscriber);</span>
+<span class="fc" id="L105">        subscriber.producer = producer;</span>
+        
+<span class="fc" id="L107">        child.add(subscriber);</span>
+<span class="fc" id="L108">        child.setProducer(producer);</span>
+        
+<span class="fc" id="L110">        return subscriber;</span>
+    }
+
+    static final class MergeProducer&lt;T&gt; extends AtomicLong implements Producer {
+        /** */
+        private static final long serialVersionUID = -1214379189873595503L;
+
+        final MergeSubscriber&lt;T&gt; subscriber;
+        
+<span class="fc" id="L119">        public MergeProducer(MergeSubscriber&lt;T&gt; subscriber) {</span>
+<span class="fc" id="L120">            this.subscriber = subscriber;</span>
+<span class="fc" id="L121">        }</span>
+        
+        @Override
+        public void request(long n) {
+<span class="fc bfc" id="L125" title="All 2 branches covered.">            if (n &gt; 0) {</span>
+<span class="fc bfc" id="L126" title="All 2 branches covered.">                if (get() == Long.MAX_VALUE) {</span>
+<span class="fc" id="L127">                    return;</span>
+                }
+<span class="fc" id="L129">                BackpressureUtils.getAndAddRequest(this, n);</span>
+<span class="fc" id="L130">                subscriber.emit();</span>
+            } else 
+<span class="pc bpc" id="L132" title="1 of 2 branches missed.">            if (n &lt; 0) {</span>
+<span class="nc" id="L133">                throw new IllegalArgumentException(&quot;n &gt;= 0 required&quot;);</span>
+            }
+<span class="fc" id="L135">        }</span>
+        public long produced(int n) {
+<span class="fc" id="L137">            return addAndGet(-n);</span>
+        }
+    }
+    
+    /**
+     * The subscriber that observes Observables. 
+     * @param &lt;T&gt; the value type
+     */
+    static final class MergeSubscriber&lt;T&gt; extends Subscriber&lt;Observable&lt;? extends T&gt;&gt; {
+        final Subscriber&lt;? super T&gt; child;
+        final boolean delayErrors;
+        final int maxConcurrent;
+        
+        MergeProducer&lt;T&gt; producer;
+        
+        volatile Queue&lt;Object&gt; queue;
+        
+        /** Tracks the active subscriptions to sources. */
+        volatile CompositeSubscription subscriptions;
+        /** Due to the emission loop, we need to store errors somewhere if !delayErrors. */
+        volatile ConcurrentLinkedQueue&lt;Throwable&gt; errors;
+        
+        final NotificationLite&lt;T&gt; nl;
+        
+        volatile boolean done;
+        
+        /** Guarded by this. */
+        boolean emitting;
+        /** Guarded by this. */
+        boolean missed;
+        
+        final Object innerGuard;
+        /** Copy-on-write array, guarded by innerGuard. */
+        volatile InnerSubscriber&lt;?&gt;[] innerSubscribers;
+        
+        /** Used to generate unique InnerSubscriber IDs. Modified from onNext only. */
+        long uniqueId;
+        
+        /** Which was the last InnerSubscriber that emitted? Accessed if emitting == true. */
+        long lastId;
+        /** What was its index in the innerSubscribers array? Accessed if emitting == true. */
+        int lastIndex;
+        
+        /** An empty array to avoid creating new empty arrays in removeInner. */ 
+<span class="fc" id="L181">        static final InnerSubscriber&lt;?&gt;[] EMPTY = new InnerSubscriber&lt;?&gt;[0];</span>
+
+        final int scalarEmissionLimit;
+        
+        int scalarEmissionCount;
+        
+<span class="fc" id="L187">        public MergeSubscriber(Subscriber&lt;? super T&gt; child, boolean delayErrors, int maxConcurrent) {</span>
+<span class="fc" id="L188">            this.child = child;</span>
+<span class="fc" id="L189">            this.delayErrors = delayErrors;</span>
+<span class="fc" id="L190">            this.maxConcurrent = maxConcurrent;</span>
+<span class="fc" id="L191">            this.nl = NotificationLite.instance();</span>
+<span class="fc" id="L192">            this.innerGuard = new Object();</span>
+<span class="fc" id="L193">            this.innerSubscribers = EMPTY;</span>
+<span class="fc bfc" id="L194" title="All 2 branches covered.">            if (maxConcurrent == Integer.MAX_VALUE) {</span>
+<span class="fc" id="L195">                scalarEmissionLimit = Integer.MAX_VALUE;</span>
+<span class="fc" id="L196">                request(Long.MAX_VALUE);</span>
+            } else {
+<span class="fc" id="L198">                scalarEmissionLimit = Math.max(1, maxConcurrent &gt;&gt; 1);</span>
+<span class="fc" id="L199">                request(maxConcurrent);</span>
+            }
+<span class="fc" id="L201">        }</span>
+        
+        Queue&lt;Throwable&gt; getOrCreateErrorQueue() {
+<span class="fc" id="L204">            ConcurrentLinkedQueue&lt;Throwable&gt; q = errors;</span>
+<span class="fc bfc" id="L205" title="All 2 branches covered.">            if (q == null) {</span>
+<span class="fc" id="L206">                synchronized (this) {</span>
+<span class="fc" id="L207">                    q = errors;</span>
+<span class="pc bpc" id="L208" title="1 of 2 branches missed.">                    if (q == null) {</span>
+<span class="fc" id="L209">                        q = new ConcurrentLinkedQueue&lt;Throwable&gt;();</span>
+<span class="fc" id="L210">                        errors = q;</span>
+                    }
+<span class="pc" id="L212">                }</span>
+            }
+<span class="fc" id="L214">            return q;</span>
+        }
+        CompositeSubscription getOrCreateComposite() {
+<span class="fc" id="L217">            CompositeSubscription c = subscriptions;</span>
+<span class="fc bfc" id="L218" title="All 2 branches covered.">            if (c == null) {</span>
+<span class="fc" id="L219">                boolean shouldAdd = false;</span>
+<span class="fc" id="L220">                synchronized (this) {</span>
+<span class="fc" id="L221">                    c = subscriptions;</span>
+<span class="pc bpc" id="L222" title="1 of 2 branches missed.">                    if (c == null) {</span>
+<span class="fc" id="L223">                        c = new CompositeSubscription();</span>
+<span class="fc" id="L224">                        subscriptions = c;</span>
+<span class="fc" id="L225">                        shouldAdd = true;</span>
+                    }
+<span class="pc" id="L227">                }</span>
+<span class="pc bpc" id="L228" title="1 of 2 branches missed.">                if (shouldAdd) {</span>
+<span class="fc" id="L229">                    add(c);</span>
+                }
+            }
+<span class="fc" id="L232">            return c;</span>
+        }
+        
+        @Override
+        public void onNext(Observable&lt;? extends T&gt; t) {
+<span class="fc bfc" id="L237" title="All 2 branches covered.">            if (t == null) {</span>
+<span class="fc" id="L238">                return;</span>
+            }
+<span class="fc bfc" id="L240" title="All 2 branches covered.">            if (t instanceof ScalarSynchronousObservable) {</span>
+<span class="fc" id="L241">                tryEmit(((ScalarSynchronousObservable&lt;? extends T&gt;)t).get());</span>
+            } else {
+<span class="fc" id="L243">                InnerSubscriber&lt;T&gt; inner = new InnerSubscriber&lt;T&gt;(this, uniqueId++);</span>
+<span class="fc" id="L244">                addInner(inner);</span>
+<span class="fc" id="L245">                t.unsafeSubscribe(inner);</span>
+<span class="fc" id="L246">                emit();</span>
+            }
+<span class="fc" id="L248">        }</span>
+        
+        private void reportError() {
+<span class="fc" id="L251">            List&lt;Throwable&gt; list = new ArrayList&lt;Throwable&gt;(errors);</span>
+<span class="fc bfc" id="L252" title="All 2 branches covered.">            if (list.size() == 1) {</span>
+<span class="fc" id="L253">                child.onError(list.get(0));</span>
+            } else {
+<span class="fc" id="L255">                child.onError(new CompositeException(list));</span>
+            }
+<span class="fc" id="L257">        }</span>
+        
+        @Override
+        public void onError(Throwable e) {
+<span class="fc" id="L261">            getOrCreateErrorQueue().offer(e);</span>
+<span class="fc" id="L262">            done = true;</span>
+<span class="fc" id="L263">            emit();</span>
+<span class="fc" id="L264">        }</span>
+        @Override
+        public void onCompleted() {
+<span class="fc" id="L267">            done = true;</span>
+<span class="fc" id="L268">            emit();</span>
+<span class="fc" id="L269">        }</span>
+        
+        void addInner(InnerSubscriber&lt;T&gt; inner) {
+<span class="fc" id="L272">            getOrCreateComposite().add(inner);</span>
+<span class="fc" id="L273">            synchronized (innerGuard) {</span>
+<span class="fc" id="L274">                InnerSubscriber&lt;?&gt;[] a = innerSubscribers;</span>
+<span class="fc" id="L275">                int n = a.length;</span>
+<span class="fc" id="L276">                InnerSubscriber&lt;?&gt;[] b = new InnerSubscriber&lt;?&gt;[n + 1];</span>
+<span class="fc" id="L277">                System.arraycopy(a, 0, b, 0, n);</span>
+<span class="fc" id="L278">                b[n] = inner;</span>
+<span class="fc" id="L279">                innerSubscribers = b;</span>
+<span class="pc" id="L280">            }</span>
+<span class="fc" id="L281">        }</span>
+        void removeInner(InnerSubscriber&lt;T&gt; inner) {
+<span class="fc" id="L283">            RxRingBuffer q = inner.queue;</span>
+<span class="fc bfc" id="L284" title="All 2 branches covered.">            if (q != null) {</span>
+<span class="fc" id="L285">                q.release();</span>
+            }
+            // subscription is non-null here because the very first addInner will create it before
+            // this can be called
+<span class="fc" id="L289">            subscriptions.remove(inner);</span>
+<span class="fc" id="L290">            synchronized (innerGuard) {</span>
+<span class="fc" id="L291">                InnerSubscriber&lt;?&gt;[] a = innerSubscribers;</span>
+<span class="fc" id="L292">                int n = a.length;</span>
+<span class="fc" id="L293">                int j = -1;</span>
+                // locate the inner
+<span class="pc bpc" id="L295" title="1 of 2 branches missed.">                for (int i = 0; i &lt; n; i++) {</span>
+<span class="fc bfc" id="L296" title="All 2 branches covered.">                    if (inner.equals(a[i])) {</span>
+<span class="fc" id="L297">                        j = i;</span>
+<span class="fc" id="L298">                        break;</span>
+                    }
+                }
+<span class="pc bpc" id="L301" title="1 of 2 branches missed.">                if (j &lt; 0) {</span>
+<span class="nc" id="L302">                    return;</span>
+                }
+<span class="fc bfc" id="L304" title="All 2 branches covered.">                if (n == 1) {</span>
+<span class="fc" id="L305">                    innerSubscribers = EMPTY;</span>
+<span class="fc" id="L306">                    return;</span>
+                }
+<span class="fc" id="L308">                InnerSubscriber&lt;?&gt;[] b = new InnerSubscriber&lt;?&gt;[n - 1];</span>
+<span class="fc" id="L309">                System.arraycopy(a, 0, b, 0, j);</span>
+<span class="fc" id="L310">                System.arraycopy(a, j + 1, b, j, n - j - 1);</span>
+<span class="fc" id="L311">                innerSubscribers = b;</span>
+<span class="pc" id="L312">            }</span>
+<span class="fc" id="L313">        }</span>
+        
+        /**
+         * Tries to emit the value directly to the child if
+         * no concurrent emission is happening at the moment.
+         * &lt;p&gt;
+         * Since the scalar-value queue optimization applies
+         * to both the main source and the inner subscribers,
+         * we handle things in a shared manner.
+         * 
+         * @param subscriber
+         * @param value
+         */
+        void tryEmit(InnerSubscriber&lt;T&gt; subscriber, T value) {
+<span class="fc" id="L327">            boolean success = false;</span>
+<span class="fc" id="L328">            long r = producer.get();</span>
+<span class="fc bfc" id="L329" title="All 2 branches covered.">            if (r != 0L) {</span>
+<span class="fc" id="L330">                synchronized (this) {</span>
+                    // if nobody is emitting and child has available requests
+<span class="fc" id="L332">                    r = producer.get();</span>
+<span class="fc bfc" id="L333" title="All 4 branches covered.">                    if (!emitting &amp;&amp; r != 0L) {</span>
+<span class="fc" id="L334">                        emitting = true;</span>
+<span class="fc" id="L335">                        success = true;</span>
+                    }
+<span class="pc" id="L337">                }</span>
+            }
+<span class="fc bfc" id="L339" title="All 2 branches covered.">            if (success) {</span>
+<span class="fc" id="L340">                emitScalar(subscriber, value, r);</span>
+            } else {
+<span class="fc" id="L342">                queueScalar(subscriber, value);</span>
+            }
+<span class="fc" id="L344">        }</span>
+
+        protected void queueScalar(InnerSubscriber&lt;T&gt; subscriber, T value) {
+            /*
+             * If the attempt to make a fast-path emission failed
+             * due to lack of requests or an ongoing emission,
+             * enqueue the value and try the slow emission path.
+             */
+<span class="fc" id="L352">            RxRingBuffer q = subscriber.queue;</span>
+<span class="fc bfc" id="L353" title="All 2 branches covered.">            if (q == null) {</span>
+<span class="fc" id="L354">                q = RxRingBuffer.getSpscInstance();</span>
+<span class="fc" id="L355">                subscriber.add(q);</span>
+<span class="fc" id="L356">                subscriber.queue = q;</span>
+            }
+            try {
+<span class="fc" id="L359">                q.onNext(nl.next(value));</span>
+<span class="fc" id="L360">            } catch (MissingBackpressureException ex) {</span>
+<span class="fc" id="L361">                subscriber.unsubscribe();</span>
+<span class="fc" id="L362">                subscriber.onError(ex);</span>
+<span class="fc" id="L363">                return;</span>
+<span class="fc" id="L364">            } catch (IllegalStateException ex) {</span>
+<span class="pc bpc" id="L365" title="1 of 2 branches missed.">                if (!subscriber.isUnsubscribed()) {</span>
+<span class="nc" id="L366">                    subscriber.unsubscribe();</span>
+<span class="nc" id="L367">                    subscriber.onError(ex);</span>
+                }
+<span class="fc" id="L369">                return;</span>
+<span class="fc" id="L370">            }</span>
+<span class="fc" id="L371">            emit();</span>
+<span class="fc" id="L372">        }</span>
+
+        protected void emitScalar(InnerSubscriber&lt;T&gt; subscriber, T value, long r) {
+<span class="fc" id="L375">            boolean skipFinal = false;</span>
+            try {
+                try {
+<span class="fc" id="L378">                    child.onNext(value);</span>
+<span class="fc" id="L379">                } catch (Throwable t) {</span>
+<span class="pc bpc" id="L380" title="1 of 2 branches missed.">                    if (!delayErrors) {</span>
+<span class="nc" id="L381">                        Exceptions.throwIfFatal(t);</span>
+<span class="nc" id="L382">                        skipFinal = true;</span>
+<span class="nc" id="L383">                        subscriber.unsubscribe();</span>
+<span class="nc" id="L384">                        subscriber.onError(t);</span>
+                        return;
+                    }
+<span class="fc" id="L387">                    getOrCreateErrorQueue().offer(t);</span>
+<span class="fc" id="L388">                }</span>
+<span class="fc bfc" id="L389" title="All 2 branches covered.">                if (r != Long.MAX_VALUE) {</span>
+<span class="fc" id="L390">                    producer.produced(1);</span>
+                }
+<span class="fc" id="L392">                subscriber.requestMore(1);</span>
+                // check if some state changed while emitting
+<span class="fc" id="L394">                synchronized (this) {</span>
+<span class="fc" id="L395">                    skipFinal = true;</span>
+<span class="fc bfc" id="L396" title="All 2 branches covered.">                    if (!missed) {</span>
+<span class="fc" id="L397">                        emitting = false;</span>
+<span class="fc" id="L398">                        return;</span>
+                    }
+<span class="fc" id="L400">                    missed = false;</span>
+<span class="pc" id="L401">                }</span>
+            } finally {
+<span class="pc bpc" id="L403" title="5 of 8 branches missed.">                if (!skipFinal) {</span>
+<span class="pc" id="L404">                    synchronized (this) {</span>
+<span class="pc" id="L405">                        emitting = false;</span>
+<span class="pc" id="L406">                    }</span>
+                }
+            }
+            /*
+             * In the synchronized block below request(1) we check
+             * if there was a concurrent emission attempt and if there was,
+             * we stay in emission mode and enter the emission loop
+             * which will take care all the queued up state and 
+             * emission possibilities.
+             */
+<span class="fc" id="L416">            emitLoop();</span>
+<span class="fc" id="L417">        }</span>
+
+        public void requestMore(long n) {
+<span class="fc" id="L420">            request(n);</span>
+<span class="fc" id="L421">        }</span>
+        
+        /**
+         * Tries to emit the value directly to the child if
+         * no concurrent emission is happening at the moment.
+         * &lt;p&gt;
+         * Since the scalar-value queue optimization applies
+         * to both the main source and the inner subscribers,
+         * we handle things in a shared manner.
+         * 
+         * @param subscriber
+         * @param value
+         */
+        void tryEmit(T value) {
+<span class="fc" id="L435">            boolean success = false;</span>
+<span class="fc" id="L436">            long r = producer.get();</span>
+<span class="fc bfc" id="L437" title="All 2 branches covered.">            if (r != 0L) {</span>
+<span class="fc" id="L438">                synchronized (this) {</span>
+                    // if nobody is emitting and child has available requests
+<span class="fc" id="L440">                    r = producer.get();</span>
+<span class="pc bpc" id="L441" title="1 of 4 branches missed.">                    if (!emitting &amp;&amp; r != 0L) {</span>
+<span class="fc" id="L442">                        emitting = true;</span>
+<span class="fc" id="L443">                        success = true;</span>
+                    }
+<span class="pc" id="L445">                }</span>
+            }
+<span class="fc bfc" id="L447" title="All 2 branches covered.">            if (success) {</span>
+<span class="fc" id="L448">                emitScalar(value, r);</span>
+            } else {
+<span class="fc" id="L450">                queueScalar(value);</span>
+            }
+<span class="fc" id="L452">        }</span>
+
+        protected void queueScalar(T value) {
+            /*
+             * If the attempt to make a fast-path emission failed
+             * due to lack of requests or an ongoing emission,
+             * enqueue the value and try the slow emission path.
+             */
+<span class="fc" id="L460">            Queue&lt;Object&gt; q = this.queue;</span>
+<span class="fc bfc" id="L461" title="All 2 branches covered.">            if (q == null) {</span>
+<span class="fc" id="L462">                int mc = maxConcurrent;</span>
+<span class="fc bfc" id="L463" title="All 2 branches covered.">                if (mc == Integer.MAX_VALUE) {</span>
+<span class="fc" id="L464">                    q = new SpscUnboundedAtomicArrayQueue&lt;Object&gt;(RxRingBuffer.SIZE);</span>
+                } else {
+<span class="pc bpc" id="L466" title="1 of 2 branches missed.">                    if (Pow2.isPowerOfTwo(mc)) {</span>
+<span class="pc bpc" id="L467" title="1 of 2 branches missed.">                        if (UnsafeAccess.isUnsafeAvailable()) {</span>
+<span class="fc" id="L468">                            q = new SpscArrayQueue&lt;Object&gt;(mc);</span>
+                        } else {
+<span class="nc" id="L470">                            q = new SpscAtomicArrayQueue&lt;Object&gt;(mc);</span>
+                        }
+                    } else {
+<span class="nc" id="L473">                        q = new SpscExactAtomicArrayQueue&lt;Object&gt;(mc);</span>
+                    }
+                }
+<span class="fc" id="L476">                this.queue = q;</span>
+            }
+<span class="pc bpc" id="L478" title="1 of 2 branches missed.">            if (!q.offer(value)) {</span>
+<span class="nc" id="L479">                unsubscribe();</span>
+<span class="nc" id="L480">                onError(OnErrorThrowable.addValueAsLastCause(new MissingBackpressureException(), value));</span>
+<span class="nc" id="L481">                return;</span>
+            }
+<span class="fc" id="L483">            emit();</span>
+<span class="fc" id="L484">        }</span>
+
+        protected void emitScalar(T value, long r) {
+<span class="fc" id="L487">            boolean skipFinal = false;</span>
+            try {
+                try {
+<span class="fc" id="L490">                    child.onNext(value);</span>
+<span class="nc" id="L491">                } catch (Throwable t) {</span>
+<span class="nc bnc" id="L492" title="All 2 branches missed.">                    if (!delayErrors) {</span>
+<span class="nc" id="L493">                        Exceptions.throwIfFatal(t);</span>
+<span class="nc" id="L494">                        skipFinal = true;</span>
+<span class="nc" id="L495">                        this.unsubscribe();</span>
+<span class="nc" id="L496">                        this.onError(t);</span>
+                        return;
+                    }
+<span class="nc" id="L499">                    getOrCreateErrorQueue().offer(t);</span>
+<span class="fc" id="L500">                }</span>
+<span class="fc bfc" id="L501" title="All 2 branches covered.">                if (r != Long.MAX_VALUE) {</span>
+<span class="fc" id="L502">                    producer.produced(1);</span>
+                }
+                
+<span class="fc" id="L505">                int produced = scalarEmissionCount + 1;</span>
+<span class="fc bfc" id="L506" title="All 2 branches covered.">                if (produced == scalarEmissionLimit) {</span>
+<span class="fc" id="L507">                    scalarEmissionCount = 0;</span>
+<span class="fc" id="L508">                    this.requestMore(produced);</span>
+                } else {
+<span class="fc" id="L510">                    scalarEmissionCount = produced;</span>
+                }
+                
+                // check if some state changed while emitting
+<span class="fc" id="L514">                synchronized (this) {</span>
+<span class="fc" id="L515">                    skipFinal = true;</span>
+<span class="fc bfc" id="L516" title="All 2 branches covered.">                    if (!missed) {</span>
+<span class="fc" id="L517">                        emitting = false;</span>
+<span class="fc" id="L518">                        return;</span>
+                    }
+<span class="fc" id="L520">                    missed = false;</span>
+<span class="pc" id="L521">                }</span>
+            } finally {
+<span class="pc bpc" id="L523" title="5 of 8 branches missed.">                if (!skipFinal) {</span>
+<span class="pc" id="L524">                    synchronized (this) {</span>
+<span class="pc" id="L525">                        emitting = false;</span>
+<span class="pc" id="L526">                    }</span>
+                }
+            }
+            /*
+             * In the synchronized block below request(1) we check
+             * if there was a concurrent emission attempt and if there was,
+             * we stay in emission mode and enter the emission loop
+             * which will take care all the queued up state and 
+             * emission possibilities.
+             */
+<span class="fc" id="L536">            emitLoop();</span>
+<span class="fc" id="L537">        }</span>
+        
+        void emit() {
+<span class="fc" id="L540">            synchronized (this) {</span>
+<span class="fc bfc" id="L541" title="All 2 branches covered.">                if (emitting) {</span>
+<span class="fc" id="L542">                    missed = true;</span>
+<span class="fc" id="L543">                    return;</span>
+                }
+<span class="fc" id="L545">                emitting = true;</span>
+<span class="pc" id="L546">            }</span>
+<span class="fc" id="L547">            emitLoop();</span>
+<span class="fc" id="L548">        }</span>
+        /**
+         * The standard emission loop serializing events and requests.
+         */
+        void emitLoop() {
+<span class="fc" id="L553">            boolean skipFinal = false;</span>
+            try {
+<span class="fc" id="L555">                final Subscriber&lt;? super T&gt; child = this.child;</span>
+                for (;;) {
+                    // eagerly check if child unsubscribed or we reached a terminal state.
+<span class="fc bfc" id="L558" title="All 2 branches covered.">                    if (checkTerminate()) {</span>
+<span class="fc" id="L559">                        skipFinal = true;</span>
+                        return;
+                    }
+<span class="fc" id="L562">                    Queue&lt;Object&gt; svq = queue;</span>
+                    
+<span class="fc" id="L564">                    long r = producer.get();</span>
+<span class="fc bfc" id="L565" title="All 2 branches covered.">                    boolean unbounded = r == Long.MAX_VALUE;</span>
+                    
+                    // count the number of 'completed' sources to replenish them in batches
+<span class="fc" id="L568">                    int replenishMain = 0;</span>
+
+                    // try emitting as many scalars as possible
+<span class="fc bfc" id="L571" title="All 2 branches covered.">                    if (svq != null) {</span>
+                        for (;;) {
+<span class="fc" id="L573">                            int scalarEmission = 0;</span>
+<span class="fc" id="L574">                            Object o = null;</span>
+<span class="fc bfc" id="L575" title="All 2 branches covered.">                            while (r &gt; 0) {</span>
+<span class="fc" id="L576">                                o = svq.poll();</span>
+                                // eagerly check if child unsubscribed or we reached a terminal state.
+<span class="pc bpc" id="L578" title="1 of 2 branches missed.">                                if (checkTerminate()) {</span>
+<span class="nc" id="L579">                                    skipFinal = true;</span>
+                                    return;
+                                }
+<span class="fc bfc" id="L582" title="All 2 branches covered.">                                if (o == null) {</span>
+<span class="fc" id="L583">                                    break;</span>
+                                }
+<span class="fc" id="L585">                                T v = nl.getValue(o);</span>
+                                // if child throws, report bounce it back immediately
+                                try {
+<span class="fc" id="L588">                                    child.onNext(v);</span>
+<span class="nc" id="L589">                                } catch (Throwable t) {</span>
+<span class="nc bnc" id="L590" title="All 2 branches missed.">                                    if (!delayErrors) {</span>
+<span class="nc" id="L591">                                        Exceptions.throwIfFatal(t);</span>
+<span class="nc" id="L592">                                        skipFinal = true;</span>
+<span class="nc" id="L593">                                        unsubscribe();</span>
+<span class="nc" id="L594">                                        child.onError(t);</span>
+                                        return;
+                                    }
+<span class="nc" id="L597">                                    getOrCreateErrorQueue().offer(t);</span>
+<span class="fc" id="L598">                                }</span>
+<span class="fc" id="L599">                                replenishMain++;</span>
+<span class="fc" id="L600">                                scalarEmission++;</span>
+<span class="fc" id="L601">                                r--;</span>
+<span class="fc" id="L602">                            }</span>
+<span class="fc bfc" id="L603" title="All 2 branches covered.">                            if (scalarEmission &gt; 0) {</span>
+<span class="pc bpc" id="L604" title="1 of 2 branches missed.">                                if (unbounded) {</span>
+<span class="nc" id="L605">                                    r = Long.MAX_VALUE;</span>
+                                } else {
+<span class="fc" id="L607">                                    r = producer.produced(scalarEmission);</span>
+                                }
+                            }
+<span class="pc bpc" id="L610" title="1 of 4 branches missed.">                            if (r == 0L || o == null) {</span>
+<span class="fc" id="L611">                                break;</span>
+                            }
+<span class="nc" id="L613">                        }</span>
+                    }
+
+                    /*
+                     * We need to read done before innerSubscribers because innerSubcribers are added
+                     * before done is set to true. If it were the other way around, we could read an empty
+                     * innerSubscribers, get paused and then read a done flag but an async producer
+                     * might have added more subscribers between the two.
+                     */
+<span class="fc" id="L622">                    boolean d = done;</span>
+                    // re-read svq because it could have been created
+                    // asynchronously just before done was set to true.
+<span class="fc" id="L625">                    svq = queue;</span>
+                    // read the current set of inner subscribers
+<span class="fc" id="L627">                    InnerSubscriber&lt;?&gt;[] inner = innerSubscribers;</span>
+<span class="fc" id="L628">                    int n = inner.length;</span>
+                    
+                    // check if upstream is done, there are no scalar values 
+                    // and no active inner subscriptions
+<span class="fc bfc" id="L632" title="All 8 branches covered.">                    if (d &amp;&amp; (svq == null || svq.isEmpty()) &amp;&amp; n == 0) {</span>
+<span class="fc" id="L633">                        Queue&lt;Throwable&gt; e = errors;</span>
+<span class="pc bpc" id="L634" title="1 of 4 branches missed.">                        if (e == null || e.isEmpty()) {</span>
+<span class="fc" id="L635">                            child.onCompleted();</span>
+                        } else {
+<span class="fc" id="L637">                            reportError();</span>
+                        }
+<span class="fc" id="L639">                        skipFinal = true;</span>
+                        return;
+                    }
+                    
+<span class="fc" id="L643">                    boolean innerCompleted = false;</span>
+<span class="fc bfc" id="L644" title="All 2 branches covered.">                    if (n &gt; 0) {</span>
+                        // let's continue the round-robin emission from last location
+<span class="fc" id="L646">                        long startId = lastId;</span>
+<span class="fc" id="L647">                        int index = lastIndex;</span>
+                        
+                        // in case there were changes in the array or the index
+                        // no longer points to the inner with the cached id
+<span class="fc bfc" id="L651" title="All 4 branches covered.">                        if (n &lt;= index || inner[index].id != startId) {</span>
+<span class="fc bfc" id="L652" title="All 2 branches covered.">                            if (n &lt;= index) {</span>
+<span class="fc" id="L653">                                index = 0;</span>
+                            }
+                            // try locating the inner with the cached index
+<span class="fc" id="L656">                            int j = index;</span>
+<span class="fc bfc" id="L657" title="All 2 branches covered.">                            for (int i = 0; i &lt; n; i++) {</span>
+<span class="fc bfc" id="L658" title="All 2 branches covered.">                                if (inner[j].id == startId) {</span>
+<span class="fc" id="L659">                                    break;</span>
+                                }
+                                // wrap around in round-robin fashion
+<span class="fc" id="L662">                                j++;</span>
+<span class="fc bfc" id="L663" title="All 2 branches covered.">                                if (j == n) {</span>
+<span class="fc" id="L664">                                    j = 0;</span>
+                                }
+                            }
+                            // if we found it again, j will point to it
+                            // otherwise, we continue with the replacement at j
+<span class="fc" id="L669">                            index = j;</span>
+<span class="fc" id="L670">                            lastIndex = j;</span>
+<span class="fc" id="L671">                            lastId = inner[j].id;</span>
+                        }
+                        
+<span class="fc" id="L674">                        int j = index;</span>
+                        // loop through all sources once to avoid delaying any new sources too much
+<span class="fc bfc" id="L676" title="All 2 branches covered.">                        for (int i = 0; i &lt; n; i++) {</span>
+                            // eagerly check if child unsubscribed or we reached a terminal state.
+<span class="fc bfc" id="L678" title="All 2 branches covered.">                            if (checkTerminate()) {</span>
+<span class="fc" id="L679">                                skipFinal = true;</span>
+                                return;
+                            }
+                            @SuppressWarnings(&quot;unchecked&quot;)
+<span class="fc" id="L683">                            InnerSubscriber&lt;T&gt; is = (InnerSubscriber&lt;T&gt;)inner[j];</span>
+                            
+<span class="fc" id="L685">                            Object o = null;</span>
+                            for (;;) {
+<span class="fc" id="L687">                                int produced = 0;</span>
+<span class="fc bfc" id="L688" title="All 2 branches covered.">                                while (r &gt; 0) {</span>
+                                    // eagerly check if child unsubscribed or we reached a terminal state.
+<span class="fc bfc" id="L690" title="All 2 branches covered.">                                    if (checkTerminate()) {</span>
+<span class="fc" id="L691">                                        skipFinal = true;</span>
+                                        return;
+                                    }
+<span class="fc" id="L694">                                    RxRingBuffer q = is.queue;</span>
+<span class="fc bfc" id="L695" title="All 2 branches covered.">                                    if (q == null) {</span>
+<span class="fc" id="L696">                                        break;</span>
+                                    }
+<span class="fc" id="L698">                                    o = q.poll();</span>
+<span class="fc bfc" id="L699" title="All 2 branches covered.">                                    if (o == null) {</span>
+<span class="fc" id="L700">                                        break;</span>
+                                    }
+<span class="fc" id="L702">                                    T v = nl.getValue(o);</span>
+                                    // if child throws, report bounce it back immediately
+                                    try {
+<span class="fc" id="L705">                                        child.onNext(v);</span>
+<span class="nc" id="L706">                                    } catch (Throwable t) {</span>
+<span class="nc" id="L707">                                        skipFinal = true;</span>
+<span class="nc" id="L708">                                        Exceptions.throwIfFatal(t);</span>
+                                        try {
+<span class="nc" id="L710">                                            child.onError(t);</span>
+                                        } finally {
+<span class="nc" id="L712">                                            unsubscribe();</span>
+<span class="nc" id="L713">                                        }</span>
+                                        return;
+<span class="fc" id="L715">                                    }</span>
+<span class="fc" id="L716">                                    r--;</span>
+<span class="fc" id="L717">                                    produced++;</span>
+<span class="fc" id="L718">                                }</span>
+<span class="fc bfc" id="L719" title="All 2 branches covered.">                                if (produced &gt; 0) {</span>
+<span class="fc bfc" id="L720" title="All 2 branches covered.">                                    if (!unbounded) {</span>
+<span class="fc" id="L721">                                        r = producer.produced(produced);</span>
+                                    } else {
+<span class="fc" id="L723">                                        r = Long.MAX_VALUE;</span>
+                                    }
+<span class="fc" id="L725">                                    is.requestMore(produced);</span>
+                                }
+                                // if we run out of requests or queued values, break
+<span class="fc bfc" id="L728" title="All 4 branches covered.">                                if (r == 0 || o == null) {</span>
+<span class="fc" id="L729">                                    break;</span>
+                                }
+<span class="fc" id="L731">                            }</span>
+<span class="fc" id="L732">                            boolean innerDone = is.done;</span>
+<span class="fc" id="L733">                            RxRingBuffer innerQueue = is.queue;</span>
+<span class="fc bfc" id="L734" title="All 6 branches covered.">                            if (innerDone &amp;&amp; (innerQueue == null || innerQueue.isEmpty())) {</span>
+<span class="fc" id="L735">                                removeInner(is);</span>
+<span class="pc bpc" id="L736" title="1 of 2 branches missed.">                                if (checkTerminate()) {</span>
+<span class="nc" id="L737">                                    skipFinal = true;</span>
+                                    return;
+                                }
+<span class="fc" id="L740">                                replenishMain++;</span>
+<span class="fc" id="L741">                                innerCompleted = true;</span>
+                            }
+                            // if we run out of requests, don't try the other sources
+<span class="fc bfc" id="L744" title="All 2 branches covered.">                            if (r == 0) {</span>
+<span class="fc" id="L745">                                break;</span>
+                            }
+                            
+                            // wrap around in round-robin fashion
+<span class="fc" id="L749">                            j++;</span>
+<span class="fc bfc" id="L750" title="All 2 branches covered.">                            if (j == n) {</span>
+<span class="fc" id="L751">                                j = 0;</span>
+                            }
+                        }
+                        // if we run out of requests or just completed a round, save the index and id
+<span class="fc" id="L755">                        lastIndex = j;</span>
+<span class="fc" id="L756">                        lastId = inner[j].id;</span>
+                    }
+                    
+<span class="fc bfc" id="L759" title="All 2 branches covered.">                    if (replenishMain &gt; 0) {</span>
+<span class="fc" id="L760">                        request(replenishMain);</span>
+                    }
+                    // if one or more inner completed, loop again to see if we can terminate the whole stream
+<span class="fc bfc" id="L763" title="All 2 branches covered.">                    if (innerCompleted) {</span>
+<span class="fc" id="L764">                        continue;</span>
+                    }
+                    // in case there were updates to the state, we loop again
+<span class="fc" id="L767">                    synchronized (this) {</span>
+<span class="fc bfc" id="L768" title="All 2 branches covered.">                        if (!missed) {</span>
+<span class="fc" id="L769">                            skipFinal = true;</span>
+<span class="fc" id="L770">                            emitting = false;</span>
+<span class="fc" id="L771">                            break;</span>
+                        }
+<span class="fc" id="L773">                        missed = false;</span>
+<span class="pc" id="L774">                    }</span>
+<span class="fc" id="L775">                }</span>
+            } finally {
+<span class="pc bpc" id="L777" title="14 of 20 branches missed.">                if (!skipFinal) {</span>
+<span class="pc" id="L778">                    synchronized (this) {</span>
+<span class="pc" id="L779">                        emitting = false;</span>
+<span class="pc" id="L780">                    }</span>
+                }
+            }
+<span class="fc" id="L783">        }</span>
+        
+        /**
+         * Check if the operator reached some terminal state: child unsubscribed,
+         * an error was reported and we don't delay errors.
+         * @return true if the child unsubscribed or there are errors available and merge doesn't delay errors.
+         */
+        boolean checkTerminate() {
+<span class="fc bfc" id="L791" title="All 2 branches covered.">            if (child.isUnsubscribed()) {</span>
+<span class="fc" id="L792">                return true;</span>
+            }
+<span class="fc" id="L794">            Queue&lt;Throwable&gt; e = errors;</span>
+<span class="pc bpc" id="L795" title="1 of 6 branches missed.">            if (!delayErrors &amp;&amp; (e != null &amp;&amp; !e.isEmpty())) {</span>
+                try {
+<span class="fc" id="L797">                    reportError();</span>
+                } finally {
+<span class="fc" id="L799">                    unsubscribe();</span>
+<span class="fc" id="L800">                }</span>
+<span class="fc" id="L801">                return true;</span>
+            }
+<span class="fc" id="L803">            return false;</span>
+        }
+    }
+    static final class InnerSubscriber&lt;T&gt; extends Subscriber&lt;T&gt; {
+        final MergeSubscriber&lt;T&gt; parent;
+        final long id;
+        volatile boolean done;
+        volatile RxRingBuffer queue;
+        int outstanding;
+<span class="fc" id="L812">        static final int limit = RxRingBuffer.SIZE / 4;</span>
+        
+<span class="fc" id="L814">        public InnerSubscriber(MergeSubscriber&lt;T&gt; parent, long id) {</span>
+<span class="fc" id="L815">            this.parent = parent;</span>
+<span class="fc" id="L816">            this.id = id;</span>
+<span class="fc" id="L817">        }</span>
+        @Override
+        public void onStart() {
+<span class="fc" id="L820">            outstanding = RxRingBuffer.SIZE;</span>
+<span class="fc" id="L821">            request(RxRingBuffer.SIZE);</span>
+<span class="fc" id="L822">        }</span>
+        @Override
+        public void onNext(T t) {
+<span class="fc" id="L825">            parent.tryEmit(this, t);</span>
+<span class="fc" id="L826">        }</span>
+        @Override
+        public void onError(Throwable e) {
+<span class="fc" id="L829">            done = true;</span>
+<span class="fc" id="L830">            parent.getOrCreateErrorQueue().offer(e);</span>
+<span class="fc" id="L831">            parent.emit();</span>
+<span class="fc" id="L832">        }</span>
+        @Override
+        public void onCompleted() {
+<span class="fc" id="L835">            done = true;</span>
+<span class="fc" id="L836">            parent.emit();</span>
+<span class="fc" id="L837">        }</span>
+        public void requestMore(long n) {
+<span class="fc" id="L839">            int r = outstanding - (int)n;</span>
+<span class="fc bfc" id="L840" title="All 2 branches covered.">            if (r &gt; limit) {</span>
+<span class="fc" id="L841">                outstanding = r;</span>
+<span class="fc" id="L842">                return;</span>
+            }
+<span class="fc" id="L844">            outstanding = RxRingBuffer.SIZE;</span>
+<span class="fc" id="L845">            int k = RxRingBuffer.SIZE - r;</span>
+<span class="pc bpc" id="L846" title="1 of 2 branches missed.">            if (k &gt; 0) {</span>
+<span class="fc" id="L847">                request(k);</span>
+            }
+<span class="fc" id="L849">        }</span>
+    }}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

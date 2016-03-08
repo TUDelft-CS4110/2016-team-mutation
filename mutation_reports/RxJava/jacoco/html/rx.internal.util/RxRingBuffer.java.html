@@ -1,0 +1,458 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>RxRingBuffer.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.internal.util</a> &gt; <span class="el_source">RxRingBuffer.java</span></div><h1>RxRingBuffer.java</h1><pre class="source lang-java linenums">/**
+ * Copyright 2014 Netflix, Inc.
+ * 
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package rx.internal.util;
+
+import java.util.Queue;
+
+import rx.Observer;
+import rx.Subscription;
+import rx.exceptions.MissingBackpressureException;
+import rx.internal.operators.NotificationLite;
+import rx.internal.util.unsafe.SpmcArrayQueue;
+import rx.internal.util.unsafe.SpscArrayQueue;
+import rx.internal.util.unsafe.UnsafeAccess;
+
+/**
+ * This assumes Spsc or Spmc usage. This means only a single producer calling the on* methods. This is the Rx
+ * contract of an Observer (see http://reactivex.io/documentation/contract.html). Concurrent invocations of
+ * on* methods will not be thread-safe.
+ */
+public class RxRingBuffer implements Subscription {
+
+    public static RxRingBuffer getSpscInstance() {
+<span class="pc bpc" id="L36" title="1 of 2 branches missed.">        if (UnsafeAccess.isUnsafeAvailable()) {</span>
+<span class="fc" id="L37">            return new RxRingBuffer(SPSC_POOL, SIZE);</span>
+        } else {
+<span class="nc" id="L39">            return new RxRingBuffer();</span>
+        }
+    }
+
+    public static RxRingBuffer getSpmcInstance() {
+<span class="pc bpc" id="L44" title="1 of 2 branches missed.">        if (UnsafeAccess.isUnsafeAvailable()) {</span>
+<span class="fc" id="L45">            return new RxRingBuffer(SPMC_POOL, SIZE);</span>
+        } else {
+<span class="nc" id="L47">            return new RxRingBuffer();</span>
+        }
+    }
+
+    /**
+     * Queue implementation testing that led to current choices of data structures:
+     * 
+     * With synchronized LinkedList
+     * &lt;pre&gt; {@code
+     * Benchmark                                        Mode   Samples        Score  Score error    Units
+     * r.i.RxRingBufferPerf.ringBufferAddRemove1       thrpt         5 19118392.046  1002814.238    ops/s
+     * r.i.RxRingBufferPerf.ringBufferAddRemove1000    thrpt         5    17891.641      252.747    ops/s
+     * 
+     * With MpscPaddedQueue (single consumer, so failing 1 unit test)
+     * 
+     * Benchmark                                        Mode   Samples        Score  Score error    Units
+     * r.i.RxRingBufferPerf.ringBufferAddRemove1       thrpt         5 22164483.238  3035027.348    ops/s
+     * r.i.RxRingBufferPerf.ringBufferAddRemove1000    thrpt         5    23154.303      602.548    ops/s
+     * 
+     * 
+     * With ConcurrentLinkedQueue (tracking count separately)
+     * 
+     * Benchmark                                        Mode   Samples        Score  Score error    Units
+     * r.i.RxRingBufferPerf.ringBufferAddRemove1       thrpt         5 17353906.092   378756.411    ops/s
+     * r.i.RxRingBufferPerf.ringBufferAddRemove1000    thrpt         5    19224.411     1010.610    ops/s
+     * 
+     * With ConcurrentLinkedQueue (using queue.size() method for count)
+     * 
+     * Benchmark                                        Mode   Samples        Score  Score error    Units
+     * r.i.RxRingBufferPerf.ringBufferAddRemove1       thrpt         5 23951121.098  1982380.330    ops/s
+     * r.i.RxRingBufferPerf.ringBufferAddRemove1000    thrpt         5     1142.351       33.592    ops/s
+     * 
+     * With SynchronizedQueue (synchronized LinkedList ... no object pooling)
+     * 
+     * r.i.RxRingBufferPerf.createUseAndDestroy1       thrpt         5 33231667.136   685757.510    ops/s
+     * r.i.RxRingBufferPerf.createUseAndDestroy1000    thrpt         5    74623.614     5493.766    ops/s
+     * r.i.RxRingBufferPerf.ringBufferAddRemove1       thrpt         5 22907359.257   707026.632    ops/s
+     * r.i.RxRingBufferPerf.ringBufferAddRemove1000    thrpt         5    22222.410      320.829    ops/s
+     * 
+     * With ArrayBlockingQueue
+     * 
+     * Benchmark                                            Mode   Samples        Score  Score error    Units
+     * r.i.RxRingBufferPerf.createUseAndDestroy1       thrpt         5  2389804.664    68990.804    ops/s
+     * r.i.RxRingBufferPerf.createUseAndDestroy1000    thrpt         5    27384.274     1411.789    ops/s
+     * r.i.RxRingBufferPerf.ringBufferAddRemove1       thrpt         5 26497037.559    91176.247    ops/s
+     * r.i.RxRingBufferPerf.ringBufferAddRemove1000    thrpt         5    17985.144      237.771    ops/s
+     * 
+     * With ArrayBlockingQueue and Object Pool
+     * 
+     * Benchmark                                            Mode   Samples        Score  Score error    Units
+     * r.i.RxRingBufferPerf.createUseAndDestroy1       thrpt         5 12465685.522   399070.770    ops/s
+     * r.i.RxRingBufferPerf.createUseAndDestroy1000    thrpt         5    27701.294      395.217    ops/s
+     * r.i.RxRingBufferPerf.ringBufferAddRemove1       thrpt         5 26399625.086   695639.436    ops/s
+     * r.i.RxRingBufferPerf.ringBufferAddRemove1000    thrpt         5    17985.427      253.190    ops/s
+     * 
+     * With SpscArrayQueue (single consumer, so failing 1 unit test)
+     *  - requires access to Unsafe
+     * 
+     * Benchmark                                        Mode   Samples        Score  Score error    Units
+     * r.i.RxRingBufferPerf.createUseAndDestroy1       thrpt         5  1922996.035    49183.766    ops/s
+     * r.i.RxRingBufferPerf.createUseAndDestroy1000    thrpt         5    70890.186     1382.550    ops/s
+     * r.i.RxRingBufferPerf.ringBufferAddRemove1       thrpt         5 80637811.605  3509706.954    ops/s
+     * r.i.RxRingBufferPerf.ringBufferAddRemove1000    thrpt         5    71822.453     4127.660    ops/s
+     * 
+     * 
+     * With SpscArrayQueue and Object Pool (object pool improves createUseAndDestroy1 by 10x)
+     * 
+     * Benchmark                                        Mode   Samples        Score  Score error    Units
+     * r.i.RxRingBufferPerf.createUseAndDestroy1       thrpt         5 25220069.264  1329078.785    ops/s
+     * r.i.RxRingBufferPerf.createUseAndDestroy1000    thrpt         5    72313.457     3535.447    ops/s
+     * r.i.RxRingBufferPerf.ringBufferAddRemove1       thrpt         5 81863840.884  2191416.069    ops/s
+     * r.i.RxRingBufferPerf.ringBufferAddRemove1000    thrpt         5    73140.822     1528.764    ops/s
+     * 
+     * With SpmcArrayQueue
+     *  - requires access to Unsafe
+     *  
+     * Benchmark                                            Mode   Samples        Score  Score error    Units
+     * r.i.RxRingBufferPerf.spmcCreateUseAndDestroy1       thrpt         5 27630345.474   769219.142    ops/s
+     * r.i.RxRingBufferPerf.spmcCreateUseAndDestroy1000    thrpt         5    80052.046     4059.541    ops/s
+     * r.i.RxRingBufferPerf.spmcRingBufferAddRemove1       thrpt         5 44449524.222   563068.793    ops/s
+     * r.i.RxRingBufferPerf.spmcRingBufferAddRemove1000    thrpt         5    65231.253     1805.732    ops/s
+     * 
+     * With SpmcArrayQueue and ObjectPool (object pool improves createUseAndDestroy1 by 10x)
+     * 
+     * Benchmark                                        Mode   Samples        Score  Score error    Units
+     * r.i.RxRingBufferPerf.createUseAndDestroy1       thrpt         5 18489343.061  1011872.825    ops/s
+     * r.i.RxRingBufferPerf.createUseAndDestroy1000    thrpt         5    46416.434     1439.144    ops/s
+     * r.i.RxRingBufferPerf.ringBufferAddRemove        thrpt         5 38280945.847  1071801.279    ops/s
+     * r.i.RxRingBufferPerf.ringBufferAddRemove1000    thrpt         5    42337.663     1052.231    ops/s
+     * 
+     * --------------
+     * 
+     * When UnsafeAccess.isUnsafeAvailable() == true we can use the Spmc/SpscArrayQueue implementations.
+     * 
+     * } &lt;/pre&gt;
+     */
+
+<span class="fc" id="L144">    private static final NotificationLite&lt;Object&gt; on = NotificationLite.instance();</span>
+
+    private Queue&lt;Object&gt; queue;
+
+    private final int size;
+    private final ObjectPool&lt;Queue&lt;Object&gt;&gt; pool;
+
+    /**
+     * We store the terminal state separately so it doesn't count against the size.
+     * We don't just +1 the size since some of the queues require sizes that are a power of 2.
+     * This is a subjective thing ... wanting to keep the size (ie 1024) the actual number of onNext
+     * that can be sent rather than something like 1023 onNext + 1 terminal event. It also simplifies
+     * checking that we have received only 1 terminal event, as we don't need to peek at the last item
+     * or retain a boolean flag.
+     */
+    public volatile Object terminalState;
+
+    // default size of ring buffer
+    /**
+     * 128 was chosen as the default based on the numbers below. A stream processing system may benefit from increasing to 512+.
+     * 
+     * &lt;pre&gt; {@code
+     * ./gradlew benchmarks '-Pjmh=-f 1 -tu s -bm thrpt -wi 5 -i 5 -r 1 .*OperatorObserveOnPerf.*'
+     * 
+     * 1024
+     * 
+     * Benchmark                                         (size)   Mode   Samples        Score  Score error    Units
+     * r.o.OperatorObserveOnPerf.observeOnComputation         1  thrpt         5   100642.874    24676.478    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnComputation      1000  thrpt         5     4095.901       90.730    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnComputation   1000000  thrpt         5        9.797        4.982    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnImmediate           1  thrpt         5 15536155.489   758579.454    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnImmediate        1000  thrpt         5   156257.341     6324.176    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnImmediate     1000000  thrpt         5      157.099        7.143    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnNewThread           1  thrpt         5    16864.641     1826.877    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnNewThread        1000  thrpt         5     4269.317      169.480    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnNewThread     1000000  thrpt         5       13.393        1.047    ops/s
+     * 
+     * 512
+     * 
+     * Benchmark                                         (size)   Mode   Samples        Score  Score error    Units
+     * r.o.OperatorObserveOnPerf.observeOnComputation         1  thrpt         5    98945.980    48050.282    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnComputation      1000  thrpt         5     4111.149       95.987    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnComputation   1000000  thrpt         5       12.483        3.067    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnImmediate           1  thrpt         5 16032469.143   620157.818    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnImmediate        1000  thrpt         5   157997.290     5097.718    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnImmediate     1000000  thrpt         5      156.462        7.728    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnNewThread           1  thrpt         5    15813.984     8260.170    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnNewThread        1000  thrpt         5     4358.334      251.609    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnNewThread     1000000  thrpt         5       13.647        0.613    ops/s
+     * 
+     * 256
+     * 
+     * Benchmark                                         (size)   Mode   Samples        Score  Score error    Units
+     * r.o.OperatorObserveOnPerf.observeOnComputation         1  thrpt         5   108489.834     2688.489    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnComputation      1000  thrpt         5     4526.674      728.019    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnComputation   1000000  thrpt         5       13.372        0.457    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnImmediate           1  thrpt         5 16435113.709   311602.627    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnImmediate        1000  thrpt         5   157611.204    13146.108    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnImmediate     1000000  thrpt         5      158.346        2.500    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnNewThread           1  thrpt         5    16976.775      968.191    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnNewThread        1000  thrpt         5     6238.210     2060.387    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnNewThread     1000000  thrpt         5       13.465        0.566    ops/s
+     * 
+     * 128
+     * 
+     * Benchmark                                         (size)   Mode   Samples        Score  Score error    Units
+     * r.o.OperatorObserveOnPerf.observeOnComputation         1  thrpt         5   106887.027    29307.913    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnComputation      1000  thrpt         5     6713.891      202.989    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnComputation   1000000  thrpt         5       11.929        0.187    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnImmediate           1  thrpt         5 16055774.724   350633.068    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnImmediate        1000  thrpt         5   153403.821    17976.156    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnImmediate     1000000  thrpt         5      153.559       20.178    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnNewThread           1  thrpt         5    17172.274      236.816    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnNewThread        1000  thrpt         5     7073.555      595.990    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnNewThread     1000000  thrpt         5       11.855        1.093    ops/s
+     * 
+     * 32
+     * 
+     * Benchmark                                         (size)   Mode   Samples        Score  Score error    Units
+     * r.o.OperatorObserveOnPerf.observeOnComputation         1  thrpt         5   106128.589    20986.201    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnComputation      1000  thrpt         5     6396.607       73.627    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnComputation   1000000  thrpt         5        7.643        0.668    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnImmediate           1  thrpt         5 16012419.447   409004.521    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnImmediate        1000  thrpt         5   157907.001     5772.849    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnImmediate     1000000  thrpt         5      155.308       23.853    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnNewThread           1  thrpt         5    16927.513      606.692    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnNewThread        1000  thrpt         5     5191.084      244.876    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnNewThread     1000000  thrpt         5        8.288        0.217    ops/s
+     * 
+     * 16
+     * 
+     * Benchmark                                         (size)   Mode   Samples        Score  Score error    Units
+     * r.o.OperatorObserveOnPerf.observeOnComputation         1  thrpt         5   109974.741      839.064    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnComputation      1000  thrpt         5     4538.912      173.561    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnComputation   1000000  thrpt         5        5.420        0.111    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnImmediate           1  thrpt         5 16017466.785   768748.695    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnImmediate        1000  thrpt         5   157934.065    13479.575    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnImmediate     1000000  thrpt         5      155.922       17.781    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnNewThread           1  thrpt         5    14903.686     3325.205    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnNewThread        1000  thrpt         5     3784.776     1054.131    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnNewThread     1000000  thrpt         5        5.624        0.130    ops/s
+     * 
+     * 2
+     * 
+     * Benchmark                                         (size)   Mode   Samples        Score  Score error    Units
+     * r.o.OperatorObserveOnPerf.observeOnComputation         1  thrpt         5   112663.216      899.005    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnComputation      1000  thrpt         5      899.737        9.460    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnComputation   1000000  thrpt         5        0.999        0.100    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnImmediate           1  thrpt         5 16087325.336   783206.227    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnImmediate        1000  thrpt         5   156747.025     4880.489    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnImmediate     1000000  thrpt         5      156.645        3.810    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnNewThread           1  thrpt         5    15958.711      673.895    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnNewThread        1000  thrpt         5      884.624       47.692    ops/s
+     * r.o.OperatorObserveOnPerf.observeOnNewThread     1000000  thrpt         5        1.173        0.100    ops/s
+     * } &lt;/pre&gt;
+     */
+<span class="fc" id="L260">    static int _size = 128;</span>
+    static {
+        // lower default for Android (https://github.com/ReactiveX/RxJava/issues/1820)
+<span class="pc bpc" id="L263" title="1 of 2 branches missed.">        if (PlatformDependent.isAndroid()) {</span>
+<span class="nc" id="L264">            _size = 16;</span>
+        }
+
+        // possible system property for overriding
+<span class="fc" id="L268">        String sizeFromProperty = System.getProperty(&quot;rx.ring-buffer.size&quot;); // also see IndexedRingBuffer</span>
+<span class="pc bpc" id="L269" title="1 of 2 branches missed.">        if (sizeFromProperty != null) {</span>
+            try {
+<span class="nc" id="L271">                _size = Integer.parseInt(sizeFromProperty);</span>
+<span class="nc" id="L272">            } catch (Exception e) {</span>
+<span class="nc" id="L273">                System.err.println(&quot;Failed to set 'rx.buffer.size' with value &quot; + sizeFromProperty + &quot; =&gt; &quot; + e.getMessage());</span>
+<span class="nc" id="L274">            }</span>
+        }
+    }
+<span class="fc" id="L277">    public static final int SIZE = _size;</span>
+
+    /* Public so Schedulers can manage the lifecycle of the inner worker. */
+<span class="fc" id="L280">    public static ObjectPool&lt;Queue&lt;Object&gt;&gt; SPSC_POOL = new ObjectPool&lt;Queue&lt;Object&gt;&gt;() {</span>
+
+        @Override
+        protected SpscArrayQueue&lt;Object&gt; createObject() {
+<span class="fc" id="L284">            return new SpscArrayQueue&lt;Object&gt;(SIZE);</span>
+        }
+
+    };
+
+    /* Public so Schedulers can manage the lifecycle of the inner worker. */
+<span class="fc" id="L290">    public static ObjectPool&lt;Queue&lt;Object&gt;&gt; SPMC_POOL = new ObjectPool&lt;Queue&lt;Object&gt;&gt;() {</span>
+
+        @Override
+        protected SpmcArrayQueue&lt;Object&gt; createObject() {
+<span class="fc" id="L294">            return new SpmcArrayQueue&lt;Object&gt;(SIZE);</span>
+        }
+
+    };
+    
+<span class="fc" id="L299">    private RxRingBuffer(Queue&lt;Object&gt; queue, int size) {</span>
+<span class="fc" id="L300">        this.queue = queue;</span>
+<span class="fc" id="L301">        this.pool = null;</span>
+<span class="fc" id="L302">        this.size = size;</span>
+<span class="fc" id="L303">    }</span>
+
+<span class="fc" id="L305">    private RxRingBuffer(ObjectPool&lt;Queue&lt;Object&gt;&gt; pool, int size) {</span>
+<span class="fc" id="L306">        this.pool = pool;</span>
+<span class="fc" id="L307">        this.queue = pool.borrowObject();</span>
+<span class="fc" id="L308">        this.size = size;</span>
+<span class="fc" id="L309">    }</span>
+
+    public synchronized void release() {
+<span class="fc" id="L312">        Queue&lt;Object&gt; q = queue;</span>
+<span class="fc" id="L313">        ObjectPool&lt;Queue&lt;Object&gt;&gt; p = pool;</span>
+<span class="pc bpc" id="L314" title="1 of 4 branches missed.">        if (p != null &amp;&amp; q != null) {</span>
+<span class="fc" id="L315">            q.clear();</span>
+<span class="fc" id="L316">            queue = null;</span>
+<span class="fc" id="L317">            p.returnObject(q);</span>
+        }
+<span class="fc" id="L319">    }</span>
+
+    @Override
+    public void unsubscribe() {
+<span class="fc" id="L323">        release();</span>
+<span class="fc" id="L324">    }</span>
+
+    /* package accessible for unit tests */RxRingBuffer() {
+<span class="fc" id="L327">        this(new SynchronizedQueue&lt;Object&gt;(SIZE), SIZE);</span>
+<span class="fc" id="L328">    }</span>
+
+    /**
+     * 
+     * @param o
+     * @throws MissingBackpressureException
+     *             if more onNext are sent than have been requested
+     */
+    public void onNext(Object o) throws MissingBackpressureException {
+<span class="fc" id="L337">        boolean iae = false;</span>
+<span class="fc" id="L338">        boolean mbe = false;</span>
+<span class="fc" id="L339">        synchronized (this) {</span>
+<span class="fc" id="L340">            Queue&lt;Object&gt; q = queue;</span>
+<span class="fc bfc" id="L341" title="All 2 branches covered.">            if (q != null) {</span>
+<span class="fc bfc" id="L342" title="All 2 branches covered.">                mbe = !q.offer(on.next(o));</span>
+            } else {
+<span class="fc" id="L344">                iae = true;</span>
+            }
+<span class="pc" id="L346">        }</span>
+        
+<span class="fc bfc" id="L348" title="All 2 branches covered.">        if (iae) {</span>
+<span class="fc" id="L349">            throw new IllegalStateException(&quot;This instance has been unsubscribed and the queue is no longer usable.&quot;);</span>
+        }
+<span class="fc bfc" id="L351" title="All 2 branches covered.">        if (mbe) {</span>
+<span class="fc" id="L352">            throw new MissingBackpressureException();</span>
+        }
+<span class="fc" id="L354">    }</span>
+
+    public void onCompleted() {
+        // we ignore terminal events if we already have one
+<span class="fc bfc" id="L358" title="All 2 branches covered.">        if (terminalState == null) {</span>
+<span class="fc" id="L359">            terminalState = on.completed();</span>
+        }
+<span class="fc" id="L361">    }</span>
+
+    public void onError(Throwable t) {
+        // we ignore terminal events if we already have one
+<span class="fc bfc" id="L365" title="All 2 branches covered.">        if (terminalState == null) {</span>
+<span class="fc" id="L366">            terminalState = on.error(t);</span>
+        }
+<span class="fc" id="L368">    }</span>
+
+    public int available() {
+<span class="nc" id="L371">        return size - count();</span>
+    }
+
+    public int capacity() {
+<span class="nc" id="L375">        return size;</span>
+    }
+
+    public int count() {
+<span class="nc" id="L379">        Queue&lt;Object&gt; q = queue;</span>
+<span class="nc bnc" id="L380" title="All 2 branches missed.">        if (q == null) {</span>
+<span class="nc" id="L381">            return 0;</span>
+        }
+<span class="nc" id="L383">        return q.size();</span>
+    }
+
+    public boolean isEmpty() {
+<span class="fc" id="L387">        Queue&lt;Object&gt; q = queue;</span>
+<span class="pc bpc" id="L388" title="1 of 2 branches missed.">        if (q == null) {</span>
+<span class="nc" id="L389">            return true;</span>
+        }
+<span class="fc" id="L391">        return q.isEmpty();</span>
+    }
+
+    public Object poll() {
+        Object o;
+<span class="fc" id="L396">        synchronized (this) {</span>
+<span class="fc" id="L397">            Queue&lt;Object&gt; q = queue;</span>
+<span class="fc bfc" id="L398" title="All 2 branches covered.">            if (q == null) {</span>
+                // we are unsubscribed and have released the underlying queue
+<span class="fc" id="L400">                return null;</span>
+            }
+<span class="fc" id="L402">            o = q.poll();</span>
+            
+<span class="fc" id="L404">            Object ts = terminalState;</span>
+<span class="pc bpc" id="L405" title="1 of 6 branches missed.">            if (o == null &amp;&amp; ts != null &amp;&amp; q.peek() == null) {</span>
+<span class="fc" id="L406">                o = ts;</span>
+                // once emitted we clear so a poll loop will finish
+<span class="fc" id="L408">                terminalState = null;</span>
+            }
+<span class="pc" id="L410">        }</span>
+<span class="fc" id="L411">        return o;</span>
+    }
+
+    public Object peek() {
+        Object o;
+<span class="fc" id="L416">        synchronized (this) {</span>
+<span class="fc" id="L417">            Queue&lt;Object&gt; q = queue;</span>
+<span class="pc bpc" id="L418" title="1 of 2 branches missed.">            if (q == null) {</span>
+                // we are unsubscribed and have released the underlying queue
+<span class="nc" id="L420">                return null;</span>
+            }
+<span class="fc" id="L422">            o = q.peek();</span>
+<span class="fc" id="L423">            Object ts = terminalState;</span>
+<span class="pc bpc" id="L424" title="1 of 6 branches missed.">            if (o == null &amp;&amp; ts != null &amp;&amp; q.peek() == null) {</span>
+<span class="fc" id="L425">                o = ts;</span>
+            }
+<span class="pc" id="L427">        }</span>
+<span class="fc" id="L428">        return o;</span>
+    }
+
+    public boolean isCompleted(Object o) {
+<span class="fc" id="L432">        return on.isCompleted(o);</span>
+    }
+
+    public boolean isError(Object o) {
+<span class="nc" id="L436">        return on.isError(o);</span>
+    }
+
+    public Object getValue(Object o) {
+<span class="fc" id="L440">        return on.getValue(o);</span>
+    }
+
+    @SuppressWarnings({ &quot;unchecked&quot;, &quot;rawtypes&quot; })
+    public boolean accept(Object o, Observer child) {
+<span class="nc" id="L445">        return on.accept(child, o);</span>
+    }
+
+    public Throwable asError(Object o) {
+<span class="nc" id="L449">        return on.getError(o);</span>
+    }
+
+    @Override
+    public boolean isUnsubscribed() {
+<span class="pc bpc" id="L454" title="1 of 2 branches missed.">        return queue == null;</span>
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

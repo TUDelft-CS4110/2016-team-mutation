@@ -1,0 +1,295 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>ProducerObserverArbiter.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.internal.producers</a> &gt; <span class="el_source">ProducerObserverArbiter.java</span></div><h1>ProducerObserverArbiter.java</h1><pre class="source lang-java linenums">/**
+ * Copyright 2015 Netflix, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package rx.internal.producers;
+
+import java.util.*;
+
+import rx.*;
+import rx.Observer;
+import rx.exceptions.*;
+import rx.internal.operators.BackpressureUtils;
+
+/**
+ * Producer that serializes any event emission with requesting and producer changes.
+ * &lt;p&gt;
+ * The implementation shortcuts on error and overwrites producers that got delayed, similar
+ * to ProducerArbiter.
+ *
+ * @param &lt;T&gt; the value type
+ */
+public final class ProducerObserverArbiter&lt;T&gt; implements Producer, Observer&lt;T&gt; {
+    final Subscriber&lt;? super T&gt; child;
+     
+    boolean emitting;
+     
+    List&lt;T&gt; queue;
+    
+    Producer currentProducer;
+    long requested;
+    
+    long missedRequested;
+    Producer missedProducer;
+    Object missedTerminal;
+    
+    volatile boolean hasError;
+    
+<span class="fc" id="L49">    static final Producer NULL_PRODUCER = new Producer() {</span>
+        @Override
+        public void request(long n) {
+            
+<span class="nc" id="L53">        }</span>
+    };
+     
+<span class="fc" id="L56">    public ProducerObserverArbiter(Subscriber&lt;? super T&gt; child) {</span>
+<span class="fc" id="L57">        this.child = child;</span>
+<span class="fc" id="L58">    }</span>
+     
+    @Override
+    public void onNext(T t) {
+<span class="fc" id="L62">        synchronized (this) {</span>
+<span class="pc bpc" id="L63" title="1 of 2 branches missed.">            if (emitting) {</span>
+<span class="nc" id="L64">                List&lt;T&gt; q = queue;</span>
+<span class="nc bnc" id="L65" title="All 2 branches missed.">                if (q == null) {</span>
+<span class="nc" id="L66">                    q = new ArrayList&lt;T&gt;(4);</span>
+<span class="nc" id="L67">                    queue = q;</span>
+                }
+<span class="nc" id="L69">                q.add(t);</span>
+<span class="nc" id="L70">                return;</span>
+            }
+<span class="pc" id="L72">        }</span>
+<span class="fc" id="L73">        boolean skipFinal = false;</span>
+        try {
+<span class="fc" id="L75">            child.onNext(t);</span>
+            
+<span class="fc" id="L77">            long r = requested;</span>
+<span class="fc bfc" id="L78" title="All 2 branches covered.">            if (r != Long.MAX_VALUE) {</span>
+<span class="fc" id="L79">                requested = r - 1;</span>
+            }
+            
+<span class="fc" id="L82">            emitLoop();</span>
+<span class="fc" id="L83">            skipFinal = true;</span>
+        } finally {
+<span class="pc bpc" id="L85" title="3 of 4 branches missed.">            if (!skipFinal) {</span>
+<span class="nc" id="L86">                synchronized (this) {</span>
+<span class="nc" id="L87">                    emitting = false;</span>
+<span class="nc" id="L88">                }</span>
+            }
+        }
+<span class="fc" id="L91">    }</span>
+     
+    @Override
+    public void onError(Throwable e) {
+        boolean emit;
+<span class="nc" id="L96">        synchronized (this) {</span>
+<span class="nc bnc" id="L97" title="All 2 branches missed.">            if (emitting) {</span>
+<span class="nc" id="L98">                missedTerminal = e;</span>
+<span class="nc" id="L99">                emit = false;</span>
+            } else {
+<span class="nc" id="L101">                emitting = true;</span>
+<span class="nc" id="L102">                emit = true;</span>
+            }
+<span class="nc" id="L104">        }</span>
+<span class="nc bnc" id="L105" title="All 2 branches missed.">        if (emit) {</span>
+<span class="nc" id="L106">            child.onError(e);</span>
+        } else {
+<span class="nc" id="L108">            hasError = true;</span>
+        }
+<span class="nc" id="L110">    }</span>
+    
+    @Override
+    public void onCompleted() {
+<span class="fc" id="L114">        synchronized (this) {</span>
+<span class="pc bpc" id="L115" title="1 of 2 branches missed.">            if (emitting) {</span>
+<span class="nc" id="L116">                missedTerminal = true;</span>
+<span class="nc" id="L117">                return;</span>
+            }
+<span class="fc" id="L119">            emitting = true;</span>
+<span class="pc" id="L120">        }</span>
+<span class="fc" id="L121">        child.onCompleted();</span>
+<span class="fc" id="L122">    }</span>
+    
+    @Override
+    public void request(long n) {
+<span class="pc bpc" id="L126" title="1 of 2 branches missed.">        if (n &lt; 0) {</span>
+<span class="nc" id="L127">            throw new IllegalArgumentException(&quot;n &gt;= 0 required&quot;);</span>
+        }
+<span class="fc bfc" id="L129" title="All 2 branches covered.">        if (n == 0) {</span>
+<span class="fc" id="L130">            return;</span>
+        }
+<span class="fc" id="L132">        synchronized (this) {</span>
+<span class="pc bpc" id="L133" title="1 of 2 branches missed.">            if (emitting) {</span>
+<span class="nc" id="L134">                missedRequested += n;</span>
+<span class="nc" id="L135">                return;</span>
+            }
+<span class="fc" id="L137">            emitting = true;</span>
+<span class="pc" id="L138">        }</span>
+<span class="fc" id="L139">        Producer p = currentProducer;</span>
+<span class="fc" id="L140">        boolean skipFinal = false;</span>
+        try {
+<span class="fc" id="L142">            long r = requested;</span>
+<span class="fc" id="L143">            long u = r + n;</span>
+<span class="pc bpc" id="L144" title="1 of 2 branches missed.">            if (u &lt; 0) {</span>
+<span class="nc" id="L145">                u = Long.MAX_VALUE;</span>
+            }
+<span class="fc" id="L147">            requested = u;</span>
+
+<span class="fc" id="L149">            emitLoop();</span>
+<span class="fc" id="L150">            skipFinal = true;</span>
+        } finally {
+<span class="pc bpc" id="L152" title="3 of 4 branches missed.">            if (!skipFinal) {</span>
+<span class="nc" id="L153">                synchronized (this) {</span>
+<span class="nc" id="L154">                    emitting = false;</span>
+<span class="nc" id="L155">                }</span>
+            }
+        }
+<span class="fc bfc" id="L158" title="All 2 branches covered.">        if (p != null) {</span>
+<span class="fc" id="L159">            p.request(n);</span>
+        }
+<span class="fc" id="L161">    }</span>
+    
+    public void setProducer(Producer p) {
+<span class="fc" id="L164">        synchronized (this) {</span>
+<span class="pc bpc" id="L165" title="1 of 2 branches missed.">            if (emitting) {</span>
+<span class="nc bnc" id="L166" title="All 2 branches missed.">                missedProducer = p != null ? p : NULL_PRODUCER;</span>
+<span class="nc" id="L167">                return;</span>
+            }
+<span class="fc" id="L169">            emitting = true;</span>
+<span class="pc" id="L170">        }</span>
+<span class="fc" id="L171">        boolean skipFinal = false;</span>
+<span class="fc" id="L172">        currentProducer = p;</span>
+<span class="fc" id="L173">        long r = requested;</span>
+        try {
+<span class="fc" id="L175">            emitLoop();</span>
+<span class="fc" id="L176">            skipFinal = true;</span>
+        } finally {
+<span class="pc bpc" id="L178" title="3 of 4 branches missed.">            if (!skipFinal) {</span>
+<span class="nc" id="L179">                synchronized (this) {</span>
+<span class="nc" id="L180">                    emitting = false;</span>
+<span class="nc" id="L181">                }</span>
+            }
+        }
+<span class="fc bfc" id="L184" title="All 4 branches covered.">        if (p != null &amp;&amp; r != 0) {</span>
+<span class="fc" id="L185">            p.request(r);</span>
+        }
+<span class="fc" id="L187">    }</span>
+    
+    void emitLoop() {
+<span class="fc" id="L190">        final Subscriber&lt;? super T&gt; c = child;</span>
+
+<span class="fc" id="L192">        long toRequest = 0L;</span>
+<span class="fc" id="L193">        Producer requestFrom = null;</span>
+        
+        outer:
+        for (;;) {
+            long localRequested;
+            Producer localProducer;
+            Object localTerminal;
+            List&lt;T&gt; q;
+<span class="fc" id="L201">            boolean quit = false;</span>
+<span class="fc" id="L202">            synchronized (this) {</span>
+<span class="fc" id="L203">                localRequested = missedRequested;</span>
+<span class="fc" id="L204">                localProducer = missedProducer;</span>
+<span class="fc" id="L205">                localTerminal = missedTerminal;</span>
+<span class="fc" id="L206">                q = queue;</span>
+<span class="pc bpc" id="L207" title="4 of 8 branches missed.">                if (localRequested == 0L &amp;&amp; localProducer == null &amp;&amp; q == null</span>
+                        &amp;&amp; localTerminal == null) {
+<span class="fc" id="L209">                    emitting = false;</span>
+<span class="fc" id="L210">                    quit = true;</span>
+                } else {
+<span class="nc" id="L212">                    missedRequested = 0L;</span>
+<span class="nc" id="L213">                    missedProducer = null;</span>
+<span class="nc" id="L214">                    queue = null;</span>
+<span class="nc" id="L215">                    missedTerminal = null;</span>
+                }
+<span class="pc" id="L217">            }</span>
+<span class="pc bpc" id="L218" title="1 of 2 branches missed.">            if (quit) {</span>
+<span class="pc bpc" id="L219" title="3 of 4 branches missed.">                if (toRequest != 0L &amp;&amp; requestFrom != null) {</span>
+<span class="nc" id="L220">                    requestFrom.request(toRequest);</span>
+                }
+<span class="fc" id="L222">                return;</span>
+            }
+            
+<span class="nc bnc" id="L225" title="All 4 branches missed.">            boolean empty = q == null || q.isEmpty();</span>
+<span class="nc bnc" id="L226" title="All 2 branches missed.">            if (localTerminal != null) {</span>
+<span class="nc bnc" id="L227" title="All 2 branches missed.">                if (localTerminal != Boolean.TRUE) {</span>
+<span class="nc" id="L228">                    c.onError((Throwable)localTerminal);</span>
+<span class="nc" id="L229">                    return;</span>
+                } else
+<span class="nc bnc" id="L231" title="All 2 branches missed.">                if (empty) {</span>
+<span class="nc" id="L232">                    c.onCompleted();</span>
+<span class="nc" id="L233">                    return;</span>
+                }
+            }
+<span class="nc" id="L236">            long e = 0;</span>
+<span class="nc bnc" id="L237" title="All 2 branches missed.">            if (q != null) {</span>
+<span class="nc bnc" id="L238" title="All 2 branches missed.">                for (T v : q) {</span>
+<span class="nc bnc" id="L239" title="All 2 branches missed.">                    if (c.isUnsubscribed()) {</span>
+<span class="nc" id="L240">                        return;</span>
+                    } else
+<span class="nc bnc" id="L242" title="All 2 branches missed.">                    if (hasError) {</span>
+<span class="nc" id="L243">                        continue outer; // if an error has been set, shortcut the loop and act on it</span>
+                    }
+                    try {
+<span class="nc" id="L246">                        c.onNext(v);</span>
+<span class="nc" id="L247">                    } catch (Throwable ex) {</span>
+<span class="nc" id="L248">                        Exceptions.throwOrReport(ex, c, v);</span>
+<span class="nc" id="L249">                        return;</span>
+<span class="nc" id="L250">                    }</span>
+<span class="nc" id="L251">                }</span>
+<span class="nc" id="L252">                e += q.size();</span>
+            }
+<span class="nc" id="L254">            long r = requested;</span>
+            // if requested is max, we don't do any accounting
+<span class="nc bnc" id="L256" title="All 2 branches missed.">            if (r != Long.MAX_VALUE) {</span>
+                // if there were missing requested, add it up
+<span class="nc bnc" id="L258" title="All 2 branches missed.">                if (localRequested != 0L) {</span>
+<span class="nc" id="L259">                    long u = r + localRequested;</span>
+<span class="nc bnc" id="L260" title="All 2 branches missed.">                    if (u &lt; 0) {</span>
+<span class="nc" id="L261">                        u = Long.MAX_VALUE;</span>
+                    }
+<span class="nc" id="L263">                    r = u;</span>
+                }
+                // if there were emissions and we don't run on max since the last check, subtract
+<span class="nc bnc" id="L266" title="All 4 branches missed.">                if (e != 0L &amp;&amp; r != Long.MAX_VALUE) {</span>
+<span class="nc" id="L267">                    long u = r - e;</span>
+<span class="nc bnc" id="L268" title="All 2 branches missed.">                    if (u &lt; 0) {</span>
+<span class="nc" id="L269">                        throw new IllegalStateException(&quot;More produced than requested&quot;);</span>
+                    }
+<span class="nc" id="L271">                    r = u;</span>
+                }
+<span class="nc" id="L273">                requested = r;</span>
+            }
+<span class="nc bnc" id="L275" title="All 2 branches missed.">            if (localProducer != null) {</span>
+<span class="nc bnc" id="L276" title="All 2 branches missed.">                if (localProducer == NULL_PRODUCER) {</span>
+<span class="nc" id="L277">                    currentProducer = null;</span>
+                } else {
+<span class="nc" id="L279">                    currentProducer = localProducer;</span>
+<span class="nc bnc" id="L280" title="All 2 branches missed.">                    if (r != 0L) {</span>
+<span class="nc" id="L281">                        toRequest = BackpressureUtils.addCap(toRequest, r);</span>
+<span class="nc" id="L282">                        requestFrom = localProducer;</span>
+                    }
+                }
+            } else {
+<span class="nc" id="L286">                Producer p = currentProducer;</span>
+<span class="nc bnc" id="L287" title="All 4 branches missed.">                if (p != null &amp;&amp; localRequested != 0L) {</span>
+<span class="nc" id="L288">                    toRequest = BackpressureUtils.addCap(toRequest, localRequested);</span>
+<span class="nc" id="L289">                    requestFrom = p;</span>
+                }
+            }
+<span class="nc" id="L292">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

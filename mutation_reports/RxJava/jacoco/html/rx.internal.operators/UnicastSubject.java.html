@@ -1,0 +1,333 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>UnicastSubject.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.internal.operators</a> &gt; <span class="el_source">UnicastSubject.java</span></div><h1>UnicastSubject.java</h1><pre class="source lang-java linenums">/**
+ * Copyright 2014 Netflix, Inc.
+ * 
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package rx.internal.operators;
+
+import java.util.Queue;
+import java.util.concurrent.atomic.*;
+
+import rx.*;
+import rx.exceptions.*;
+import rx.functions.*;
+import rx.internal.util.atomic.*;
+import rx.internal.util.unsafe.*;
+import rx.subjects.Subject;
+import rx.subscriptions.Subscriptions;
+
+/**
+ * A Subject variant which buffers events until a single Subscriber arrives and replays them to it
+ * and potentially switches to direct delivery once the Subscriber caught up and requested an unlimited
+ * amount. In this case, the buffered values are no longer retained. If the Subscriber
+ * requests a limited amount, queueing is involved and only those values are retained which
+ * weren't requested by the Subscriber at that time.
+ */
+public final class UnicastSubject&lt;T&gt; extends Subject&lt;T, T&gt; {
+
+    /**
+     * Constructs an empty UnicastSubject instance with the default capacity hint of 16 elements.
+     * 
+     * @return the created UnicastSubject instance
+     */
+    public static &lt;T&gt; UnicastSubject&lt;T&gt; create() {
+<span class="fc" id="L44">        return create(16);</span>
+    }
+    /**
+     * Constructs an empty UnicastSubject instance with a capacity hint.
+     * &lt;p&gt;The capacity hint determines the internal queue's island size: the larger
+     * it is the less frequent allocation will happen if there is no subscriber
+     * or the subscriber hasn't caught up.
+     * @param capacityHint the capacity hint for the internal queue
+     * @return the created BufferUntilSubscriber instance
+     */
+    public static &lt;T&gt; UnicastSubject&lt;T&gt; create(int capacityHint) {
+<span class="fc" id="L55">        State&lt;T&gt; state = new State&lt;T&gt;(capacityHint);</span>
+<span class="fc" id="L56">        return new UnicastSubject&lt;T&gt;(state);</span>
+    }
+    
+    final State&lt;T&gt; state;
+
+    private UnicastSubject(State&lt;T&gt; state) {
+<span class="fc" id="L62">        super(state);</span>
+<span class="fc" id="L63">        this.state = state;</span>
+<span class="fc" id="L64">    }</span>
+    
+    @Override
+    public void onNext(T t) {
+<span class="fc" id="L68">        state.onNext(t);</span>
+<span class="fc" id="L69">    }</span>
+    
+    @Override
+    public void onError(Throwable e) {
+<span class="fc" id="L73">        state.onError(e);</span>
+<span class="fc" id="L74">    }</span>
+    
+    @Override
+    public void onCompleted() {
+<span class="fc" id="L78">        state.onCompleted();</span>
+<span class="fc" id="L79">    }</span>
+    
+    @Override
+    public boolean hasObservers() {
+<span class="nc bnc" id="L83" title="All 2 branches missed.">        return state.subscriber.get() != null;</span>
+    }
+    
+    /**
+     * The single-consumption replaying state.
+     *
+     * @param &lt;T&gt; the value type
+     */
+    static final class State&lt;T&gt; extends AtomicLong implements Producer, Observer&lt;T&gt;, Action0, OnSubscribe&lt;T&gt; {
+        /** */
+        private static final long serialVersionUID = -9044104859202255786L;
+        /** The single subscriber. */
+        final AtomicReference&lt;Subscriber&lt;? super T&gt;&gt; subscriber;
+        /** The queue holding values until the subscriber arrives and catches up. */
+        final Queue&lt;Object&gt; queue;
+        /** JCTools queues don't accept nulls. */
+        final NotificationLite&lt;T&gt; nl;
+        /** In case the source emitted an error. */
+        Throwable error;
+        /** Indicates the source has terminated. */
+        volatile boolean done;
+        /** Emitter loop: emitting indicator. Guarded by this. */
+        boolean emitting;
+        /** Emitter loop: missed emission indicator. Guarded by this. */
+        boolean missed;
+        /** Indicates the queue can be bypassed because the child has caught up with the replay. */
+        volatile boolean caughtUp;
+        /**
+         * Constructor.
+         * @param capacityHint indicates how large each island in the Spsc queue should be to
+         * reduce allocation frequency
+         */
+<span class="fc" id="L115">        public State(int capacityHint) {</span>
+<span class="fc" id="L116">            this.nl = NotificationLite.instance();</span>
+<span class="fc" id="L117">            this.subscriber = new AtomicReference&lt;Subscriber&lt;? super T&gt;&gt;();</span>
+            Queue&lt;Object&gt; q;
+<span class="pc bpc" id="L119" title="1 of 2 branches missed.">            if (capacityHint &gt; 1) {</span>
+<span class="pc bpc" id="L120" title="1 of 2 branches missed.">                q = UnsafeAccess.isUnsafeAvailable()</span>
+                        ? new SpscUnboundedArrayQueue&lt;Object&gt;(capacityHint)
+                        : new SpscUnboundedAtomicArrayQueue&lt;Object&gt;(capacityHint);
+            } else {
+<span class="nc bnc" id="L124" title="All 2 branches missed.">                q = UnsafeAccess.isUnsafeAvailable()</span>
+                        ? new SpscLinkedQueue&lt;Object&gt;()
+                        : new SpscLinkedAtomicQueue&lt;Object&gt;();
+            }
+<span class="fc" id="L128">            this.queue = q;</span>
+<span class="fc" id="L129">        }</span>
+        
+        @Override
+        public void onNext(T t) {
+<span class="fc bfc" id="L133" title="All 2 branches covered.">            if (!done) {</span>
+<span class="fc bfc" id="L134" title="All 2 branches covered.">                if (!caughtUp) {</span>
+<span class="fc" id="L135">                    boolean stillReplay = false;</span>
+                    /*
+                     * We need to offer while holding the lock because
+                     * we have to atomically switch caughtUp to true
+                     * that can only happen if there isn't any concurrent
+                     * offer() happening while the emission is in replayLoop().
+                     */
+<span class="fc" id="L142">                    synchronized (this) {</span>
+<span class="fc bfc" id="L143" title="All 2 branches covered.">                        if (!caughtUp) {</span>
+<span class="fc" id="L144">                            queue.offer(nl.next(t));</span>
+<span class="fc" id="L145">                            stillReplay = true;</span>
+                        }
+<span class="pc" id="L147">                    }</span>
+<span class="fc bfc" id="L148" title="All 2 branches covered.">                    if (stillReplay) {</span>
+<span class="fc" id="L149">                        replay();</span>
+<span class="fc" id="L150">                        return;</span>
+                    }
+                }
+<span class="fc" id="L153">                Subscriber&lt;? super T&gt; s = subscriber.get();</span>
+                try {
+<span class="fc" id="L155">                    s.onNext(t);</span>
+<span class="nc" id="L156">                } catch (Throwable ex) {</span>
+<span class="nc" id="L157">                    Exceptions.throwOrReport(ex, s, t);</span>
+<span class="fc" id="L158">                }</span>
+            }
+<span class="fc" id="L160">        }</span>
+        @Override
+        public void onError(Throwable e) {
+<span class="pc bpc" id="L163" title="1 of 2 branches missed.">            if (!done) {</span>
+<span class="fc" id="L164">                error = e;</span>
+<span class="fc" id="L165">                done = true;</span>
+<span class="fc bfc" id="L166" title="All 2 branches covered.">                if (!caughtUp) {</span>
+<span class="fc" id="L167">                    boolean stillReplay = false;</span>
+<span class="fc" id="L168">                    synchronized (this) {</span>
+<span class="pc bpc" id="L169" title="1 of 2 branches missed.">                        stillReplay = !caughtUp;</span>
+<span class="pc" id="L170">                    }</span>
+<span class="pc bpc" id="L171" title="1 of 2 branches missed.">                    if (stillReplay) {</span>
+<span class="fc" id="L172">                        replay();</span>
+<span class="fc" id="L173">                        return;</span>
+                    }
+                }
+<span class="fc" id="L176">                subscriber.get().onError(e);</span>
+            }
+<span class="fc" id="L178">        }</span>
+        @Override
+        public void onCompleted() {
+<span class="pc bpc" id="L181" title="1 of 2 branches missed.">            if (!done) {</span>
+<span class="fc" id="L182">                done = true;</span>
+<span class="fc bfc" id="L183" title="All 2 branches covered.">                if (!caughtUp) {</span>
+<span class="fc" id="L184">                    boolean stillReplay = false;</span>
+<span class="fc" id="L185">                    synchronized (this) {</span>
+<span class="pc bpc" id="L186" title="1 of 2 branches missed.">                        stillReplay = !caughtUp;</span>
+<span class="pc" id="L187">                    }</span>
+<span class="pc bpc" id="L188" title="1 of 2 branches missed.">                    if (stillReplay) {</span>
+<span class="fc" id="L189">                        replay();</span>
+<span class="fc" id="L190">                        return;</span>
+                    }
+                }
+<span class="fc" id="L193">                subscriber.get().onCompleted();</span>
+            }
+<span class="fc" id="L195">        }</span>
+        
+        @Override
+        public void request(long n) {
+<span class="pc bpc" id="L199" title="1 of 2 branches missed.">            if (n &lt; 0L) {</span>
+<span class="nc" id="L200">                throw new IllegalArgumentException(&quot;n &gt;= 0 required&quot;);</span>
+            } else
+<span class="fc bfc" id="L202" title="All 2 branches covered.">            if (n &gt; 0L) {</span>
+<span class="fc" id="L203">                BackpressureUtils.getAndAddRequest(this, n);</span>
+<span class="fc" id="L204">                replay();</span>
+            } else
+<span class="fc bfc" id="L206" title="All 2 branches covered.">            if (done) { // terminal events can be delivered for zero requests</span>
+<span class="fc" id="L207">                replay();</span>
+            }
+<span class="fc" id="L209">        }</span>
+        /**
+         * Tries to set the given subscriber if not already set, sending an
+         * IllegalStateException to the subscriber otherwise.
+         * @param subscriber
+         */
+        @Override
+        public void call(Subscriber&lt;? super T&gt; subscriber) {
+<span class="pc bpc" id="L217" title="1 of 2 branches missed.">            if (this.subscriber.compareAndSet(null, subscriber)) {</span>
+<span class="fc" id="L218">                subscriber.add(Subscriptions.create(this));</span>
+<span class="fc" id="L219">                subscriber.setProducer(this);</span>
+            } else {
+<span class="nc" id="L221">                subscriber.onError(new IllegalStateException(&quot;Only a single subscriber is allowed&quot;));</span>
+            }
+<span class="fc" id="L223">        }</span>
+        /**
+         * Tries to replay the contents of the queue.
+         */
+        void replay() {
+<span class="fc" id="L228">            synchronized (this) {</span>
+<span class="fc bfc" id="L229" title="All 2 branches covered.">                if (emitting) {</span>
+<span class="fc" id="L230">                    missed = true;</span>
+<span class="fc" id="L231">                    return;</span>
+                }
+<span class="fc" id="L233">                emitting = true;</span>
+<span class="pc" id="L234">            }</span>
+<span class="fc" id="L235">            Queue&lt;Object&gt; q = queue;</span>
+            for (;;) {
+<span class="fc" id="L237">                Subscriber&lt;? super T&gt; s = subscriber.get();</span>
+<span class="fc" id="L238">                boolean unlimited = false;</span>
+<span class="fc bfc" id="L239" title="All 2 branches covered.">                if (s != null) {</span>
+<span class="fc" id="L240">                    boolean d = done;</span>
+<span class="fc" id="L241">                    boolean empty = q.isEmpty();</span>
+                    
+<span class="fc bfc" id="L243" title="All 2 branches covered.">                    if (checkTerminated(d, empty, s)) {</span>
+<span class="fc" id="L244">                        return;</span>
+                    }
+<span class="fc" id="L246">                    long r = get();</span>
+<span class="fc bfc" id="L247" title="All 2 branches covered.">                    unlimited = r == Long.MAX_VALUE;</span>
+<span class="fc" id="L248">                    long e = 0L;</span>
+                    
+<span class="fc bfc" id="L250" title="All 2 branches covered.">                    while (r != 0) {</span>
+<span class="fc" id="L251">                        d = done;</span>
+<span class="fc" id="L252">                        Object v = q.poll();</span>
+<span class="fc bfc" id="L253" title="All 2 branches covered.">                        empty = v == null;</span>
+<span class="fc bfc" id="L254" title="All 2 branches covered.">                        if (checkTerminated(d, empty, s)) {</span>
+<span class="fc" id="L255">                            return;</span>
+                        }
+<span class="fc bfc" id="L257" title="All 2 branches covered.">                        if (empty) {</span>
+<span class="fc" id="L258">                            break;</span>
+                        }
+<span class="fc" id="L260">                        T value = nl.getValue(v);</span>
+                        try {
+<span class="fc" id="L262">                            s.onNext(value);</span>
+<span class="nc" id="L263">                        } catch (Throwable ex) {</span>
+<span class="nc" id="L264">                            q.clear();</span>
+<span class="nc" id="L265">                            Exceptions.throwIfFatal(ex);</span>
+<span class="nc" id="L266">                            s.onError(OnErrorThrowable.addValueAsLastCause(ex, value));</span>
+<span class="nc" id="L267">                            return;</span>
+<span class="fc" id="L268">                        }</span>
+<span class="fc" id="L269">                        r--;</span>
+<span class="fc" id="L270">                        e++;</span>
+<span class="fc" id="L271">                    }</span>
+<span class="fc bfc" id="L272" title="All 4 branches covered.">                    if (!unlimited &amp;&amp; e != 0L) {</span>
+<span class="fc" id="L273">                        addAndGet(-e);</span>
+                    }
+                }
+                
+<span class="fc" id="L277">                synchronized (this) {</span>
+<span class="fc bfc" id="L278" title="All 2 branches covered.">                    if (!missed) {</span>
+<span class="fc bfc" id="L279" title="All 4 branches covered.">                        if (unlimited &amp;&amp; q.isEmpty()) {</span>
+<span class="fc" id="L280">                            caughtUp = true;</span>
+                        }
+<span class="fc" id="L282">                        emitting = false;</span>
+<span class="fc" id="L283">                        return;</span>
+                    }
+<span class="fc" id="L285">                    missed = false;</span>
+<span class="pc" id="L286">                }</span>
+<span class="fc" id="L287">            }</span>
+        }
+        /**
+         * Terminates the state by setting the done flag and tries to clear the queue.
+         * Should be called only when the child unsubscribes
+         */
+        @Override
+        public void call() {
+<span class="fc" id="L295">            done = true;</span>
+<span class="fc" id="L296">            synchronized (this) {</span>
+<span class="fc bfc" id="L297" title="All 2 branches covered.">                if (emitting) {</span>
+<span class="fc" id="L298">                    return;</span>
+                }
+<span class="fc" id="L300">                emitting = true;</span>
+<span class="pc" id="L301">            }</span>
+<span class="fc" id="L302">            queue.clear();</span>
+<span class="fc" id="L303">        }</span>
+        /**
+         * Checks if one of the terminal conditions have been met: child unsubscribed,
+         * an error happened or the source terminated and the queue is empty
+         * @param done
+         * @param empty
+         * @param s
+         * @return
+         */
+        boolean checkTerminated(boolean done, boolean empty, Subscriber&lt;? super T&gt; s) {
+<span class="pc bpc" id="L313" title="1 of 2 branches missed.">            if (s.isUnsubscribed()) {</span>
+<span class="nc" id="L314">                queue.clear();</span>
+<span class="nc" id="L315">                return true;</span>
+            }
+<span class="fc bfc" id="L317" title="All 2 branches covered.">            if (done) {</span>
+<span class="fc" id="L318">                Throwable e = error;</span>
+<span class="fc bfc" id="L319" title="All 2 branches covered.">                if (e != null) {</span>
+<span class="fc" id="L320">                    queue.clear();</span>
+<span class="fc" id="L321">                    s.onError(e);</span>
+<span class="fc" id="L322">                    return true;</span>
+                } else
+<span class="fc bfc" id="L324" title="All 2 branches covered.">                if (empty) {</span>
+<span class="fc" id="L325">                    s.onCompleted();</span>
+<span class="fc" id="L326">                    return true;</span>
+                }
+            }
+<span class="fc" id="L329">            return false;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

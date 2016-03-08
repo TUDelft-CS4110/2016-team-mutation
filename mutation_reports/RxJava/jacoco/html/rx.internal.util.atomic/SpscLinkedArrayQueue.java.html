@@ -1,0 +1,357 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>SpscLinkedArrayQueue.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.internal.util.atomic</a> &gt; <span class="el_source">SpscLinkedArrayQueue.java</span></div><h1>SpscLinkedArrayQueue.java</h1><pre class="source lang-java linenums">/**
+ * Copyright 2014 Netflix, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+
+package rx.internal.util.atomic;
+
+import java.util.*;
+import java.util.concurrent.atomic.*;
+
+import rx.internal.util.unsafe.Pow2;
+
+
+/*
+ * The code was inspired by the similarly named JCTools class: 
+ * https://github.com/JCTools/JCTools/blob/master/jctools-core/src/main/java/org/jctools/queues/atomic
+ */
+
+/**
+ * A single-producer single-consumer array-backed queue which can allocate new arrays in case the consumer is slower
+ * than the producer.
+ */
+public final class SpscLinkedArrayQueue&lt;T&gt; implements Queue&lt;T&gt; {
+<span class="fc" id="L35">    static final int MAX_LOOK_AHEAD_STEP = Integer.getInteger(&quot;jctools.spsc.max.lookahead.step&quot;, 4096);</span>
+    protected volatile long producerIndex;
+    @SuppressWarnings(&quot;rawtypes&quot;)
+<span class="fc" id="L38">    static final AtomicLongFieldUpdater&lt;SpscLinkedArrayQueue&gt; PRODUCER_INDEX =</span>
+            AtomicLongFieldUpdater.newUpdater(SpscLinkedArrayQueue.class, &quot;producerIndex&quot;);
+    protected int producerLookAheadStep;
+    protected long producerLookAhead;
+    protected int producerMask;
+    protected AtomicReferenceArray&lt;Object&gt; producerBuffer;
+    protected int consumerMask;
+    protected AtomicReferenceArray&lt;Object&gt; consumerBuffer;
+    protected volatile long consumerIndex;
+    @SuppressWarnings(&quot;rawtypes&quot;)
+<span class="fc" id="L48">    static final AtomicLongFieldUpdater&lt;SpscLinkedArrayQueue&gt; CONSUMER_INDEX =</span>
+            AtomicLongFieldUpdater.newUpdater(SpscLinkedArrayQueue.class, &quot;consumerIndex&quot;);
+<span class="fc" id="L50">    private static final Object HAS_NEXT = new Object();</span>
+
+<span class="fc" id="L52">    public SpscLinkedArrayQueue(final int bufferSize) {</span>
+<span class="fc" id="L53">        int p2capacity = Pow2.roundToPowerOfTwo(bufferSize);</span>
+<span class="fc" id="L54">        int mask = p2capacity - 1;</span>
+<span class="fc" id="L55">        AtomicReferenceArray&lt;Object&gt; buffer = new AtomicReferenceArray&lt;Object&gt;(p2capacity + 1);</span>
+<span class="fc" id="L56">        producerBuffer = buffer;</span>
+<span class="fc" id="L57">        producerMask = mask;</span>
+<span class="fc" id="L58">        adjustLookAheadStep(p2capacity);</span>
+<span class="fc" id="L59">        consumerBuffer = buffer;</span>
+<span class="fc" id="L60">        consumerMask = mask;</span>
+<span class="fc" id="L61">        producerLookAhead = mask - 1; // we know it's all empty to start with</span>
+<span class="fc" id="L62">        soProducerIndex(0L);</span>
+<span class="fc" id="L63">    }</span>
+
+    /**
+     * {@inheritDoc}
+     * &lt;p&gt;
+     * This implementation is correct for single producer thread use only.
+     */
+    @Override
+    public final boolean offer(final T e) {
+        // local load of field to avoid repeated loads after volatile reads
+<span class="nc" id="L73">        final AtomicReferenceArray&lt;Object&gt; buffer = producerBuffer;</span>
+<span class="nc" id="L74">        final long index = lpProducerIndex();</span>
+<span class="nc" id="L75">        final int mask = producerMask;</span>
+<span class="nc" id="L76">        final int offset = calcWrappedOffset(index, mask);</span>
+<span class="nc bnc" id="L77" title="All 2 branches missed.">        if (index &lt; producerLookAhead) {</span>
+<span class="nc" id="L78">            return writeToQueue(buffer, e, index, offset);</span>
+        } else {
+<span class="nc" id="L80">            final int lookAheadStep = producerLookAheadStep;</span>
+            // go around the buffer or resize if full (unless we hit max capacity)
+<span class="nc" id="L82">            int lookAheadElementOffset = calcWrappedOffset(index + lookAheadStep, mask);</span>
+<span class="nc bnc" id="L83" title="All 2 branches missed.">            if (null == lvElement(buffer, lookAheadElementOffset)) {// LoadLoad</span>
+<span class="nc" id="L84">                producerLookAhead = index + lookAheadStep - 1; // joy, there's plenty of room</span>
+<span class="nc" id="L85">                return writeToQueue(buffer, e, index, offset);</span>
+<span class="nc bnc" id="L86" title="All 2 branches missed.">            } else if (null == lvElement(buffer, calcWrappedOffset(index + 1, mask))) { // buffer is not full</span>
+<span class="nc" id="L87">                return writeToQueue(buffer, e, index, offset);</span>
+            } else {
+<span class="nc" id="L89">                resize(buffer, index, offset, e, mask); // add a buffer and link old to new</span>
+<span class="nc" id="L90">                return true;</span>
+            }
+        }
+    }
+
+    private boolean writeToQueue(final AtomicReferenceArray&lt;Object&gt; buffer, final T e, final long index, final int offset) {
+<span class="nc" id="L96">        soProducerIndex(index + 1);// this ensures atomic write of long on 32bit platforms</span>
+<span class="nc" id="L97">        soElement(buffer, offset, e);// StoreStore</span>
+<span class="nc" id="L98">        return true;</span>
+    }
+
+    private void resize(final AtomicReferenceArray&lt;Object&gt; oldBuffer, final long currIndex, final int offset, final T e,
+            final long mask) {
+<span class="nc" id="L103">        final int capacity = oldBuffer.length();</span>
+<span class="nc" id="L104">        final AtomicReferenceArray&lt;Object&gt; newBuffer = new AtomicReferenceArray&lt;Object&gt;(capacity);</span>
+<span class="nc" id="L105">        producerBuffer = newBuffer;</span>
+<span class="nc" id="L106">        producerLookAhead = currIndex + mask - 1;</span>
+<span class="nc" id="L107">        soProducerIndex(currIndex + 1);// this ensures correctness on 32bit platforms</span>
+<span class="nc" id="L108">        soElement(newBuffer, offset, e);// StoreStore</span>
+<span class="nc" id="L109">        soNext(oldBuffer, newBuffer);</span>
+<span class="nc" id="L110">        soElement(oldBuffer, offset, HAS_NEXT); // new buffer is visible after element is</span>
+                                                                 // inserted
+<span class="nc" id="L112">    }</span>
+
+    private void soNext(AtomicReferenceArray&lt;Object&gt; curr, AtomicReferenceArray&lt;Object&gt; next) {
+<span class="fc" id="L115">        soElement(curr, calcDirectOffset(curr.length() - 1), next);</span>
+<span class="fc" id="L116">    }</span>
+    @SuppressWarnings(&quot;unchecked&quot;)
+    private AtomicReferenceArray&lt;Object&gt; lvNext(AtomicReferenceArray&lt;Object&gt; curr) {
+<span class="fc" id="L119">        return (AtomicReferenceArray&lt;Object&gt;)lvElement(curr, calcDirectOffset(curr.length() - 1));</span>
+    }
+    /**
+     * {@inheritDoc}
+     * &lt;p&gt;
+     * This implementation is correct for single consumer thread use only.
+     */
+    @SuppressWarnings(&quot;unchecked&quot;)
+    @Override
+    public final T poll() {
+        // local load of field to avoid repeated loads after volatile reads
+<span class="fc" id="L130">        final AtomicReferenceArray&lt;Object&gt; buffer = consumerBuffer;</span>
+<span class="fc" id="L131">        final long index = lpConsumerIndex();</span>
+<span class="fc" id="L132">        final int mask = consumerMask;</span>
+<span class="fc" id="L133">        final int offset = calcWrappedOffset(index, mask);</span>
+<span class="fc" id="L134">        final Object e = lvElement(buffer, offset);// LoadLoad</span>
+<span class="pc bpc" id="L135" title="1 of 2 branches missed.">        boolean isNextBuffer = e == HAS_NEXT;</span>
+<span class="pc bpc" id="L136" title="1 of 4 branches missed.">        if (null != e &amp;&amp; !isNextBuffer) {</span>
+<span class="fc" id="L137">            soConsumerIndex(index + 1);// this ensures correctness on 32bit platforms</span>
+<span class="fc" id="L138">            soElement(buffer, offset, null);// StoreStore</span>
+<span class="fc" id="L139">            return (T) e;</span>
+<span class="pc bpc" id="L140" title="1 of 2 branches missed.">        } else if (isNextBuffer) {</span>
+<span class="nc" id="L141">            return newBufferPoll(lvNext(buffer), index, mask);</span>
+        }
+
+<span class="fc" id="L144">        return null;</span>
+    }
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    private T newBufferPoll(AtomicReferenceArray&lt;Object&gt; nextBuffer, final long index, final int mask) {
+<span class="nc" id="L149">        consumerBuffer = nextBuffer;</span>
+<span class="nc" id="L150">        final int offsetInNew = calcWrappedOffset(index, mask);</span>
+<span class="nc" id="L151">        final T n = (T) lvElement(nextBuffer, offsetInNew);// LoadLoad</span>
+<span class="nc bnc" id="L152" title="All 2 branches missed.">        if (null == n) {</span>
+<span class="nc" id="L153">            return null;</span>
+        } else {
+<span class="nc" id="L155">            soConsumerIndex(index + 1);// this ensures correctness on 32bit platforms</span>
+<span class="nc" id="L156">            soElement(nextBuffer, offsetInNew, null);// StoreStore</span>
+<span class="nc" id="L157">            return n;</span>
+        }
+    }
+
+    /**
+     * {@inheritDoc}
+     * &lt;p&gt;
+     * This implementation is correct for single consumer thread use only.
+     */
+    @SuppressWarnings(&quot;unchecked&quot;)
+    @Override
+    public final T peek() {
+<span class="fc" id="L169">        final AtomicReferenceArray&lt;Object&gt; buffer = consumerBuffer;</span>
+<span class="fc" id="L170">        final long index = lpConsumerIndex();</span>
+<span class="fc" id="L171">        final int mask = consumerMask;</span>
+<span class="fc" id="L172">        final int offset = calcWrappedOffset(index, mask);</span>
+<span class="fc" id="L173">        final Object e = lvElement(buffer, offset);// LoadLoad</span>
+<span class="fc bfc" id="L174" title="All 2 branches covered.">        if (e == HAS_NEXT) {</span>
+<span class="fc" id="L175">            return newBufferPeek(lvNext(buffer), index, mask);</span>
+        }
+
+<span class="fc" id="L178">        return (T) e;</span>
+    }
+    
+    @Override
+    public void clear() {
+<span class="pc bpc" id="L183" title="2 of 4 branches missed.">        while (poll() != null || !isEmpty());</span>
+<span class="fc" id="L184">    }</span>
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    private T newBufferPeek(AtomicReferenceArray&lt;Object&gt; nextBuffer, final long index, final int mask) {
+<span class="fc" id="L188">        consumerBuffer = nextBuffer;</span>
+<span class="fc" id="L189">        final int offsetInNew = calcWrappedOffset(index, mask);</span>
+<span class="fc" id="L190">        return (T) lvElement(nextBuffer, offsetInNew);// LoadLoad</span>
+    }
+
+    @Override
+    public final int size() {
+        /*
+         * It is possible for a thread to be interrupted or reschedule between the read of the producer and
+         * consumer indices, therefore protection is required to ensure size is within valid range. In the
+         * event of concurrent polls/offers to this method the size is OVER estimated as we read consumer
+         * index BEFORE the producer index.
+         */
+<span class="nc" id="L201">        long after = lvConsumerIndex();</span>
+        while (true) {
+<span class="nc" id="L203">            final long before = after;</span>
+<span class="nc" id="L204">            final long currentProducerIndex = lvProducerIndex();</span>
+<span class="nc" id="L205">            after = lvConsumerIndex();</span>
+<span class="nc bnc" id="L206" title="All 2 branches missed.">            if (before == after) {</span>
+<span class="nc" id="L207">                return (int) (currentProducerIndex - after);</span>
+            }
+<span class="nc" id="L209">        }</span>
+    }
+    
+    @Override
+    public boolean isEmpty() {
+<span class="fc bfc" id="L214" title="All 2 branches covered.">        return lvProducerIndex() == lvConsumerIndex();</span>
+    }
+
+    private void adjustLookAheadStep(int capacity) {
+<span class="fc" id="L218">        producerLookAheadStep = Math.min(capacity / 4, MAX_LOOK_AHEAD_STEP);</span>
+<span class="fc" id="L219">    }</span>
+
+    private long lvProducerIndex() {
+<span class="fc" id="L222">        return producerIndex;</span>
+    }
+
+    private long lvConsumerIndex() {
+<span class="fc" id="L226">        return consumerIndex;</span>
+    }
+
+    private long lpProducerIndex() {
+<span class="nc" id="L230">        return producerIndex;</span>
+    }
+
+    private long lpConsumerIndex() {
+<span class="fc" id="L234">        return consumerIndex;</span>
+    }
+
+    private void soProducerIndex(long v) {
+<span class="fc" id="L238">        PRODUCER_INDEX.lazySet(this, v);</span>
+<span class="fc" id="L239">    }</span>
+
+    private void soConsumerIndex(long v) {
+<span class="fc" id="L242">        CONSUMER_INDEX.lazySet(this, v);</span>
+<span class="fc" id="L243">    }</span>
+
+    private static int calcWrappedOffset(long index, int mask) {
+<span class="fc" id="L246">        return calcDirectOffset((int)index &amp; mask);</span>
+    }
+    private static int calcDirectOffset(int index) {
+<span class="fc" id="L249">        return index;</span>
+    }
+    private static void soElement(AtomicReferenceArray&lt;Object&gt; buffer, int offset, Object e) {
+<span class="fc" id="L252">        buffer.lazySet(offset, e);</span>
+<span class="fc" id="L253">    }</span>
+
+    private static &lt;E&gt; Object lvElement(AtomicReferenceArray&lt;Object&gt; buffer, int offset) {
+<span class="fc" id="L256">        return buffer.get(offset);</span>
+    }
+
+    @Override
+    public final Iterator&lt;T&gt; iterator() {
+<span class="nc" id="L261">        throw new UnsupportedOperationException();</span>
+    }
+
+    @Override
+    public boolean contains(Object o) {
+<span class="nc" id="L266">        throw new UnsupportedOperationException();</span>
+    }
+
+    @Override
+    public Object[] toArray() {
+<span class="nc" id="L271">        throw new UnsupportedOperationException();</span>
+    }
+
+    @Override
+    public &lt;E&gt; E[] toArray(E[] a) {
+<span class="nc" id="L276">        throw new UnsupportedOperationException();</span>
+    }
+
+    @Override
+    public boolean remove(Object o) {
+<span class="nc" id="L281">        throw new UnsupportedOperationException();</span>
+    }
+
+    @Override
+    public boolean containsAll(Collection&lt;?&gt; c) {
+<span class="nc" id="L286">        throw new UnsupportedOperationException();</span>
+    }
+
+    @Override
+    public boolean addAll(Collection&lt;? extends T&gt; c) {
+<span class="nc" id="L291">        throw new UnsupportedOperationException();</span>
+    }
+
+    @Override
+    public boolean removeAll(Collection&lt;?&gt; c) {
+<span class="nc" id="L296">        throw new UnsupportedOperationException();</span>
+    }
+
+    @Override
+    public boolean retainAll(Collection&lt;?&gt; c) {
+<span class="nc" id="L301">        throw new UnsupportedOperationException();</span>
+    }
+
+    @Override
+    public boolean add(T e) {
+<span class="nc" id="L306">        throw new UnsupportedOperationException();</span>
+    }
+
+    @Override
+    public T remove() {
+<span class="nc" id="L311">        throw new UnsupportedOperationException();</span>
+    }
+
+    @Override
+    public T element() {
+<span class="nc" id="L316">        throw new UnsupportedOperationException();</span>
+    }
+    
+    /**
+     * Offer two elements at the same time.
+     * &lt;p&gt;Don't use the regular offer() with this at all!
+     * @param first
+     * @param second
+     * @return
+     */
+    public boolean offer(T first, T second) {
+<span class="fc" id="L327">        final AtomicReferenceArray&lt;Object&gt; buffer = producerBuffer;</span>
+<span class="fc" id="L328">        final long p = producerIndex;</span>
+<span class="fc" id="L329">        final int m = producerMask;</span>
+        
+<span class="fc" id="L331">        int pi = calcWrappedOffset(p + 2, m);</span>
+        
+<span class="fc bfc" id="L333" title="All 2 branches covered.">        if (null == lvElement(buffer, pi)) {</span>
+<span class="fc" id="L334">            pi = calcWrappedOffset(p, m);</span>
+<span class="fc" id="L335">            soElement(buffer, pi + 1, second);</span>
+<span class="fc" id="L336">            soProducerIndex(p + 2);</span>
+<span class="fc" id="L337">            soElement(buffer, pi, first);</span>
+        } else {
+<span class="fc" id="L339">            final int capacity = buffer.length();</span>
+<span class="fc" id="L340">            final AtomicReferenceArray&lt;Object&gt; newBuffer = new AtomicReferenceArray&lt;Object&gt;(capacity);</span>
+<span class="fc" id="L341">            producerBuffer = newBuffer;</span>
+            
+<span class="fc" id="L343">            pi = calcWrappedOffset(p, m);</span>
+<span class="fc" id="L344">            soElement(newBuffer, pi + 1, second);// StoreStore</span>
+<span class="fc" id="L345">            soElement(newBuffer, pi, first);</span>
+<span class="fc" id="L346">            soNext(buffer, newBuffer);</span>
+            
+<span class="fc" id="L348">            soProducerIndex(p + 2);// this ensures correctness on 32bit platforms</span>
+            
+<span class="fc" id="L350">            soElement(buffer, pi, HAS_NEXT); // new buffer is visible after element is</span>
+        }
+
+<span class="fc" id="L353">        return true;</span>
+    }
+}
+
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

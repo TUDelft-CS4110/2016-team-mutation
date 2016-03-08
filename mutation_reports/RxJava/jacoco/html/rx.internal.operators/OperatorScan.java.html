@@ -1,0 +1,349 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>OperatorScan.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.internal.operators</a> &gt; <span class="el_source">OperatorScan.java</span></div><h1>OperatorScan.java</h1><pre class="source lang-java linenums">/**
+ * Copyright 2014 Netflix, Inc.
+ * 
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package rx.internal.operators;
+
+import java.util.Queue;
+import java.util.concurrent.atomic.AtomicLong;
+
+import rx.*;
+import rx.Observable.Operator;
+import rx.exceptions.*;
+import rx.functions.*;
+import rx.internal.util.atomic.SpscLinkedAtomicQueue;
+import rx.internal.util.unsafe.*;
+
+/**
+ * Returns an Observable that applies a function to the first item emitted by a source Observable, then feeds
+ * the result of that function along with the second item emitted by an Observable into the same function, and
+ * so on until all items have been emitted by the source Observable, emitting the result of each of these
+ * iterations.
+ * &lt;p&gt;
+ * &lt;img width=&quot;640&quot; src=&quot;https://github.com/ReactiveX/RxJava/wiki/images/rx-operators/scan.png&quot; alt=&quot;&quot;&gt;
+ * &lt;p&gt;
+ * This sort of function is sometimes called an accumulator.
+ * &lt;p&gt;
+ * Note that when you pass a seed to {@code scan} the resulting Observable will emit that seed as its
+ * first emitted item.
+ * 
+ * @param &lt;R&gt; the aggregate and output type
+ * @param &lt;T&gt; the input value type
+ */
+public final class OperatorScan&lt;R, T&gt; implements Operator&lt;R, T&gt; {
+
+    private final Func0&lt;R&gt; initialValueFactory;
+    final Func2&lt;R, ? super T, R&gt; accumulator;
+    // sentinel if we don't receive an initial value
+<span class="fc" id="L49">    private static final Object NO_INITIAL_VALUE = new Object();</span>
+
+    /**
+     * Applies an accumulator function over an observable sequence and returns each intermediate result with the
+     * specified source and accumulator.
+     * 
+     * @param initialValue
+     *            the initial (seed) accumulator value
+     * @param accumulator
+     *            an accumulator function to be invoked on each element from the sequence
+     * @see &lt;a href=&quot;http://msdn.microsoft.com/en-us/library/hh212007.aspx&quot;&gt;Observable.Scan(TSource, TAccumulate) Method (IObservable(TSource), TAccumulate, Func(TAccumulate, TSource,
+     *      TAccumulate))&lt;/a&gt;
+     */
+    public OperatorScan(final R initialValue, Func2&lt;R, ? super T, R&gt; accumulator) {
+<span class="fc" id="L63">        this(new Func0&lt;R&gt;() {</span>
+
+            @Override
+            public R call() {
+<span class="fc" id="L67">                return initialValue;</span>
+            }
+            
+        }, accumulator);
+<span class="fc" id="L71">    }</span>
+    
+<span class="fc" id="L73">    public OperatorScan(Func0&lt;R&gt; initialValueFactory, Func2&lt;R, ? super T, R&gt; accumulator) {</span>
+<span class="fc" id="L74">        this.initialValueFactory = initialValueFactory;</span>
+<span class="fc" id="L75">        this.accumulator = accumulator;</span>
+<span class="fc" id="L76">    }</span>
+
+    /**
+     * Applies an accumulator function over an observable sequence and returns each intermediate result with the
+     * specified source and accumulator.
+     * 
+     * @param accumulator
+     *            an accumulator function to be invoked on each element from the sequence
+     * @see &lt;a href=&quot;http://msdn.microsoft.com/en-us/library/hh211665.aspx&quot;&gt;Observable.Scan(TSource) Method (IObservable(TSource), Func(TSource, TSource, TSource))&lt;/a&gt;
+     */
+    @SuppressWarnings(&quot;unchecked&quot;)
+    public OperatorScan(final Func2&lt;R, ? super T, R&gt; accumulator) {
+<span class="fc" id="L88">        this((R) NO_INITIAL_VALUE, accumulator);</span>
+<span class="fc" id="L89">    }</span>
+
+    @Override
+    public Subscriber&lt;? super T&gt; call(final Subscriber&lt;? super R&gt; child) {
+<span class="fc" id="L93">        final R initialValue = initialValueFactory.call();</span>
+        
+<span class="fc bfc" id="L95" title="All 2 branches covered.">        if (initialValue == NO_INITIAL_VALUE) {</span>
+<span class="fc" id="L96">            return new Subscriber&lt;T&gt;(child) {</span>
+                boolean once;
+                R value;
+                @SuppressWarnings(&quot;unchecked&quot;)
+                @Override
+                public void onNext(T t) {
+                    R v;
+<span class="fc bfc" id="L103" title="All 2 branches covered.">                    if (!once) {</span>
+<span class="fc" id="L104">                        once = true;</span>
+<span class="fc" id="L105">                        v = (R)t;</span>
+                    } else {
+<span class="fc" id="L107">                        v = value;</span>
+                        try {
+<span class="fc" id="L109">                            v = accumulator.call(v, t);</span>
+<span class="nc" id="L110">                        } catch (Throwable e) {</span>
+<span class="nc" id="L111">                            Exceptions.throwOrReport(e, child, t);</span>
+<span class="nc" id="L112">                            return;</span>
+<span class="fc" id="L113">                        }</span>
+                    }
+<span class="fc" id="L115">                    value = v;</span>
+<span class="fc" id="L116">                    child.onNext(v);</span>
+<span class="fc" id="L117">                }</span>
+                @Override
+                public void onError(Throwable e) {
+<span class="nc" id="L120">                    child.onError(e);</span>
+<span class="nc" id="L121">                }</span>
+                @Override
+                public void onCompleted() {
+<span class="fc" id="L124">                    child.onCompleted();</span>
+<span class="fc" id="L125">                }</span>
+            };
+        }
+        
+<span class="fc" id="L129">        final InitialProducer&lt;R&gt; ip = new InitialProducer&lt;R&gt;(initialValue, child);</span>
+        
+<span class="fc" id="L131">        Subscriber&lt;T&gt; parent = new Subscriber&lt;T&gt;() {</span>
+<span class="fc" id="L132">            private R value = initialValue;</span>
+
+            @Override
+            public void onNext(T currentValue) {
+<span class="fc" id="L136">                R v = value;</span>
+                try {
+<span class="fc" id="L138">                    v = accumulator.call(v, currentValue);</span>
+<span class="fc" id="L139">                } catch (Throwable e) {</span>
+<span class="fc" id="L140">                    Exceptions.throwOrReport(e, this, currentValue);</span>
+<span class="fc" id="L141">                    return;</span>
+<span class="fc" id="L142">                }</span>
+<span class="fc" id="L143">                value = v;</span>
+<span class="fc" id="L144">                ip.onNext(v);</span>
+<span class="fc" id="L145">            }</span>
+
+            @Override
+            public void onError(Throwable e) {
+<span class="fc" id="L149">                ip.onError(e);</span>
+<span class="fc" id="L150">            }</span>
+
+            @Override
+            public void onCompleted() {
+<span class="fc" id="L154">                ip.onCompleted();</span>
+<span class="fc" id="L155">            }</span>
+            
+            @Override
+            public void setProducer(final Producer producer) {
+<span class="fc" id="L159">                ip.setProducer(producer);</span>
+<span class="fc" id="L160">            }</span>
+        };
+        
+<span class="fc" id="L163">        child.add(parent);</span>
+<span class="fc" id="L164">        child.setProducer(ip);</span>
+<span class="fc" id="L165">        return parent;</span>
+    }
+    
+    static final class InitialProducer&lt;R&gt; implements Producer, Observer&lt;R&gt; {
+        final Subscriber&lt;? super R&gt; child;
+        final Queue&lt;Object&gt; queue;
+        
+        boolean emitting;
+        /** Missed a terminal event. */
+        boolean missed;
+        /** Missed a request. */
+        long missedRequested;
+        /** The current requested amount. */
+        final AtomicLong requested;
+        /** The current producer. */
+        volatile Producer producer;
+        
+        volatile boolean done;
+        Throwable error;
+        
+<span class="fc" id="L185">        public InitialProducer(R initialValue, Subscriber&lt;? super R&gt; child) {</span>
+<span class="fc" id="L186">            this.child = child;</span>
+            Queue&lt;Object&gt; q;
+            // TODO switch to the linked-array based queue once available
+<span class="pc bpc" id="L189" title="1 of 2 branches missed.">            if (UnsafeAccess.isUnsafeAvailable()) {</span>
+<span class="fc" id="L190">                q = new SpscLinkedQueue&lt;Object&gt;(); // new SpscUnboundedArrayQueue&lt;R&gt;(8);</span>
+            } else {
+<span class="nc" id="L192">                q = new SpscLinkedAtomicQueue&lt;Object&gt;();  // new SpscUnboundedAtomicArrayQueue&lt;R&gt;(8);</span>
+            }
+<span class="fc" id="L194">            this.queue = q;</span>
+<span class="fc" id="L195">            q.offer(NotificationLite.instance().next(initialValue));</span>
+<span class="fc" id="L196">            this.requested = new AtomicLong();</span>
+<span class="fc" id="L197">        }</span>
+        
+        @Override
+        public void onNext(R t) {
+<span class="fc" id="L201">            queue.offer(NotificationLite.instance().next(t));</span>
+<span class="fc" id="L202">            emit();</span>
+<span class="fc" id="L203">        }</span>
+        
+        boolean checkTerminated(boolean d, boolean empty, Subscriber&lt;? super R&gt; child) {
+<span class="fc bfc" id="L206" title="All 2 branches covered.">            if (child.isUnsubscribed()) {</span>
+<span class="fc" id="L207">                return true;</span>
+            }
+<span class="fc bfc" id="L209" title="All 2 branches covered.">            if (d) {</span>
+<span class="fc" id="L210">                Throwable err = error;</span>
+<span class="fc bfc" id="L211" title="All 2 branches covered.">                if (err != null) {</span>
+<span class="fc" id="L212">                    child.onError(err);</span>
+<span class="fc" id="L213">                    return true;</span>
+                } else
+<span class="pc bpc" id="L215" title="1 of 2 branches missed.">                if (empty) {</span>
+<span class="fc" id="L216">                    child.onCompleted();</span>
+<span class="fc" id="L217">                    return true;</span>
+                }
+            }
+<span class="fc" id="L220">            return false;</span>
+        }
+        
+        @Override
+        public void onError(Throwable e) {
+<span class="fc" id="L225">            error = e;</span>
+<span class="fc" id="L226">            done = true;</span>
+<span class="fc" id="L227">            emit();</span>
+<span class="fc" id="L228">        }</span>
+        
+        @Override
+        public void onCompleted() {
+<span class="fc" id="L232">            done = true;</span>
+<span class="fc" id="L233">            emit();</span>
+<span class="fc" id="L234">        }</span>
+        
+        @Override
+        public void request(long n) {
+<span class="pc bpc" id="L238" title="1 of 2 branches missed.">            if (n &lt; 0L) {</span>
+<span class="nc" id="L239">                throw new IllegalArgumentException(&quot;n &gt;= required but it was &quot; + n);</span>
+            } else
+<span class="pc bpc" id="L241" title="1 of 2 branches missed.">            if (n != 0L) {</span>
+<span class="fc" id="L242">                BackpressureUtils.getAndAddRequest(requested, n);</span>
+<span class="fc" id="L243">                Producer p = producer;</span>
+<span class="fc bfc" id="L244" title="All 2 branches covered.">                if (p == null) {</span>
+                    // not synchronizing on this to avoid clash with emit()
+<span class="fc" id="L246">                    synchronized (requested) {</span>
+<span class="fc" id="L247">                        p = producer;</span>
+<span class="pc bpc" id="L248" title="1 of 2 branches missed.">                        if (p == null) {</span>
+<span class="fc" id="L249">                            long mr = missedRequested;</span>
+<span class="fc" id="L250">                            missedRequested = BackpressureUtils.addCap(mr, n);</span>
+                        }
+<span class="pc" id="L252">                    }</span>
+                }
+<span class="fc bfc" id="L254" title="All 2 branches covered.">                if (p != null) {</span>
+<span class="fc" id="L255">                    p.request(n);</span>
+                }
+<span class="fc" id="L257">                emit();</span>
+            }
+<span class="fc" id="L259">        }</span>
+        
+        public void setProducer(Producer p) {
+<span class="pc bpc" id="L262" title="1 of 2 branches missed.">            if (p == null) {</span>
+<span class="nc" id="L263">                throw new NullPointerException();</span>
+            }
+            long mr;
+            // not synchronizing on this to avoid clash with emit()
+<span class="fc" id="L267">            synchronized (requested) {</span>
+<span class="pc bpc" id="L268" title="1 of 2 branches missed.">                if (producer != null) {</span>
+<span class="nc" id="L269">                    throw new IllegalStateException(&quot;Can't set more than one Producer!&quot;);</span>
+                }
+<span class="fc" id="L271">                mr = missedRequested;</span>
+                // request one less because of the initial value, this happens once
+                // and is performed only if the request is not at MAX_VALUE already
+<span class="fc bfc" id="L274" title="All 2 branches covered.">                if (mr != Long.MAX_VALUE) {</span>
+<span class="fc" id="L275">                    mr -= 1;</span>
+                }
+<span class="fc" id="L277">                missedRequested = 0L;</span>
+<span class="fc" id="L278">                producer = p;</span>
+<span class="pc" id="L279">            }</span>
+            
+<span class="fc bfc" id="L281" title="All 2 branches covered.">            if (mr &gt; 0L) {</span>
+<span class="fc" id="L282">                p.request(mr);</span>
+            }
+<span class="fc" id="L284">            emit();</span>
+<span class="fc" id="L285">        }</span>
+        
+        void emit() {
+<span class="fc" id="L288">            synchronized (this) {</span>
+<span class="fc bfc" id="L289" title="All 2 branches covered.">                if (emitting) {</span>
+<span class="fc" id="L290">                    missed = true;</span>
+<span class="fc" id="L291">                    return;</span>
+                }
+<span class="fc" id="L293">                emitting = true;</span>
+<span class="pc" id="L294">            }</span>
+<span class="fc" id="L295">            emitLoop();</span>
+<span class="fc" id="L296">        }</span>
+        
+        void emitLoop() {
+<span class="fc" id="L299">            final Subscriber&lt;? super R&gt; child = this.child;</span>
+<span class="fc" id="L300">            final Queue&lt;Object&gt; queue = this.queue;</span>
+<span class="fc" id="L301">            final NotificationLite&lt;R&gt; nl = NotificationLite.instance();</span>
+<span class="fc" id="L302">            AtomicLong requested = this.requested;</span>
+            
+<span class="fc" id="L304">            long r = requested.get();</span>
+            for (;;) {
+<span class="fc bfc" id="L306" title="All 2 branches covered.">                boolean max = r == Long.MAX_VALUE;</span>
+<span class="fc" id="L307">                boolean d = done;</span>
+<span class="fc" id="L308">                boolean empty = queue.isEmpty();</span>
+<span class="fc bfc" id="L309" title="All 2 branches covered.">                if (checkTerminated(d, empty, child)) {</span>
+<span class="fc" id="L310">                    return;</span>
+                }
+<span class="fc" id="L312">                long e = 0L;</span>
+<span class="fc bfc" id="L313" title="All 2 branches covered.">                while (r != 0L) {</span>
+<span class="fc" id="L314">                    d = done;</span>
+<span class="fc" id="L315">                    Object o = queue.poll();</span>
+<span class="fc bfc" id="L316" title="All 2 branches covered.">                    empty = o == null;</span>
+<span class="fc bfc" id="L317" title="All 2 branches covered.">                    if (checkTerminated(d, empty, child)) {</span>
+<span class="fc" id="L318">                        return;</span>
+                    }
+<span class="fc bfc" id="L320" title="All 2 branches covered.">                    if (empty) {</span>
+<span class="fc" id="L321">                        break;</span>
+                    }
+<span class="fc" id="L323">                    R v = nl.getValue(o);</span>
+                    try {
+<span class="fc" id="L325">                        child.onNext(v);</span>
+<span class="nc" id="L326">                    } catch (Throwable ex) {</span>
+<span class="nc" id="L327">                        Exceptions.throwOrReport(ex, child, v);</span>
+<span class="nc" id="L328">                        return;</span>
+<span class="fc" id="L329">                    }</span>
+<span class="fc" id="L330">                    r--;</span>
+<span class="fc" id="L331">                    e--;</span>
+<span class="fc" id="L332">                }</span>
+                
+<span class="fc bfc" id="L334" title="All 4 branches covered.">                if (e != 0 &amp;&amp; !max) {</span>
+<span class="fc" id="L335">                    r = requested.addAndGet(e);</span>
+                }
+                
+<span class="fc" id="L338">                synchronized (this) {</span>
+<span class="fc bfc" id="L339" title="All 2 branches covered.">                    if (!missed) {</span>
+<span class="fc" id="L340">                        emitting = false;</span>
+<span class="fc" id="L341">                        return;</span>
+                    }
+<span class="fc" id="L343">                    missed = false;</span>
+<span class="pc" id="L344">                }</span>
+<span class="fc" id="L345">            }</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

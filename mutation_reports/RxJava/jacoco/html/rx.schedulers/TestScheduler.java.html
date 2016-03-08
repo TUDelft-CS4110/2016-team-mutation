@@ -1,0 +1,187 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>TestScheduler.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.schedulers</a> &gt; <span class="el_source">TestScheduler.java</span></div><h1>TestScheduler.java</h1><pre class="source lang-java linenums">/**
+ * Copyright 2014 Netflix, Inc.
+ * 
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package rx.schedulers;
+
+import java.util.Comparator;
+import java.util.PriorityQueue;
+import java.util.Queue;
+import java.util.concurrent.TimeUnit;
+
+import rx.Scheduler;
+import rx.Subscription;
+import rx.functions.Action0;
+import rx.subscriptions.BooleanSubscription;
+import rx.subscriptions.Subscriptions;
+
+/**
+ * The {@code TestScheduler} is useful for debugging. It allows you to test schedules of events by manually
+ * advancing the clock at whatever pace you choose.
+ */
+<span class="fc" id="L33">public class TestScheduler extends Scheduler {</span>
+<span class="fc" id="L34">    final Queue&lt;TimedAction&gt; queue = new PriorityQueue&lt;TimedAction&gt;(11, new CompareActionsByTime());</span>
+<span class="fc" id="L35">    static long counter = 0;</span>
+
+    private static final class TimedAction {
+
+        final long time;
+        final Action0 action;
+        final Worker scheduler;
+<span class="fc" id="L42">        private final long count = counter++; // for differentiating tasks at same time</span>
+
+<span class="fc" id="L44">        TimedAction(Worker scheduler, long time, Action0 action) {</span>
+<span class="fc" id="L45">            this.time = time;</span>
+<span class="fc" id="L46">            this.action = action;</span>
+<span class="fc" id="L47">            this.scheduler = scheduler;</span>
+<span class="fc" id="L48">        }</span>
+
+        @Override
+        public String toString() {
+<span class="nc" id="L52">            return String.format(&quot;TimedAction(time = %d, action = %s)&quot;, time, action.toString());</span>
+        }
+    }
+
+    private static class CompareActionsByTime implements Comparator&lt;TimedAction&gt; {
+<span class="fc" id="L57">        CompareActionsByTime() {</span>
+<span class="fc" id="L58">        }</span>
+
+        @Override
+        public int compare(TimedAction action1, TimedAction action2) {
+<span class="fc bfc" id="L62" title="All 2 branches covered.">            if (action1.time == action2.time) {</span>
+<span class="pc bpc" id="L63" title="1 of 4 branches missed.">                return action1.count &lt; action2.count ? -1 : ((action1.count &gt; action2.count) ? 1 : 0);</span>
+            } else {
+<span class="pc bpc" id="L65" title="1 of 4 branches missed.">                return action1.time &lt; action2.time ? -1 : ((action1.time &gt; action2.time) ? 1 : 0);</span>
+            }
+        }
+    }
+
+    // Storing time in nanoseconds internally.
+    long time;
+
+    @Override
+    public long now() {
+<span class="fc" id="L75">        return TimeUnit.NANOSECONDS.toMillis(time);</span>
+    }
+
+    /**
+     * Moves the Scheduler's clock forward by a specified amount of time.
+     *
+     * @param delayTime
+     *          the amount of time to move the Scheduler's clock forward
+     * @param unit
+     *          the units of time that {@code delayTime} is expressed in
+     */
+    public void advanceTimeBy(long delayTime, TimeUnit unit) {
+<span class="fc" id="L87">        advanceTimeTo(time + unit.toNanos(delayTime), TimeUnit.NANOSECONDS);</span>
+<span class="fc" id="L88">    }</span>
+
+    /**
+     * Moves the Scheduler's clock to a particular moment in time.
+     *
+     * @param delayTime
+     *          the point in time to move the Scheduler's clock to
+     * @param unit
+     *          the units of time that {@code delayTime} is expressed in
+     */
+    public void advanceTimeTo(long delayTime, TimeUnit unit) {
+<span class="fc" id="L99">        long targetTime = unit.toNanos(delayTime);</span>
+<span class="fc" id="L100">        triggerActions(targetTime);</span>
+<span class="fc" id="L101">    }</span>
+
+    /**
+     * Triggers any actions that have not yet been triggered and that are scheduled to be triggered at or
+     * before this Scheduler's present time.
+     */
+    public void triggerActions() {
+<span class="fc" id="L108">        triggerActions(time);</span>
+<span class="fc" id="L109">    }</span>
+
+    private void triggerActions(long targetTimeInNanos) {
+<span class="fc bfc" id="L112" title="All 2 branches covered.">        while (!queue.isEmpty()) {</span>
+<span class="fc" id="L113">            TimedAction current = queue.peek();</span>
+<span class="fc bfc" id="L114" title="All 2 branches covered.">            if (current.time &gt; targetTimeInNanos) {</span>
+<span class="fc" id="L115">                break;</span>
+            }
+            // if scheduled time is 0 (immediate) use current virtual time
+<span class="fc bfc" id="L118" title="All 2 branches covered.">            time = current.time == 0 ? time : current.time;</span>
+<span class="fc" id="L119">            queue.remove();</span>
+
+            // Only execute if not unsubscribed
+<span class="fc bfc" id="L122" title="All 2 branches covered.">            if (!current.scheduler.isUnsubscribed()) {</span>
+<span class="fc" id="L123">                current.action.call();</span>
+            }
+<span class="fc" id="L125">        }</span>
+<span class="fc" id="L126">        time = targetTimeInNanos;</span>
+<span class="fc" id="L127">    }</span>
+
+    @Override
+    public Worker createWorker() {
+<span class="fc" id="L131">        return new InnerTestScheduler();</span>
+    }
+
+<span class="fc" id="L134">    private final class InnerTestScheduler extends Worker {</span>
+
+<span class="fc" id="L136">        private final BooleanSubscription s = new BooleanSubscription();</span>
+
+<span class="fc" id="L138">        InnerTestScheduler() {</span>
+<span class="fc" id="L139">        }</span>
+
+        @Override
+        public void unsubscribe() {
+<span class="fc" id="L143">            s.unsubscribe();</span>
+<span class="fc" id="L144">        }</span>
+
+        @Override
+        public boolean isUnsubscribed() {
+<span class="fc" id="L148">            return s.isUnsubscribed();</span>
+        }
+
+        @Override
+        public Subscription schedule(Action0 action, long delayTime, TimeUnit unit) {
+<span class="fc" id="L153">            final TimedAction timedAction = new TimedAction(this, time + unit.toNanos(delayTime), action);</span>
+<span class="fc" id="L154">            queue.add(timedAction);</span>
+<span class="fc" id="L155">            return Subscriptions.create(new Action0() {</span>
+
+                @Override
+                public void call() {
+<span class="fc" id="L159">                    queue.remove(timedAction);</span>
+<span class="fc" id="L160">                }</span>
+
+            });
+        }
+
+        @Override
+        public Subscription schedule(Action0 action) {
+<span class="fc" id="L167">            final TimedAction timedAction = new TimedAction(this, 0, action);</span>
+<span class="fc" id="L168">            queue.add(timedAction);</span>
+<span class="fc" id="L169">            return Subscriptions.create(new Action0() {</span>
+
+                @Override
+                public void call() {
+<span class="fc" id="L173">                    queue.remove(timedAction);</span>
+<span class="fc" id="L174">                }</span>
+
+            });
+        }
+
+        @Override
+        public long now() {
+<span class="fc" id="L181">            return TestScheduler.this.now();</span>
+        }
+
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

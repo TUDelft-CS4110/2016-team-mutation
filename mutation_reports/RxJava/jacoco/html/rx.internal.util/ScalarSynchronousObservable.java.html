@@ -1,0 +1,280 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>ScalarSynchronousObservable.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.internal.util</a> &gt; <span class="el_source">ScalarSynchronousObservable.java</span></div><h1>ScalarSynchronousObservable.java</h1><pre class="source lang-java linenums">/**
+ * Copyright 2014 Netflix, Inc.
+ * 
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package rx.internal.util;
+
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import rx.*;
+import rx.exceptions.Exceptions;
+import rx.functions.*;
+import rx.internal.producers.SingleProducer;
+import rx.internal.schedulers.EventLoopsScheduler;
+import rx.observers.Subscribers;
+
+/**
+ * An Observable that emits a single constant scalar value to Subscribers.
+ * &lt;p&gt;
+ * This is a direct implementation of the Observable class to allow identifying it
+ * in flatMap and bypass the subscription to it altogether.
+ *
+ * @param &lt;T&gt; the value type
+ */
+public final class ScalarSynchronousObservable&lt;T&gt; extends Observable&lt;T&gt; {
+    /**
+     * Indicates that the Producer used by this Observable should be fully
+     * threadsafe. It is possible, but unlikely that multiple concurrent
+     * requests will arrive to just().
+     */
+    static final boolean STRONG_MODE;
+    static {
+<span class="fc" id="L43">        String wp = System.getProperty(&quot;rx.just.strong-mode&quot;, &quot;false&quot;);</span>
+<span class="fc" id="L44">        STRONG_MODE = Boolean.valueOf(wp);</span>
+<span class="fc" id="L45">    }</span>
+
+    /**
+     * Creates a scalar producer depending on the state of STRONG_MODE.
+     * @param &lt;T&gt; the type of the scalar value
+     * @param s the target subscriber
+     * @param v the value to emit
+     * @return the created Producer
+     */
+    static &lt;T&gt; Producer createProducer(Subscriber&lt;? super T&gt; s, T v) {
+<span class="pc bpc" id="L55" title="1 of 2 branches missed.">        if (STRONG_MODE) {</span>
+<span class="nc" id="L56">            return new SingleProducer&lt;T&gt;(s, v);</span>
+        }
+<span class="fc" id="L58">        return new WeakSingleProducer&lt;T&gt;(s, v);</span>
+    }
+    
+    /**
+     * Constructs a ScalarSynchronousObservable with the given constant value.
+     * @param &lt;T&gt; the value type
+     * @param t the value to emit when requested
+     * @return the new Observable
+     */
+    public static &lt;T&gt; ScalarSynchronousObservable&lt;T&gt; create(T t) {
+<span class="fc" id="L68">        return new ScalarSynchronousObservable&lt;T&gt;(t);</span>
+    }
+
+    /** The constant scalar value to emit on request. */
+    final T t;
+
+    protected ScalarSynchronousObservable(final T t) {
+<span class="fc" id="L75">        super(new OnSubscribe&lt;T&gt;() {</span>
+
+            @Override
+            public void call(Subscriber&lt;? super T&gt; s) {
+<span class="fc" id="L79">                s.setProducer(createProducer(s, t));</span>
+<span class="fc" id="L80">            }</span>
+
+        });
+<span class="fc" id="L83">        this.t = t;</span>
+<span class="fc" id="L84">    }</span>
+
+    /**
+     * Returns the scalar constant value directly.
+     * @return the scalar constant value directly
+     */
+    public T get() {
+<span class="fc" id="L91">        return t;</span>
+    }
+    
+    
+    /**
+     * Customized observeOn/subscribeOn implementation which emits the scalar
+     * value directly or with less overhead on the specified scheduler.
+     * @param scheduler the target scheduler
+     * @return the new observable
+     */
+    public Observable&lt;T&gt; scalarScheduleOn(final Scheduler scheduler) {
+        final Func1&lt;Action0, Subscription&gt; onSchedule;
+<span class="fc bfc" id="L103" title="All 2 branches covered.">        if (scheduler instanceof EventLoopsScheduler) {</span>
+<span class="fc" id="L104">            final EventLoopsScheduler els = (EventLoopsScheduler) scheduler;</span>
+<span class="fc" id="L105">            onSchedule = new Func1&lt;Action0, Subscription&gt;() {</span>
+                @Override
+                public Subscription call(Action0 a) {
+<span class="fc" id="L108">                    return els.scheduleDirect(a);</span>
+                }
+            };
+<span class="fc" id="L111">        } else {</span>
+<span class="fc" id="L112">            onSchedule = new Func1&lt;Action0, Subscription&gt;() {</span>
+                @Override
+                public Subscription call(final Action0 a) {
+<span class="fc" id="L115">                    final Scheduler.Worker w = scheduler.createWorker();</span>
+<span class="fc" id="L116">                    w.schedule(new Action0() {</span>
+                        @Override
+                        public void call() {
+                            try {
+<span class="fc" id="L120">                                a.call();</span>
+                            } finally {
+<span class="pc" id="L122">                                w.unsubscribe();</span>
+<span class="fc" id="L123">                            }</span>
+<span class="fc" id="L124">                        }</span>
+                    });
+<span class="fc" id="L126">                    return w;</span>
+                }
+            };
+        }
+        
+<span class="fc" id="L131">        return create(new ScalarAsyncOnSubscribe&lt;T&gt;(t, onSchedule));</span>
+    }
+    
+    /**
+     * The OnSubscribe implementation that creates the ScalarAsyncProducer for each
+     * incoming subscriber.
+     *
+     * @param &lt;T&gt; the value type
+     */
+    static final class ScalarAsyncOnSubscribe&lt;T&gt; implements OnSubscribe&lt;T&gt; {
+        final T value;
+        final Func1&lt;Action0, Subscription&gt; onSchedule;
+
+<span class="fc" id="L144">        ScalarAsyncOnSubscribe(T value, Func1&lt;Action0, Subscription&gt; onSchedule) {</span>
+<span class="fc" id="L145">            this.value = value;</span>
+<span class="fc" id="L146">            this.onSchedule = onSchedule;</span>
+<span class="fc" id="L147">        }</span>
+
+        @Override
+        public void call(Subscriber&lt;? super T&gt; s) {
+<span class="fc" id="L151">            s.setProducer(new ScalarAsyncProducer&lt;T&gt;(s, value, onSchedule));</span>
+<span class="fc" id="L152">        }</span>
+    }
+
+    /**
+     * Represents a producer which schedules the emission of a scalar value on
+     * the first positive request via the given scheduler callback.
+     *
+     * @param &lt;T&gt; the value type
+     */
+    static final class ScalarAsyncProducer&lt;T&gt; extends AtomicBoolean implements Producer, Action0 {
+        /** */
+        private static final long serialVersionUID = -2466317989629281651L;
+        final Subscriber&lt;? super T&gt; actual;
+        final T value;
+        final Func1&lt;Action0, Subscription&gt; onSchedule;
+        
+<span class="fc" id="L168">        public ScalarAsyncProducer(Subscriber&lt;? super T&gt; actual, T value, Func1&lt;Action0, Subscription&gt; onSchedule) {</span>
+<span class="fc" id="L169">            this.actual = actual;</span>
+<span class="fc" id="L170">            this.value = value;</span>
+<span class="fc" id="L171">            this.onSchedule = onSchedule;</span>
+<span class="fc" id="L172">        }</span>
+
+        @Override
+        public void request(long n) {
+<span class="pc bpc" id="L176" title="1 of 2 branches missed.">            if (n &lt; 0L) {</span>
+<span class="nc" id="L177">                throw new IllegalArgumentException(&quot;n &gt;= 0 required but it was &quot; + n);</span>
+            }
+<span class="fc bfc" id="L179" title="All 4 branches covered.">            if (n != 0 &amp;&amp; compareAndSet(false, true)) {</span>
+<span class="fc" id="L180">                actual.add(onSchedule.call(this));</span>
+            }
+<span class="fc" id="L182">        }</span>
+        
+        @Override
+        public void call() {
+<span class="fc" id="L186">            Subscriber&lt;? super T&gt; a = actual;</span>
+<span class="pc bpc" id="L187" title="1 of 2 branches missed.">            if (a.isUnsubscribed()) {</span>
+<span class="nc" id="L188">                return;</span>
+            }
+<span class="fc" id="L190">            T v = value;</span>
+            try {
+<span class="fc" id="L192">                a.onNext(v);</span>
+<span class="fc" id="L193">            } catch (Throwable e) {</span>
+<span class="fc" id="L194">                Exceptions.throwOrReport(e, a, v);</span>
+<span class="fc" id="L195">                return;</span>
+<span class="fc" id="L196">            }</span>
+<span class="fc bfc" id="L197" title="All 2 branches covered.">            if (a.isUnsubscribed()) {</span>
+<span class="fc" id="L198">                return;</span>
+            }
+<span class="fc" id="L200">            a.onCompleted();</span>
+<span class="fc" id="L201">        }</span>
+        
+        @Override
+        public String toString() {
+<span class="nc" id="L205">            return &quot;ScalarAsyncProducer[&quot; + value + &quot;, &quot; + get() + &quot;]&quot;;</span>
+        }
+    }
+    
+    /**
+     * Given this scalar source as input to a flatMap, avoid one step of subscription
+     * and subscribes to the single Observable returned by the function.
+     * &lt;p&gt;
+     * If the functions returns another scalar, no subscription happens and this inner
+     * scalar value will be emitted once requested.
+     * @param &lt;R&gt; the result type
+     * @param func the mapper function that returns an Observable for the scalar value of this
+     * @return the new observable
+     */
+    public &lt;R&gt; Observable&lt;R&gt; scalarFlatMap(final Func1&lt;? super T, ? extends Observable&lt;? extends R&gt;&gt; func) {
+<span class="fc" id="L220">        return create(new OnSubscribe&lt;R&gt;() {</span>
+            @Override
+            public void call(final Subscriber&lt;? super R&gt; child) {
+<span class="fc" id="L223">                Observable&lt;? extends R&gt; o = func.call(t);</span>
+<span class="fc bfc" id="L224" title="All 2 branches covered.">                if (o instanceof ScalarSynchronousObservable) {</span>
+<span class="fc" id="L225">                    child.setProducer(createProducer(child, ((ScalarSynchronousObservable&lt;? extends R&gt;)o).t));</span>
+                } else {
+<span class="fc" id="L227">                    o.unsafeSubscribe(Subscribers.wrap(child));</span>
+                }
+<span class="fc" id="L229">            }</span>
+        });
+    }
+    
+    /**
+     * This is the weak version of SingleProducer that uses plain fields
+     * to avoid reentrancy and as such is not threadsafe for concurrent
+     * request() calls.
+     *
+     * @param &lt;T&gt; the value type
+     */
+    static final class WeakSingleProducer&lt;T&gt; implements Producer {
+        final Subscriber&lt;? super T&gt; actual;
+        final T value;
+        boolean once;
+        
+<span class="fc" id="L245">        public WeakSingleProducer(Subscriber&lt;? super T&gt; actual, T value) {</span>
+<span class="fc" id="L246">            this.actual = actual;</span>
+<span class="fc" id="L247">            this.value = value;</span>
+<span class="fc" id="L248">        }</span>
+        
+        @Override
+        public void request(long n) {
+<span class="fc bfc" id="L252" title="All 2 branches covered.">            if (once) {</span>
+<span class="fc" id="L253">                return;</span>
+            }
+<span class="pc bpc" id="L255" title="1 of 2 branches missed.">            if (n &lt; 0L) {</span>
+<span class="nc" id="L256">                throw new IllegalStateException(&quot;n &gt;= required but it was &quot; + n);</span>
+            }
+<span class="fc bfc" id="L258" title="All 2 branches covered.">            if (n != 0L) {</span>
+<span class="fc" id="L259">                once = true;</span>
+<span class="fc" id="L260">                Subscriber&lt;? super T&gt; a = actual;</span>
+<span class="fc bfc" id="L261" title="All 2 branches covered.">                if (a.isUnsubscribed()) {</span>
+<span class="fc" id="L262">                    return;</span>
+                }
+<span class="fc" id="L264">                T v = value;</span>
+                try {
+<span class="fc" id="L266">                    a.onNext(v);</span>
+<span class="fc" id="L267">                } catch (Throwable e) {</span>
+<span class="fc" id="L268">                    Exceptions.throwOrReport(e, a, v);</span>
+<span class="fc" id="L269">                    return;</span>
+<span class="fc" id="L270">                }</span>
+                
+<span class="fc bfc" id="L272" title="All 2 branches covered.">                if (a.isUnsubscribed()) {</span>
+<span class="fc" id="L273">                    return;</span>
+                }
+<span class="fc" id="L275">                a.onCompleted();</span>
+            }
+<span class="fc" id="L277">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

@@ -1,0 +1,213 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>SafeSubscriber.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.observers</a> &gt; <span class="el_source">SafeSubscriber.java</span></div><h1>SafeSubscriber.java</h1><pre class="source lang-java linenums">/**
+ * Copyright 2014 Netflix, Inc.
+ * 
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package rx.observers;
+
+import java.util.Arrays;
+
+import rx.Subscriber;
+import rx.exceptions.CompositeException;
+import rx.exceptions.Exceptions;
+import rx.exceptions.OnCompletedFailedException;
+import rx.exceptions.OnErrorFailedException;
+import rx.exceptions.OnErrorNotImplementedException;
+import rx.exceptions.UnsubscribeFailedException;
+import rx.internal.util.RxJavaPluginUtils;
+
+/**
+ * {@code SafeSubscriber} is a wrapper around {@code Subscriber} that ensures that the {@code Subscriber}
+ * complies with &lt;a href=&quot;http://reactivex.io/documentation/contract.html&quot;&gt;the Observable contract&lt;/a&gt;.
+ * &lt;p&gt;
+ * The following is taken from &lt;a href=&quot;http://go.microsoft.com/fwlink/?LinkID=205219&quot;&gt;the Rx Design Guidelines
+ * document&lt;/a&gt;:
+ * &lt;blockquote&gt;&lt;p&gt;
+ * Messages sent to instances of the {@code IObserver} interface follow the following grammar:
+ * &lt;/p&gt;&lt;blockquote&gt;&lt;p&gt; {@code OnNext* (OnCompleted | OnError)?} &lt;/p&gt;&lt;/blockquote&gt;&lt;p&gt;
+ * This grammar allows observable sequences to send any amount (0 or more) of {@code OnNext} messages to the
+ * subscriber, optionally followed by a single success ({@code OnCompleted}) or failure ({@code OnError})
+ * message.
+ * &lt;/p&gt;&lt;p&gt;
+ * The single message indicating that an observable sequence has finished ensures that consumers of the
+ * observable sequence can deterministically establish that it is safe to perform cleanup operations.
+ * &lt;/p&gt;&lt;p&gt;
+ * A single failure further ensures that abort semantics can be maintained for operators that work on
+ * multiple observable sequences (see paragraph 6.6).
+ * &lt;/p&gt;&lt;/blockquote&gt;
+ * &lt;p&gt;
+ * This wrapper does the following:
+ * &lt;ul&gt;
+ * &lt;li&gt;Allows only single execution of either {@code onError} or {@code onCompleted}.&lt;/li&gt;
+ * &lt;li&gt;Ensures that once an {@code onCompleted} or {@code onError} is performed, no further calls can be executed&lt;/li&gt;
+ * &lt;li&gt;If {@code unsubscribe} is called, the upstream {@code Observable} is notified and the event delivery will be stopped in a
+ * best effort manner (i.e., further onXXX calls may still slip through).&lt;/li&gt;
+ * &lt;li&gt;When {@code onError} or {@code onCompleted} occur, unsubscribes from the {@code Observable} (if executing asynchronously).&lt;/li&gt;
+ * &lt;/ul&gt;
+ * {@code SafeSubscriber} will not synchronize {@code onNext} execution. Use {@link SerializedSubscriber} to do
+ * that.
+ * 
+ * @param &lt;T&gt;
+ *            the type of item expected by the {@link Subscriber}
+ */
+public class SafeSubscriber&lt;T&gt; extends Subscriber&lt;T&gt; {
+
+    private final Subscriber&lt;? super T&gt; actual;
+
+<span class="fc" id="L67">    boolean done = false;</span>
+
+    public SafeSubscriber(Subscriber&lt;? super T&gt; actual) {
+<span class="fc" id="L70">        super(actual);</span>
+<span class="fc" id="L71">        this.actual = actual;</span>
+<span class="fc" id="L72">    }</span>
+
+    /**
+     * Notifies the Subscriber that the {@code Observable} has finished sending push-based notifications.
+     * &lt;p&gt;
+     * The {@code Observable} will not call this method if it calls {@link #onError}.
+     */
+    @Override
+    public void onCompleted() {
+<span class="fc bfc" id="L81" title="All 2 branches covered.">        if (!done) {</span>
+<span class="fc" id="L82">            done = true;</span>
+            try {
+<span class="fc" id="L84">                actual.onCompleted();</span>
+<span class="fc" id="L85">            } catch (Throwable e) {</span>
+                // we handle here instead of another method so we don't add stacks to the frame
+                // which can prevent it from being able to handle StackOverflow
+<span class="fc" id="L88">                Exceptions.throwIfFatal(e);</span>
+<span class="fc" id="L89">                RxJavaPluginUtils.handleException(e);</span>
+<span class="fc" id="L90">                throw new OnCompletedFailedException(e.getMessage(), e);</span>
+            } finally {
+<span class="fc" id="L92">                try {</span>
+                    // Similarly to onError if failure occurs in unsubscribe then Rx contract is broken
+                    // and we throw an UnsubscribeFailureException.
+<span class="fc" id="L95">                    unsubscribe();</span>
+<span class="fc" id="L96">                } catch (Throwable e) {</span>
+<span class="fc" id="L97">                    RxJavaPluginUtils.handleException(e);</span>
+<span class="fc" id="L98">                    throw new UnsubscribeFailedException(e.getMessage(), e);</span>
+<span class="fc" id="L99">                }</span>
+            }
+        }
+<span class="fc" id="L102">    }</span>
+
+    /**
+     * Notifies the Subscriber that the {@code Observable} has experienced an error condition.
+     * &lt;p&gt;
+     * If the {@code Observable} calls this method, it will not thereafter call {@link #onNext} or
+     * {@link #onCompleted}.
+     * 
+     * @param e
+     *          the exception encountered by the Observable
+     */
+    @Override
+    public void onError(Throwable e) {
+        // we handle here instead of another method so we don't add stacks to the frame
+        // which can prevent it from being able to handle StackOverflow
+<span class="fc" id="L117">        Exceptions.throwIfFatal(e);</span>
+<span class="fc bfc" id="L118" title="All 2 branches covered.">        if (!done) {</span>
+<span class="fc" id="L119">            done = true;</span>
+<span class="fc" id="L120">            _onError(e);</span>
+        }
+<span class="fc" id="L122">    }</span>
+
+    /**
+     * Provides the Subscriber with a new item to observe.
+     * &lt;p&gt;
+     * The {@code Observable} may call this method 0 or more times.
+     * &lt;p&gt;
+     * The {@code Observable} will not call this method again after it calls either {@link #onCompleted} or
+     * {@link #onError}.
+     * 
+     * @param args
+     *          the item emitted by the Observable
+     */
+    @Override
+    public void onNext(T args) {
+        try {
+<span class="fc bfc" id="L138" title="All 2 branches covered.">            if (!done) {</span>
+<span class="fc" id="L139">                actual.onNext(args);</span>
+            }
+<span class="fc" id="L141">        } catch (Throwable e) {</span>
+            // we handle here instead of another method so we don't add stacks to the frame
+            // which can prevent it from being able to handle StackOverflow
+<span class="fc" id="L144">            Exceptions.throwOrReport(e, this);</span>
+<span class="fc" id="L145">        }</span>
+<span class="fc" id="L146">    }</span>
+
+    /**
+     * The logic for {@code onError} without the {@code isFinished} check so it can be called from within
+     * {@code onCompleted}.
+     * 
+     * @see &lt;a href=&quot;https://github.com/ReactiveX/RxJava/issues/630&quot;&gt;the report of this bug&lt;/a&gt;
+     */
+    protected void _onError(Throwable e) {
+<span class="fc" id="L155">        RxJavaPluginUtils.handleException(e);</span>
+        try {
+<span class="fc" id="L157">            actual.onError(e);</span>
+<span class="fc" id="L158">        } catch (Throwable e2) {</span>
+<span class="fc bfc" id="L159" title="All 2 branches covered.">            if (e2 instanceof OnErrorNotImplementedException) {</span>
+                /*
+                 * onError isn't implemented so throw
+                 * 
+                 * https://github.com/ReactiveX/RxJava/issues/198
+                 * 
+                 * Rx Design Guidelines 5.2
+                 * 
+                 * &quot;when calling the Subscribe method that only has an onNext argument, the OnError behavior
+                 * will be to rethrow the exception on the thread that the message comes out from the observable
+                 * sequence. The OnCompleted behavior in this case is to do nothing.&quot;
+                 */
+                try {
+<span class="fc" id="L172">                    unsubscribe();</span>
+<span class="fc" id="L173">                } catch (Throwable unsubscribeException) {</span>
+<span class="fc" id="L174">                    RxJavaPluginUtils.handleException(unsubscribeException);</span>
+<span class="fc" id="L175">                    throw new RuntimeException(&quot;Observer.onError not implemented and error while unsubscribing.&quot;, new CompositeException(Arrays.asList(e, unsubscribeException)));</span>
+<span class="fc" id="L176">                }</span>
+<span class="fc" id="L177">                throw (OnErrorNotImplementedException) e2;</span>
+            } else {
+                /*
+                 * throw since the Rx contract is broken if onError failed
+                 * 
+                 * https://github.com/ReactiveX/RxJava/issues/198
+                 */
+<span class="fc" id="L184">                RxJavaPluginUtils.handleException(e2);</span>
+                try {
+<span class="fc" id="L186">                    unsubscribe();</span>
+<span class="fc" id="L187">                } catch (Throwable unsubscribeException) {</span>
+<span class="fc" id="L188">                    RxJavaPluginUtils.handleException(unsubscribeException);</span>
+<span class="fc" id="L189">                    throw new OnErrorFailedException(&quot;Error occurred when trying to propagate error to Observer.onError and during unsubscription.&quot;, new CompositeException(Arrays.asList(e, e2, unsubscribeException)));</span>
+<span class="fc" id="L190">                }</span>
+
+<span class="fc" id="L192">                throw new OnErrorFailedException(&quot;Error occurred when trying to propagate error to Observer.onError&quot;, new CompositeException(Arrays.asList(e, e2)));</span>
+            }
+<span class="fc" id="L194">        }</span>
+        // if we did not throw above we will unsubscribe here, if onError failed then unsubscribe happens in the catch
+        try {
+<span class="fc" id="L197">            unsubscribe();</span>
+<span class="fc" id="L198">        } catch (RuntimeException unsubscribeException) {</span>
+<span class="fc" id="L199">            RxJavaPluginUtils.handleException(unsubscribeException);</span>
+<span class="fc" id="L200">            throw new OnErrorFailedException(unsubscribeException);</span>
+<span class="fc" id="L201">        }</span>
+<span class="fc" id="L202">    }</span>
+
+    /**
+     * Returns the {@link Subscriber} underlying this {@code SafeSubscriber}.
+     *
+     * @return the {@link Subscriber} that was used to create this {@code SafeSubscriber}
+     */
+    public Subscriber&lt;? super T&gt; getActual() {
+<span class="fc" id="L210">        return actual;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

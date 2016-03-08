@@ -1,0 +1,485 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>OnSubscribePublishMulticast.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.internal.operators</a> &gt; <span class="el_source">OnSubscribePublishMulticast.java</span></div><h1>OnSubscribePublishMulticast.java</h1><pre class="source lang-java linenums">/**
+ * Copyright 2016 Netflix, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+
+package rx.internal.operators;
+
+import java.util.Queue;
+import java.util.concurrent.atomic.*;
+
+import rx.*;
+import rx.exceptions.MissingBackpressureException;
+import rx.internal.util.atomic.SpscAtomicArrayQueue;
+import rx.internal.util.unsafe.*;
+
+/**
+ * Multicasts notifications coming through its input Subscriber view to its
+ * client Subscribers via lockstep backpressure mode.
+ * 
+ * &lt;p&gt;The difference between this class and OperatorPublish is that this
+ * class doesn't consume the upstream if there are no child subscribers but
+ * waits for them to show up. Plus if the upstream source terminates, late
+ * subscribers will be immediately terminated with the same terminal event
+ * unlike OperatorPublish which just waits for the next connection.
+ * 
+ * &lt;p&gt;The class extends AtomicInteger which is the work-in-progress gate
+ * for the drain-loop serializing subscriptions and child request changes.
+ * 
+ * @param &lt;T&gt; the input and output type
+ */
+public final class OnSubscribePublishMulticast&lt;T&gt; extends AtomicInteger 
+implements Observable.OnSubscribe&lt;T&gt;, Observer&lt;T&gt;, Subscription {
+    /** */
+    private static final long serialVersionUID = -3741892510772238743L;
+    /** 
+     * The prefetch queue holding onto a fixed amount of items until all
+     * all child subscribers have requested something.
+     */
+    final Queue&lt;T&gt; queue;
+    /**
+     * The number of items to prefetch from the upstreams source.
+     */
+    final int prefetch;
+    
+    /**
+     * Delays the error delivery to happen only after all values have been consumed.
+     */
+    final boolean delayError;
+    /**
+     * The subscriber that can be 'connected' to the upstream source.
+     */
+    final ParentSubscriber&lt;T&gt; parent;
+    /** Indicates the upstream has completed. */
+    volatile boolean done;
+    /** 
+     * Holds onto the upstream's exception if done is true and this field is non-null.
+     * &lt;p&gt;This field must be read after done or if subscribers == TERMINATED to
+     * establish a proper happens-before. 
+     */
+    Throwable error;
+
+    /**
+     * Holds the upstream producer if any, set through the parent subscriber.
+     */
+    volatile Producer producer;
+    /**
+     * A copy-on-write array of currently subscribed child subscribers' wrapper structure.
+     */
+    volatile PublishProducer&lt;T&gt;[] subscribers;
+    
+    /** 
+     * Represents an empty array of subscriber wrapper, 
+     * helps avoid allocating an empty array all the time. 
+     */
+<span class="fc" id="L86">    static final PublishProducer&lt;?&gt;[] EMPTY = new PublishProducer[0];</span>
+
+    /**
+     * Represents a final state for this class that prevents new subscribers
+     * from subscribing to it.
+     */
+<span class="fc" id="L92">    static final PublishProducer&lt;?&gt;[] TERMINATED = new PublishProducer[0];</span>
+
+    /**
+     * Constructor, initializes the fields
+     * @param prefetch the prefetch amount, &amp;gt; 0 required
+     * @param delayError delay the error delivery after the normal items?
+     * @throws IllegalArgumentException if prefetch &amp;lt;= 0
+     */
+    @SuppressWarnings(&quot;unchecked&quot;)
+<span class="fc" id="L101">    public OnSubscribePublishMulticast(int prefetch, boolean delayError) {</span>
+<span class="fc bfc" id="L102" title="All 2 branches covered.">        if (prefetch &lt;= 0) {</span>
+<span class="fc" id="L103">            throw new IllegalArgumentException(&quot;prefetch &gt; 0 required but it was &quot; + prefetch);</span>
+        }
+<span class="fc" id="L105">        this.prefetch = prefetch;</span>
+<span class="fc" id="L106">        this.delayError = delayError;</span>
+<span class="pc bpc" id="L107" title="1 of 2 branches missed.">        if (UnsafeAccess.isUnsafeAvailable()) {</span>
+<span class="fc" id="L108">            this.queue = new SpscArrayQueue&lt;T&gt;(prefetch);</span>
+        } else {
+<span class="nc" id="L110">            this.queue = new SpscAtomicArrayQueue&lt;T&gt;(prefetch);</span>
+        }
+<span class="fc" id="L112">        this.subscribers = (PublishProducer&lt;T&gt;[]) EMPTY;</span>
+<span class="fc" id="L113">        this.parent = new ParentSubscriber&lt;T&gt;(this);</span>
+<span class="fc" id="L114">    }</span>
+    
+    @Override
+    public void call(Subscriber&lt;? super T&gt; t) {
+<span class="fc" id="L118">        PublishProducer&lt;T&gt; pp = new PublishProducer&lt;T&gt;(t, this);</span>
+<span class="fc" id="L119">        t.add(pp);</span>
+<span class="fc" id="L120">        t.setProducer(pp);</span>
+        
+<span class="fc bfc" id="L122" title="All 2 branches covered.">        if (add(pp)) {</span>
+<span class="pc bpc" id="L123" title="1 of 2 branches missed.">            if (pp.isUnsubscribed()) {</span>
+<span class="nc" id="L124">                remove(pp);</span>
+            } else {
+<span class="fc" id="L126">                drain();</span>
+            }
+        } else {
+<span class="fc" id="L129">            Throwable e = error;</span>
+<span class="pc bpc" id="L130" title="1 of 2 branches missed.">            if (e != null) {</span>
+<span class="nc" id="L131">                t.onError(e);</span>
+            } else {
+<span class="fc" id="L133">                t.onCompleted();</span>
+            }
+        }
+<span class="fc" id="L136">    }</span>
+    
+    @Override
+    public void onNext(T t) {
+<span class="fc bfc" id="L140" title="All 2 branches covered.">        if (!queue.offer(t)) {</span>
+<span class="fc" id="L141">            parent.unsubscribe();</span>
+            
+<span class="fc" id="L143">            error = new MissingBackpressureException(&quot;Queue full?!&quot;);</span>
+<span class="fc" id="L144">            done = true;</span>
+        }
+<span class="fc" id="L146">        drain();</span>
+<span class="fc" id="L147">    }</span>
+    
+    @Override
+    public void onError(Throwable e) {
+<span class="nc" id="L151">        error = e;</span>
+<span class="nc" id="L152">        done = true;</span>
+<span class="nc" id="L153">        drain();</span>
+<span class="nc" id="L154">    }</span>
+    
+    @Override
+    public void onCompleted() {
+<span class="fc" id="L158">        done = true;</span>
+<span class="fc" id="L159">        drain();</span>
+<span class="fc" id="L160">    }</span>
+    
+    /**
+     * Sets the main producer and issues the prefetch amount.
+     * @param p the producer to set
+     */
+    void setProducer(Producer p) {
+<span class="fc" id="L167">        this.producer = p;</span>
+<span class="fc" id="L168">        p.request(prefetch);</span>
+<span class="fc" id="L169">    }</span>
+    
+    /**
+     * The serialization loop that determines the minimum request of
+     * all subscribers and tries to emit as many items from the queue if
+     * they are available.
+     * 
+     * &lt;p&gt;The execution of the drain-loop is guaranteed to be thread-safe.
+     */
+    void drain() {
+<span class="fc bfc" id="L179" title="All 2 branches covered.">        if (getAndIncrement() != 0) {</span>
+<span class="fc" id="L180">            return;</span>
+        }
+        
+<span class="fc" id="L183">        final Queue&lt;T&gt; q = queue;</span>
+        
+<span class="fc" id="L185">        int missed = 0;</span>
+        
+        for (;;) {
+            
+<span class="fc" id="L189">            long r = Long.MAX_VALUE;</span>
+<span class="fc" id="L190">            PublishProducer&lt;T&gt;[] a = subscribers;</span>
+<span class="fc" id="L191">            int n = a.length;</span>
+            
+<span class="fc bfc" id="L193" title="All 2 branches covered.">            for (PublishProducer&lt;T&gt; inner : a) {</span>
+<span class="fc" id="L194">                r = Math.min(r, inner.get());</span>
+            }
+            
+<span class="fc bfc" id="L197" title="All 2 branches covered.">            if (n != 0) {</span>
+<span class="fc" id="L198">                long e = 0L;</span>
+                
+<span class="fc bfc" id="L200" title="All 2 branches covered.">                while (e != r) {</span>
+<span class="fc" id="L201">                    boolean d = done;</span>
+                    
+<span class="fc" id="L203">                    T v = q.poll();</span>
+                    
+<span class="fc bfc" id="L205" title="All 2 branches covered.">                    boolean empty = v == null;</span>
+                    
+<span class="fc bfc" id="L207" title="All 2 branches covered.">                    if (checkTerminated(d, empty)) {</span>
+<span class="fc" id="L208">                        return;</span>
+                    }
+                    
+<span class="fc bfc" id="L211" title="All 2 branches covered.">                    if (empty) {</span>
+<span class="fc" id="L212">                        break;</span>
+                    }
+                    
+<span class="fc bfc" id="L215" title="All 2 branches covered.">                    for (PublishProducer&lt;T&gt; inner : a) {</span>
+<span class="fc" id="L216">                        inner.actual.onNext(v);</span>
+                    }
+                    
+<span class="fc" id="L219">                    e++;</span>
+<span class="fc" id="L220">                }</span>
+                
+<span class="fc bfc" id="L222" title="All 2 branches covered.">                if (e == r) {</span>
+<span class="fc bfc" id="L223" title="All 2 branches covered.">                    if (checkTerminated(done, q.isEmpty())) {</span>
+<span class="fc" id="L224">                        return;</span>
+                    }
+                }
+                
+<span class="fc bfc" id="L228" title="All 2 branches covered.">                if (e != 0L) {</span>
+<span class="fc" id="L229">                    Producer p = producer;</span>
+<span class="fc bfc" id="L230" title="All 2 branches covered.">                    if (p != null) {</span>
+<span class="fc" id="L231">                        p.request(e);</span>
+                    }
+<span class="fc bfc" id="L233" title="All 2 branches covered.">                    for (PublishProducer&lt;T&gt; inner : a) {</span>
+<span class="fc" id="L234">                        BackpressureUtils.produced(inner, e);</span>
+                    }
+                    
+                }
+            }
+            
+<span class="fc" id="L240">            missed = addAndGet(-missed);</span>
+<span class="fc bfc" id="L241" title="All 2 branches covered.">            if (missed == 0) {</span>
+<span class="fc" id="L242">                break;</span>
+            }
+<span class="fc" id="L244">        }</span>
+<span class="fc" id="L245">    }</span>
+    
+    /**
+     * Given the current source state, terminates all child subscribers.
+     * @param d the source-done indicator
+     * @param empty the queue-emptiness indicator
+     * @return true if the class reached its terminal state
+     */
+    boolean checkTerminated(boolean d, boolean empty) {
+<span class="fc bfc" id="L254" title="All 2 branches covered.">        if (d) {</span>
+<span class="fc bfc" id="L255" title="All 2 branches covered.">            if (delayError) {</span>
+<span class="fc bfc" id="L256" title="All 2 branches covered.">                if (empty) {</span>
+<span class="fc" id="L257">                    PublishProducer&lt;T&gt;[] a = terminate();</span>
+<span class="fc" id="L258">                    Throwable ex = error;</span>
+<span class="pc bpc" id="L259" title="1 of 2 branches missed.">                    if (ex != null) {</span>
+<span class="fc bfc" id="L260" title="All 2 branches covered.">                        for (PublishProducer&lt;T&gt; inner : a) {</span>
+<span class="fc" id="L261">                            inner.actual.onError(ex);</span>
+                        }
+                    } else {
+<span class="nc bnc" id="L264" title="All 2 branches missed.">                        for (PublishProducer&lt;T&gt; inner : a) {</span>
+<span class="nc" id="L265">                            inner.actual.onCompleted();</span>
+                        }
+                    }
+<span class="fc" id="L268">                    return true;</span>
+                }
+            } else {
+<span class="fc" id="L271">                Throwable ex = error;</span>
+<span class="fc bfc" id="L272" title="All 2 branches covered.">                if (ex != null) {</span>
+<span class="fc" id="L273">                    queue.clear();</span>
+<span class="fc" id="L274">                    PublishProducer&lt;T&gt;[] a = terminate();</span>
+<span class="fc bfc" id="L275" title="All 2 branches covered.">                    for (PublishProducer&lt;T&gt; inner : a) {</span>
+<span class="fc" id="L276">                        inner.actual.onError(ex);</span>
+                    }
+<span class="fc" id="L278">                    return true;</span>
+                } else
+<span class="fc bfc" id="L280" title="All 2 branches covered.">                if (empty) {</span>
+<span class="fc" id="L281">                    PublishProducer&lt;T&gt;[] a = terminate();</span>
+<span class="fc bfc" id="L282" title="All 2 branches covered.">                    for (PublishProducer&lt;T&gt; inner : a) {</span>
+<span class="fc" id="L283">                        inner.actual.onCompleted();</span>
+                    }
+<span class="fc" id="L285">                    return true;</span>
+                }
+            }
+        }
+<span class="fc" id="L289">        return false;</span>
+    }
+
+    /**
+     * Atomically swaps in the terminated state.
+     * @return the last set of subscribers before the state change or an empty array
+     */
+    @SuppressWarnings(&quot;unchecked&quot;)
+    PublishProducer&lt;T&gt;[] terminate() {
+<span class="fc" id="L298">        PublishProducer&lt;T&gt;[] a = subscribers;</span>
+<span class="pc bpc" id="L299" title="1 of 2 branches missed.">        if (a != TERMINATED) {</span>
+<span class="fc" id="L300">            synchronized (this) {</span>
+<span class="fc" id="L301">                a = subscribers;</span>
+<span class="pc bpc" id="L302" title="1 of 2 branches missed.">                if (a != TERMINATED) {</span>
+<span class="fc" id="L303">                    subscribers = (PublishProducer&lt;T&gt;[]) TERMINATED;</span>
+                }
+<span class="pc" id="L305">            }</span>
+        }
+<span class="fc" id="L307">        return a;</span>
+    }
+    
+    /**
+     * Atomically adds the given wrapper of a child Subscriber to the subscribers array.
+     * @param inner the wrapper
+     * @return true if successful, false if the terminal state has been reached in the meantime
+     */
+    boolean add(PublishProducer&lt;T&gt; inner) {
+<span class="fc" id="L316">        PublishProducer&lt;T&gt;[] a = subscribers;</span>
+<span class="fc bfc" id="L317" title="All 2 branches covered.">        if (a == TERMINATED) {</span>
+<span class="fc" id="L318">            return false;</span>
+        }
+<span class="fc" id="L320">        synchronized (this) {</span>
+<span class="fc" id="L321">            a = subscribers;</span>
+<span class="pc bpc" id="L322" title="1 of 2 branches missed.">            if (a == TERMINATED) {</span>
+<span class="nc" id="L323">                return false;</span>
+            }
+            
+<span class="fc" id="L326">            int n = a.length;</span>
+            @SuppressWarnings(&quot;unchecked&quot;)
+<span class="fc" id="L328">            PublishProducer&lt;T&gt;[] b = new PublishProducer[n + 1];</span>
+<span class="fc" id="L329">            System.arraycopy(a, 0, b, 0, n);</span>
+<span class="fc" id="L330">            b[n] = inner;</span>
+<span class="fc" id="L331">            subscribers = b;</span>
+<span class="fc" id="L332">            return true;</span>
+<span class="nc" id="L333">        }</span>
+    }
+
+    /**
+     * Atomically removes the given wrapper, if present, from the subscribers array.
+     * @param inner the wrapper to remove
+     */
+    @SuppressWarnings(&quot;unchecked&quot;)
+    void remove(PublishProducer&lt;T&gt; inner) {
+<span class="fc" id="L342">        PublishProducer&lt;T&gt;[] a = subscribers;</span>
+<span class="pc bpc" id="L343" title="1 of 4 branches missed.">        if (a == TERMINATED || a == EMPTY) {</span>
+<span class="fc" id="L344">            return;</span>
+        }
+<span class="fc" id="L346">        synchronized (this) {</span>
+<span class="fc" id="L347">            a = subscribers;</span>
+<span class="pc bpc" id="L348" title="2 of 4 branches missed.">            if (a == TERMINATED || a == EMPTY) {</span>
+<span class="nc" id="L349">                return;</span>
+            }
+            
+<span class="fc" id="L352">            int j = -1;</span>
+<span class="fc" id="L353">            int n = a.length;</span>
+            
+<span class="pc bpc" id="L355" title="1 of 2 branches missed.">            for (int i = 0; i &lt; n; i++) {</span>
+<span class="fc bfc" id="L356" title="All 2 branches covered.">                if (a[i] == inner) {</span>
+<span class="fc" id="L357">                    j = i;</span>
+<span class="fc" id="L358">                    break;</span>
+                }
+            }
+            
+<span class="pc bpc" id="L362" title="1 of 2 branches missed.">            if (j &lt; 0) {</span>
+<span class="nc" id="L363">                return;</span>
+            }
+            
+            PublishProducer&lt;T&gt;[] b;
+<span class="fc bfc" id="L367" title="All 2 branches covered.">            if (n == 1) {</span>
+<span class="fc" id="L368">                b = (PublishProducer&lt;T&gt;[])EMPTY;</span>
+            } else {
+<span class="fc" id="L370">                b = new PublishProducer[n - 1];</span>
+<span class="fc" id="L371">                System.arraycopy(a, 0, b, 0, j);</span>
+<span class="fc" id="L372">                System.arraycopy(a, j + 1, b, j, n - j - 1);</span>
+            }
+<span class="fc" id="L374">            subscribers = b;</span>
+<span class="pc" id="L375">        }</span>
+<span class="fc" id="L376">    }</span>
+
+    /**
+     * The subscriber that must be used for subscribing to the upstream source.
+     * @param &lt;T&gt; the input value type;
+     */
+    static final class ParentSubscriber&lt;T&gt; extends Subscriber&lt;T&gt; {
+        /** The reference to the parent state where the events are forwarded to. */
+        final OnSubscribePublishMulticast&lt;T&gt; state;
+        
+        public ParentSubscriber(OnSubscribePublishMulticast&lt;T&gt; state) {
+<span class="fc" id="L387">            super();</span>
+<span class="fc" id="L388">            this.state = state;</span>
+<span class="fc" id="L389">        }</span>
+        
+        @Override
+        public void onNext(T t) {
+<span class="fc" id="L393">            state.onNext(t);</span>
+<span class="fc" id="L394">        }</span>
+        
+        @Override
+        public void onError(Throwable e) {
+<span class="nc" id="L398">            state.onError(e);</span>
+<span class="nc" id="L399">        }</span>
+        
+        @Override
+        public void onCompleted() {
+<span class="fc" id="L403">            state.onCompleted();</span>
+<span class="fc" id="L404">        }</span>
+        
+        @Override
+        public void setProducer(Producer p) {
+<span class="fc" id="L408">            state.setProducer(p);</span>
+<span class="fc" id="L409">        }</span>
+    }
+    
+    /**
+     * Returns the input subscriber of this class that must be subscribed
+     * to the upstream source.
+     * @return the subscriber instance
+     */
+    public Subscriber&lt;T&gt; subscriber() {
+<span class="fc" id="L418">        return parent;</span>
+    }
+    
+    @Override
+    public void unsubscribe() {
+<span class="fc" id="L423">        parent.unsubscribe();</span>
+<span class="fc" id="L424">    }</span>
+    
+    @Override
+    public boolean isUnsubscribed() {
+<span class="fc" id="L428">        return parent.isUnsubscribed();</span>
+    }
+    
+    /**
+     * A Producer and Subscription that wraps a child Subscriber and manages
+     * its backpressure requests along with its unsubscription from the parent
+     * class.
+     * 
+     * &lt;p&gt;The class extends AtomicLong that holds onto the child's requested amount.
+     * 
+     * @param &lt;T&gt; the output value type
+     */
+    static final class PublishProducer&lt;T&gt; 
+    extends AtomicLong
+    implements Producer, Subscription {
+        /** */
+        private static final long serialVersionUID = 960704844171597367L;
+
+        /** The actual subscriber to receive the events. */
+        final Subscriber&lt;? super T&gt; actual;
+        
+        /** The parent object to request draining or removal. */
+        final OnSubscribePublishMulticast&lt;T&gt; parent;
+        
+        /** Makes sure unsubscription happens only once. */
+        final AtomicBoolean once;
+
+<span class="fc" id="L455">        public PublishProducer(Subscriber&lt;? super T&gt; actual, OnSubscribePublishMulticast&lt;T&gt; parent) {</span>
+<span class="fc" id="L456">            this.actual = actual;</span>
+<span class="fc" id="L457">            this.parent = parent;</span>
+<span class="fc" id="L458">            this.once = new AtomicBoolean();</span>
+<span class="fc" id="L459">        }</span>
+        
+        @Override
+        public void request(long n) {
+<span class="pc bpc" id="L463" title="1 of 2 branches missed.">            if (n &lt; 0) {</span>
+<span class="nc" id="L464">                throw new IllegalArgumentException(&quot;n &gt;= 0 required but it was &quot; + n);</span>
+            } else
+<span class="fc bfc" id="L466" title="All 2 branches covered.">            if (n != 0) {</span>
+<span class="fc" id="L467">                BackpressureUtils.getAndAddRequest(this, n);</span>
+<span class="fc" id="L468">                parent.drain();</span>
+            }
+<span class="fc" id="L470">        }</span>
+        
+        @Override
+        public boolean isUnsubscribed() {
+<span class="fc" id="L474">            return once.get();</span>
+        }
+        
+        @Override
+        public void unsubscribe() {
+<span class="pc bpc" id="L479" title="1 of 2 branches missed.">            if (once.compareAndSet(false, true)) {</span>
+<span class="fc" id="L480">                parent.remove(this);</span>
+            }
+<span class="fc" id="L482">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

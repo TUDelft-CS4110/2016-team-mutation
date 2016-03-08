@@ -1,0 +1,168 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>OperatorMaterialize.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.internal.operators</a> &gt; <span class="el_source">OperatorMaterialize.java</span></div><h1>OperatorMaterialize.java</h1><pre class="source lang-java linenums">/**
+ * Copyright 2014 Netflix, Inc.
+ * 
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package rx.internal.operators;
+
+import java.util.concurrent.atomic.AtomicLong;
+
+import rx.Notification;
+import rx.Observable.Operator;
+import rx.Producer;
+import rx.Subscriber;
+import rx.plugins.RxJavaPlugins;
+
+/**
+ * Turns all of the notifications from an Observable into {@code onNext} emissions, and marks
+ * them with their original notification types within {@link Notification} objects.
+ * &lt;p&gt;
+ * &lt;img width=&quot;640&quot; src=&quot;https://github.com/ReactiveX/RxJava/wiki/images/rx-operators/materialize.png&quot; alt=&quot;&quot;&gt;
+ * &lt;p&gt;
+ * See &lt;a href=&quot;http://msdn.microsoft.com/en-us/library/hh229453.aspx&quot;&gt;here&lt;/a&gt; for the Microsoft Rx equivalent.
+ */
+public final class OperatorMaterialize&lt;T&gt; implements Operator&lt;Notification&lt;T&gt;, T&gt; {
+
+    /** Lazy initialization via inner-class holder. */
+<span class="nc" id="L37">    private static final class Holder {</span>
+        /** A singleton instance. */
+<span class="fc" id="L39">        static final OperatorMaterialize&lt;Object&gt; INSTANCE = new OperatorMaterialize&lt;Object&gt;();</span>
+    }
+
+    /**
+     * @return a singleton instance of this stateless operator.
+     */
+    @SuppressWarnings(&quot;unchecked&quot;)
+    public static &lt;T&gt; OperatorMaterialize&lt;T&gt; instance() {
+<span class="fc" id="L47">        return (OperatorMaterialize&lt;T&gt;) Holder.INSTANCE;</span>
+    }
+
+<span class="fc" id="L50">    OperatorMaterialize() {</span>
+<span class="fc" id="L51">    }</span>
+
+    @Override
+    public Subscriber&lt;? super T&gt; call(final Subscriber&lt;? super Notification&lt;T&gt;&gt; child) {
+<span class="fc" id="L55">        final ParentSubscriber&lt;T&gt; parent = new ParentSubscriber&lt;T&gt;(child);</span>
+<span class="fc" id="L56">        child.add(parent);</span>
+<span class="fc" id="L57">        child.setProducer(new Producer() {</span>
+            @Override
+            public void request(long n) {
+<span class="fc bfc" id="L60" title="All 2 branches covered.">                if (n &gt; 0) {</span>
+<span class="fc" id="L61">                    parent.requestMore(n);</span>
+                }
+<span class="fc" id="L63">            }</span>
+        });
+<span class="fc" id="L65">        return parent;</span>
+    }
+
+    private static class ParentSubscriber&lt;T&gt; extends Subscriber&lt;T&gt; {
+
+        private final Subscriber&lt;? super Notification&lt;T&gt;&gt; child;
+
+        private volatile Notification&lt;T&gt; terminalNotification;
+        
+        // guarded by this
+<span class="fc" id="L75">        private boolean busy = false;</span>
+        // guarded by this
+<span class="fc" id="L77">        private boolean missed = false;</span>
+
+<span class="fc" id="L79">        private final AtomicLong requested = new AtomicLong();</span>
+
+<span class="fc" id="L81">        ParentSubscriber(Subscriber&lt;? super Notification&lt;T&gt;&gt; child) {</span>
+<span class="fc" id="L82">            this.child = child;</span>
+<span class="fc" id="L83">        }</span>
+
+        @Override
+        public void onStart() {
+<span class="fc" id="L87">            request(0);</span>
+<span class="fc" id="L88">        }</span>
+
+        void requestMore(long n) {
+<span class="fc" id="L91">            BackpressureUtils.getAndAddRequest(requested, n);</span>
+<span class="fc" id="L92">            request(n);</span>
+<span class="fc" id="L93">            drain();</span>
+<span class="fc" id="L94">        }</span>
+
+        @Override
+        public void onCompleted() {
+<span class="fc" id="L98">            terminalNotification = Notification.createOnCompleted();</span>
+<span class="fc" id="L99">            drain();</span>
+<span class="fc" id="L100">        }</span>
+
+        @Override
+        public void onError(Throwable e) {
+<span class="fc" id="L104">            terminalNotification = Notification.createOnError(e);</span>
+<span class="fc" id="L105">            RxJavaPlugins.getInstance().getErrorHandler().handleError(e);</span>
+<span class="fc" id="L106">            drain();</span>
+<span class="fc" id="L107">        }</span>
+
+        @Override
+        public void onNext(T t) {
+<span class="fc" id="L111">            child.onNext(Notification.createOnNext(t));</span>
+<span class="fc" id="L112">            decrementRequested();</span>
+<span class="fc" id="L113">        }</span>
+
+        private void decrementRequested() {
+            // atomically decrement requested
+<span class="fc" id="L117">            AtomicLong localRequested = this.requested;</span>
+            while (true) {
+<span class="fc" id="L119">                long r = localRequested.get();</span>
+<span class="fc bfc" id="L120" title="All 2 branches covered.">                if (r == Long.MAX_VALUE) {</span>
+                    // don't decrement if unlimited requested
+<span class="fc" id="L122">                    return;</span>
+<span class="fc bfc" id="L123" title="All 2 branches covered.">                } else if (localRequested.compareAndSet(r, r - 1)) {</span>
+<span class="fc" id="L124">                    return;</span>
+                }
+<span class="fc" id="L126">            }</span>
+        }
+
+        private void drain() {
+<span class="fc" id="L130">            synchronized (this) {</span>
+<span class="pc bpc" id="L131" title="1 of 2 branches missed.">                if (busy) {</span>
+                    // set flag to force extra loop if drain loop running
+<span class="nc" id="L133">                    missed = true;</span>
+<span class="nc" id="L134">                    return;</span>
+                } 
+<span class="pc" id="L136">            }</span>
+            // drain loop
+<span class="fc" id="L138">            final AtomicLong localRequested = this.requested;</span>
+<span class="fc bfc" id="L139" title="All 2 branches covered.">            while (!child.isUnsubscribed()) {</span>
+                Notification&lt;T&gt; tn;
+<span class="fc" id="L141">                tn = terminalNotification;</span>
+<span class="fc bfc" id="L142" title="All 2 branches covered.">                if (tn != null) {</span>
+<span class="fc bfc" id="L143" title="All 2 branches covered.">                    if (localRequested.get() &gt; 0) {</span>
+                        // allow tn to be GC'd after the onNext call
+<span class="fc" id="L145">                        terminalNotification = null;</span>
+                        // emit the terminal notification
+<span class="fc" id="L147">                        child.onNext(tn);</span>
+<span class="fc bfc" id="L148" title="All 2 branches covered.">                        if (!child.isUnsubscribed()) {</span>
+<span class="fc" id="L149">                            child.onCompleted();</span>
+                        }
+                        // note that we leave busy=true here
+                        // which will prevent further drains
+<span class="fc" id="L153">                        return;</span>
+                    }
+                }
+                // continue looping if drain() was called while in
+                // this loop
+<span class="fc" id="L158">                synchronized (this) {</span>
+<span class="pc bpc" id="L159" title="1 of 2 branches missed.">                    if (!missed) {</span>
+<span class="fc" id="L160">                        busy = false;</span>
+<span class="fc" id="L161">                        return;</span>
+                    }
+<span class="nc" id="L163">                }</span>
+<span class="nc" id="L164">            }</span>
+<span class="fc" id="L165">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

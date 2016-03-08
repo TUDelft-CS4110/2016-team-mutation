@@ -1,0 +1,2243 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>Completable.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx</a> &gt; <span class="el_source">Completable.java</span></div><h1>Completable.java</h1><pre class="source lang-java linenums">/**
+ * Copyright 2014 Netflix, Inc.
+ * 
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package rx;
+
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import rx.Observable.OnSubscribe;
+import rx.annotations.Experimental;
+import rx.exceptions.*;
+import rx.functions.*;
+import rx.internal.operators.*;
+import rx.internal.util.*;
+import rx.plugins.*;
+import rx.schedulers.Schedulers;
+import rx.subscriptions.*;
+
+/**
+ * Represents a deferred computation without any value but only indication for completion or exception.
+ * 
+ * The class follows a similar event pattern as Reactive-Streams: onSubscribe (onError|onComplete)?
+ */
+@Experimental
+public class Completable {
+    /**
+     * Callback used for building deferred computations that takes a CompletableSubscriber.
+     */
+    public interface CompletableOnSubscribe extends Action1&lt;CompletableSubscriber&gt; {
+        
+    }
+    
+    /**
+     * Convenience interface and callback used by the lift operator that given a child CompletableSubscriber,
+     * return a parent CompletableSubscriber that does any kind of lifecycle-related transformations.
+     */
+    public interface CompletableOperator extends Func1&lt;CompletableSubscriber, CompletableSubscriber&gt; {
+        
+    }
+    
+    /**
+     * Represents the subscription API callbacks when subscribing to a Completable instance.
+     */
+    public interface CompletableSubscriber {
+        /**
+         * Called once the deferred computation completes normally.
+         */
+        void onCompleted();
+        
+        /**
+         * Called once if the deferred computation 'throws' an exception.
+         * @param e the exception, not null.
+         */
+        void onError(Throwable e);
+        
+        /**
+         * Called once by the Completable to set a Subscription on this instance which
+         * then can be used to cancel the subscription at any time.
+         * @param d the Subscription instance to call dispose on for cancellation, not null
+         */
+        void onSubscribe(Subscription d);
+    }
+    
+    /**
+     * Convenience interface and callback used by the compose operator to turn a Completable into another
+     * Completable fluently.
+     */
+    public interface CompletableTransformer extends Func1&lt;Completable, Completable&gt; {
+        
+    }
+    
+    /** Single instance of a complete Completable. */
+<span class="fc" id="L87">    static final Completable COMPLETE = create(new CompletableOnSubscribe() {</span>
+        @Override
+        public void call(CompletableSubscriber s) {
+<span class="fc" id="L90">            s.onSubscribe(Subscriptions.unsubscribed());</span>
+<span class="fc" id="L91">            s.onCompleted();</span>
+<span class="fc" id="L92">        }</span>
+    });
+    
+    /** Single instance of a never Completable. */
+<span class="fc" id="L96">    static final Completable NEVER = create(new CompletableOnSubscribe() {</span>
+        @Override
+        public void call(CompletableSubscriber s) {
+<span class="fc" id="L99">            s.onSubscribe(Subscriptions.unsubscribed());</span>
+<span class="fc" id="L100">        }</span>
+    });
+    
+    /** The error handler instance. */
+<span class="fc" id="L104">    static final RxJavaErrorHandler ERROR_HANDLER = RxJavaPlugins.getInstance().getErrorHandler();</span>
+    
+    /**
+     * Returns a Completable which terminates as soon as one of the source Completables
+     * terminates (normally or with an error) and cancels all other Completables.
+     * @param sources the array of source Completables
+     * @return the new Completable instance
+     * @throws NullPointerException if sources is null
+     */
+    public static Completable amb(final Completable... sources) {
+<span class="fc" id="L114">        requireNonNull(sources);</span>
+<span class="fc bfc" id="L115" title="All 2 branches covered.">        if (sources.length == 0) {</span>
+<span class="fc" id="L116">            return complete();</span>
+        }
+<span class="fc bfc" id="L118" title="All 2 branches covered.">        if (sources.length == 1) {</span>
+<span class="fc" id="L119">            return sources[0];</span>
+        }
+        
+<span class="fc" id="L122">        return create(new CompletableOnSubscribe() {</span>
+            @Override
+            public void call(final CompletableSubscriber s) {
+<span class="fc" id="L125">                final CompositeSubscription set = new CompositeSubscription();</span>
+<span class="fc" id="L126">                s.onSubscribe(set);</span>
+
+<span class="fc" id="L128">                final AtomicBoolean once = new AtomicBoolean();</span>
+                
+<span class="fc" id="L130">                CompletableSubscriber inner = new CompletableSubscriber() {</span>
+                    @Override
+                    public void onCompleted() {
+<span class="pc bpc" id="L133" title="1 of 2 branches missed.">                        if (once.compareAndSet(false, true)) {</span>
+<span class="fc" id="L134">                            set.unsubscribe();</span>
+<span class="fc" id="L135">                            s.onCompleted();</span>
+                        }
+<span class="fc" id="L137">                    }</span>
+
+                    @Override
+                    public void onError(Throwable e) {
+<span class="pc bpc" id="L141" title="1 of 2 branches missed.">                        if (once.compareAndSet(false, true)) {</span>
+<span class="fc" id="L142">                            set.unsubscribe();</span>
+<span class="fc" id="L143">                            s.onError(e);</span>
+                        } else {
+<span class="nc" id="L145">                            ERROR_HANDLER.handleError(e);</span>
+                        }
+<span class="fc" id="L147">                    }</span>
+
+                    @Override
+                    public void onSubscribe(Subscription d) {
+<span class="fc" id="L151">                        set.add(d);</span>
+<span class="fc" id="L152">                    }</span>
+                    
+                };
+                
+<span class="fc bfc" id="L156" title="All 2 branches covered.">                for (Completable c : sources) {</span>
+<span class="pc bpc" id="L157" title="1 of 2 branches missed.">                    if (set.isUnsubscribed()) {</span>
+<span class="nc" id="L158">                        return;</span>
+                    }
+<span class="fc bfc" id="L160" title="All 2 branches covered.">                    if (c == null) {</span>
+<span class="fc" id="L161">                        NullPointerException npe = new NullPointerException(&quot;One of the sources is null&quot;);</span>
+<span class="pc bpc" id="L162" title="1 of 2 branches missed.">                        if (once.compareAndSet(false, true)) {</span>
+<span class="fc" id="L163">                            set.unsubscribe();</span>
+<span class="fc" id="L164">                            s.onError(npe);</span>
+                        } else {
+<span class="nc" id="L166">                            ERROR_HANDLER.handleError(npe);</span>
+                        }
+<span class="fc" id="L168">                        return;</span>
+                    }
+<span class="pc bpc" id="L170" title="2 of 4 branches missed.">                    if (once.get() || set.isUnsubscribed()) {</span>
+<span class="nc" id="L171">                        return;</span>
+                    }
+                    
+                    // no need to have separate subscribers because inner is stateless
+<span class="fc" id="L175">                    c.subscribe(inner);</span>
+                }
+<span class="fc" id="L177">            }</span>
+        });
+    }
+    
+    /**
+     * Returns a Completable which terminates as soon as one of the source Completables
+     * terminates (normally or with an error) and cancels all other Completables.
+     * @param sources the array of source Completables
+     * @return the new Completable instance
+     * @throws NullPointerException if sources is null
+     */
+    public static Completable amb(final Iterable&lt;? extends Completable&gt; sources) {
+<span class="fc" id="L189">        requireNonNull(sources);</span>
+        
+<span class="fc" id="L191">        return create(new CompletableOnSubscribe() {</span>
+            @Override
+            public void call(final CompletableSubscriber s) {
+<span class="fc" id="L194">                final CompositeSubscription set = new CompositeSubscription();</span>
+<span class="fc" id="L195">                s.onSubscribe(set);</span>
+
+<span class="fc" id="L197">                final AtomicBoolean once = new AtomicBoolean();</span>
+                
+<span class="fc" id="L199">                CompletableSubscriber inner = new CompletableSubscriber() {</span>
+                    @Override
+                    public void onCompleted() {
+<span class="pc bpc" id="L202" title="1 of 2 branches missed.">                        if (once.compareAndSet(false, true)) {</span>
+<span class="fc" id="L203">                            set.unsubscribe();</span>
+<span class="fc" id="L204">                            s.onCompleted();</span>
+                        }
+<span class="fc" id="L206">                    }</span>
+
+                    @Override
+                    public void onError(Throwable e) {
+<span class="pc bpc" id="L210" title="1 of 2 branches missed.">                        if (once.compareAndSet(false, true)) {</span>
+<span class="fc" id="L211">                            set.unsubscribe();</span>
+<span class="fc" id="L212">                            s.onError(e);</span>
+                        } else {
+<span class="nc" id="L214">                            ERROR_HANDLER.handleError(e);</span>
+                        }
+<span class="fc" id="L216">                    }</span>
+
+                    @Override
+                    public void onSubscribe(Subscription d) {
+<span class="fc" id="L220">                        set.add(d);</span>
+<span class="fc" id="L221">                    }</span>
+                    
+                };
+                
+                Iterator&lt;? extends Completable&gt; it;
+                
+                try {
+<span class="fc" id="L228">                    it = sources.iterator();</span>
+<span class="fc" id="L229">                } catch (Throwable e) {</span>
+<span class="fc" id="L230">                    s.onError(e);</span>
+<span class="fc" id="L231">                    return;</span>
+<span class="fc" id="L232">                }</span>
+                
+<span class="fc bfc" id="L234" title="All 2 branches covered.">                if (it == null) {</span>
+<span class="fc" id="L235">                    s.onError(new NullPointerException(&quot;The iterator returned is null&quot;));</span>
+<span class="fc" id="L236">                    return;</span>
+                }
+                
+<span class="fc" id="L239">                boolean empty = true;</span>
+                
+                for (;;) {
+<span class="pc bpc" id="L242" title="1 of 4 branches missed.">                    if (once.get() || set.isUnsubscribed()) {</span>
+<span class="fc" id="L243">                        return;</span>
+                    }
+                    
+                    boolean b;
+                    
+                    try {
+<span class="fc" id="L249">                        b = it.hasNext();</span>
+<span class="fc" id="L250">                    } catch (Throwable e) {</span>
+<span class="pc bpc" id="L251" title="1 of 2 branches missed.">                        if (once.compareAndSet(false, true)) {</span>
+<span class="fc" id="L252">                            set.unsubscribe();</span>
+<span class="fc" id="L253">                            s.onError(e);</span>
+                        } else {
+<span class="nc" id="L255">                            ERROR_HANDLER.handleError(e);</span>
+                        }
+<span class="fc" id="L257">                        return;</span>
+<span class="fc" id="L258">                    }</span>
+                    
+<span class="fc bfc" id="L260" title="All 2 branches covered.">                    if (!b) {</span>
+<span class="pc bpc" id="L261" title="1 of 2 branches missed.">                        if (empty) {</span>
+<span class="fc" id="L262">                            s.onCompleted();</span>
+                        }
+                        break;
+                    }
+                    
+<span class="fc" id="L267">                    empty = false;</span>
+                    
+<span class="pc bpc" id="L269" title="2 of 4 branches missed.">                    if (once.get() || set.isUnsubscribed()) {</span>
+<span class="nc" id="L270">                        return;</span>
+                    }
+
+                    Completable c;
+                    
+                    try {
+<span class="fc" id="L276">                        c = it.next();</span>
+<span class="fc" id="L277">                    } catch (Throwable e) {</span>
+<span class="pc bpc" id="L278" title="1 of 2 branches missed.">                        if (once.compareAndSet(false, true)) {</span>
+<span class="fc" id="L279">                            set.unsubscribe();</span>
+<span class="fc" id="L280">                            s.onError(e);</span>
+                        } else {
+<span class="nc" id="L282">                            ERROR_HANDLER.handleError(e);</span>
+                        }
+<span class="fc" id="L284">                        return;</span>
+<span class="fc" id="L285">                    }</span>
+                    
+<span class="fc bfc" id="L287" title="All 2 branches covered.">                    if (c == null) {</span>
+<span class="fc" id="L288">                        NullPointerException npe = new NullPointerException(&quot;One of the sources is null&quot;);</span>
+<span class="pc bpc" id="L289" title="1 of 2 branches missed.">                        if (once.compareAndSet(false, true)) {</span>
+<span class="fc" id="L290">                            set.unsubscribe();</span>
+<span class="fc" id="L291">                            s.onError(npe);</span>
+                        } else {
+<span class="nc" id="L293">                            ERROR_HANDLER.handleError(npe);</span>
+                        }
+<span class="fc" id="L295">                        return;</span>
+                    }
+                    
+<span class="pc bpc" id="L298" title="2 of 4 branches missed.">                    if (once.get() || set.isUnsubscribed()) {</span>
+<span class="nc" id="L299">                        return;</span>
+                    }
+                    
+                    // no need to have separate subscribers because inner is stateless
+<span class="fc" id="L303">                    c.subscribe(inner);</span>
+<span class="fc" id="L304">                }</span>
+<span class="fc" id="L305">            }</span>
+        });
+    }
+    
+    /**
+     * Returns a Completable instance that completes immediately when subscribed to.
+     * @return a Completable instance that completes immediately 
+     */
+    public static Completable complete() {
+<span class="fc" id="L314">        return COMPLETE;</span>
+    }
+    
+    /**
+     * Returns a Completable which completes only when all sources complete, one after another.
+     * @param sources the sources to concatenate
+     * @return the Completable instance which completes only when all sources complete
+     * @throws NullPointerException if sources is null
+     */
+    public static Completable concat(Completable... sources) {
+<span class="fc" id="L324">        requireNonNull(sources);</span>
+<span class="fc bfc" id="L325" title="All 2 branches covered.">        if (sources.length == 0) {</span>
+<span class="fc" id="L326">            return complete();</span>
+        } else
+<span class="fc bfc" id="L328" title="All 2 branches covered.">        if (sources.length == 1) {</span>
+<span class="fc" id="L329">            return sources[0];</span>
+        }
+<span class="fc" id="L331">        return create(new CompletableOnSubscribeConcatArray(sources));</span>
+    }
+    
+    /**
+     * Returns a Completable which completes only when all sources complete, one after another.
+     * @param sources the sources to concatenate
+     * @return the Completable instance which completes only when all sources complete
+     * @throws NullPointerException if sources is null
+     */
+    public static Completable concat(Iterable&lt;? extends Completable&gt; sources) {
+<span class="fc" id="L341">        requireNonNull(sources);</span>
+        
+<span class="fc" id="L343">        return create(new CompletableOnSubscribeConcatIterable(sources));</span>
+    }
+    
+    /**
+     * Returns a Completable which completes only when all sources complete, one after another.
+     * @param sources the sources to concatenate
+     * @return the Completable instance which completes only when all sources complete
+     * @throws NullPointerException if sources is null
+     */
+    public static Completable concat(Observable&lt;? extends Completable&gt; sources) {
+<span class="fc" id="L353">        return concat(sources, 2);</span>
+    }
+    
+    /**
+     * Returns a Completable which completes only when all sources complete, one after another.
+     * @param sources the sources to concatenate
+     * @param prefetch the number of sources to prefetch from the sources
+     * @return the Completable instance which completes only when all sources complete
+     * @throws NullPointerException if sources is null
+     */
+    public static Completable concat(Observable&lt;? extends Completable&gt; sources, int prefetch) {
+<span class="fc" id="L364">        requireNonNull(sources);</span>
+<span class="pc bpc" id="L365" title="1 of 2 branches missed.">        if (prefetch &lt; 1) {</span>
+<span class="nc" id="L366">            throw new IllegalArgumentException(&quot;prefetch &gt; 0 required but it was &quot; + prefetch);</span>
+        }
+<span class="fc" id="L368">        return create(new CompletableOnSubscribeConcat(sources, prefetch));</span>
+    }
+    
+    /**
+     * Constructs a Completable instance by wrapping the given onSubscribe callback.
+     * @param onSubscribe the callback which will receive the CompletableSubscriber instances
+     * when the Completable is subscribed to.
+     * @return the created Completable instance
+     * @throws NullPointerException if onSubscribe is null
+     */
+    public static Completable create(CompletableOnSubscribe onSubscribe) {
+<span class="fc" id="L379">        requireNonNull(onSubscribe);</span>
+        try {
+            // TODO plugin wrapping onSubscribe
+            
+<span class="fc" id="L383">            return new Completable(onSubscribe);</span>
+<span class="nc" id="L384">        } catch (NullPointerException ex) {</span>
+<span class="nc" id="L385">            throw ex;</span>
+<span class="nc" id="L386">        } catch (Throwable ex) {</span>
+<span class="nc" id="L387">            ERROR_HANDLER.handleError(ex);</span>
+<span class="nc" id="L388">            throw toNpe(ex);</span>
+        } 
+    }
+    
+    /**
+     * Defers the subscription to a Completable instance returned by a supplier.
+     * @param completableFunc0 the supplier that returns the Completable that will be subscribed to.
+     * @return the Completable instance
+     */
+    public static Completable defer(final Func0&lt;? extends Completable&gt; completableFunc0) {
+<span class="fc" id="L398">        requireNonNull(completableFunc0);</span>
+<span class="fc" id="L399">        return create(new CompletableOnSubscribe() {</span>
+            @Override
+            public void call(CompletableSubscriber s) {
+                Completable c;
+                
+                try {
+<span class="fc" id="L405">                    c = completableFunc0.call();</span>
+<span class="fc" id="L406">                } catch (Throwable e) {</span>
+<span class="fc" id="L407">                    s.onSubscribe(Subscriptions.unsubscribed());</span>
+<span class="fc" id="L408">                    s.onError(e);</span>
+<span class="fc" id="L409">                    return;</span>
+<span class="fc" id="L410">                }</span>
+                
+<span class="fc bfc" id="L412" title="All 2 branches covered.">                if (c == null) {</span>
+<span class="fc" id="L413">                    s.onSubscribe(Subscriptions.unsubscribed());</span>
+<span class="fc" id="L414">                    s.onError(new NullPointerException(&quot;The completable returned is null&quot;));</span>
+<span class="fc" id="L415">                    return;</span>
+                }
+                
+<span class="fc" id="L418">                c.subscribe(s);</span>
+<span class="fc" id="L419">            }</span>
+        });
+    }
+    
+    /**
+     * Creates a Completable which calls the given error supplier for each subscriber
+     * and emits its returned Throwable.
+     * &lt;p&gt;
+     * If the errorFunc0 returns null, the child CompletableSubscribers will receive a
+     * NullPointerException.
+     * @param errorFunc0 the error supplier, not null
+     * @return the new Completable instance
+     * @throws NullPointerException if errorFunc0 is null
+     */
+    public static Completable error(final Func0&lt;? extends Throwable&gt; errorFunc0) {
+<span class="nc" id="L434">        requireNonNull(errorFunc0);</span>
+<span class="nc" id="L435">        return create(new CompletableOnSubscribe() {</span>
+            @Override
+            public void call(CompletableSubscriber s) {
+<span class="nc" id="L438">                s.onSubscribe(Subscriptions.unsubscribed());</span>
+                Throwable error;
+                
+                try {
+<span class="nc" id="L442">                    error = errorFunc0.call();</span>
+<span class="nc" id="L443">                } catch (Throwable e) {</span>
+<span class="nc" id="L444">                    error = e;</span>
+<span class="nc" id="L445">                }</span>
+                
+<span class="nc bnc" id="L447" title="All 2 branches missed.">                if (error == null) {</span>
+<span class="nc" id="L448">                    error = new NullPointerException(&quot;The error supplied is null&quot;);</span>
+                }
+<span class="nc" id="L450">                s.onError(error);</span>
+<span class="nc" id="L451">            }</span>
+        });
+    }
+
+    /**
+     * Creates a Completable instance that emits the given Throwable exception to subscribers.
+     * @param error the Throwable instance to emit, not null
+     * @return the new Completable instance
+     * @throws NullPointerException if error is null
+     */
+    public static Completable error(final Throwable error) {
+<span class="fc" id="L462">        requireNonNull(error);</span>
+<span class="fc" id="L463">        return create(new CompletableOnSubscribe() {</span>
+            @Override
+            public void call(CompletableSubscriber s) {
+<span class="fc" id="L466">                s.onSubscribe(Subscriptions.unsubscribed());</span>
+<span class="fc" id="L467">                s.onError(error);</span>
+<span class="fc" id="L468">            }</span>
+        });
+    }
+    
+    /**
+     * Returns a Completable instance that runs the given Action0 for each subscriber and
+     * emits either an unchecked exception or simply completes.
+     * @param run the runnable to run for each subscriber
+     * @return the new Completable instance
+     * @throws NullPointerException if run is null
+     */
+    public static Completable fromAction(final Action0 action) {
+<span class="fc" id="L480">        requireNonNull(action);</span>
+<span class="fc" id="L481">        return create(new CompletableOnSubscribe() {</span>
+            @Override
+            public void call(CompletableSubscriber s) {
+<span class="fc" id="L484">                BooleanSubscription bs = new BooleanSubscription();</span>
+<span class="fc" id="L485">                s.onSubscribe(bs);</span>
+                try {
+<span class="fc" id="L487">                    action.call();</span>
+<span class="fc" id="L488">                } catch (Throwable e) {</span>
+<span class="pc bpc" id="L489" title="1 of 2 branches missed.">                    if (!bs.isUnsubscribed()) {</span>
+<span class="fc" id="L490">                        s.onError(e);</span>
+                    }
+<span class="fc" id="L492">                    return;</span>
+<span class="fc" id="L493">                }</span>
+<span class="pc bpc" id="L494" title="1 of 2 branches missed.">                if (!bs.isUnsubscribed()) {</span>
+<span class="fc" id="L495">                    s.onCompleted();</span>
+                }
+<span class="fc" id="L497">            }</span>
+        });
+    }
+    
+    /**
+     * Returns a Completable which when subscribed, executes the callable function, ignores its
+     * normal result and emits onError or onCompleted only.
+     * @param callable the callable instance to execute for each subscriber
+     * @return the new Completable instance
+     */
+    public static Completable fromCallable(final Callable&lt;?&gt; callable) {
+<span class="fc" id="L508">        requireNonNull(callable);</span>
+<span class="fc" id="L509">        return create(new CompletableOnSubscribe() {</span>
+            @Override
+            public void call(CompletableSubscriber s) {
+<span class="fc" id="L512">                BooleanSubscription bs = new BooleanSubscription();</span>
+<span class="fc" id="L513">                s.onSubscribe(bs);</span>
+                try {
+<span class="fc" id="L515">                    callable.call();</span>
+<span class="fc" id="L516">                } catch (Throwable e) {</span>
+<span class="pc bpc" id="L517" title="1 of 2 branches missed.">                    if (!bs.isUnsubscribed()) {</span>
+<span class="fc" id="L518">                        s.onError(e);</span>
+                    }
+<span class="fc" id="L520">                    return;</span>
+<span class="fc" id="L521">                }</span>
+<span class="fc bfc" id="L522" title="All 2 branches covered.">                if (!bs.isUnsubscribed()) {</span>
+<span class="fc" id="L523">                    s.onCompleted();</span>
+                }
+<span class="fc" id="L525">            }</span>
+        });
+    }
+    
+    /**
+     * Returns a Completable instance that reacts to the termination of the given Future in a blocking fashion.
+     * &lt;p&gt;
+     * Note that cancellation from any of the subscribers to this Completable will cancel the future.
+     * @param future the future to react to
+     * @return the new Completable instance
+     */
+    public static Completable fromFuture(Future&lt;?&gt; future) {
+<span class="fc" id="L537">        requireNonNull(future);</span>
+<span class="fc" id="L538">        return fromObservable(Observable.from(future));</span>
+    }
+    
+    /**
+     * Returns a Completable instance that subscribes to the given flowable, ignores all values and
+     * emits only the terminal event.
+     * @param flowable the Flowable instance to subscribe to, not null
+     * @return the new Completable instance
+     * @throws NullPointerException if flowable is null
+     */
+    public static Completable fromObservable(final Observable&lt;?&gt; flowable) {
+<span class="fc" id="L549">        requireNonNull(flowable);</span>
+<span class="fc" id="L550">        return create(new CompletableOnSubscribe() {</span>
+            @Override
+            public void call(final CompletableSubscriber cs) {
+<span class="fc" id="L553">                Subscriber&lt;Object&gt; subscriber = new Subscriber&lt;Object&gt;() {</span>
+
+                    @Override
+                    public void onCompleted() {
+<span class="fc" id="L557">                        cs.onCompleted();</span>
+<span class="fc" id="L558">                    }</span>
+
+                    @Override
+                    public void onError(Throwable t) {
+<span class="fc" id="L562">                        cs.onError(t);</span>
+<span class="fc" id="L563">                    }</span>
+
+                    @Override
+                    public void onNext(Object t) {
+                        // ignored
+<span class="fc" id="L568">                    }</span>
+                };
+<span class="fc" id="L570">                cs.onSubscribe(subscriber);</span>
+<span class="fc" id="L571">                flowable.unsafeSubscribe(subscriber);</span>
+<span class="fc" id="L572">            }</span>
+        });
+    }
+
+    /**
+     * Returns a Completable instance that when subscribed to, subscribes to the Single instance and
+     * emits a completion event if the single emits onSuccess or forwards any onError events.
+     * @param single the Single instance to subscribe to, not null
+     * @return the new Completable instance
+     * @throws NullPointerException if single is null
+     */
+    public static Completable fromSingle(final Single&lt;?&gt; single) {
+<span class="fc" id="L584">        requireNonNull(single);</span>
+<span class="fc" id="L585">        return create(new CompletableOnSubscribe() {</span>
+            @Override
+            public void call(final CompletableSubscriber s) {
+<span class="fc" id="L588">                SingleSubscriber&lt;Object&gt; te = new SingleSubscriber&lt;Object&gt;() {</span>
+
+                    @Override
+                    public void onError(Throwable e) {
+<span class="fc" id="L592">                        s.onError(e);</span>
+<span class="fc" id="L593">                    }</span>
+
+                    @Override
+                    public void onSuccess(Object value) {
+<span class="fc" id="L597">                        s.onCompleted();</span>
+<span class="fc" id="L598">                    }</span>
+                    
+                };
+<span class="fc" id="L601">                s.onSubscribe(te);</span>
+<span class="fc" id="L602">                single.subscribe(te);</span>
+<span class="fc" id="L603">            }</span>
+        });
+    }
+    
+    /**
+     * Returns a Completable instance that subscribes to all sources at once and
+     * completes only when all source Completables complete or one of them emits an error.
+     * @param sources the iterable sequence of sources.
+     * @return the new Completable instance
+     * @throws NullPointerException if sources is null
+     */
+    public static Completable merge(Completable... sources) {
+<span class="fc" id="L615">        requireNonNull(sources);</span>
+<span class="fc bfc" id="L616" title="All 2 branches covered.">        if (sources.length == 0) {</span>
+<span class="fc" id="L617">            return complete();</span>
+        } else
+<span class="fc bfc" id="L619" title="All 2 branches covered.">        if (sources.length == 1) {</span>
+<span class="fc" id="L620">            return sources[0];</span>
+        }
+<span class="fc" id="L622">        return create(new CompletableOnSubscribeMergeArray(sources));</span>
+    }
+    
+    /**
+     * Returns a Completable instance that subscribes to all sources at once and
+     * completes only when all source Completables complete or one of them emits an error.
+     * @param sources the iterable sequence of sources.
+     * @return the new Completable instance
+     * @throws NullPointerException if sources is null
+     */
+    public static Completable merge(Iterable&lt;? extends Completable&gt; sources) {
+<span class="fc" id="L633">        requireNonNull(sources);</span>
+<span class="fc" id="L634">        return create(new CompletableOnSubscribeMergeIterable(sources));</span>
+    }
+
+    /**
+     * Returns a Completable instance that subscribes to all sources at once and
+     * completes only when all source Completables complete or one of them emits an error.
+     * @param sources the iterable sequence of sources.
+     * @return the new Completable instance
+     * @throws NullPointerException if sources is null
+     */
+    public static Completable merge(Observable&lt;? extends Completable&gt; sources) {
+<span class="fc" id="L645">        return merge0(sources, Integer.MAX_VALUE, false);</span>
+    }
+    
+    /**
+     * Returns a Completable instance that keeps subscriptions to a limited number of sources at once and
+     * completes only when all source Completables complete or one of them emits an error.
+     * @param sources the iterable sequence of sources.
+     * @param maxConcurrency the maximum number of concurrent subscriptions
+     * @return the new Completable instance
+     * @throws NullPointerException if sources is null
+     * @throws IllegalArgumentException if maxConcurrency is less than 1
+     */
+    public static Completable merge(Observable&lt;? extends Completable&gt; sources, int maxConcurrency) {
+<span class="fc" id="L658">        return merge0(sources, maxConcurrency, false);</span>
+        
+    }
+    
+    /**
+     * Returns a Completable instance that keeps subscriptions to a limited number of sources at once and
+     * completes only when all source Completables terminate in one way or another, combining any exceptions
+     * thrown by either the sources Observable or the inner Completable instances.
+     * @param sources the iterable sequence of sources.
+     * @param maxConcurrency the maximum number of concurrent subscriptions
+     * @param delayErrors delay all errors from the main source and from the inner Completables?
+     * @return the new Completable instance
+     * @throws NullPointerException if sources is null
+     * @throws IllegalArgumentException if maxConcurrency is less than 1
+     */
+    protected static Completable merge0(Observable&lt;? extends Completable&gt; sources, int maxConcurrency, boolean delayErrors) {
+<span class="fc" id="L674">        requireNonNull(sources);</span>
+<span class="pc bpc" id="L675" title="1 of 2 branches missed.">        if (maxConcurrency &lt; 1) {</span>
+<span class="nc" id="L676">            throw new IllegalArgumentException(&quot;maxConcurrency &gt; 0 required but it was &quot; + maxConcurrency);</span>
+        }
+<span class="fc" id="L678">        return create(new CompletableOnSubscribeMerge(sources, maxConcurrency, delayErrors));</span>
+    }
+    
+    /**
+     * Returns a Completable that subscribes to all Completables in the source array and delays
+     * any error emitted by either the sources observable or any of the inner Completables until all of
+     * them terminate in a way or another.
+     * @param sources the array of Completables
+     * @return the new Completable instance
+     * @throws NullPointerException if sources is null
+     */
+    public static Completable mergeDelayError(Completable... sources) {
+<span class="fc" id="L690">        requireNonNull(sources);</span>
+<span class="fc" id="L691">        return create(new CompletableOnSubscribeMergeDelayErrorArray(sources));</span>
+    }
+
+    /**
+     * Returns a Completable that subscribes to all Completables in the source sequence and delays
+     * any error emitted by either the sources observable or any of the inner Completables until all of
+     * them terminate in a way or another.
+     * @param sources the sequence of Completables
+     * @return the new Completable instance
+     * @throws NullPointerException if sources is null
+     */
+    public static Completable mergeDelayError(Iterable&lt;? extends Completable&gt; sources) {
+<span class="fc" id="L703">        requireNonNull(sources);</span>
+<span class="fc" id="L704">        return create(new CompletableOnSubscribeMergeDelayErrorIterable(sources));</span>
+    }
+
+    /**
+     * Returns a Completable that subscribes to all Completables in the source sequence and delays
+     * any error emitted by either the sources observable or any of the inner Completables until all of
+     * them terminate in a way or another.
+     * @param sources the sequence of Completables
+     * @return the new Completable instance
+     * @throws NullPointerException if sources is null
+     */
+    public static Completable mergeDelayError(Observable&lt;? extends Completable&gt; sources) {
+<span class="fc" id="L716">        return merge0(sources, Integer.MAX_VALUE, true);</span>
+    }
+
+    
+    /**
+     * Returns a Completable that subscribes to a limited number of inner Completables at once in 
+     * the source sequence and delays any error emitted by either the sources 
+     * observable or any of the inner Completables until all of
+     * them terminate in a way or another.
+     * @param sources the sequence of Completables
+     * @return the new Completable instance
+     * @throws NullPointerException if sources is null
+     */
+    public static Completable mergeDelayError(Observable&lt;? extends Completable&gt; sources, int maxConcurrency) {
+<span class="fc" id="L730">        return merge0(sources, maxConcurrency, true);</span>
+    }
+    
+    /**
+     * Returns a Completable that never calls onError or onComplete.
+     * @return the singleton instance that never calls onError or onComplete
+     */
+    public static Completable never() {
+<span class="fc" id="L738">        return NEVER;</span>
+    }
+    
+    /**
+     * Java 7 backport: throws a NullPointerException if o is null.
+     * @param o the object to check
+     * @return the o value
+     * @throws NullPointerException if o is null
+     */
+    static &lt;T&gt; T requireNonNull(T o) {
+<span class="fc bfc" id="L748" title="All 2 branches covered.">        if (o == null) {</span>
+<span class="fc" id="L749">            throw new NullPointerException();</span>
+        }
+<span class="fc" id="L751">        return o;</span>
+    }
+    
+    /**
+     * Returns a Completable instance that fires its onComplete event after the given delay ellapsed.
+     * @param delay the delay time
+     * @param unit the delay unit
+     * @return the new Completable instance
+     */
+    public static Completable timer(long delay, TimeUnit unit) {
+<span class="fc" id="L761">        return timer(delay, unit, Schedulers.computation());</span>
+    }
+    
+    /**
+     * Returns a Completable instance that fires its onComplete event after the given delay ellapsed
+     * by using the supplied scheduler.
+     * @param delay the delay time
+     * @param unit the delay unit
+     * @return the new Completable instance
+     */
+    public static Completable timer(final long delay, final TimeUnit unit, final Scheduler scheduler) {
+<span class="fc" id="L772">        requireNonNull(unit);</span>
+<span class="fc" id="L773">        requireNonNull(scheduler);</span>
+<span class="fc" id="L774">        return create(new CompletableOnSubscribe() {</span>
+            @Override
+            public void call(final CompletableSubscriber s) {
+<span class="fc" id="L777">                MultipleAssignmentSubscription mad = new MultipleAssignmentSubscription();</span>
+<span class="fc" id="L778">                s.onSubscribe(mad);</span>
+<span class="pc bpc" id="L779" title="1 of 2 branches missed.">                if (!mad.isUnsubscribed()) {</span>
+<span class="fc" id="L780">                    final Scheduler.Worker w = scheduler.createWorker();</span>
+<span class="fc" id="L781">                    mad.set(w);</span>
+<span class="fc" id="L782">                    w.schedule(new Action0() {</span>
+                        @Override
+                        public void call() {
+                            try {
+<span class="fc" id="L786">                                s.onCompleted();</span>
+                            } finally {
+<span class="pc" id="L788">                                w.unsubscribe();</span>
+<span class="fc" id="L789">                            }</span>
+<span class="fc" id="L790">                        }</span>
+                    }, delay, unit);
+                }
+<span class="fc" id="L793">            }</span>
+        });
+    }
+    
+    /**
+     * Creates a NullPointerException instance and sets the given Throwable as its initial cause.
+     * @param ex the Throwable instance to use as cause, not null (not verified)
+     * @return the created NullPointerException
+     */
+    static NullPointerException toNpe(Throwable ex) {
+<span class="fc" id="L803">        NullPointerException npe = new NullPointerException(&quot;Actually not, but can't pass out an exception otherwise...&quot;);</span>
+<span class="fc" id="L804">        npe.initCause(ex);</span>
+<span class="fc" id="L805">        return npe;</span>
+    }
+    
+    /**
+     * Returns a Completable instance which manages a resource along 
+     * with a custom Completable instance while the subscription is active.
+     * &lt;p&gt;
+     * This overload performs an eager unsubscription before the terminal event is emitted.
+     * 
+     * @param resourceFunc0 the supplier that returns a resource to be managed. 
+     * @param completableFunc1 the function that given a resource returns a Completable instance that will be subscribed to
+     * @param disposer the consumer that disposes the resource created by the resource supplier
+     * @return the new Completable instance
+     */
+    public static &lt;R&gt; Completable using(Func0&lt;R&gt; resourceFunc0, 
+            Func1&lt;? super R, ? extends Completable&gt; completableFunc1, 
+            Action1&lt;? super R&gt; disposer) {
+<span class="fc" id="L822">        return using(resourceFunc0, completableFunc1, disposer, true);</span>
+    }
+    
+    /**
+     * Returns a Completable instance which manages a resource along 
+     * with a custom Completable instance while the subscription is active and performs eager or lazy
+     * resource disposition.
+     * &lt;p&gt;
+     * If this overload performs a lazy unsubscription after the terminal event is emitted.
+     * Exceptions thrown at this time will be delivered to RxJavaPlugins only.
+     * 
+     * @param resourceFunc0 the supplier that returns a resource to be managed
+     * @param completableFunc1 the function that given a resource returns a non-null
+     * Completable instance that will be subscribed to
+     * @param disposer the consumer that disposes the resource created by the resource supplier
+     * @param eager if true, the resource is disposed before the terminal event is emitted, if false, the
+     * resource is disposed after the terminal event has been emitted
+     * @return the new Completable instance
+     */
+    public static &lt;R&gt; Completable using(final Func0&lt;R&gt; resourceFunc0, 
+            final Func1&lt;? super R, ? extends Completable&gt; completableFunc1, 
+            final Action1&lt;? super R&gt; disposer, 
+            final boolean eager) {
+<span class="fc" id="L845">        requireNonNull(resourceFunc0);</span>
+<span class="fc" id="L846">        requireNonNull(completableFunc1);</span>
+<span class="fc" id="L847">        requireNonNull(disposer);</span>
+        
+<span class="fc" id="L849">        return create(new CompletableOnSubscribe() {</span>
+            @Override
+            public void call(final CompletableSubscriber s) {
+                final R resource;
+                
+                try {
+<span class="fc" id="L855">                    resource = resourceFunc0.call();</span>
+<span class="fc" id="L856">                } catch (Throwable e) {</span>
+<span class="fc" id="L857">                    s.onSubscribe(Subscriptions.unsubscribed());</span>
+<span class="fc" id="L858">                    s.onError(e);</span>
+<span class="fc" id="L859">                    return;</span>
+<span class="fc" id="L860">                }</span>
+                
+                Completable cs;
+                
+                try {
+<span class="fc" id="L865">                    cs = completableFunc1.call(resource);</span>
+<span class="fc" id="L866">                } catch (Throwable e) {</span>
+                    try {
+<span class="fc" id="L868">                        disposer.call(resource);</span>
+<span class="fc" id="L869">                    } catch (Throwable ex) {</span>
+<span class="fc" id="L870">                        Exceptions.throwIfFatal(e);</span>
+<span class="fc" id="L871">                        Exceptions.throwIfFatal(ex);</span>
+
+<span class="fc" id="L873">                        s.onSubscribe(Subscriptions.unsubscribed());</span>
+<span class="fc" id="L874">                        s.onError(new CompositeException(Arrays.asList(e, ex)));</span>
+<span class="fc" id="L875">                        return;</span>
+<span class="fc" id="L876">                    }</span>
+<span class="fc" id="L877">                    Exceptions.throwIfFatal(e);</span>
+                    
+<span class="fc" id="L879">                    s.onSubscribe(Subscriptions.unsubscribed());</span>
+<span class="fc" id="L880">                    s.onError(e);</span>
+<span class="fc" id="L881">                    return;</span>
+<span class="fc" id="L882">                }</span>
+                
+<span class="fc bfc" id="L884" title="All 2 branches covered.">                if (cs == null) {</span>
+                    try {
+<span class="fc" id="L886">                        disposer.call(resource);</span>
+<span class="fc" id="L887">                    } catch (Throwable ex) {</span>
+<span class="fc" id="L888">                        Exceptions.throwIfFatal(ex);</span>
+
+<span class="fc" id="L890">                        s.onSubscribe(Subscriptions.unsubscribed());</span>
+<span class="fc" id="L891">                        s.onError(new CompositeException(Arrays.asList(new NullPointerException(&quot;The completable supplied is null&quot;), ex)));</span>
+<span class="fc" id="L892">                        return;</span>
+<span class="fc" id="L893">                    }</span>
+<span class="fc" id="L894">                    s.onSubscribe(Subscriptions.unsubscribed());</span>
+<span class="fc" id="L895">                    s.onError(new NullPointerException(&quot;The completable supplied is null&quot;));</span>
+<span class="fc" id="L896">                    return;</span>
+                }
+                
+<span class="fc" id="L899">                final AtomicBoolean once = new AtomicBoolean();</span>
+                
+<span class="fc" id="L901">                cs.subscribe(new CompletableSubscriber() {</span>
+                    Subscription d;
+                    void dispose() {
+<span class="fc" id="L904">                        d.unsubscribe();</span>
+<span class="pc bpc" id="L905" title="1 of 2 branches missed.">                        if (once.compareAndSet(false, true)) {</span>
+                            try {
+<span class="fc" id="L907">                                disposer.call(resource);</span>
+<span class="nc" id="L908">                            } catch (Throwable ex) {</span>
+<span class="nc" id="L909">                                ERROR_HANDLER.handleError(ex);</span>
+<span class="fc" id="L910">                            }</span>
+                        }
+<span class="fc" id="L912">                    }</span>
+
+                    @Override
+                    public void onCompleted() {
+<span class="fc bfc" id="L916" title="All 2 branches covered.">                        if (eager) {</span>
+<span class="pc bpc" id="L917" title="1 of 2 branches missed.">                            if (once.compareAndSet(false, true)) {</span>
+                                try {
+<span class="fc" id="L919">                                    disposer.call(resource);</span>
+<span class="fc" id="L920">                                } catch (Throwable ex) {</span>
+<span class="fc" id="L921">                                    s.onError(ex);</span>
+<span class="fc" id="L922">                                    return;</span>
+<span class="fc" id="L923">                                }</span>
+                            }
+                        }
+                        
+<span class="fc" id="L927">                        s.onCompleted();</span>
+                        
+<span class="fc bfc" id="L929" title="All 2 branches covered.">                        if (!eager) {</span>
+<span class="fc" id="L930">                            dispose();</span>
+                        }
+<span class="fc" id="L932">                    }</span>
+
+                    @Override
+                    public void onError(Throwable e) {
+<span class="fc bfc" id="L936" title="All 2 branches covered.">                        if (eager) {</span>
+<span class="pc bpc" id="L937" title="1 of 2 branches missed.">                            if (once.compareAndSet(false, true)) {</span>
+                                try {
+<span class="fc" id="L939">                                    disposer.call(resource);</span>
+<span class="nc" id="L940">                                } catch (Throwable ex) {</span>
+<span class="nc" id="L941">                                    e = new CompositeException(Arrays.asList(e, ex));</span>
+<span class="fc" id="L942">                                }</span>
+                            }
+                        }
+                        
+<span class="fc" id="L946">                        s.onError(e);</span>
+                        
+<span class="fc bfc" id="L948" title="All 2 branches covered.">                        if (!eager) {</span>
+<span class="fc" id="L949">                            dispose();</span>
+                        }
+<span class="fc" id="L951">                    }</span>
+                    
+                    @Override
+                    public void onSubscribe(Subscription d) {
+<span class="fc" id="L955">                        this.d = d;</span>
+<span class="fc" id="L956">                        s.onSubscribe(Subscriptions.create(new Action0() {</span>
+                            @Override
+                            public void call() {
+<span class="nc" id="L959">                                dispose();</span>
+<span class="nc" id="L960">                            }</span>
+                        }));
+<span class="fc" id="L962">                    }</span>
+                });
+<span class="fc" id="L964">            }</span>
+        });
+    }
+    
+    /** The actual subscription action. */
+    private final CompletableOnSubscribe onSubscribe;
+    
+    /**
+     * Constructs a Completable instance with the given onSubscribe callback.
+     * @param onSubscribe the callback that will receive CompletableSubscribers when they subscribe,
+     * not null (not verified)
+     */
+<span class="fc" id="L976">    protected Completable(CompletableOnSubscribe onSubscribe) {</span>
+<span class="fc" id="L977">        this.onSubscribe = onSubscribe;</span>
+<span class="fc" id="L978">    }</span>
+    
+    /**
+     * Returns a Completable that emits the a terminated event of either this Completable
+     * or the other Completable whichever fires first.
+     * @param other the other Completable, not null
+     * @return the new Completable instance
+     * @throws NullPointerException if other is null
+     */
+    public final Completable ambWith(Completable other) {
+<span class="fc" id="L988">        requireNonNull(other);</span>
+<span class="fc" id="L989">        return amb(this, other);</span>
+    }
+    
+    /**
+     * Subscribes to and awaits the termination of this Completable instance in a blocking manner and
+     * rethrows any exception emitted.
+     * @throws RuntimeException wrapping an InterruptedException if the current thread is interrupted
+     */
+    public final void await() {
+<span class="fc" id="L998">        final CountDownLatch cdl = new CountDownLatch(1);</span>
+<span class="fc" id="L999">        final Throwable[] err = new Throwable[1];</span>
+        
+<span class="fc" id="L1001">        subscribe(new CompletableSubscriber() {</span>
+
+            @Override
+            public void onCompleted() {
+<span class="fc" id="L1005">                cdl.countDown();</span>
+<span class="fc" id="L1006">            }</span>
+
+            @Override
+            public void onError(Throwable e) {
+<span class="fc" id="L1010">                err[0] = e;</span>
+<span class="fc" id="L1011">                cdl.countDown();</span>
+<span class="fc" id="L1012">            }</span>
+
+            @Override
+            public void onSubscribe(Subscription d) {
+                // ignored
+<span class="fc" id="L1017">            }</span>
+            
+        });
+        
+<span class="fc bfc" id="L1021" title="All 2 branches covered.">        if (cdl.getCount() == 0) {</span>
+<span class="pc bpc" id="L1022" title="1 of 2 branches missed.">            if (err[0] != null) {</span>
+<span class="nc" id="L1023">                Exceptions.propagate(err[0]);</span>
+            }
+<span class="fc" id="L1025">            return;</span>
+        }
+        try {
+<span class="fc" id="L1028">            cdl.await();</span>
+<span class="nc" id="L1029">        } catch (InterruptedException ex) {</span>
+<span class="nc" id="L1030">            throw Exceptions.propagate(ex);</span>
+<span class="fc" id="L1031">        }</span>
+<span class="pc bpc" id="L1032" title="1 of 2 branches missed.">        if (err[0] != null) {</span>
+<span class="nc" id="L1033">            Exceptions.propagate(err[0]);</span>
+        }
+<span class="fc" id="L1035">    }</span>
+    
+    /**
+     * Subscribes to and awaits the termination of this Completable instance in a blocking manner
+     * with a specific timeout and rethrows any exception emitted within the timeout window.
+     * @param timeout the timeout value
+     * @param unit the timeout unit
+     * @return true if the this Completable instance completed normally within the time limit,
+     * false if the timeout ellapsed before this Completable terminated.
+     * @throws RuntimeException wrapping an InterruptedException if the current thread is interrupted
+     */
+    public final boolean await(long timeout, TimeUnit unit) {
+<span class="nc" id="L1047">        requireNonNull(unit);</span>
+        
+<span class="nc" id="L1049">        final CountDownLatch cdl = new CountDownLatch(1);</span>
+<span class="nc" id="L1050">        final Throwable[] err = new Throwable[1];</span>
+        
+<span class="nc" id="L1052">        subscribe(new CompletableSubscriber() {</span>
+
+            @Override
+            public void onCompleted() {
+<span class="nc" id="L1056">                cdl.countDown();</span>
+<span class="nc" id="L1057">            }</span>
+
+            @Override
+            public void onError(Throwable e) {
+<span class="nc" id="L1061">                err[0] = e;</span>
+<span class="nc" id="L1062">                cdl.countDown();</span>
+<span class="nc" id="L1063">            }</span>
+
+            @Override
+            public void onSubscribe(Subscription d) {
+                // ignored
+<span class="nc" id="L1068">            }</span>
+            
+        });
+        
+<span class="nc bnc" id="L1072" title="All 2 branches missed.">        if (cdl.getCount() == 0) {</span>
+<span class="nc bnc" id="L1073" title="All 2 branches missed.">            if (err[0] != null) {</span>
+<span class="nc" id="L1074">                Exceptions.propagate(err[0]);</span>
+            }
+<span class="nc" id="L1076">            return true;</span>
+        }
+        boolean b;
+        try {
+<span class="nc" id="L1080">             b = cdl.await(timeout, unit);</span>
+<span class="nc" id="L1081">        } catch (InterruptedException ex) {</span>
+<span class="nc" id="L1082">            throw Exceptions.propagate(ex);</span>
+<span class="nc" id="L1083">        }</span>
+<span class="nc bnc" id="L1084" title="All 2 branches missed.">        if (b) {</span>
+<span class="nc bnc" id="L1085" title="All 2 branches missed.">            if (err[0] != null) {</span>
+<span class="nc" id="L1086">                Exceptions.propagate(err[0]);</span>
+            }
+        }
+<span class="nc" id="L1089">        return b;</span>
+    }
+    
+    /**
+     * Calls the given transformer function with this instance and returns the function's resulting
+     * Completable.
+     * @param transformer the transformer function, not null
+     * @return the Completable returned by the function
+     * @throws NullPointerException if transformer is null
+     */
+    public final Completable compose(CompletableTransformer transformer) {
+<span class="fc" id="L1100">        return to(transformer);</span>
+    }
+    
+    /**
+     * Returns an Observable which will subscribe to this Completable and once that is completed then 
+     * will subscribe to the {@code next} Observable. An error event from this Completable will be 
+     * propagated to the downstream subscriber and will result in skipping the subscription of the 
+     * Observable.  
+     * 
+     * @param next the Observable to subscribe after this Completable is completed, not null
+     * @return Observable that composes this Completable and next
+     * @throws NullPointerException if next is null
+     */
+    public final &lt;T&gt; Observable&lt;T&gt; andThen(Observable&lt;T&gt; next) {
+<span class="fc" id="L1114">        requireNonNull(next);</span>
+<span class="fc" id="L1115">        return next.delaySubscription(toObservable());</span>
+    }
+    
+    /**
+     * Concatenates this Completable with another Completable.
+     * @param other the other Completable, not null
+     * @return the new Completable which subscribes to this and then the other Completable
+     * @throws NullPointerException if other is null
+     */
+    public final Completable concatWith(Completable other) {
+<span class="fc" id="L1125">        requireNonNull(other);</span>
+<span class="fc" id="L1126">        return concat(this, other);</span>
+    }
+
+    /**
+     * Returns a Completable which delays the emission of the completion event by the given time.
+     * @param delay the delay time
+     * @param unit the delay unit
+     * @return the new Completable instance
+     * @throws NullPointerException if unit is null
+     */
+    public final Completable delay(long delay, TimeUnit unit) {
+<span class="fc" id="L1137">        return delay(delay, unit, Schedulers.computation(), false);</span>
+    }
+    
+    /**
+     * Returns a Completable which delays the emission of the completion event by the given time while
+     * running on the specified scheduler.
+     * @param delay the delay time
+     * @param unit the delay unit
+     * @param scheduler the scheduler to run the delayed completion on
+     * @return the new Completable instance
+     * @throws NullPointerException if unit or scheduler is null
+     */
+    public final Completable delay(long delay, TimeUnit unit, Scheduler scheduler) {
+<span class="nc" id="L1150">        return delay(delay, unit, scheduler, false);</span>
+    }
+    
+    /**
+     * Returns a Completable which delays the emission of the completion event, and optionally the error as well, by the given time while
+     * running on the specified scheduler.
+     * @param delay the delay time
+     * @param unit the delay unit
+     * @param scheduler the scheduler to run the delayed completion on
+     * @param delayError delay the error emission as well?
+     * @return the new Completable instance
+     * @throws NullPointerException if unit or scheduler is null
+     */
+    public final Completable delay(final long delay, final TimeUnit unit, final Scheduler scheduler, final boolean delayError) {
+<span class="fc" id="L1164">        requireNonNull(unit);</span>
+<span class="fc" id="L1165">        requireNonNull(scheduler);</span>
+<span class="fc" id="L1166">        return create(new CompletableOnSubscribe() {</span>
+            @Override
+            public void call(final CompletableSubscriber s) {
+<span class="fc" id="L1169">                final CompositeSubscription set = new CompositeSubscription();</span>
+                
+<span class="fc" id="L1171">                final Scheduler.Worker w = scheduler.createWorker();</span>
+<span class="fc" id="L1172">                set.add(w);</span>
+                
+<span class="fc" id="L1174">                subscribe(new CompletableSubscriber() {</span>
+
+                    
+                    @Override
+                    public void onCompleted() {
+<span class="fc" id="L1179">                        set.add(w.schedule(new Action0() {</span>
+                            @Override
+                            public void call() {
+                                try {
+<span class="fc" id="L1183">                                    s.onCompleted();</span>
+                                } finally {
+<span class="pc" id="L1185">                                    w.unsubscribe();</span>
+<span class="fc" id="L1186">                                }</span>
+<span class="fc" id="L1187">                            }</span>
+                        }, delay, unit));
+<span class="fc" id="L1189">                    }</span>
+
+                    @Override
+                    public void onError(final Throwable e) {
+<span class="fc bfc" id="L1193" title="All 2 branches covered.">                        if (delayError) {</span>
+<span class="fc" id="L1194">                            set.add(w.schedule(new Action0() {</span>
+                                @Override
+                                public void call() {
+                                    try {
+<span class="fc" id="L1198">                                        s.onError(e);</span>
+                                    } finally {
+<span class="pc" id="L1200">                                        w.unsubscribe();</span>
+<span class="fc" id="L1201">                                    }</span>
+<span class="fc" id="L1202">                                }</span>
+                            }, delay, unit));
+                        } else {
+<span class="fc" id="L1205">                            s.onError(e);</span>
+                        }
+<span class="fc" id="L1207">                    }</span>
+
+                    @Override
+                    public void onSubscribe(Subscription d) {
+<span class="fc" id="L1211">                        set.add(d);</span>
+<span class="fc" id="L1212">                        s.onSubscribe(set);</span>
+<span class="fc" id="L1213">                    }</span>
+                    
+                });
+<span class="fc" id="L1216">            }</span>
+        });
+    }
+
+    /**
+     * Returns a Completable which calls the given onComplete callback if this Completable completes.
+     * @param onComplete the callback to call when this emits an onComplete event
+     * @return the new Completable instance
+     * @throws NullPointerException if onComplete is null
+     * @deprecated Use {@link #doOnCompleted(Action0)} instead.
+     */
+    @Deprecated public final Completable doOnComplete(Action0 onComplete) {
+<span class="nc" id="L1228">        return doOnCompleted(onComplete);</span>
+    }
+
+    /**
+     * Returns a Completable which calls the given onCompleted callback if this Completable completes.
+     * @param onCompleted the callback to call when this emits an onComplete event
+     * @return the new Completable instance
+     * @throws NullPointerException if onComplete is null
+     */
+    public final Completable doOnCompleted(Action0 onCompleted) {
+<span class="fc" id="L1238">        return doOnLifecycle(Actions.empty(), Actions.empty(), onCompleted, Actions.empty(), Actions.empty());</span>
+    }
+    
+    /**
+     * Returns a Completable which calls the giveon onUnsubscribe callback if the child subscriber cancels
+     * the subscription.
+     * @param onUnsubscribe the callback to call when the child subscriber cancels the subscription
+     * @return the new Completable instance
+     * @throws NullPointerException if onDispose is null
+     */
+    public final Completable doOnUnsubscribe(Action0 onUnsubscribe) {
+<span class="fc" id="L1249">        return doOnLifecycle(Actions.empty(), Actions.empty(), Actions.empty(), Actions.empty(), onUnsubscribe);</span>
+    }
+    
+    /**
+     * Returns a Completable which calls the given onError callback if this Completable emits an error.
+     * @param onError the error callback
+     * @return the new Completable instance
+     * @throws NullPointerException if onError is null
+     */
+    public final Completable doOnError(Action1&lt;? super Throwable&gt; onError) {
+<span class="fc" id="L1259">        return doOnLifecycle(Actions.empty(), onError, Actions.empty(), Actions.empty(), Actions.empty());</span>
+    }
+
+    /**
+     * Returns a Completable instance that calls the various callbacks on the specific
+     * lifecycle events.
+     * @param onSubscribe the consumer called when a CompletableSubscriber subscribes.
+     * @param onError the consumer called when this emits an onError event
+     * @param onComplete the runnable called just before when this Completable completes normally
+     * @param onAfterComplete the runnable called after this Completable completes normally
+     * @param onUnsubscribe the runnable called when the child cancels the subscription
+     * @return the new Completable instance
+     */
+    protected final Completable doOnLifecycle(
+            final Action1&lt;? super Subscription&gt; onSubscribe, 
+            final Action1&lt;? super Throwable&gt; onError, 
+            final Action0 onComplete, 
+            final Action0 onAfterComplete,
+            final Action0 onUnsubscribe) {
+<span class="fc" id="L1278">        requireNonNull(onSubscribe);</span>
+<span class="fc" id="L1279">        requireNonNull(onError);</span>
+<span class="fc" id="L1280">        requireNonNull(onComplete);</span>
+<span class="fc" id="L1281">        requireNonNull(onAfterComplete);</span>
+<span class="fc" id="L1282">        requireNonNull(onUnsubscribe);</span>
+<span class="fc" id="L1283">        return create(new CompletableOnSubscribe() {</span>
+            @Override
+            public void call(final CompletableSubscriber s) {
+<span class="fc" id="L1286">                subscribe(new CompletableSubscriber() {</span>
+
+                    @Override
+                    public void onCompleted() {
+                        try {
+<span class="fc" id="L1291">                            onComplete.call();</span>
+<span class="fc" id="L1292">                        } catch (Throwable e) {</span>
+<span class="fc" id="L1293">                            s.onError(e);</span>
+<span class="fc" id="L1294">                            return;</span>
+<span class="fc" id="L1295">                        }</span>
+                        
+<span class="fc" id="L1297">                        s.onCompleted();</span>
+                        
+                        try {
+<span class="fc" id="L1300">                            onAfterComplete.call();</span>
+<span class="nc" id="L1301">                        } catch (Throwable e) {</span>
+<span class="nc" id="L1302">                            ERROR_HANDLER.handleError(e);</span>
+<span class="fc" id="L1303">                        }</span>
+<span class="fc" id="L1304">                    }</span>
+
+                    @Override
+                    public void onError(Throwable e) {
+                        try {
+<span class="fc" id="L1309">                            onError.call(e);</span>
+<span class="fc" id="L1310">                        } catch (Throwable ex) {</span>
+<span class="fc" id="L1311">                            e = new CompositeException(Arrays.asList(e, ex));</span>
+<span class="fc" id="L1312">                        }</span>
+                        
+<span class="fc" id="L1314">                        s.onError(e);</span>
+<span class="fc" id="L1315">                    }</span>
+
+                    @Override
+                    public void onSubscribe(final Subscription d) {
+                        
+                        try {
+<span class="fc" id="L1321">                            onSubscribe.call(d);</span>
+<span class="fc" id="L1322">                        } catch (Throwable ex) {</span>
+<span class="fc" id="L1323">                            d.unsubscribe();</span>
+<span class="fc" id="L1324">                            s.onSubscribe(Subscriptions.unsubscribed());</span>
+<span class="fc" id="L1325">                            s.onError(ex);</span>
+<span class="fc" id="L1326">                            return;</span>
+<span class="fc" id="L1327">                        }</span>
+                        
+<span class="fc" id="L1329">                        s.onSubscribe(Subscriptions.create(new Action0() {</span>
+                            @Override
+                            public void call() {
+                                try {
+<span class="fc" id="L1333">                                    onUnsubscribe.call();</span>
+<span class="fc" id="L1334">                                } catch (Throwable e) {</span>
+<span class="fc" id="L1335">                                    ERROR_HANDLER.handleError(e);</span>
+<span class="fc" id="L1336">                                }</span>
+<span class="fc" id="L1337">                                d.unsubscribe();</span>
+<span class="fc" id="L1338">                            }</span>
+                        }));
+<span class="fc" id="L1340">                    }</span>
+                    
+                });
+<span class="fc" id="L1343">            }</span>
+        });
+    }
+    
+    /**
+     * Returns a Completable instance that calls the given onSubscribe callback with the disposable
+     * that child subscribers receive on subscription.
+     * @param onSubscribe the callback called when a child subscriber subscribes
+     * @return the new Completable instance
+     * @throws NullPointerException if onSubscribe is null
+     */
+    public final Completable doOnSubscribe(Action1&lt;? super Subscription&gt; onSubscribe) {
+<span class="fc" id="L1355">        return doOnLifecycle(onSubscribe, Actions.empty(), Actions.empty(), Actions.empty(), Actions.empty());</span>
+    }
+    
+    /**
+     * Returns a Completable instance that calls the given onTerminate callback just before this Completable
+     * completes normally or with an exception
+     * @param onTerminate the callback to call just before this Completable terminates
+     * @return the new Completable instance
+     */
+    public final Completable doOnTerminate(final Action0 onTerminate) {
+<span class="fc" id="L1365">        return doOnLifecycle(Actions.empty(), new Action1&lt;Throwable&gt;() {</span>
+            @Override
+            public void call(Throwable e) {
+<span class="fc" id="L1368">                onTerminate.call();</span>
+<span class="fc" id="L1369">            }</span>
+        }, onTerminate, Actions.empty(), Actions.empty());
+    }
+    
+    /**
+     * Returns a completable that first runs this Completable
+     * and then the other completable.
+     * &lt;p&gt;
+     * This is an alias for {@link #concatWith(Completable)}.
+     * @param other the other Completable, not null
+     * @return the new Completable instance
+     * @throws NullPointerException if other is null
+     */
+    public final Completable endWith(Completable other) {
+<span class="fc" id="L1383">        return concatWith(other);</span>
+    }
+    
+    /**
+     * Returns an Observable that first runs this Completable instance and
+     * resumes with the given next Observable.
+     * @param next the next Observable to continue
+     * @return the new Observable instance
+     * @throws NullPointerException if next is null
+     */
+    public final &lt;T&gt; Observable&lt;T&gt; endWith(Observable&lt;T&gt; next) {
+<span class="fc" id="L1394">        return next.startWith(this.&lt;T&gt;toObservable());</span>
+    }
+
+    /**
+     * Returns a Completable instace that calls the given onAfterComplete callback after this
+     * Completable completes normally.
+     * @param onAfterComplete the callback to call after this Completable emits an onComplete event.
+     * @return the new Completable instance
+     * @throws NullPointerException if onAfterComplete is null
+     */
+    public final Completable doAfterTerminate(Action0 onAfterComplete) {
+<span class="fc" id="L1405">        return doOnLifecycle(Actions.empty(), Actions.empty(), Actions.empty(), onAfterComplete, Actions.empty());</span>
+    }
+    
+    /**
+     * Subscribes to this Completable instance and blocks until it terminates, then returns null or
+     * the emitted exception if any.
+     * @return the throwable if this terminated with an error, null otherwise
+     * @throws RuntimeException that wraps an InterruptedException if the wait is interrupted
+     */
+    public final Throwable get() {
+<span class="fc" id="L1415">        final CountDownLatch cdl = new CountDownLatch(1);</span>
+<span class="fc" id="L1416">        final Throwable[] err = new Throwable[1];</span>
+        
+<span class="fc" id="L1418">        subscribe(new CompletableSubscriber() {</span>
+
+            @Override
+            public void onCompleted() {
+<span class="fc" id="L1422">                cdl.countDown();</span>
+<span class="fc" id="L1423">            }</span>
+
+            @Override
+            public void onError(Throwable e) {
+<span class="fc" id="L1427">                err[0] = e;</span>
+<span class="fc" id="L1428">                cdl.countDown();</span>
+<span class="fc" id="L1429">            }</span>
+
+            @Override
+            public void onSubscribe(Subscription d) {
+                // ignored
+<span class="fc" id="L1434">            }</span>
+            
+        });
+        
+<span class="fc bfc" id="L1438" title="All 2 branches covered.">        if (cdl.getCount() == 0) {</span>
+<span class="fc" id="L1439">            return err[0];</span>
+        }
+        try {
+<span class="fc" id="L1442">            cdl.await();</span>
+<span class="nc" id="L1443">        } catch (InterruptedException ex) {</span>
+<span class="nc" id="L1444">            throw Exceptions.propagate(ex);</span>
+<span class="fc" id="L1445">        }</span>
+<span class="fc" id="L1446">        return err[0];</span>
+    }
+    
+    /**
+     * Subscribes to this Completable instance and blocks until it terminates or the specified timeout 
+     * ellapses, then returns null for normal termination or the emitted exception if any.
+     * @return the throwable if this terminated with an error, null otherwise
+     * @throws RuntimeException that wraps an InterruptedException if the wait is interrupted or
+     * TimeoutException if the specified timeout ellapsed before it
+     */
+    public final Throwable get(long timeout, TimeUnit unit) {
+<span class="fc" id="L1457">        requireNonNull(unit);</span>
+        
+<span class="fc" id="L1459">        final CountDownLatch cdl = new CountDownLatch(1);</span>
+<span class="fc" id="L1460">        final Throwable[] err = new Throwable[1];</span>
+        
+<span class="fc" id="L1462">        subscribe(new CompletableSubscriber() {</span>
+
+            @Override
+            public void onCompleted() {
+<span class="nc" id="L1466">                cdl.countDown();</span>
+<span class="nc" id="L1467">            }</span>
+
+            @Override
+            public void onError(Throwable e) {
+<span class="nc" id="L1471">                err[0] = e;</span>
+<span class="nc" id="L1472">                cdl.countDown();</span>
+<span class="nc" id="L1473">            }</span>
+
+            @Override
+            public void onSubscribe(Subscription d) {
+                // ignored
+<span class="fc" id="L1478">            }</span>
+            
+        });
+        
+<span class="pc bpc" id="L1482" title="1 of 2 branches missed.">        if (cdl.getCount() == 0) {</span>
+<span class="nc" id="L1483">            return err[0];</span>
+        }
+        boolean b;
+        try {
+<span class="nc" id="L1487">            b = cdl.await(timeout, unit);</span>
+<span class="nc" id="L1488">        } catch (InterruptedException ex) {</span>
+<span class="nc" id="L1489">            throw Exceptions.propagate(ex);</span>
+<span class="nc" id="L1490">        }</span>
+<span class="nc bnc" id="L1491" title="All 2 branches missed.">        if (b) {</span>
+<span class="nc" id="L1492">            return err[0];</span>
+        }
+<span class="nc" id="L1494">        Exceptions.propagate(new TimeoutException());</span>
+<span class="nc" id="L1495">        return null;</span>
+    }
+    
+    /**
+     * Lifts a CompletableSubscriber transformation into the chain of Completables.
+     * @param onLift the lifting function that transforms the child subscriber with a parent subscriber.
+     * @return the new Completable instance
+     * @throws NullPointerException if onLift is null
+     */
+    public final Completable lift(final CompletableOperator onLift) {
+<span class="fc" id="L1505">        requireNonNull(onLift);</span>
+<span class="fc" id="L1506">        return create(new CompletableOnSubscribe() {</span>
+            @Override
+            public void call(CompletableSubscriber s) {
+                try {
+                    // TODO plugin wrapping
+
+<span class="fc" id="L1512">                    CompletableSubscriber sw = onLift.call(s);</span>
+                    
+<span class="fc" id="L1514">                    subscribe(sw);</span>
+<span class="fc" id="L1515">                } catch (NullPointerException ex) {</span>
+<span class="fc" id="L1516">                    throw ex;</span>
+<span class="nc" id="L1517">                } catch (Throwable ex) {</span>
+<span class="nc" id="L1518">                    throw toNpe(ex);</span>
+<span class="fc" id="L1519">                }</span>
+<span class="fc" id="L1520">            }</span>
+        });
+    }
+
+    /**
+     * Returns a Completable which subscribes to this and the other Completable and completes
+     * when both of them complete or one emits an error.
+     * @param other the other Completable instance
+     * @return the new Completable instance
+     * @throws NullPointerException if other is null
+     */
+    public final Completable mergeWith(Completable other) {
+<span class="fc" id="L1532">        requireNonNull(other);</span>
+<span class="fc" id="L1533">        return merge(this, other);</span>
+    }
+    
+    /**
+     * Returns a Completable which emits the terminal events from the thread of the specified scheduler.
+     * @param scheduler the scheduler to emit terminal events on
+     * @return the new Completable instance
+     * @throws NullPointerException if scheduler is null
+     */
+    public final Completable observeOn(final Scheduler scheduler) {
+<span class="fc" id="L1543">        requireNonNull(scheduler);</span>
+<span class="fc" id="L1544">        return create(new CompletableOnSubscribe() {</span>
+            @Override
+            public void call(final CompletableSubscriber s) {
+                
+<span class="fc" id="L1548">                final SubscriptionList ad = new SubscriptionList();</span>
+                
+<span class="fc" id="L1550">                final Scheduler.Worker w = scheduler.createWorker();</span>
+<span class="fc" id="L1551">                ad.add(w);</span>
+                
+<span class="fc" id="L1553">                s.onSubscribe(ad);</span>
+                
+<span class="fc" id="L1555">                subscribe(new CompletableSubscriber() {</span>
+
+                    @Override
+                    public void onCompleted() {
+<span class="fc" id="L1559">                        w.schedule(new Action0() {</span>
+                            @Override
+                            public void call() {
+                                try {
+<span class="fc" id="L1563">                                    s.onCompleted();</span>
+                                } finally {
+<span class="pc" id="L1565">                                    ad.unsubscribe();</span>
+<span class="fc" id="L1566">                                }</span>
+<span class="fc" id="L1567">                            }</span>
+                        });
+<span class="fc" id="L1569">                    }</span>
+
+                    @Override
+                    public void onError(final Throwable e) {
+<span class="fc" id="L1573">                        w.schedule(new Action0() {</span>
+                            @Override
+                            public void call() {
+                                try {
+<span class="fc" id="L1577">                                    s.onError(e);</span>
+                                } finally {
+<span class="pc" id="L1579">                                    ad.unsubscribe();</span>
+<span class="fc" id="L1580">                                }</span>
+<span class="fc" id="L1581">                            }</span>
+                        });
+<span class="fc" id="L1583">                    }</span>
+
+                    @Override
+                    public void onSubscribe(Subscription d) {
+<span class="fc" id="L1587">                        ad.add(d);</span>
+<span class="fc" id="L1588">                    }</span>
+                    
+                });
+<span class="fc" id="L1591">            }</span>
+        });
+    }
+    
+    /**
+     * Returns a Completable instance that if this Completable emits an error, it will emit an onComplete
+     * and swallow the throwable.
+     * @return the new Completable instance
+     */
+    public final Completable onErrorComplete() {
+<span class="fc" id="L1601">        return onErrorComplete(UtilityFunctions.alwaysTrue());</span>
+    }
+
+    /**
+     * Returns a Completable instance that if this Completable emits an error and the predicate returns
+     * true, it will emit an onComplete and swallow the throwable.
+     * @param predicate the predicate to call when an Throwable is emitted which should return true
+     * if the Throwable should be swallowed and replaced with an onComplete.
+     * @return the new Completable instance
+     */
+    public final Completable onErrorComplete(final Func1&lt;? super Throwable, Boolean&gt; predicate) {
+<span class="fc" id="L1612">        requireNonNull(predicate);</span>
+        
+<span class="fc" id="L1614">        return create(new CompletableOnSubscribe() {</span>
+            @Override
+            public void call(final CompletableSubscriber s) {
+<span class="fc" id="L1617">                subscribe(new CompletableSubscriber() {</span>
+
+                    @Override
+                    public void onCompleted() {
+<span class="nc" id="L1621">                        s.onCompleted();</span>
+<span class="nc" id="L1622">                    }</span>
+
+                    @Override
+                    public void onError(Throwable e) {
+                        boolean b;
+                        
+                        try {
+<span class="fc" id="L1629">                            b = predicate.call(e);</span>
+<span class="nc" id="L1630">                        } catch (Throwable ex) {</span>
+<span class="nc" id="L1631">                            e = new CompositeException(Arrays.asList(e, ex));</span>
+<span class="nc" id="L1632">                            return;</span>
+<span class="fc" id="L1633">                        }</span>
+                        
+<span class="fc bfc" id="L1635" title="All 2 branches covered.">                        if (b) {</span>
+<span class="fc" id="L1636">                            s.onCompleted();</span>
+                        } else {
+<span class="fc" id="L1638">                            s.onError(e);</span>
+                        }
+<span class="fc" id="L1640">                    }</span>
+
+                    @Override
+                    public void onSubscribe(Subscription d) {
+<span class="fc" id="L1644">                        s.onSubscribe(d);</span>
+<span class="fc" id="L1645">                    }</span>
+                    
+                });
+<span class="fc" id="L1648">            }</span>
+        });
+    }
+    
+    /**
+     * Returns a Completable instance that when encounters an error from this Completable, calls the
+     * specified mapper function that returns another Completable instance for it and resumes the
+     * execution with it.
+     * @param errorMapper the mapper function that takes the error and should return a Completable as
+     * continuation.
+     * @return the new Completable instance
+     */
+    public final Completable onErrorResumeNext(final Func1&lt;? super Throwable, ? extends Completable&gt; errorMapper) {
+<span class="fc" id="L1661">        requireNonNull(errorMapper);</span>
+<span class="fc" id="L1662">        return create(new CompletableOnSubscribe() {</span>
+            @Override
+            public void call(final CompletableSubscriber s) {
+<span class="fc" id="L1665">                final SerialSubscription sd = new SerialSubscription();</span>
+<span class="fc" id="L1666">                subscribe(new CompletableSubscriber() {</span>
+
+                    @Override
+                    public void onCompleted() {
+<span class="nc" id="L1670">                        s.onCompleted();</span>
+<span class="nc" id="L1671">                    }</span>
+
+                    @Override
+                    public void onError(Throwable e) {
+                        Completable c;
+                        
+                        try {
+<span class="fc" id="L1678">                            c = errorMapper.call(e);</span>
+<span class="fc" id="L1679">                        } catch (Throwable ex) {</span>
+<span class="fc" id="L1680">                            e = new CompositeException(Arrays.asList(e, ex));</span>
+<span class="fc" id="L1681">                            s.onError(e);</span>
+<span class="fc" id="L1682">                            return;</span>
+<span class="fc" id="L1683">                        }</span>
+                        
+<span class="fc bfc" id="L1685" title="All 2 branches covered.">                        if (c == null) {</span>
+<span class="fc" id="L1686">                            NullPointerException npe = new NullPointerException(&quot;The completable returned is null&quot;);</span>
+<span class="fc" id="L1687">                            e = new CompositeException(Arrays.asList(e, npe));</span>
+<span class="fc" id="L1688">                            s.onError(e);</span>
+<span class="fc" id="L1689">                            return;</span>
+                        }
+                        
+<span class="fc" id="L1692">                        c.subscribe(new CompletableSubscriber() {</span>
+
+                            @Override
+                            public void onCompleted() {
+<span class="fc" id="L1696">                                s.onCompleted();</span>
+<span class="fc" id="L1697">                            }</span>
+
+                            @Override
+                            public void onError(Throwable e) {
+<span class="fc" id="L1701">                                s.onError(e);</span>
+<span class="fc" id="L1702">                            }</span>
+
+                            @Override
+                            public void onSubscribe(Subscription d) {
+<span class="fc" id="L1706">                                sd.set(d);</span>
+<span class="fc" id="L1707">                            }</span>
+                            
+                        });
+<span class="fc" id="L1710">                    }</span>
+
+                    @Override
+                    public void onSubscribe(Subscription d) {
+<span class="fc" id="L1714">                        sd.set(d);</span>
+<span class="fc" id="L1715">                    }</span>
+                    
+                });
+<span class="fc" id="L1718">            }</span>
+        });
+    }
+    
+    /**
+     * Returns a Completable that repeatedly subscribes to this Completable until cancelled.
+     * @return the new Completable instance
+     */
+    public final Completable repeat() {
+<span class="fc" id="L1727">        return fromObservable(toObservable().repeat());</span>
+    }
+    
+    /**
+     * Returns a Completable that subscribes repeatedly at most the given times to this Completable.
+     * @param times the number of times the resubscription should happen
+     * @return the new Completable instance
+     * @throws IllegalArgumentException if times is less than zero
+     */
+    public final Completable repeat(long times) {
+<span class="fc" id="L1737">        return fromObservable(toObservable().repeat(times));</span>
+    }
+    
+    /**
+     * Returns a Completable instance that repeats when the Publisher returned by the handler
+     * emits an item or completes when this Publisher emits a completed event.
+     * @param handler the function that transforms the stream of values indicating the completion of
+     * this Completable and returns a Publisher that emits items for repeating or completes to indicate the
+     * repetition should stop
+     * @return the new Completable instance
+     * @throws NullPointerException if stop is null
+     */
+    public final Completable repeatWhen(Func1&lt;? super Observable&lt;? extends Void&gt;, ? extends Observable&lt;?&gt;&gt; handler) {
+<span class="nc" id="L1750">        requireNonNull(handler); // FIXME do a null check in Observable</span>
+<span class="nc" id="L1751">        return fromObservable(toObservable().repeatWhen(handler));</span>
+    }
+    
+    /**
+     * Returns a Completable that retries this Completable as long as it emits an onError event.
+     * @return the new Completable instance
+     */
+    public final Completable retry() {
+<span class="fc" id="L1759">        return fromObservable(toObservable().retry());</span>
+    }
+    
+    /**
+     * Returns a Completable that retries this Completable in case of an error as long as the predicate
+     * returns true.
+     * @param predicate the predicate called when this emits an error with the repeat count and the latest exception
+     * and should return true to retry.
+     * @return the new Completable instance
+     */
+    public final Completable retry(Func2&lt;Integer, Throwable, Boolean&gt; predicate) {
+<span class="fc" id="L1770">        return fromObservable(toObservable().retry(predicate));</span>
+    }
+
+    /**
+     * Returns a Completable that when this Completable emits an error, retries at most the given
+     * number of times before giving up and emitting the last error.
+     * @param times the number of times the returned Completable should retry this Completable
+     * @return the new Completable instance
+     * @throws IllegalArgumentException if times is negative
+     */
+    public final Completable retry(long times) {
+<span class="fc" id="L1781">        return fromObservable(toObservable().retry(times));</span>
+    }
+
+    /**
+     * Returns a Completable which given a Publisher and when this Completable emits an error, delivers
+     * that error through an Observable and the Publisher should return a value indicating a retry in response
+     * or a terminal event indicating a termination.
+     * @param handler the handler that receives an Observable delivering Throwables and should return a Publisher that
+     * emits items to indicate retries or emits terminal events to indicate termination.
+     * @return the new Completable instance
+     * @throws NullPointerException if handler is null
+     */
+    public final Completable retryWhen(Func1&lt;? super Observable&lt;? extends Throwable&gt;, ? extends Observable&lt;?&gt;&gt; handler) {
+<span class="fc" id="L1794">        return fromObservable(toObservable().retryWhen(handler));</span>
+    }
+
+    /**
+     * Returns a Completable which first runs the other Completable
+     * then this completable if the other completed normally.
+     * @param other the other completable to run first
+     * @return the new Completable instance
+     * @throws NullPointerException if other is null
+     */
+    public final Completable startWith(Completable other) {
+<span class="fc" id="L1805">        requireNonNull(other);</span>
+<span class="fc" id="L1806">        return concat(other, this);</span>
+    }
+
+    /**
+     * Returns an Observable which first delivers the events
+     * of the other Observable then runs this Completable.
+     * @param other the other Observable to run first
+     * @return the new Observable instance
+     * @throws NullPointerException if other is null
+     */
+    public final &lt;T&gt; Observable&lt;T&gt; startWith(Observable&lt;T&gt; other) {
+<span class="fc" id="L1817">        requireNonNull(other);</span>
+<span class="fc" id="L1818">        return this.&lt;T&gt;toObservable().startWith(other);</span>
+    }
+    
+    /**
+     * Subscribes to this Completable and returns a Subscription which can be used to cancel
+     * the subscription.
+     * @return the Subscription that allows cancelling the subscription
+     */
+    public final Subscription subscribe() {
+<span class="fc" id="L1827">        final MultipleAssignmentSubscription mad = new MultipleAssignmentSubscription();</span>
+<span class="fc" id="L1828">        subscribe(new CompletableSubscriber() {</span>
+            @Override
+            public void onCompleted() {
+<span class="fc" id="L1831">                mad.unsubscribe();</span>
+<span class="fc" id="L1832">            }</span>
+            
+            @Override
+            public void onError(Throwable e) {
+<span class="fc" id="L1836">                ERROR_HANDLER.handleError(e);</span>
+<span class="fc" id="L1837">                mad.unsubscribe();</span>
+<span class="fc" id="L1838">                deliverUncaughtException(e);</span>
+<span class="fc" id="L1839">            }</span>
+            
+            @Override
+            public void onSubscribe(Subscription d) {
+<span class="fc" id="L1843">                mad.set(d);</span>
+<span class="fc" id="L1844">            }</span>
+        });
+        
+<span class="fc" id="L1847">        return mad;</span>
+    }
+    /**
+     * Subscribes to this Completable and calls the given Action0 when this Completable
+     * completes normally.
+     * &lt;p&gt;
+     * If this Completable emits an error, it is sent to ERROR_HANDLER.handleError and gets swallowed.
+     * @param onComplete the runnable called when this Completable completes normally
+     * @return the Subscription that allows cancelling the subscription
+     */
+    public final Subscription subscribe(final Action0 onComplete) {
+<span class="fc" id="L1858">        requireNonNull(onComplete);</span>
+        
+<span class="fc" id="L1860">        final MultipleAssignmentSubscription mad = new MultipleAssignmentSubscription();</span>
+<span class="fc" id="L1861">        subscribe(new CompletableSubscriber() {</span>
+            @Override
+            public void onCompleted() {
+                try {
+<span class="fc" id="L1865">                    onComplete.call();</span>
+<span class="fc" id="L1866">                } catch (Throwable e) {</span>
+<span class="fc" id="L1867">                    ERROR_HANDLER.handleError(e);</span>
+<span class="fc" id="L1868">                    deliverUncaughtException(e);</span>
+                } finally {
+<span class="pc" id="L1870">                    mad.unsubscribe();</span>
+<span class="fc" id="L1871">                }</span>
+<span class="fc" id="L1872">            }</span>
+            
+            @Override
+            public void onError(Throwable e) {
+<span class="fc" id="L1876">                ERROR_HANDLER.handleError(e);</span>
+<span class="fc" id="L1877">                mad.unsubscribe();</span>
+<span class="fc" id="L1878">                deliverUncaughtException(e);</span>
+<span class="fc" id="L1879">            }</span>
+            
+            @Override
+            public void onSubscribe(Subscription d) {
+<span class="fc" id="L1883">                mad.set(d);</span>
+<span class="fc" id="L1884">            }</span>
+        });
+        
+<span class="fc" id="L1887">        return mad;</span>
+    }
+
+    /**
+     * Subscribes to this Completable and calls back either the onError or onComplete functions.
+     * 
+     * @param onError the consumer that is called if this Completable emits an error
+     * @param onComplete the runnable that is called if the Completable completes normally
+     * @return the Subscription that can be used for cancelling the subscription asynchronously
+     * @throws NullPointerException if either callback is null
+     */
+    public final Subscription subscribe(final Action1&lt;? super Throwable&gt; onError, final Action0 onComplete) {
+<span class="fc" id="L1899">        requireNonNull(onError);</span>
+<span class="fc" id="L1900">        requireNonNull(onComplete);</span>
+        
+<span class="fc" id="L1902">        final MultipleAssignmentSubscription mad = new MultipleAssignmentSubscription();</span>
+<span class="fc" id="L1903">        subscribe(new CompletableSubscriber() {</span>
+            @Override
+            public void onCompleted() {
+                try {
+<span class="fc" id="L1907">                    onComplete.call();</span>
+<span class="fc" id="L1908">                } catch (Throwable e) {</span>
+<span class="fc" id="L1909">                    onError(e);</span>
+<span class="fc" id="L1910">                    return;</span>
+<span class="fc" id="L1911">                }</span>
+<span class="fc" id="L1912">                mad.unsubscribe();</span>
+<span class="fc" id="L1913">            }</span>
+            
+            @Override
+            public void onError(Throwable e) {
+                try {
+<span class="fc" id="L1918">                    onError.call(e);</span>
+<span class="fc" id="L1919">                } catch (Throwable ex) {</span>
+<span class="fc" id="L1920">                    e = new CompositeException(Arrays.asList(e, ex));</span>
+<span class="fc" id="L1921">                    ERROR_HANDLER.handleError(e);</span>
+<span class="fc" id="L1922">                    deliverUncaughtException(e);</span>
+                } finally {
+<span class="pc" id="L1924">                    mad.unsubscribe();</span>
+<span class="fc" id="L1925">                }</span>
+<span class="fc" id="L1926">            }</span>
+            
+            @Override
+            public void onSubscribe(Subscription d) {
+<span class="fc" id="L1930">                mad.set(d);</span>
+<span class="fc" id="L1931">            }</span>
+        });
+        
+<span class="fc" id="L1934">        return mad;</span>
+    }
+
+    private static void deliverUncaughtException(Throwable e) {
+<span class="fc" id="L1938">        Thread thread = Thread.currentThread();</span>
+<span class="fc" id="L1939">        thread.getUncaughtExceptionHandler().uncaughtException(thread, e);</span>
+<span class="fc" id="L1940">    }</span>
+
+    /**
+     * Subscribes the given CompletableSubscriber to this Completable instance.
+     * @param s the CompletableSubscriber, not null
+     * @throws NullPointerException if s is null
+     */
+    public final void subscribe(CompletableSubscriber s) {
+<span class="fc" id="L1948">        requireNonNull(s);</span>
+        try {
+            // TODO plugin wrapping the subscriber
+            
+<span class="fc" id="L1952">            onSubscribe.call(s);</span>
+<span class="fc" id="L1953">        } catch (NullPointerException ex) {</span>
+<span class="fc" id="L1954">            throw ex;</span>
+<span class="fc" id="L1955">        } catch (Throwable ex) {</span>
+<span class="fc" id="L1956">            ERROR_HANDLER.handleError(ex);</span>
+<span class="fc" id="L1957">            throw toNpe(ex);</span>
+<span class="fc" id="L1958">        }</span>
+<span class="fc" id="L1959">    }</span>
+
+    /**
+     * Subscribes a reactive-streams Subscriber to this Completable instance which
+     * will receive only an onError or onComplete event.
+     * @param s the reactive-streams Subscriber, not null
+     * @throws NullPointerException if s is null
+     */
+    public final &lt;T&gt; void subscribe(Subscriber&lt;T&gt; s) {
+<span class="fc" id="L1968">        requireNonNull(s);</span>
+        try {
+<span class="fc" id="L1970">            final Subscriber&lt;?&gt; sw = s; // FIXME hooking in 1.x is kind of strange to me</span>
+            
+<span class="pc bpc" id="L1972" title="1 of 2 branches missed.">            if (sw == null) {</span>
+<span class="nc" id="L1973">                throw new NullPointerException(&quot;The RxJavaPlugins.onSubscribe returned a null Subscriber&quot;);</span>
+            }
+            
+<span class="fc" id="L1976">            subscribe(new CompletableSubscriber() {</span>
+                @Override
+                public void onCompleted() {
+<span class="fc" id="L1979">                    sw.onCompleted();</span>
+<span class="fc" id="L1980">                }</span>
+                
+                @Override
+                public void onError(Throwable e) {
+<span class="fc" id="L1984">                    sw.onError(e);</span>
+<span class="fc" id="L1985">                }</span>
+                
+                @Override
+                public void onSubscribe(Subscription d) {
+<span class="fc" id="L1989">                    sw.add(d);</span>
+<span class="fc" id="L1990">                }</span>
+            });
+            
+<span class="nc" id="L1993">        } catch (NullPointerException ex) {</span>
+<span class="nc" id="L1994">            throw ex;</span>
+<span class="nc" id="L1995">        } catch (Throwable ex) {</span>
+<span class="nc" id="L1996">            ERROR_HANDLER.handleError(ex);</span>
+<span class="nc" id="L1997">            throw toNpe(ex);</span>
+<span class="fc" id="L1998">        }</span>
+<span class="fc" id="L1999">    }</span>
+
+    /**
+     * Returns a Completable which subscribes the child subscriber on the specified scheduler, making
+     * sure the subscription side-effects happen on that specific thread of the scheduler.
+     * @param scheduler the Scheduler to subscribe on
+     * @return the new Completable instance
+     * @throws NullPointerException if scheduler is null
+     */
+    public final Completable subscribeOn(final Scheduler scheduler) {
+<span class="fc" id="L2009">        requireNonNull(scheduler);</span>
+        
+<span class="fc" id="L2011">        return create(new CompletableOnSubscribe() {</span>
+            @Override
+            public void call(final CompletableSubscriber s) {
+                // FIXME cancellation of this schedule
+                
+<span class="fc" id="L2016">                final Scheduler.Worker w = scheduler.createWorker();</span>
+                
+<span class="fc" id="L2018">                w.schedule(new Action0() {</span>
+                    @Override
+                    public void call() {
+                        try {
+<span class="fc" id="L2022">                            subscribe(s);</span>
+                        } finally {
+<span class="pc" id="L2024">                            w.unsubscribe();</span>
+<span class="fc" id="L2025">                        }</span>
+<span class="fc" id="L2026">                    }</span>
+                });
+<span class="fc" id="L2028">            }</span>
+        });
+    }
+
+    /**
+     * Returns a Completable that runs this Completable and emits a TimeoutException in case
+     * this Completable doesn't complete within the given time.
+     * @param timeout the timeout value
+     * @param unit the timeout unit
+     * @return the new Completable instance
+     * @throws NullPointerException if unit is null
+     */
+    public final Completable timeout(long timeout, TimeUnit unit) {
+<span class="fc" id="L2041">        return timeout0(timeout, unit, Schedulers.computation(), null);</span>
+    }
+    
+    /**
+     * Returns a Completable that runs this Completable and switches to the other Completable
+     * in case this Completable doesn't complete within the given time.
+     * @param timeout the timeout value
+     * @param unit the timeout unit
+     * @param other the other Completable instance to switch to in case of a timeout
+     * @return the new Completable instance
+     * @throws NullPointerException if unit or other is null
+     */
+    public final Completable timeout(long timeout, TimeUnit unit, Completable other) {
+<span class="fc" id="L2054">        requireNonNull(other);</span>
+<span class="fc" id="L2055">        return timeout0(timeout, unit, Schedulers.computation(), other);</span>
+    }
+    
+    /**
+     * Returns a Completable that runs this Completable and emits a TimeoutException in case
+     * this Completable doesn't complete within the given time while &quot;waiting&quot; on the specified
+     * Scheduler.
+     * @param timeout the timeout value
+     * @param unit the timeout unit
+     * @param scheduler the scheduler to use to wait for completion
+     * @return the new Completable instance
+     * @throws NullPointerException if unit or scheduler is null
+     */
+    public final Completable timeout(long timeout, TimeUnit unit, Scheduler scheduler) {
+<span class="nc" id="L2069">        return timeout0(timeout, unit, scheduler, null);</span>
+    }
+    
+    /**
+     * Returns a Completable that runs this Completable and switches to the other Completable
+     * in case this Completable doesn't complete within the given time while &quot;waiting&quot; on
+     * the specified scheduler.
+     * @param timeout the timeout value
+     * @param unit the timeout unit
+     * @param scheduler the scheduler to use to wait for completion
+     * @param other the other Completable instance to switch to in case of a timeout
+     * @return the new Completable instance
+     * @throws NullPointerException if unit, scheduler or other is null
+     */
+    public final Completable timeout(long timeout, TimeUnit unit, Scheduler scheduler, Completable other) {
+<span class="nc" id="L2084">        requireNonNull(other);</span>
+<span class="nc" id="L2085">        return timeout0(timeout, unit, scheduler, other);</span>
+    }
+    
+    /**
+     * Returns a Completable that runs this Completable and optionally switches to the other Completable
+     * in case this Completable doesn't complete within the given time while &quot;waiting&quot; on
+     * the specified scheduler.
+     * @param timeout the timeout value
+     * @param unit the timeout unit
+     * @param scheduler the scheduler to use to wait for completion
+     * @param other the other Completable instance to switch to in case of a timeout, 
+     * if null a TimeoutException is emitted instead
+     * @return the new Completable instance
+     * @throws NullPointerException if unit or scheduler
+     */
+    public final Completable timeout0(long timeout, TimeUnit unit, Scheduler scheduler, Completable other) {
+<span class="fc" id="L2101">        requireNonNull(unit);</span>
+<span class="fc" id="L2102">        requireNonNull(scheduler);</span>
+<span class="fc" id="L2103">        return create(new CompletableOnSubscribeTimeout(this, timeout, unit, scheduler, other));</span>
+    }
+    
+    /**
+     * Allows fluent conversion to another type via a function callback.
+     * @param converter the function called with this which should return some other value.
+     * @return the converted value
+     * @throws NullPointerException if converter is null
+     */
+    public final &lt;U&gt; U to(Func1&lt;? super Completable, U&gt; converter) {
+<span class="fc" id="L2113">        return converter.call(this);</span>
+    }
+
+    /**
+     * Returns an Observable which when subscribed to subscribes to this Completable and
+     * relays the terminal events to the subscriber.
+     * @return the new Observable created
+     */
+    public final &lt;T&gt; Observable&lt;T&gt; toObservable() {
+<span class="fc" id="L2122">        return Observable.create(new OnSubscribe&lt;T&gt;() {</span>
+            @Override
+            public void call(Subscriber&lt;? super T&gt; s) {
+<span class="fc" id="L2125">                subscribe(s);</span>
+<span class="fc" id="L2126">            }</span>
+        });
+    }
+    
+    /**
+     * Convers this Completable into a Single which when this Completable completes normally,
+     * calls the given supplier and emits its returned value through onSuccess.
+     * @param completionValueFunc0 the value supplier called when this Completable completes normally
+     * @return the new Single instance
+     * @throws NullPointerException if completionValueFunc0 is null
+     */
+    public final &lt;T&gt; Single&lt;T&gt; toSingle(final Func0&lt;? extends T&gt; completionValueFunc0) {
+<span class="fc" id="L2138">        requireNonNull(completionValueFunc0);</span>
+<span class="fc" id="L2139">        return Single.create(new rx.Single.OnSubscribe&lt;T&gt;() {</span>
+            @Override
+            public void call(final SingleSubscriber&lt;? super T&gt; s) {
+<span class="fc" id="L2142">                subscribe(new CompletableSubscriber() {</span>
+
+                    @Override
+                    public void onCompleted() {
+                        T v;
+
+                        try {
+<span class="fc" id="L2149">                            v = completionValueFunc0.call();</span>
+<span class="fc" id="L2150">                        } catch (Throwable e) {</span>
+<span class="fc" id="L2151">                            s.onError(e);</span>
+<span class="fc" id="L2152">                            return;</span>
+<span class="fc" id="L2153">                        }</span>
+                        
+<span class="fc bfc" id="L2155" title="All 2 branches covered.">                        if (v == null) {</span>
+<span class="fc" id="L2156">                            s.onError(new NullPointerException(&quot;The value supplied is null&quot;));</span>
+                        } else {
+<span class="fc" id="L2158">                            s.onSuccess(v);</span>
+                        }
+<span class="fc" id="L2160">                    }</span>
+
+                    @Override
+                    public void onError(Throwable e) {
+<span class="fc" id="L2164">                        s.onError(e);</span>
+<span class="fc" id="L2165">                    }</span>
+
+                    @Override
+                    public void onSubscribe(Subscription d) {
+<span class="fc" id="L2169">                        s.add(d);</span>
+<span class="fc" id="L2170">                    }</span>
+                    
+                });
+<span class="fc" id="L2173">            }</span>
+        });
+    }
+    
+    /**
+     * Convers this Completable into a Single which when this Completable completes normally,
+     * emits the given value through onSuccess.
+     * @param completionValue the value to emit when this Completable completes normally
+     * @return the new Single instance
+     * @throws NullPointerException if completionValue is null
+     */
+    public final &lt;T&gt; Single&lt;T&gt; toSingleDefault(final T completionValue) {
+<span class="fc" id="L2185">        requireNonNull(completionValue);</span>
+<span class="fc" id="L2186">        return toSingle(new Func0&lt;T&gt;() {</span>
+            @Override
+            public T call() {
+<span class="fc" id="L2189">                return completionValue;</span>
+            }
+        });
+    }
+    
+    /**
+     * Returns a Completable which makes sure when a subscriber cancels the subscription, the 
+     * dispose is called on the specified scheduler
+     * @param scheduler the target scheduler where to execute the cancellation
+     * @return the new Completable instance
+     * @throws NullPointerException if scheduler is null
+     */
+    public final Completable unsubscribeOn(final Scheduler scheduler) {
+<span class="fc" id="L2202">        requireNonNull(scheduler);</span>
+<span class="fc" id="L2203">        return create(new CompletableOnSubscribe() {</span>
+            @Override
+            public void call(final CompletableSubscriber s) {
+<span class="fc" id="L2206">                subscribe(new CompletableSubscriber() {</span>
+
+                    @Override
+                    public void onCompleted() {
+<span class="nc" id="L2210">                        s.onCompleted();</span>
+<span class="nc" id="L2211">                    }</span>
+
+                    @Override
+                    public void onError(Throwable e) {
+<span class="nc" id="L2215">                        s.onError(e);</span>
+<span class="nc" id="L2216">                    }</span>
+
+                    @Override
+                    public void onSubscribe(final Subscription d) {
+<span class="fc" id="L2220">                        s.onSubscribe(Subscriptions.create(new Action0() {</span>
+                            @Override
+                            public void call() {
+<span class="fc" id="L2223">                                final Scheduler.Worker w = scheduler.createWorker();</span>
+<span class="fc" id="L2224">                                w.schedule(new Action0() {</span>
+                                    @Override
+                                    public void call() {
+                                        try {
+<span class="fc" id="L2228">                                            d.unsubscribe();</span>
+                                        } finally {
+<span class="pc" id="L2230">                                            w.unsubscribe();</span>
+<span class="fc" id="L2231">                                        }</span>
+<span class="fc" id="L2232">                                    }</span>
+                                });
+<span class="fc" id="L2234">                            }</span>
+                        }));
+<span class="fc" id="L2236">                    }</span>
+                    
+                });
+<span class="fc" id="L2239">            }</span>
+        });
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

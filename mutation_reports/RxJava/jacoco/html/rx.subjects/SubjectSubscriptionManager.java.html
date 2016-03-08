@@ -1,0 +1,343 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>SubjectSubscriptionManager.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.subjects</a> &gt; <span class="el_source">SubjectSubscriptionManager.java</span></div><h1>SubjectSubscriptionManager.java</h1><pre class="source lang-java linenums">/**
+ * Copyright 2014 Netflix, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package rx.subjects;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
+
+import rx.Observable.OnSubscribe;
+import rx.Observer;
+import rx.Subscriber;
+import rx.functions.Action0;
+import rx.functions.Action1;
+import rx.functions.Actions;
+import rx.internal.operators.NotificationLite;
+import rx.subscriptions.Subscriptions;
+
+/**
+ * Represents the typical state and OnSubscribe logic for a Subject implementation.
+ * @param &lt;T&gt; the source and return value type
+ */
+@SuppressWarnings({&quot;unchecked&quot;, &quot;rawtypes&quot;})
+/* package */final class SubjectSubscriptionManager&lt;T&gt; extends AtomicReference&lt;SubjectSubscriptionManager.State&lt;T&gt;&gt; implements OnSubscribe&lt;T&gt; {
+    /** Stores the latest value or the terminal value for some Subjects. */
+    volatile Object latest;
+    /** Indicates that the subject is active (cheaper than checking the state).*/
+<span class="fc" id="L40">    boolean active = true;</span>
+    /** Action called when a new subscriber subscribes but before it is added to the state. */
+<span class="fc" id="L42">    Action1&lt;SubjectObserver&lt;T&gt;&gt; onStart = Actions.empty();</span>
+    /** Action called after the subscriber has been added to the state. */
+<span class="fc" id="L44">    Action1&lt;SubjectObserver&lt;T&gt;&gt; onAdded = Actions.empty();</span>
+    /** Action called when the subscriber wants to subscribe to a terminal state. */
+<span class="fc" id="L46">    Action1&lt;SubjectObserver&lt;T&gt;&gt; onTerminated = Actions.empty();</span>
+    /** The notification lite. */
+<span class="fc" id="L48">    public final NotificationLite&lt;T&gt; nl = NotificationLite.instance();</span>
+
+    public SubjectSubscriptionManager() {
+<span class="fc" id="L51">        super(State.EMPTY);</span>
+<span class="fc" id="L52">    }</span>
+
+    @Override
+    public void call(final Subscriber&lt;? super T&gt; child) {
+<span class="fc" id="L56">        SubjectObserver&lt;T&gt; bo = new SubjectObserver&lt;T&gt;(child);</span>
+<span class="fc" id="L57">        addUnsubscriber(child, bo);</span>
+<span class="fc" id="L58">        onStart.call(bo);</span>
+<span class="fc bfc" id="L59" title="All 2 branches covered.">        if (!child.isUnsubscribed()) {</span>
+<span class="fc bfc" id="L60" title="All 4 branches covered.">            if (add(bo) &amp;&amp; child.isUnsubscribed()) {</span>
+<span class="fc" id="L61">                remove(bo);</span>
+            }
+        }
+<span class="fc" id="L64">    }</span>
+    /** Registers the unsubscribe action for the given subscriber. */
+    void addUnsubscriber(Subscriber&lt;? super T&gt; child, final SubjectObserver&lt;T&gt; bo) {
+<span class="fc" id="L67">        child.add(Subscriptions.create(new Action0() {</span>
+            @Override
+            public void call() {
+<span class="fc" id="L70">                remove(bo);</span>
+<span class="fc" id="L71">            }</span>
+        }));
+<span class="fc" id="L73">    }    </span>
+    /** Set the latest NotificationLite value. */
+    void setLatest(Object value) {
+<span class="fc" id="L76">        latest = value;</span>
+<span class="fc" id="L77">    }</span>
+    /** @return Retrieve the latest NotificationLite value */
+    Object getLatest() {
+<span class="fc" id="L80">        return latest;</span>
+    }
+    /** @return the array of active subscribers, don't write into the array! */
+    SubjectObserver&lt;T&gt;[] observers() {
+<span class="fc" id="L84">        return get().observers;</span>
+    }
+    /**
+     * Try to atomically add a SubjectObserver to the active state.
+     * @param o the SubjectObserver to add
+     * @return false if the subject is already in its terminal state
+     */
+    boolean add(SubjectObserver&lt;T&gt; o) {
+        do {
+<span class="fc" id="L93">            State oldState = get();</span>
+<span class="fc bfc" id="L94" title="All 2 branches covered.">            if (oldState.terminated) {</span>
+<span class="fc" id="L95">                onTerminated.call(o);</span>
+<span class="fc" id="L96">                return false;</span>
+            }
+<span class="fc" id="L98">            State newState = oldState.add(o);</span>
+<span class="fc bfc" id="L99" title="All 2 branches covered.">            if (compareAndSet(oldState, newState)) {</span>
+<span class="fc" id="L100">                onAdded.call(o);</span>
+<span class="fc" id="L101">                return true;</span>
+            }
+<span class="fc" id="L103">        } while (true);</span>
+    }
+    /**
+     * Atomically remove the specified SubjectObserver from the active observers.
+     * @param o the SubjectObserver to remove
+     */
+    void remove(SubjectObserver&lt;T&gt; o) {
+        do {
+<span class="fc" id="L111">            State oldState = get();</span>
+<span class="fc bfc" id="L112" title="All 2 branches covered.">            if (oldState.terminated) {</span>
+<span class="fc" id="L113">                return;</span>
+            }
+<span class="fc" id="L115">            State newState = oldState.remove(o);</span>
+<span class="pc bpc" id="L116" title="1 of 4 branches missed.">            if (newState == oldState || compareAndSet(oldState, newState)) {</span>
+<span class="fc" id="L117">                return;</span>
+            }
+<span class="nc" id="L119">        } while (true);</span>
+    }
+    /**
+     * Set a new latest NotificationLite value and return the active observers.
+     * @param n the new latest value
+     * @return the array of SubjectObservers, don't write into the array!
+     */
+    SubjectObserver&lt;T&gt;[] next(Object n) {
+<span class="fc" id="L127">        setLatest(n);</span>
+<span class="fc" id="L128">        return get().observers;</span>
+    }
+    /**
+     * Atomically set the terminal NotificationLite value (which could be any of the 3),
+     * clear the active observers and return the last active observers.
+     * @param n the terminal value
+     * @return the last active SubjectObservers
+     */
+    SubjectObserver&lt;T&gt;[] terminate(Object n) {
+<span class="fc" id="L137">        setLatest(n);</span>
+<span class="fc" id="L138">        active = false;</span>
+
+<span class="fc" id="L140">        State&lt;T&gt; oldState = get();</span>
+<span class="pc bpc" id="L141" title="1 of 2 branches missed.">        if (oldState.terminated) {</span>
+<span class="nc" id="L142">            return State.NO_OBSERVERS;</span>
+        }
+<span class="fc" id="L144">        return getAndSet(State.TERMINATED).observers;</span>
+    }
+
+    /** State-machine representing the termination state and active SubjectObservers. */
+    protected static final class State&lt;T&gt; {
+        final boolean terminated;
+        final SubjectObserver[] observers;
+<span class="fc" id="L151">        static final SubjectObserver[] NO_OBSERVERS = new SubjectObserver[0];</span>
+<span class="fc" id="L152">        static final State TERMINATED = new State(true, NO_OBSERVERS);</span>
+<span class="fc" id="L153">        static final State EMPTY = new State(false, NO_OBSERVERS);</span>
+        
+<span class="fc" id="L155">        public State(boolean terminated, SubjectObserver[] observers) {</span>
+<span class="fc" id="L156">            this.terminated = terminated;</span>
+<span class="fc" id="L157">            this.observers = observers;</span>
+<span class="fc" id="L158">        }</span>
+        public State add(SubjectObserver o) {
+<span class="fc" id="L160">            SubjectObserver[] a = observers;</span>
+<span class="fc" id="L161">            int n = a.length;</span>
+<span class="fc" id="L162">            SubjectObserver[] b = new SubjectObserver[n + 1];</span>
+<span class="fc" id="L163">            System.arraycopy(observers, 0, b, 0, n);</span>
+<span class="fc" id="L164">            b[n] = o;</span>
+<span class="fc" id="L165">            return new State&lt;T&gt;(terminated, b);</span>
+        }
+        public State remove(SubjectObserver o) {
+<span class="fc" id="L168">            SubjectObserver[] a = observers;</span>
+<span class="fc" id="L169">            int n = a.length;</span>
+<span class="pc bpc" id="L170" title="1 of 4 branches missed.">            if (n == 1 &amp;&amp; a[0] == o) {</span>
+<span class="fc" id="L171">                return EMPTY;</span>
+            } else
+<span class="fc bfc" id="L173" title="All 2 branches covered.">                if (n == 0) {</span>
+<span class="fc" id="L174">                    return this;</span>
+                }
+<span class="fc" id="L176">            SubjectObserver[] b = new SubjectObserver[n - 1];</span>
+<span class="fc" id="L177">            int j = 0;</span>
+<span class="fc bfc" id="L178" title="All 2 branches covered.">            for (int i = 0; i &lt; n; i++) {</span>
+<span class="fc" id="L179">                SubjectObserver ai = a[i];</span>
+<span class="fc bfc" id="L180" title="All 2 branches covered.">                if (ai != o) {</span>
+<span class="pc bpc" id="L181" title="1 of 2 branches missed.">                    if (j == n - 1) {</span>
+<span class="nc" id="L182">                        return this;</span>
+                    }
+<span class="fc" id="L184">                    b[j++] = ai;</span>
+                }
+            }
+<span class="pc bpc" id="L187" title="1 of 2 branches missed.">            if (j == 0) {</span>
+<span class="nc" id="L188">                return EMPTY;</span>
+            }
+<span class="pc bpc" id="L190" title="1 of 2 branches missed.">            if (j &lt; n - 1) {</span>
+<span class="nc" id="L191">                SubjectObserver[] c = new SubjectObserver[j];</span>
+<span class="nc" id="L192">                System.arraycopy(b, 0, c, 0, j);</span>
+<span class="nc" id="L193">                b = c;</span>
+            }
+<span class="fc" id="L195">            return new State&lt;T&gt;(terminated, b);</span>
+        }
+    }
+    
+    /**
+     * Observer wrapping the actual Subscriber and providing various
+     * emission facilities.
+     * @param &lt;T&gt; the consumed value type of the actual Observer
+     */
+    protected static final class SubjectObserver&lt;T&gt; implements Observer&lt;T&gt; {
+        /** The actual Observer. */
+        final Observer&lt;? super T&gt; actual;
+        /** Was the emitFirst run? Guarded by this. */
+<span class="fc" id="L208">        boolean first = true;</span>
+        /** Guarded by this. */
+        boolean emitting;
+        /** Guarded by this. */
+        List&lt;Object&gt; queue;
+        /* volatile */boolean fastPath;
+        /** Indicate that the observer has caught up. */
+        protected volatile boolean caughtUp;
+        /** Indicate where the observer is at replaying. */
+        private volatile Object index;
+<span class="fc" id="L218">        public SubjectObserver(Observer&lt;? super T&gt; actual) {</span>
+<span class="fc" id="L219">            this.actual = actual;</span>
+<span class="fc" id="L220">        }</span>
+        @Override
+        public void onNext(T t) {
+<span class="fc" id="L223">            actual.onNext(t);</span>
+<span class="fc" id="L224">        }</span>
+        @Override
+        public void onError(Throwable e) {
+<span class="fc" id="L227">            actual.onError(e);</span>
+<span class="fc" id="L228">        }</span>
+        @Override
+        public void onCompleted() {
+<span class="fc" id="L231">            actual.onCompleted();</span>
+<span class="fc" id="L232">        }</span>
+        /**
+         * Emits the given NotificationLite value and
+         * prevents the emitFirst to run if not already run.
+         * @param n the NotificationLite value
+         * @param nl the type-appropriate notification lite object
+         */
+        protected void emitNext(Object n, final NotificationLite&lt;T&gt; nl) {
+<span class="fc bfc" id="L240" title="All 2 branches covered.">            if (!fastPath) {</span>
+<span class="fc" id="L241">                synchronized (this) {</span>
+<span class="fc" id="L242">                    first = false;</span>
+<span class="fc bfc" id="L243" title="All 2 branches covered.">                    if (emitting) {</span>
+<span class="pc bpc" id="L244" title="1 of 2 branches missed.">                        if (queue == null) {</span>
+<span class="fc" id="L245">                            queue = new ArrayList&lt;Object&gt;();</span>
+                        }
+<span class="fc" id="L247">                        queue.add(n);</span>
+<span class="fc" id="L248">                        return;</span>
+                    }
+<span class="pc" id="L250">                }</span>
+<span class="fc" id="L251">                fastPath = true;</span>
+            }
+<span class="fc" id="L253">            nl.accept(actual, n);</span>
+<span class="fc" id="L254">        }</span>
+        /**
+         * Tries to emit a NotificationLite value as the first
+         * value and drains the queue as long as possible.
+         * @param n the NotificationLite value
+         * @param nl the type-appropriate notification lite object
+         */
+        protected void emitFirst(Object n, final NotificationLite&lt;T&gt; nl) {
+<span class="fc" id="L262">            synchronized (this) {</span>
+<span class="pc bpc" id="L263" title="1 of 4 branches missed.">                if (!first || emitting) {</span>
+<span class="fc" id="L264">                    return;</span>
+                }
+<span class="fc" id="L266">                first = false;</span>
+<span class="fc bfc" id="L267" title="All 2 branches covered.">                emitting = n != null;</span>
+<span class="pc" id="L268">            }</span>
+<span class="fc bfc" id="L269" title="All 2 branches covered.">            if (n != null) {</span>
+<span class="fc" id="L270">                emitLoop(null, n, nl);</span>
+            }
+<span class="fc" id="L272">        }</span>
+        /**
+         * Emits the contents of the queue as long as there are values.
+         * @param localQueue the initial queue contents
+         * @param current the current content to emit
+         * @param nl the type-appropriate notification lite object
+         */
+        protected void emitLoop(List&lt;Object&gt; localQueue, Object current, final NotificationLite&lt;T&gt; nl) {
+<span class="fc" id="L280">            boolean once = true;</span>
+<span class="fc" id="L281">            boolean skipFinal = false;</span>
+            try {
+                do {
+<span class="fc bfc" id="L284" title="All 2 branches covered.">                    if (localQueue != null) {</span>
+<span class="fc bfc" id="L285" title="All 2 branches covered.">                        for (Object n : localQueue) {</span>
+<span class="fc" id="L286">                            accept(n, nl);</span>
+<span class="fc" id="L287">                        }</span>
+                    }
+<span class="fc bfc" id="L289" title="All 2 branches covered.">                    if (once) {</span>
+<span class="fc" id="L290">                        once = false;</span>
+<span class="fc" id="L291">                        accept(current, nl);</span>
+                    }
+<span class="fc" id="L293">                    synchronized (this) {</span>
+<span class="fc" id="L294">                        localQueue = queue;</span>
+<span class="fc" id="L295">                        queue = null;</span>
+<span class="fc bfc" id="L296" title="All 2 branches covered.">                        if (localQueue == null) {</span>
+<span class="fc" id="L297">                            emitting = false;</span>
+<span class="fc" id="L298">                            skipFinal = true;</span>
+<span class="fc" id="L299">                            break;</span>
+                        }
+<span class="pc" id="L301">                    }</span>
+<span class="fc" id="L302">                } while (true);</span>
+            } finally {
+<span class="pc bpc" id="L304" title="3 of 4 branches missed.">                if (!skipFinal) {</span>
+<span class="nc" id="L305">                    synchronized (this) {</span>
+<span class="nc" id="L306">                        emitting = false;</span>
+<span class="nc" id="L307">                    }</span>
+                }
+            }
+<span class="fc" id="L310">        }</span>
+        /**
+         * Dispatches a NotificationLite value to the actual Observer.
+         * @param n the value to dispatch
+         * @param nl the type-appropriate notification lite object
+         */
+        protected void accept(Object n, final NotificationLite&lt;T&gt; nl) {
+<span class="pc bpc" id="L317" title="1 of 2 branches missed.">            if (n != null) {</span>
+<span class="fc" id="L318">                nl.accept(actual, n);</span>
+            }
+<span class="fc" id="L320">        }</span>
+        
+        /** @return the actual Observer. */
+        protected Observer&lt;? super T&gt; getActual() {
+<span class="nc" id="L324">            return actual;</span>
+        }
+        /**
+         * Returns the stored index.
+         * @param &lt;I&gt; the index type
+         * @return the index value
+         */
+        public &lt;I&gt; I index() {
+<span class="fc" id="L332">            return (I)index;</span>
+        }
+        /**
+         * Sets a new index value.
+         * @param newIndex the new index value
+         */
+        public void index(Object newIndex) {
+<span class="fc" id="L339">            this.index = newIndex;</span>
+<span class="fc" id="L340">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

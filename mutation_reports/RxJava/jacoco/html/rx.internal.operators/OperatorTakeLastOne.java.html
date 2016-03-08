@@ -1,0 +1,175 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>OperatorTakeLastOne.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.internal.operators</a> &gt; <span class="el_source">OperatorTakeLastOne.java</span></div><h1>OperatorTakeLastOne.java</h1><pre class="source lang-java linenums">package rx.internal.operators;
+
+import java.util.concurrent.atomic.AtomicInteger;
+
+import rx.Observable.Operator;
+import rx.exceptions.Exceptions;
+import rx.Producer;
+import rx.Subscriber;
+
+public class OperatorTakeLastOne&lt;T&gt; implements Operator&lt;T, T&gt; {
+
+<span class="nc" id="L12">    private static class Holder {</span>
+<span class="fc" id="L13">        static final OperatorTakeLastOne&lt;Object&gt; INSTANCE = new OperatorTakeLastOne&lt;Object&gt;();</span>
+    }
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    public static &lt;T&gt; OperatorTakeLastOne&lt;T&gt; instance() {
+<span class="fc" id="L18">        return (OperatorTakeLastOne&lt;T&gt;) Holder.INSTANCE;</span>
+    }
+
+<span class="fc" id="L21">    OperatorTakeLastOne() {</span>
+
+<span class="fc" id="L23">    }</span>
+
+    @Override
+    public Subscriber&lt;? super T&gt; call(Subscriber&lt;? super T&gt; child) {
+<span class="fc" id="L27">        final ParentSubscriber&lt;T&gt; parent = new ParentSubscriber&lt;T&gt;(child);</span>
+<span class="fc" id="L28">        child.setProducer(new Producer() {</span>
+
+            @Override
+            public void request(long n) {
+<span class="fc" id="L32">                parent.requestMore(n);</span>
+<span class="fc" id="L33">            }</span>
+        });
+<span class="fc" id="L35">        child.add(parent);</span>
+<span class="fc" id="L36">        return parent;</span>
+    }
+
+    private static class ParentSubscriber&lt;T&gt; extends Subscriber&lt;T&gt; {
+
+        private final static int NOT_REQUESTED_NOT_COMPLETED = 0;
+        private final static int NOT_REQUESTED_COMPLETED = 1;
+        private final static int REQUESTED_NOT_COMPLETED = 2;
+        private final static int REQUESTED_COMPLETED = 3;
+
+        /*
+         * These are the expected state transitions:
+         * 
+         * NOT_REQUESTED_NOT_COMPLETED   --&gt;   REQUESTED_NOT_COMPLETED 
+         *            |                             | 
+         *            V                             V
+         * NOT_REQUESTED_COMPLETED       --&gt;   REQUESTED_COMPLETED
+         * 
+         * Once at REQUESTED_COMPLETED we emit the last value if one exists
+         */
+
+        // Used as the initial value of last
+<span class="fc" id="L58">        private static final Object ABSENT = new Object();</span>
+
+        // the downstream subscriber
+        private final Subscriber&lt;? super T&gt; child;
+
+<span class="fc" id="L63">        @SuppressWarnings(&quot;unchecked&quot;)</span>
+        // we can get away with this cast at runtime because of type erasure
+        private T last = (T) ABSENT;
+
+        // holds the current state of the stream so that we can make atomic
+        // updates to it
+<span class="fc" id="L69">        private final AtomicInteger state = new AtomicInteger(NOT_REQUESTED_NOT_COMPLETED);</span>
+
+<span class="fc" id="L71">        ParentSubscriber(Subscriber&lt;? super T&gt; child) {</span>
+<span class="fc" id="L72">            this.child = child;</span>
+<span class="fc" id="L73">        }</span>
+        
+        void requestMore(long n) {
+<span class="fc bfc" id="L76" title="All 2 branches covered.">            if (n &gt; 0) {</span>
+                // CAS loop to atomically change state given that onCompleted()
+                // or another requestMore() may be acting concurrently
+                while (true) {
+                    // read the value of state and then try state transitions
+                    // only if the value of state does not change in the
+                    // meantime (in another requestMore() or onCompleted()). If
+                    // the value has changed and we expect to do a transition
+                    // still then we loop and try again.
+<span class="fc" id="L85">                    final int s = state.get();</span>
+<span class="fc bfc" id="L86" title="All 2 branches covered.">                    if (s == NOT_REQUESTED_NOT_COMPLETED) {</span>
+<span class="pc bpc" id="L87" title="1 of 2 branches missed.">                        if (state.compareAndSet(NOT_REQUESTED_NOT_COMPLETED,</span>
+                                REQUESTED_NOT_COMPLETED)) {
+<span class="fc" id="L89">                            return;</span>
+                        }
+<span class="fc bfc" id="L91" title="All 2 branches covered.">                    } else if (s == NOT_REQUESTED_COMPLETED) {</span>
+<span class="pc bpc" id="L92" title="1 of 2 branches missed.">                        if (state.compareAndSet(NOT_REQUESTED_COMPLETED, REQUESTED_COMPLETED)) {</span>
+<span class="fc" id="L93">                            emit();</span>
+<span class="fc" id="L94">                            return;</span>
+                        }
+                    } else
+                        // already requested so we exit
+<span class="fc" id="L98">                        return;</span>
+<span class="nc" id="L99">                }</span>
+            }
+<span class="fc" id="L101">        }</span>
+
+        @Override
+        public void onCompleted() {
+            //shortcut if an empty stream
+<span class="fc bfc" id="L106" title="All 2 branches covered.">            if (last == ABSENT) {</span>
+<span class="fc" id="L107">                child.onCompleted();</span>
+<span class="fc" id="L108">                return;</span>
+            }
+            // CAS loop to atomically change state given that requestMore()
+            // may be acting concurrently
+            while (true) {
+                // read the value of state and then try state transitions
+                // only if the value of state does not change in the meantime
+                // (in another requestMore()). If the value has changed and
+                // we expect to do a transition still then we loop and try
+                // again.
+<span class="fc" id="L118">                final int s = state.get();</span>
+<span class="fc bfc" id="L119" title="All 2 branches covered.">                if (s == NOT_REQUESTED_NOT_COMPLETED) {</span>
+<span class="pc bpc" id="L120" title="1 of 2 branches missed.">                    if (state.compareAndSet(NOT_REQUESTED_NOT_COMPLETED, NOT_REQUESTED_COMPLETED)) {</span>
+<span class="fc" id="L121">                        return;</span>
+                    }
+<span class="pc bpc" id="L123" title="1 of 2 branches missed.">                } else if (s == REQUESTED_NOT_COMPLETED) {</span>
+<span class="pc bpc" id="L124" title="1 of 2 branches missed.">                    if (state.compareAndSet(REQUESTED_NOT_COMPLETED, REQUESTED_COMPLETED)) {</span>
+<span class="fc" id="L125">                        emit();</span>
+<span class="fc" id="L126">                        return;</span>
+                    }
+                } else
+                    // already completed so we exit
+<span class="nc" id="L130">                    return;</span>
+<span class="nc" id="L131">            }</span>
+        }
+
+        /**
+         * If not unsubscribed then emits last value and completed to the child
+         * subscriber.
+         */
+        private void emit() {
+<span class="pc bpc" id="L139" title="1 of 2 branches missed.">            if (isUnsubscribed()) {</span>
+                // release for gc
+<span class="nc" id="L141">                last = null;</span>
+<span class="nc" id="L142">                return;</span>
+            }
+            // Note that last is safely published despite not being volatile
+            // because a CAS update must have happened in the current thread just before
+            // emit() was called
+<span class="fc" id="L147">            T t = last;</span>
+            // release for gc
+<span class="fc" id="L149">            last = null;</span>
+<span class="pc bpc" id="L150" title="1 of 2 branches missed.">            if (t != ABSENT) {</span>
+                try {
+<span class="fc" id="L152">                    child.onNext(t);</span>
+<span class="nc" id="L153">                } catch (Throwable e) {</span>
+<span class="nc" id="L154">                    Exceptions.throwOrReport(e, child);</span>
+<span class="nc" id="L155">                    return;</span>
+<span class="fc" id="L156">                }</span>
+            }
+<span class="fc bfc" id="L158" title="All 2 branches covered.">            if (!isUnsubscribed())</span>
+<span class="fc" id="L159">                child.onCompleted();</span>
+<span class="fc" id="L160">        }</span>
+
+        @Override
+        public void onError(Throwable e) {
+<span class="fc" id="L164">            child.onError(e);</span>
+<span class="fc" id="L165">        }</span>
+
+        @Override
+        public void onNext(T t) {
+<span class="fc" id="L169">            last = t;</span>
+<span class="fc" id="L170">        }</span>
+
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

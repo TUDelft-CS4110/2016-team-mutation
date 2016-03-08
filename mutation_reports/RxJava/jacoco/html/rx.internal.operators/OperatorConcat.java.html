@@ -1,0 +1,242 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>OperatorConcat.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.internal.operators</a> &gt; <span class="el_source">OperatorConcat.java</span></div><h1>OperatorConcat.java</h1><pre class="source lang-java linenums">/**
+ * Copyright 2014 Netflix, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package rx.internal.operators;
+
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.*;
+
+import rx.*;
+import rx.Observable.Operator;
+import rx.functions.Action0;
+import rx.internal.producers.ProducerArbiter;
+import rx.observers.SerializedSubscriber;
+import rx.subscriptions.*;
+
+/**
+ * Returns an Observable that emits the items emitted by two or more Observables, one after the other.
+ * &lt;p&gt;
+ * &lt;img width=&quot;640&quot; src=&quot;https://github.com/ReactiveX/RxJava/wiki/images/rx-operators/concat.png&quot; alt=&quot;&quot;&gt;
+ *
+ * @param &lt;T&gt;
+ *            the source and result value type
+ */
+public final class OperatorConcat&lt;T&gt; implements Operator&lt;T, Observable&lt;? extends T&gt;&gt; {
+    /** Lazy initialization via inner-class holder. */
+<span class="nc" id="L38">    private static final class Holder {</span>
+        /** A singleton instance. */
+<span class="fc" id="L40">        static final OperatorConcat&lt;Object&gt; INSTANCE = new OperatorConcat&lt;Object&gt;();</span>
+    }
+    /**
+     * @return a singleton instance of this stateless operator.
+     */
+    @SuppressWarnings(&quot;unchecked&quot;)
+    public static &lt;T&gt; OperatorConcat&lt;T&gt; instance() {
+<span class="fc" id="L47">        return (OperatorConcat&lt;T&gt;)Holder.INSTANCE;</span>
+    }
+<span class="fc" id="L49">    OperatorConcat() { }</span>
+    @Override
+    public Subscriber&lt;? super Observable&lt;? extends T&gt;&gt; call(final Subscriber&lt;? super T&gt; child) {
+<span class="fc" id="L52">        final SerializedSubscriber&lt;T&gt; s = new SerializedSubscriber&lt;T&gt;(child);</span>
+<span class="fc" id="L53">        final SerialSubscription current = new SerialSubscription();</span>
+<span class="fc" id="L54">        child.add(current);</span>
+<span class="fc" id="L55">        ConcatSubscriber&lt;T&gt; cs = new ConcatSubscriber&lt;T&gt;(s, current);</span>
+<span class="fc" id="L56">        ConcatProducer&lt;T&gt; cp = new ConcatProducer&lt;T&gt;(cs);</span>
+<span class="fc" id="L57">        child.setProducer(cp);</span>
+<span class="fc" id="L58">        return cs;</span>
+    }
+
+    static final class ConcatProducer&lt;T&gt; implements Producer {
+        final ConcatSubscriber&lt;T&gt; cs;
+
+<span class="fc" id="L64">        ConcatProducer(ConcatSubscriber&lt;T&gt; cs) {</span>
+<span class="fc" id="L65">            this.cs = cs;</span>
+<span class="fc" id="L66">        }</span>
+
+        @Override
+        public void request(long n) {
+<span class="fc" id="L70">            cs.requestFromChild(n);</span>
+<span class="fc" id="L71">        }</span>
+
+    }
+
+    static final class ConcatSubscriber&lt;T&gt; extends Subscriber&lt;Observable&lt;? extends T&gt;&gt; {
+<span class="fc" id="L76">        final NotificationLite&lt;Observable&lt;? extends T&gt;&gt; nl = NotificationLite.instance();</span>
+        private final Subscriber&lt;T&gt; child;
+        private final SerialSubscription current;
+        final ConcurrentLinkedQueue&lt;Object&gt; queue;
+
+        volatile ConcatInnerSubscriber&lt;T&gt; currentSubscriber;
+
+<span class="fc" id="L83">        final AtomicInteger wip = new AtomicInteger();</span>
+
+        // accessed by REQUESTED
+<span class="fc" id="L86">        private final AtomicLong requested = new AtomicLong();</span>
+        private final ProducerArbiter arbiter;
+
+        public ConcatSubscriber(Subscriber&lt;T&gt; s, SerialSubscription current) {
+<span class="fc" id="L90">            super(s);</span>
+<span class="fc" id="L91">            this.child = s;</span>
+<span class="fc" id="L92">            this.current = current;</span>
+<span class="fc" id="L93">            this.arbiter = new ProducerArbiter();</span>
+<span class="fc" id="L94">            this.queue = new ConcurrentLinkedQueue&lt;Object&gt;();</span>
+<span class="fc" id="L95">            add(Subscriptions.create(new Action0() {</span>
+                @Override
+                public void call() {
+<span class="fc" id="L98">                    queue.clear();</span>
+<span class="fc" id="L99">                }</span>
+            }));
+<span class="fc" id="L101">        }</span>
+
+        @Override
+        public void onStart() {
+            // no need for more than 1 at a time since we concat 1 at a time, so we'll request 2 to start ...
+            // 1 to be subscribed to, 1 in the queue, then we'll keep requesting 1 at a time after that
+<span class="fc" id="L107">            request(2);</span>
+<span class="fc" id="L108">        }</span>
+
+        private void requestFromChild(long n) {
+<span class="fc bfc" id="L111" title="All 2 branches covered.">            if (n &lt;= 0) return;</span>
+            // we track 'requested' so we know whether we should subscribe the next or not
+            
+<span class="fc" id="L114">            final AtomicLong requestedField = requested;</span>
+            
+            long previous;
+            
+<span class="fc bfc" id="L118" title="All 2 branches covered.">            if (requestedField.get() != Long.MAX_VALUE) {</span>
+<span class="fc" id="L119">                previous = BackpressureUtils.getAndAddRequest(requestedField, n);</span>
+            } else {
+<span class="fc" id="L121">                previous = Long.MAX_VALUE;</span>
+            }
+            
+<span class="fc" id="L124">            arbiter.request(n);</span>
+<span class="fc bfc" id="L125" title="All 2 branches covered.">            if (previous == 0) {</span>
+<span class="pc bpc" id="L126" title="1 of 4 branches missed.">                if (currentSubscriber == null &amp;&amp; wip.get() &gt; 0) {</span>
+                    // this means we may be moving from one subscriber to another after having stopped processing
+                    // so need to kick off the subscribe via this request notification
+<span class="fc" id="L129">                    subscribeNext();</span>
+                }
+            } 
+<span class="fc" id="L132">        }</span>
+
+        @Override
+        public void onNext(Observable&lt;? extends T&gt; t) {
+<span class="fc" id="L136">            queue.add(nl.next(t));</span>
+<span class="fc bfc" id="L137" title="All 2 branches covered.">            if (wip.getAndIncrement() == 0) {</span>
+<span class="fc" id="L138">                subscribeNext();</span>
+            }
+<span class="fc" id="L140">        }</span>
+
+        @Override
+        public void onError(Throwable e) {
+<span class="fc" id="L144">            child.onError(e);</span>
+<span class="fc" id="L145">            unsubscribe();</span>
+<span class="fc" id="L146">        }</span>
+
+        @Override
+        public void onCompleted() {
+<span class="fc" id="L150">            queue.add(nl.completed());</span>
+<span class="fc bfc" id="L151" title="All 2 branches covered.">            if (wip.getAndIncrement() == 0) {</span>
+<span class="fc" id="L152">                subscribeNext();</span>
+            }
+<span class="fc" id="L154">        }</span>
+        
+
+        void completeInner() {
+<span class="fc" id="L158">            currentSubscriber = null;</span>
+<span class="fc bfc" id="L159" title="All 2 branches covered.">            if (wip.decrementAndGet() &gt; 0) {</span>
+<span class="fc" id="L160">                subscribeNext();</span>
+            }
+<span class="fc" id="L162">            request(1);</span>
+<span class="fc" id="L163">        }</span>
+
+        void subscribeNext() {
+<span class="fc bfc" id="L166" title="All 2 branches covered.">            if (requested.get() &gt; 0) {</span>
+<span class="fc" id="L167">                Object o = queue.poll();</span>
+<span class="fc bfc" id="L168" title="All 2 branches covered.">                if (nl.isCompleted(o)) {</span>
+<span class="fc" id="L169">                    child.onCompleted();</span>
+<span class="pc bpc" id="L170" title="1 of 2 branches missed.">                } else if (o != null) {</span>
+<span class="fc" id="L171">                    Observable&lt;? extends T&gt; obs = nl.getValue(o);</span>
+                    
+<span class="fc" id="L173">                    currentSubscriber = new ConcatInnerSubscriber&lt;T&gt;(this, child, arbiter);</span>
+<span class="fc" id="L174">                    current.set(currentSubscriber);</span>
+
+<span class="fc" id="L176">                    obs.unsafeSubscribe(currentSubscriber);</span>
+                }
+<span class="fc" id="L178">            } else {</span>
+                // requested == 0, so we'll peek to see if we are completed, otherwise wait until another request
+<span class="fc" id="L180">                Object o = queue.peek();</span>
+<span class="fc bfc" id="L181" title="All 2 branches covered.">                if (nl.isCompleted(o)) {</span>
+<span class="fc" id="L182">                    child.onCompleted();</span>
+                }
+            }
+<span class="fc" id="L185">        }</span>
+        
+        void produced(long c) {
+<span class="fc bfc" id="L188" title="All 2 branches covered.">            if (c != 0L) {</span>
+<span class="fc" id="L189">                arbiter.produced(c);</span>
+<span class="fc" id="L190">                BackpressureUtils.produced(requested, c);</span>
+            }
+<span class="fc" id="L192">        }</span>
+    }
+
+    static class ConcatInnerSubscriber&lt;T&gt; extends Subscriber&lt;T&gt; {
+
+        private final Subscriber&lt;T&gt; child;
+        private final ConcatSubscriber&lt;T&gt; parent;
+<span class="fc" id="L199">        private final AtomicBoolean once = new AtomicBoolean();</span>
+        private final ProducerArbiter arbiter;
+        
+        long produced;
+
+<span class="fc" id="L204">        public ConcatInnerSubscriber(ConcatSubscriber&lt;T&gt; parent, Subscriber&lt;T&gt; child, ProducerArbiter arbiter) {</span>
+<span class="fc" id="L205">            this.parent = parent;</span>
+<span class="fc" id="L206">            this.child = child;</span>
+<span class="fc" id="L207">            this.arbiter = arbiter;</span>
+<span class="fc" id="L208">        }</span>
+        
+        @Override
+        public void onNext(T t) {
+<span class="fc" id="L212">            produced++;</span>
+            
+<span class="fc" id="L214">            child.onNext(t);</span>
+<span class="fc" id="L215">        }</span>
+
+        @Override
+        public void onError(Throwable e) {
+<span class="pc bpc" id="L219" title="1 of 2 branches missed.">            if (once.compareAndSet(false, true)) {</span>
+                // terminal error through parent so everything gets cleaned up, including this inner
+<span class="fc" id="L221">                parent.onError(e);</span>
+            }
+<span class="fc" id="L223">        }</span>
+
+        @Override
+        public void onCompleted() {
+<span class="fc bfc" id="L227" title="All 2 branches covered.">            if (once.compareAndSet(false, true)) {</span>
+<span class="fc" id="L228">                ConcatSubscriber&lt;T&gt; p = parent;</span>
+                // signal the production count at once instead of one by one
+<span class="fc" id="L230">                p.produced(produced);</span>
+                // terminal completion to parent so it continues to the next
+<span class="fc" id="L232">                p.completeInner();</span>
+            }
+<span class="fc" id="L234">        }</span>
+        
+        @Override
+        public void setProducer(Producer producer) {
+<span class="fc" id="L238">            arbiter.setProducer(producer);</span>
+<span class="fc" id="L239">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

@@ -1,0 +1,308 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>OperatorBufferWithTime.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.internal.operators</a> &gt; <span class="el_source">OperatorBufferWithTime.java</span></div><h1>OperatorBufferWithTime.java</h1><pre class="source lang-java linenums">/**
+ * Copyright 2014 Netflix, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package rx.internal.operators;
+
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+import rx.Observable;
+import rx.Observable.Operator;
+import rx.Scheduler;
+import rx.Scheduler.Worker;
+import rx.Subscriber;
+import rx.exceptions.Exceptions;
+import rx.functions.Action0;
+import rx.observers.SerializedSubscriber;
+
+/**
+ * This operation takes
+ * values from the specified {@link Observable} source and stores them in a buffer. Periodically the buffer
+ * is emitted and replaced with a new buffer. How often this is done depends on the specified timespan.
+ * The creation of chunks is also periodical. How often this is done depends on the specified timeshift.
+ * When the source {@link Observable} completes or produces an error, the current buffer is emitted, and
+ * the event is propagated to all subscribed {@link Subscriber}s.
+ * &lt;p&gt;
+ * Note that this operation can produce &lt;strong&gt;non-connected, or overlapping chunks&lt;/strong&gt; depending
+ * on the input parameters.
+ * &lt;/p&gt;
+ * 
+ * @param &lt;T&gt; the buffered value type
+ */
+public final class OperatorBufferWithTime&lt;T&gt; implements Operator&lt;List&lt;T&gt;, T&gt; {
+    final long timespan;
+    final long timeshift;
+    final TimeUnit unit;
+    final int count;
+    final Scheduler scheduler;
+
+    /**
+     * @param timespan
+     *            the amount of time all chunks must be actively collect values before being emitted
+     * @param timeshift
+     *            the amount of time between creating chunks
+     * @param unit
+     *            the {@link TimeUnit} defining the unit of time for the timespan
+     * @param count
+     *            the maximum size of the buffer. Once a buffer reaches this size, it is emitted
+     * @param scheduler
+     *            the {@link Scheduler} to use for timing chunks
+     */
+<span class="fc" id="L65">    public OperatorBufferWithTime(long timespan, long timeshift, TimeUnit unit, int count, Scheduler scheduler) {</span>
+<span class="fc" id="L66">        this.timespan = timespan;</span>
+<span class="fc" id="L67">        this.timeshift = timeshift;</span>
+<span class="fc" id="L68">        this.unit = unit;</span>
+<span class="fc" id="L69">        this.count = count;</span>
+<span class="fc" id="L70">        this.scheduler = scheduler;</span>
+<span class="fc" id="L71">    }</span>
+
+    @Override
+    public Subscriber&lt;? super T&gt; call(final Subscriber&lt;? super List&lt;T&gt;&gt; child) {
+<span class="fc" id="L75">        final Worker inner = scheduler.createWorker();</span>
+<span class="fc" id="L76">        SerializedSubscriber&lt;List&lt;T&gt;&gt; serialized = new SerializedSubscriber&lt;List&lt;T&gt;&gt;(child);</span>
+        
+<span class="fc bfc" id="L78" title="All 2 branches covered.">        if (timespan == timeshift) {</span>
+<span class="fc" id="L79">            ExactSubscriber bsub = new ExactSubscriber(serialized, inner);</span>
+<span class="fc" id="L80">            bsub.add(inner);</span>
+<span class="fc" id="L81">            child.add(bsub);</span>
+<span class="fc" id="L82">            bsub.scheduleExact();</span>
+<span class="fc" id="L83">            return bsub;</span>
+        }
+        
+<span class="fc" id="L86">        InexactSubscriber bsub = new InexactSubscriber(serialized, inner);</span>
+<span class="fc" id="L87">        bsub.add(inner);</span>
+<span class="fc" id="L88">        child.add(bsub);</span>
+<span class="fc" id="L89">        bsub.startNewChunk();</span>
+<span class="fc" id="L90">        bsub.scheduleChunk();</span>
+<span class="fc" id="L91">        return bsub;</span>
+    }
+    /** Subscriber when the buffer chunking time and lenght differ. */
+    final class InexactSubscriber extends Subscriber&lt;T&gt; {
+        final Subscriber&lt;? super List&lt;T&gt;&gt; child;
+        final Worker inner;
+        /** Guarded by this. */
+        final List&lt;List&lt;T&gt;&gt; chunks;
+        /** Guarded by this. */
+        boolean done;
+<span class="fc" id="L101">        public InexactSubscriber(Subscriber&lt;? super List&lt;T&gt;&gt; child, Worker inner) {</span>
+<span class="fc" id="L102">            this.child = child;</span>
+<span class="fc" id="L103">            this.inner = inner;</span>
+<span class="fc" id="L104">            this.chunks = new LinkedList&lt;List&lt;T&gt;&gt;();</span>
+<span class="fc" id="L105">        }</span>
+
+        @Override
+        public void onNext(T t) {
+<span class="fc" id="L109">            List&lt;List&lt;T&gt;&gt; sizeReached = null;</span>
+<span class="fc" id="L110">            synchronized (this) {</span>
+<span class="pc bpc" id="L111" title="1 of 2 branches missed.">                if (done) {</span>
+<span class="nc" id="L112">                    return;</span>
+                }
+<span class="fc" id="L114">                Iterator&lt;List&lt;T&gt;&gt; it = chunks.iterator();</span>
+<span class="fc bfc" id="L115" title="All 2 branches covered.">                while (it.hasNext()) {</span>
+<span class="fc" id="L116">                    List&lt;T&gt; chunk = it.next();</span>
+<span class="fc" id="L117">                    chunk.add(t);</span>
+<span class="pc bpc" id="L118" title="1 of 2 branches missed.">                    if (chunk.size() == count) {</span>
+<span class="nc" id="L119">                        it.remove();</span>
+<span class="nc bnc" id="L120" title="All 2 branches missed.">                        if (sizeReached == null) {</span>
+<span class="nc" id="L121">                            sizeReached = new LinkedList&lt;List&lt;T&gt;&gt;();</span>
+                        }
+<span class="nc" id="L123">                        sizeReached.add(chunk);</span>
+                    }
+<span class="fc" id="L125">                }</span>
+<span class="pc" id="L126">            }</span>
+<span class="pc bpc" id="L127" title="1 of 2 branches missed.">            if (sizeReached != null) {</span>
+<span class="nc bnc" id="L128" title="All 2 branches missed.">                for (List&lt;T&gt; chunk : sizeReached) {</span>
+<span class="nc" id="L129">                    child.onNext(chunk);</span>
+<span class="nc" id="L130">                }</span>
+            }
+<span class="fc" id="L132">        }</span>
+
+        @Override
+        public void onError(Throwable e) {
+<span class="nc" id="L136">            synchronized (this) {</span>
+<span class="nc bnc" id="L137" title="All 2 branches missed.">                if (done) {</span>
+<span class="nc" id="L138">                    return;</span>
+                }
+<span class="nc" id="L140">                done = true;</span>
+<span class="nc" id="L141">                chunks.clear();</span>
+<span class="nc" id="L142">            }</span>
+<span class="nc" id="L143">            child.onError(e);</span>
+<span class="nc" id="L144">            unsubscribe();</span>
+<span class="nc" id="L145">        }</span>
+
+        @Override
+        public void onCompleted() {
+            try {
+                List&lt;List&lt;T&gt;&gt; sizeReached;
+<span class="nc" id="L151">                synchronized (this) {</span>
+<span class="nc bnc" id="L152" title="All 2 branches missed.">                    if (done) {</span>
+<span class="nc" id="L153">                        return;</span>
+                    }
+<span class="nc" id="L155">                    done = true;</span>
+<span class="nc" id="L156">                    sizeReached = new LinkedList&lt;List&lt;T&gt;&gt;(chunks);</span>
+<span class="nc" id="L157">                    chunks.clear();</span>
+<span class="nc" id="L158">                }</span>
+<span class="nc bnc" id="L159" title="All 2 branches missed.">                for (List&lt;T&gt; chunk : sizeReached) {</span>
+<span class="nc" id="L160">                    child.onNext(chunk);</span>
+<span class="nc" id="L161">                }</span>
+<span class="nc" id="L162">            } catch (Throwable t) {</span>
+<span class="nc" id="L163">                Exceptions.throwOrReport(t, child);</span>
+<span class="nc" id="L164">                return;</span>
+<span class="nc" id="L165">            }</span>
+<span class="nc" id="L166">            child.onCompleted();</span>
+<span class="nc" id="L167">            unsubscribe();</span>
+<span class="nc" id="L168">        }</span>
+        void scheduleChunk() {
+<span class="fc" id="L170">            inner.schedulePeriodically(new Action0() {</span>
+                @Override
+                public void call() {
+<span class="fc" id="L173">                    startNewChunk();</span>
+<span class="fc" id="L174">                }</span>
+            }, timeshift, timeshift, unit);
+<span class="fc" id="L176">        }</span>
+        void startNewChunk() {
+<span class="fc" id="L178">            final List&lt;T&gt; chunk = new ArrayList&lt;T&gt;();</span>
+<span class="fc" id="L179">            synchronized (this) {</span>
+<span class="pc bpc" id="L180" title="1 of 2 branches missed.">                if (done) {</span>
+<span class="nc" id="L181">                    return;</span>
+                }
+<span class="fc" id="L183">                chunks.add(chunk);</span>
+<span class="pc" id="L184">            }</span>
+<span class="fc" id="L185">            inner.schedule(new Action0() {</span>
+                @Override
+                public void call() {
+<span class="fc" id="L188">                    emitChunk(chunk);</span>
+<span class="fc" id="L189">                }</span>
+            }, timespan, unit);
+<span class="fc" id="L191">        }</span>
+        void emitChunk(List&lt;T&gt; chunkToEmit) {
+<span class="fc" id="L193">            boolean emit = false;</span>
+<span class="fc" id="L194">            synchronized (this) {</span>
+<span class="pc bpc" id="L195" title="1 of 2 branches missed.">                if (done) {</span>
+<span class="nc" id="L196">                    return;</span>
+                }
+<span class="fc" id="L198">                Iterator&lt;List&lt;T&gt;&gt; it = chunks.iterator();</span>
+<span class="pc bpc" id="L199" title="1 of 2 branches missed.">                while (it.hasNext()) {</span>
+<span class="fc" id="L200">                    List&lt;T&gt; chunk = it.next();</span>
+<span class="pc bpc" id="L201" title="1 of 2 branches missed.">                    if (chunk == chunkToEmit) {</span>
+<span class="fc" id="L202">                        it.remove();</span>
+<span class="fc" id="L203">                        emit = true;</span>
+<span class="fc" id="L204">                        break;</span>
+                    }
+<span class="nc" id="L206">                }</span>
+<span class="pc" id="L207">            }</span>
+<span class="pc bpc" id="L208" title="1 of 2 branches missed.">            if (emit) {</span>
+                try {
+<span class="fc" id="L210">                    child.onNext(chunkToEmit);</span>
+<span class="nc" id="L211">                } catch (Throwable t) {</span>
+<span class="nc" id="L212">                    Exceptions.throwOrReport(t, this);</span>
+<span class="fc" id="L213">                }</span>
+            }
+<span class="fc" id="L215">        }</span>
+    }
+    /** Subscriber when exact timed chunking is required. */
+    final class ExactSubscriber extends Subscriber&lt;T&gt; {
+        final Subscriber&lt;? super List&lt;T&gt;&gt; child;
+        final Worker inner;
+        /** Guarded by this. */
+        List&lt;T&gt; chunk;
+        /** Guarded by this. */
+        boolean done;
+<span class="fc" id="L225">        public ExactSubscriber(Subscriber&lt;? super List&lt;T&gt;&gt; child, Worker inner) {</span>
+<span class="fc" id="L226">            this.child = child;</span>
+<span class="fc" id="L227">            this.inner = inner;</span>
+<span class="fc" id="L228">            this.chunk = new ArrayList&lt;T&gt;();</span>
+<span class="fc" id="L229">        }</span>
+
+        @Override
+        public void onNext(T t) {
+<span class="fc" id="L233">            List&lt;T&gt; toEmit = null;</span>
+<span class="fc" id="L234">            synchronized (this) {</span>
+<span class="pc bpc" id="L235" title="1 of 2 branches missed.">                if (done) {</span>
+<span class="nc" id="L236">                    return;</span>
+                }
+<span class="fc" id="L238">                chunk.add(t);</span>
+<span class="fc bfc" id="L239" title="All 2 branches covered.">                if (chunk.size() == count) {</span>
+<span class="fc" id="L240">                    toEmit = chunk;</span>
+<span class="fc" id="L241">                    chunk = new ArrayList&lt;T&gt;();</span>
+                }
+<span class="pc" id="L243">            }</span>
+<span class="fc bfc" id="L244" title="All 2 branches covered.">            if (toEmit != null) {</span>
+<span class="fc" id="L245">                child.onNext(toEmit);</span>
+            }
+<span class="fc" id="L247">        }</span>
+
+        @Override
+        public void onError(Throwable e) {
+<span class="fc" id="L251">            synchronized (this) {</span>
+<span class="pc bpc" id="L252" title="1 of 2 branches missed.">                if (done) {</span>
+<span class="nc" id="L253">                    return;</span>
+                }
+<span class="fc" id="L255">                done = true;</span>
+<span class="fc" id="L256">                chunk = null;</span>
+<span class="pc" id="L257">            }</span>
+<span class="fc" id="L258">            child.onError(e);</span>
+<span class="fc" id="L259">            unsubscribe();</span>
+<span class="fc" id="L260">        }</span>
+
+        @Override
+        public void onCompleted() {
+            try {
+<span class="fc" id="L265">                inner.unsubscribe();</span>
+                List&lt;T&gt; toEmit;
+<span class="fc" id="L267">                synchronized (this) {</span>
+<span class="pc bpc" id="L268" title="1 of 2 branches missed.">                    if (done) {</span>
+<span class="nc" id="L269">                        return;</span>
+                    }
+<span class="fc" id="L271">                    done = true;</span>
+<span class="fc" id="L272">                    toEmit = chunk;</span>
+<span class="fc" id="L273">                    chunk = null;</span>
+<span class="pc" id="L274">                }</span>
+<span class="fc" id="L275">                child.onNext(toEmit);</span>
+<span class="nc" id="L276">            } catch (Throwable t) {</span>
+<span class="nc" id="L277">                Exceptions.throwOrReport(t, child);</span>
+<span class="nc" id="L278">                return;</span>
+<span class="fc" id="L279">            }</span>
+<span class="fc" id="L280">            child.onCompleted();</span>
+<span class="fc" id="L281">            unsubscribe();</span>
+<span class="fc" id="L282">        }</span>
+        void scheduleExact() {
+<span class="fc" id="L284">            inner.schedulePeriodically(new Action0() {</span>
+                @Override
+                public void call() {
+<span class="fc" id="L287">                    emit();</span>
+<span class="fc" id="L288">                }</span>
+            }, timespan, timespan, unit);
+<span class="fc" id="L290">        }</span>
+        void emit() {
+            List&lt;T&gt; toEmit;
+<span class="fc" id="L293">            synchronized (this) {</span>
+<span class="pc bpc" id="L294" title="1 of 2 branches missed.">                if (done) {</span>
+<span class="nc" id="L295">                    return;</span>
+                }
+<span class="fc" id="L297">                toEmit = chunk;</span>
+<span class="fc" id="L298">                chunk = new ArrayList&lt;T&gt;();</span>
+<span class="pc" id="L299">            }</span>
+            try {
+<span class="fc" id="L301">                child.onNext(toEmit);</span>
+<span class="nc" id="L302">            } catch (Throwable t) {</span>
+<span class="nc" id="L303">                Exceptions.throwOrReport(t, this);</span>
+<span class="fc" id="L304">            }</span>
+<span class="fc" id="L305">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

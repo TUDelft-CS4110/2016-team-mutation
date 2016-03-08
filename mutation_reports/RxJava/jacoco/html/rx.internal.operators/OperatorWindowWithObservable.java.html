@@ -1,0 +1,296 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>OperatorWindowWithObservable.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.internal.operators</a> &gt; <span class="el_source">OperatorWindowWithObservable.java</span></div><h1>OperatorWindowWithObservable.java</h1><pre class="source lang-java linenums">/**
+ * Copyright 2014 Netflix, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package rx.internal.operators;
+
+import java.util.*;
+
+import rx.*;
+import rx.Observable.Operator;
+import rx.Observable;
+import rx.Observer;
+import rx.observers.SerializedSubscriber;
+
+/**
+ * Creates non-overlapping windows of items where each window is terminated by
+ * an event from a secondary observable and a new window is started immediately.
+ * 
+ * @param &lt;T&gt; the value type
+ * @param &lt;U&gt; the boundary value type
+ */
+public final class OperatorWindowWithObservable&lt;T, U&gt; implements Operator&lt;Observable&lt;T&gt;, T&gt; {
+    final Observable&lt;U&gt; other;
+
+<span class="fc" id="L36">    public OperatorWindowWithObservable(final Observable&lt;U&gt; other) {</span>
+<span class="fc" id="L37">        this.other = other;</span>
+<span class="fc" id="L38">    }</span>
+    
+    @Override
+    public Subscriber&lt;? super T&gt; call(Subscriber&lt;? super Observable&lt;T&gt;&gt; child) {
+        
+<span class="fc" id="L43">        SourceSubscriber&lt;T&gt; sub = new SourceSubscriber&lt;T&gt;(child);</span>
+<span class="fc" id="L44">        BoundarySubscriber&lt;T, U&gt; bs = new BoundarySubscriber&lt;T, U&gt;(child, sub);</span>
+        
+<span class="fc" id="L46">        child.add(sub);</span>
+<span class="fc" id="L47">        child.add(bs);</span>
+        
+<span class="fc" id="L49">        sub.replaceWindow();</span>
+        
+<span class="fc" id="L51">        other.unsafeSubscribe(bs);</span>
+        
+<span class="fc" id="L53">        return sub;</span>
+    }
+    /** Indicate the current subject should complete and a new subject be emitted. */
+<span class="fc" id="L56">    static final Object NEXT_SUBJECT = new Object();</span>
+    /** For error and completion indication. */
+<span class="fc" id="L58">    static final NotificationLite&lt;Object&gt; nl = NotificationLite.instance();</span>
+    /** Observes the source. */
+    static final class SourceSubscriber&lt;T&gt; extends Subscriber&lt;T&gt; {
+        final Subscriber&lt;? super Observable&lt;T&gt;&gt; child;
+        final Object guard;
+        /** Accessed from the serialized part. */
+        Observer&lt;T&gt; consumer;
+        /** Accessed from the serialized part. */
+        Observable&lt;T&gt; producer;
+        /** Guarded by guard. */
+        boolean emitting;
+        /** Guarded by guard. */
+        List&lt;Object&gt; queue;
+        
+<span class="fc" id="L72">        public SourceSubscriber(Subscriber&lt;? super Observable&lt;T&gt;&gt; child) {</span>
+<span class="fc" id="L73">            this.child = new SerializedSubscriber&lt;Observable&lt;T&gt;&gt;(child);</span>
+<span class="fc" id="L74">            this.guard = new Object();</span>
+<span class="fc" id="L75">        }</span>
+        
+        @Override
+        public void onStart() {
+<span class="fc" id="L79">            request(Long.MAX_VALUE);</span>
+<span class="fc" id="L80">        }</span>
+        
+        @Override
+        public void onNext(T t) {
+            List&lt;Object&gt; localQueue;
+<span class="fc" id="L85">            synchronized (guard) {</span>
+<span class="pc bpc" id="L86" title="1 of 2 branches missed.">                if (emitting) {</span>
+<span class="nc bnc" id="L87" title="All 2 branches missed.">                    if (queue == null) {</span>
+<span class="nc" id="L88">                        queue = new ArrayList&lt;Object&gt;();</span>
+                    }
+<span class="nc" id="L90">                    queue.add(t);</span>
+<span class="nc" id="L91">                    return;</span>
+                }
+<span class="fc" id="L93">                localQueue = queue;</span>
+<span class="fc" id="L94">                queue = null;</span>
+<span class="fc" id="L95">                emitting = true;</span>
+<span class="pc" id="L96">            }</span>
+<span class="fc" id="L97">            boolean once = true;</span>
+<span class="fc" id="L98">            boolean skipFinal = false;</span>
+            try {
+                do {
+<span class="fc" id="L101">                    drain(localQueue);</span>
+<span class="pc bpc" id="L102" title="1 of 2 branches missed.">                    if (once) {</span>
+<span class="fc" id="L103">                        once = false;</span>
+<span class="fc" id="L104">                        emitValue(t);</span>
+                    }
+                    
+<span class="fc" id="L107">                    synchronized (guard) {</span>
+<span class="fc" id="L108">                        localQueue = queue;</span>
+<span class="fc" id="L109">                        queue = null;</span>
+<span class="pc bpc" id="L110" title="1 of 2 branches missed.">                        if (localQueue == null) {</span>
+<span class="fc" id="L111">                            emitting = false;</span>
+<span class="fc" id="L112">                            skipFinal = true;</span>
+<span class="fc" id="L113">                            return;</span>
+                        }
+<span class="nc" id="L115">                    }</span>
+<span class="nc bnc" id="L116" title="All 2 branches missed.">                } while (!child.isUnsubscribed());</span>
+            } finally {
+<span class="pc bpc" id="L118" title="5 of 6 branches missed.">                if (!skipFinal) {</span>
+<span class="nc" id="L119">                    synchronized (guard) {</span>
+<span class="nc" id="L120">                        emitting = false;</span>
+<span class="pc" id="L121">                    }</span>
+                }
+            }
+<span class="nc" id="L124">        }</span>
+
+        void drain(List&lt;Object&gt; queue) {
+<span class="pc bpc" id="L127" title="1 of 2 branches missed.">            if (queue == null) {</span>
+<span class="fc" id="L128">                return;</span>
+            }
+<span class="nc bnc" id="L130" title="All 2 branches missed.">            for (Object o : queue) {</span>
+<span class="nc bnc" id="L131" title="All 2 branches missed.">                if (o == NEXT_SUBJECT) {</span>
+<span class="nc" id="L132">                    replaceSubject();</span>
+                } else
+<span class="nc bnc" id="L134" title="All 2 branches missed.">                if (nl.isError(o)) {</span>
+<span class="nc" id="L135">                    error(nl.getError(o));</span>
+<span class="nc" id="L136">                    break;</span>
+                } else
+<span class="nc bnc" id="L138" title="All 2 branches missed.">                if (nl.isCompleted(o)) {</span>
+<span class="nc" id="L139">                    complete();</span>
+<span class="nc" id="L140">                    break;</span>
+                } else {
+                    @SuppressWarnings(&quot;unchecked&quot;)
+<span class="nc" id="L143">                    T t = (T)o;</span>
+<span class="nc" id="L144">                    emitValue(t);</span>
+                }
+<span class="nc" id="L146">            }</span>
+<span class="nc" id="L147">        }</span>
+        void replaceSubject() {
+<span class="fc" id="L149">            Observer&lt;T&gt; s = consumer;</span>
+<span class="fc bfc" id="L150" title="All 2 branches covered.">            if (s != null) {</span>
+<span class="fc" id="L151">                s.onCompleted();</span>
+            }
+<span class="fc" id="L153">            createNewWindow();</span>
+<span class="fc" id="L154">            child.onNext(producer);</span>
+<span class="fc" id="L155">        }</span>
+        void createNewWindow() {
+<span class="fc" id="L157">            UnicastSubject&lt;T&gt; bus = UnicastSubject.create();</span>
+<span class="fc" id="L158">            consumer = bus;</span>
+<span class="fc" id="L159">            producer = bus;</span>
+<span class="fc" id="L160">        }</span>
+        void emitValue(T t) {
+<span class="fc" id="L162">            Observer&lt;T&gt; s = consumer;</span>
+<span class="pc bpc" id="L163" title="1 of 2 branches missed.">            if (s != null) {</span>
+<span class="fc" id="L164">                s.onNext(t);</span>
+            }
+<span class="fc" id="L166">        }</span>
+        
+        @Override
+        public void onError(Throwable e) {
+<span class="fc" id="L170">            synchronized (guard) {</span>
+<span class="pc bpc" id="L171" title="1 of 2 branches missed.">                if (emitting) {</span>
+<span class="nc" id="L172">                    queue = Collections.singletonList(nl.error(e));</span>
+<span class="nc" id="L173">                    return;</span>
+                }
+<span class="fc" id="L175">                queue = null;</span>
+<span class="fc" id="L176">                emitting = true;</span>
+<span class="pc" id="L177">            }</span>
+<span class="fc" id="L178">            error(e);</span>
+<span class="fc" id="L179">        }</span>
+
+        @Override
+        public void onCompleted() {
+            List&lt;Object&gt; localQueue;
+<span class="fc" id="L184">            synchronized (guard) {</span>
+<span class="pc bpc" id="L185" title="1 of 2 branches missed.">                if (emitting) {</span>
+<span class="nc bnc" id="L186" title="All 2 branches missed.">                    if (queue == null) {</span>
+<span class="nc" id="L187">                        queue = new ArrayList&lt;Object&gt;();</span>
+                    }
+<span class="nc" id="L189">                    queue.add(nl.completed());</span>
+<span class="nc" id="L190">                    return;</span>
+                }
+<span class="fc" id="L192">                localQueue = queue;</span>
+<span class="fc" id="L193">                queue = null;</span>
+<span class="fc" id="L194">                emitting = true;</span>
+<span class="pc" id="L195">            }</span>
+            try {
+<span class="fc" id="L197">                drain(localQueue);</span>
+<span class="nc" id="L198">            } catch (Throwable e) {</span>
+<span class="nc" id="L199">                error(e);</span>
+<span class="nc" id="L200">                return;</span>
+<span class="fc" id="L201">            }</span>
+<span class="fc" id="L202">            complete();</span>
+<span class="fc" id="L203">        }</span>
+        void replaceWindow() {
+            List&lt;Object&gt; localQueue;
+<span class="fc" id="L206">            synchronized (guard) {</span>
+<span class="pc bpc" id="L207" title="1 of 2 branches missed.">                if (emitting) {</span>
+<span class="nc bnc" id="L208" title="All 2 branches missed.">                    if (queue == null) {</span>
+<span class="nc" id="L209">                        queue = new ArrayList&lt;Object&gt;();</span>
+                    }
+<span class="nc" id="L211">                    queue.add(NEXT_SUBJECT);</span>
+<span class="nc" id="L212">                    return;</span>
+                }
+<span class="fc" id="L214">                localQueue = queue;</span>
+<span class="fc" id="L215">                queue = null;</span>
+<span class="fc" id="L216">                emitting = true;</span>
+<span class="pc" id="L217">            }</span>
+<span class="fc" id="L218">            boolean once = true;</span>
+<span class="fc" id="L219">            boolean skipFinal = false;</span>
+            try {
+                do {
+<span class="fc" id="L222">                    drain(localQueue);</span>
+<span class="pc bpc" id="L223" title="1 of 2 branches missed.">                    if (once) {</span>
+<span class="fc" id="L224">                        once = false;</span>
+<span class="fc" id="L225">                        replaceSubject();</span>
+                    }
+<span class="fc" id="L227">                    synchronized (guard) {</span>
+<span class="fc" id="L228">                        localQueue = queue;</span>
+<span class="fc" id="L229">                        queue = null;</span>
+<span class="pc bpc" id="L230" title="1 of 2 branches missed.">                        if (localQueue == null) {</span>
+<span class="fc" id="L231">                            emitting = false;</span>
+<span class="fc" id="L232">                            skipFinal = true;</span>
+<span class="fc" id="L233">                            return;</span>
+                        }
+<span class="nc" id="L235">                    }</span>
+<span class="nc bnc" id="L236" title="All 2 branches missed.">                } while (!child.isUnsubscribed());</span>
+            } finally {
+<span class="pc bpc" id="L238" title="5 of 6 branches missed.">                if (!skipFinal) {</span>
+<span class="nc" id="L239">                    synchronized (guard) {</span>
+<span class="nc" id="L240">                        emitting = false;</span>
+<span class="pc" id="L241">                    }</span>
+                }
+            }
+<span class="nc" id="L244">        }</span>
+        void complete() {
+<span class="fc" id="L246">            Observer&lt;T&gt; s = consumer;</span>
+<span class="fc" id="L247">            consumer = null;</span>
+<span class="fc" id="L248">            producer = null;</span>
+            
+<span class="pc bpc" id="L250" title="1 of 2 branches missed.">            if (s != null) {</span>
+<span class="fc" id="L251">                s.onCompleted();</span>
+            }
+<span class="fc" id="L253">            child.onCompleted();</span>
+<span class="fc" id="L254">            unsubscribe();</span>
+<span class="fc" id="L255">        }</span>
+        void error(Throwable e) {
+<span class="fc" id="L257">            Observer&lt;T&gt; s = consumer;</span>
+<span class="fc" id="L258">            consumer = null;</span>
+<span class="fc" id="L259">            producer = null;</span>
+            
+<span class="pc bpc" id="L261" title="1 of 2 branches missed.">            if (s != null) {</span>
+<span class="fc" id="L262">                s.onError(e);</span>
+            }
+<span class="fc" id="L264">            child.onError(e);</span>
+<span class="fc" id="L265">            unsubscribe();</span>
+<span class="fc" id="L266">        }</span>
+    }
+    /** Observes the boundary. */
+    static final class BoundarySubscriber&lt;T, U&gt; extends Subscriber&lt;U&gt; {
+        final SourceSubscriber&lt;T&gt; sub;
+<span class="fc" id="L271">        public BoundarySubscriber(Subscriber&lt;?&gt; child, SourceSubscriber&lt;T&gt; sub) {</span>
+<span class="fc" id="L272">            this.sub = sub;</span>
+<span class="fc" id="L273">        }</span>
+        
+        @Override
+        public void onStart() {
+<span class="fc" id="L277">            request(Long.MAX_VALUE);</span>
+<span class="fc" id="L278">        }</span>
+        
+        @Override
+        public void onNext(U t) {
+<span class="fc" id="L282">            sub.replaceWindow();</span>
+<span class="fc" id="L283">        }</span>
+
+        @Override
+        public void onError(Throwable e) {
+<span class="fc" id="L287">            sub.onError(e);</span>
+<span class="fc" id="L288">        }</span>
+
+        @Override
+        public void onCompleted() {
+<span class="fc" id="L292">            sub.onCompleted();</span>
+<span class="fc" id="L293">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>
