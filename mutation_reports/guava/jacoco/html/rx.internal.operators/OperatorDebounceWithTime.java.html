@@ -1,0 +1,183 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>OperatorDebounceWithTime.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.internal.operators</a> &gt; <span class="el_source">OperatorDebounceWithTime.java</span></div><h1>OperatorDebounceWithTime.java</h1><pre class="source lang-java linenums">/**
+ * Copyright 2014 Netflix, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package rx.internal.operators;
+
+import java.util.concurrent.TimeUnit;
+import rx.Observable.Operator;
+import rx.Scheduler;
+import rx.Scheduler.Worker;
+import rx.exceptions.Exceptions;
+import rx.Subscriber;
+import rx.functions.Action0;
+import rx.observers.SerializedSubscriber;
+import rx.subscriptions.SerialSubscription;
+
+/**
+ * This operation filters out events which are published too quickly in succession. This is done by dropping events which are
+ * followed up by other events before a specified timer has expired. If the timer expires and no follow up event was published (yet)
+ * the last received event is published.
+ *
+ * @param &lt;T&gt; the value type
+ */
+public final class OperatorDebounceWithTime&lt;T&gt; implements Operator&lt;T, T&gt; {
+    final long timeout;
+    final TimeUnit unit;
+    final Scheduler scheduler;
+    /**
+     * @param timeout
+     *            How long each event has to be the 'last event' before it gets published.
+     * @param unit
+     *            The unit of time for the specified timeout.
+     * @param scheduler
+     *            The {@link Scheduler} to use internally to manage the timers which handle timeout for each event.
+     *
+     */
+<span class="fc" id="L48">    public OperatorDebounceWithTime(long timeout, TimeUnit unit, Scheduler scheduler) {</span>
+<span class="fc" id="L49">        this.timeout = timeout;</span>
+<span class="fc" id="L50">        this.unit = unit;</span>
+<span class="fc" id="L51">        this.scheduler = scheduler;</span>
+<span class="fc" id="L52">    }</span>
+    
+    @Override
+    public Subscriber&lt;? super T&gt; call(final Subscriber&lt;? super T&gt; child) {
+<span class="fc" id="L56">        final Worker worker = scheduler.createWorker();</span>
+<span class="fc" id="L57">        final SerializedSubscriber&lt;T&gt; s = new SerializedSubscriber&lt;T&gt;(child);</span>
+<span class="fc" id="L58">        final SerialSubscription ssub = new SerialSubscription();</span>
+        
+<span class="fc" id="L60">        s.add(worker);</span>
+<span class="fc" id="L61">        s.add(ssub);</span>
+        
+<span class="fc" id="L63">        return new Subscriber&lt;T&gt;(child) {</span>
+<span class="fc" id="L64">            final DebounceState&lt;T&gt; state = new DebounceState&lt;T&gt;();</span>
+<span class="fc" id="L65">            final Subscriber&lt;?&gt; self = this;</span>
+
+            @Override
+            public void onStart() {
+<span class="fc" id="L69">                request(Long.MAX_VALUE);</span>
+<span class="fc" id="L70">            }</span>
+
+            @Override
+            public void onNext(final T t) {
+                
+<span class="fc" id="L75">                final int index = state.next(t);</span>
+<span class="fc" id="L76">                ssub.set(worker.schedule(new Action0() {</span>
+                    @Override
+                    public void call() {
+<span class="fc" id="L79">                        state.emit(index, s, self);</span>
+<span class="fc" id="L80">                    }</span>
+                }, timeout, unit));
+<span class="fc" id="L82">            }</span>
+            
+            @Override
+            public void onError(Throwable e) {
+<span class="fc" id="L86">                s.onError(e);</span>
+<span class="fc" id="L87">                unsubscribe();</span>
+<span class="fc" id="L88">                state.clear();</span>
+<span class="fc" id="L89">            }</span>
+            
+            @Override
+            public void onCompleted() {
+<span class="fc" id="L93">                state.emitAndComplete(s, this);</span>
+<span class="fc" id="L94">            }</span>
+        };
+    }
+    /**
+     * Tracks the last value to be emitted and manages completion.
+     * @param &lt;T&gt; the value type
+     */
+<span class="fc" id="L101">    static final class DebounceState&lt;T&gt; {</span>
+        /** Guarded by this. */
+        int index;
+        /** Guarded by this. */
+        T value;
+        /** Guarded by this. */
+        boolean hasValue;
+        /** Guarded by this. */
+        boolean terminate;
+        /** Guarded by this. */
+        boolean emitting;
+        
+        public synchronized int next(T value) {
+<span class="fc" id="L114">            this.value = value;</span>
+<span class="fc" id="L115">            this.hasValue = true;</span>
+<span class="fc" id="L116">            return ++index;</span>
+        }
+        public void emit(int index, Subscriber&lt;T&gt; onNextAndComplete, Subscriber&lt;?&gt; onError) {
+            T localValue;
+<span class="fc" id="L120">            synchronized (this) {</span>
+<span class="pc bpc" id="L121" title="3 of 6 branches missed.">                if (emitting || !hasValue || index != this.index) {</span>
+<span class="nc" id="L122">                    return;</span>
+                }
+<span class="fc" id="L124">                localValue = value;</span>
+                
+<span class="fc" id="L126">                value = null;</span>
+<span class="fc" id="L127">                hasValue = false;</span>
+<span class="fc" id="L128">                emitting = true;</span>
+<span class="pc" id="L129">            }</span>
+
+            try {
+<span class="fc" id="L132">                onNextAndComplete.onNext(localValue);</span>
+<span class="nc" id="L133">            } catch (Throwable e) {</span>
+<span class="nc" id="L134">                Exceptions.throwOrReport(e, onError, localValue);</span>
+<span class="nc" id="L135">                return;</span>
+<span class="fc" id="L136">            }</span>
+
+            // Check if a termination was requested in the meantime.
+<span class="fc" id="L139">            synchronized (this) {</span>
+<span class="pc bpc" id="L140" title="1 of 2 branches missed.">                if (!terminate) {</span>
+<span class="fc" id="L141">                    emitting = false;</span>
+<span class="fc" id="L142">                    return;</span>
+                }
+<span class="nc" id="L144">            }</span>
+            
+<span class="nc" id="L146">            onNextAndComplete.onCompleted();</span>
+<span class="nc" id="L147">        }</span>
+        public void emitAndComplete(Subscriber&lt;T&gt; onNextAndComplete, Subscriber&lt;?&gt; onError) {
+            T localValue;
+            boolean localHasValue;
+            
+<span class="fc" id="L152">            synchronized (this) {</span>
+<span class="pc bpc" id="L153" title="1 of 2 branches missed.">                if (emitting) {</span>
+<span class="nc" id="L154">                    terminate = true;</span>
+<span class="nc" id="L155">                    return;</span>
+                }
+<span class="fc" id="L157">                localValue = value;</span>
+<span class="fc" id="L158">                localHasValue = hasValue;</span>
+                
+<span class="fc" id="L160">                value = null;</span>
+<span class="fc" id="L161">                hasValue = false;</span>
+
+<span class="fc" id="L163">                emitting = true;</span>
+<span class="pc" id="L164">            }</span>
+
+<span class="fc bfc" id="L166" title="All 2 branches covered.">            if (localHasValue) {</span>
+                try {
+<span class="fc" id="L168">                    onNextAndComplete.onNext(localValue);</span>
+<span class="nc" id="L169">                } catch (Throwable e) {</span>
+<span class="nc" id="L170">                    Exceptions.throwOrReport(e, onError, localValue);</span>
+<span class="nc" id="L171">                    return;</span>
+<span class="fc" id="L172">                }</span>
+            }
+<span class="fc" id="L174">            onNextAndComplete.onCompleted();</span>
+<span class="fc" id="L175">        }</span>
+        public synchronized void clear() {
+<span class="fc" id="L177">            ++index;</span>
+<span class="fc" id="L178">            value = null;</span>
+<span class="fc" id="L179">            hasValue = false;</span>
+<span class="fc" id="L180">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

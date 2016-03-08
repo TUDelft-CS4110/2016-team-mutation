@@ -1,0 +1,191 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>BlockingOperatorNext.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.internal.operators</a> &gt; <span class="el_source">BlockingOperatorNext.java</span></div><h1>BlockingOperatorNext.java</h1><pre class="source lang-java linenums">/**
+ * Copyright 2014 Netflix, Inc.
+ * 
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package rx.internal.operators;
+
+import java.util.Iterator;
+import java.util.NoSuchElementException;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import rx.Notification;
+import rx.Observable;
+import rx.Subscriber;
+import rx.exceptions.Exceptions;
+
+/**
+ * Returns an Iterable that blocks until the Observable emits another item, then returns that item.
+ * &lt;p&gt;
+ * &lt;img width=&quot;640&quot; src=&quot;https://github.com/ReactiveX/RxJava/wiki/images/rx-operators/B.next.png&quot; alt=&quot;&quot;&gt;
+ */
+public final class BlockingOperatorNext {
+<span class="nc" id="L35">    private BlockingOperatorNext() {</span>
+<span class="nc" id="L36">        throw new IllegalStateException(&quot;No instances!&quot;);</span>
+    }
+
+    /**
+     * Returns an {@code Iterable} that blocks until the {@code Observable} emits another item, then returns
+     * that item.
+     *
+     * @param items
+     *            the {@code Observable} to observe
+     * @return an {@code Iterable} that behaves like a blocking version of {@code items}
+     */
+    public static &lt;T&gt; Iterable&lt;T&gt; next(final Observable&lt;? extends T&gt; items) {
+<span class="fc" id="L48">        return new Iterable&lt;T&gt;() {</span>
+            @Override
+            public Iterator&lt;T&gt; iterator() {
+<span class="fc" id="L51">                NextObserver&lt;T&gt; nextObserver = new NextObserver&lt;T&gt;();</span>
+<span class="fc" id="L52">                return new NextIterator&lt;T&gt;(items, nextObserver);</span>
+            }
+        };
+
+    }
+
+    // test needs to access the observer.waiting flag non-blockingly.
+    /* private */static final class NextIterator&lt;T&gt; implements Iterator&lt;T&gt; {
+
+        private final NextObserver&lt;T&gt; observer;
+        private final Observable&lt;? extends T&gt; items;
+        private T next;
+<span class="fc" id="L64">        private boolean hasNext = true;</span>
+<span class="fc" id="L65">        private boolean isNextConsumed = true;</span>
+<span class="fc" id="L66">        private Throwable error = null;</span>
+<span class="fc" id="L67">        private boolean started = false;</span>
+
+<span class="fc" id="L69">        NextIterator(Observable&lt;? extends T&gt; items, NextObserver&lt;T&gt; observer) {</span>
+<span class="fc" id="L70">            this.items = items;</span>
+<span class="fc" id="L71">            this.observer = observer;</span>
+<span class="fc" id="L72">        }</span>
+
+        @Override
+        public boolean hasNext() {
+<span class="pc bpc" id="L76" title="1 of 2 branches missed.">            if (error != null) {</span>
+                // If any error has already been thrown, throw it again.
+<span class="nc" id="L78">                throw Exceptions.propagate(error);</span>
+            }
+            // Since an iterator should not be used in different thread,
+            // so we do not need any synchronization.
+<span class="fc bfc" id="L82" title="All 2 branches covered.">            if (!hasNext) {</span>
+                // the iterator has reached the end.
+<span class="fc" id="L84">                return false;</span>
+            }
+<span class="fc bfc" id="L86" title="All 2 branches covered.">            if (!isNextConsumed) {</span>
+                // next has not been used yet.
+<span class="fc" id="L88">                return true;</span>
+            }
+<span class="fc" id="L90">            return moveToNext();</span>
+        }
+
+        private boolean moveToNext() {
+            try {
+<span class="fc bfc" id="L95" title="All 2 branches covered.">                if (!started) {</span>
+<span class="fc" id="L96">                    started = true;</span>
+                    // if not started, start now
+<span class="fc" id="L98">                    observer.setWaiting(1);</span>
+<span class="fc" id="L99">                    items.materialize().subscribe(observer);</span>
+                }
+                
+<span class="fc" id="L102">                Notification&lt;? extends T&gt; nextNotification = observer.takeNext();</span>
+<span class="fc bfc" id="L103" title="All 2 branches covered.">                if (nextNotification.isOnNext()) {</span>
+<span class="fc" id="L104">                    isNextConsumed = false;</span>
+<span class="fc" id="L105">                    next = nextNotification.getValue();</span>
+<span class="fc" id="L106">                    return true;</span>
+                }
+                // If an observable is completed or fails,
+                // hasNext() always return false.
+<span class="fc" id="L110">                hasNext = false;</span>
+<span class="fc bfc" id="L111" title="All 2 branches covered.">                if (nextNotification.isOnCompleted()) {</span>
+<span class="fc" id="L112">                    return false;</span>
+                }
+<span class="nc bnc" id="L114" title="All 2 branches missed.">                if (nextNotification.isOnError()) {</span>
+<span class="nc" id="L115">                    error = nextNotification.getThrowable();</span>
+<span class="nc" id="L116">                    throw Exceptions.propagate(error);</span>
+                }
+<span class="nc" id="L118">                throw new IllegalStateException(&quot;Should not reach here&quot;);</span>
+<span class="nc" id="L119">            } catch (InterruptedException e) {</span>
+<span class="nc" id="L120">                observer.unsubscribe();</span>
+<span class="nc" id="L121">                Thread.currentThread().interrupt();</span>
+<span class="nc" id="L122">                error = e;</span>
+<span class="nc" id="L123">                throw Exceptions.propagate(error);</span>
+            }
+        }
+
+        @Override
+        public T next() {
+<span class="pc bpc" id="L129" title="1 of 2 branches missed.">            if (error != null) {</span>
+                // If any error has already been thrown, throw it again.
+<span class="nc" id="L131">                throw Exceptions.propagate(error);</span>
+            }
+<span class="fc bfc" id="L133" title="All 2 branches covered.">            if (hasNext()) {</span>
+<span class="fc" id="L134">                isNextConsumed = true;</span>
+<span class="fc" id="L135">                return next;</span>
+            }
+            else {
+<span class="fc" id="L138">                throw new NoSuchElementException(&quot;No more elements&quot;);</span>
+            }
+        }
+
+        @Override
+        public void remove() {
+<span class="nc" id="L144">            throw new UnsupportedOperationException(&quot;Read only iterator&quot;);</span>
+        }
+    }
+
+    private static class NextObserver&lt;T&gt; extends Subscriber&lt;Notification&lt;? extends T&gt;&gt; {
+<span class="fc" id="L149">        private final BlockingQueue&lt;Notification&lt;? extends T&gt;&gt; buf = new ArrayBlockingQueue&lt;Notification&lt;? extends T&gt;&gt;(1);</span>
+<span class="fc" id="L150">        final AtomicInteger waiting = new AtomicInteger();</span>
+
+<span class="fc" id="L152">        NextObserver() {</span>
+<span class="fc" id="L153">        }</span>
+
+        @Override
+        public void onCompleted() {
+            // ignore
+<span class="fc" id="L158">        }</span>
+
+        @Override
+        public void onError(Throwable e) {
+            // ignore
+<span class="nc" id="L163">        }</span>
+
+        @Override
+        public void onNext(Notification&lt;? extends T&gt; args) {
+
+<span class="fc bfc" id="L168" title="All 4 branches covered.">            if (waiting.getAndSet(0) == 1 || !args.isOnNext()) {</span>
+<span class="fc" id="L169">                Notification&lt;? extends T&gt; toOffer = args;</span>
+<span class="pc bpc" id="L170" title="1 of 2 branches missed.">                while (!buf.offer(toOffer)) {</span>
+<span class="nc" id="L171">                    Notification&lt;? extends T&gt; concurrentItem = buf.poll();</span>
+
+                    // in case if we won race condition with onComplete/onError method
+<span class="nc bnc" id="L174" title="All 4 branches missed.">                    if (concurrentItem != null &amp;&amp; !concurrentItem.isOnNext()) {</span>
+<span class="nc" id="L175">                        toOffer = concurrentItem;</span>
+                    }
+<span class="nc" id="L177">                }</span>
+            }
+
+<span class="fc" id="L180">        }</span>
+
+        public Notification&lt;? extends T&gt; takeNext() throws InterruptedException {
+<span class="fc" id="L183">            setWaiting(1);</span>
+<span class="fc" id="L184">            return buf.take();</span>
+        }
+        void setWaiting(int value) {
+<span class="fc" id="L187">            waiting.set(value);</span>
+<span class="fc" id="L188">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

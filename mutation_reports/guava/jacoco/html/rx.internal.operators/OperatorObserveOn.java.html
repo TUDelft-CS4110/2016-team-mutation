@@ -1,0 +1,276 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>OperatorObserveOn.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.internal.operators</a> &gt; <span class="el_source">OperatorObserveOn.java</span></div><h1>OperatorObserveOn.java</h1><pre class="source lang-java linenums">/**
+ * Copyright 2014 Netflix, Inc.
+ * 
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package rx.internal.operators;
+
+import java.util.Queue;
+import java.util.concurrent.atomic.AtomicLong;
+
+import rx.*;
+import rx.Observable.Operator;
+import rx.exceptions.MissingBackpressureException;
+import rx.functions.Action0;
+import rx.internal.util.*;
+import rx.internal.util.atomic.SpscAtomicArrayQueue;
+import rx.internal.util.unsafe.*;
+import rx.plugins.RxJavaPlugins;
+import rx.schedulers.*;
+
+/**
+ * Delivers events on the specified {@code Scheduler} asynchronously via an unbounded buffer.
+ * 
+ * &lt;img width=&quot;640&quot; src=&quot;https://github.com/ReactiveX/RxJava/wiki/images/rx-operators/observeOn.png&quot; alt=&quot;&quot;&gt;
+ * 
+ * @param &lt;T&gt;
+ *            the transmitted value type
+ */
+public final class OperatorObserveOn&lt;T&gt; implements Operator&lt;T, T&gt; {
+
+    private final Scheduler scheduler;
+    private final boolean delayError;
+
+    /**
+     * @param scheduler the scheduler to use
+     * @param delayError delay errors until all normal events are emitted in the other thread?
+     */
+<span class="fc" id="L48">    public OperatorObserveOn(Scheduler scheduler, boolean delayError) {</span>
+<span class="fc" id="L49">        this.scheduler = scheduler;</span>
+<span class="fc" id="L50">        this.delayError = delayError;</span>
+<span class="fc" id="L51">    }</span>
+
+    @Override
+    public Subscriber&lt;? super T&gt; call(Subscriber&lt;? super T&gt; child) {
+<span class="fc bfc" id="L55" title="All 2 branches covered.">        if (scheduler instanceof ImmediateScheduler) {</span>
+            // avoid overhead, execute directly
+<span class="fc" id="L57">            return child;</span>
+<span class="fc bfc" id="L58" title="All 2 branches covered.">        } else if (scheduler instanceof TrampolineScheduler) {</span>
+            // avoid overhead, execute directly
+<span class="fc" id="L60">            return child;</span>
+        } else {
+<span class="fc" id="L62">            ObserveOnSubscriber&lt;T&gt; parent = new ObserveOnSubscriber&lt;T&gt;(scheduler, child, delayError);</span>
+<span class="fc" id="L63">            parent.init();</span>
+<span class="fc" id="L64">            return parent;</span>
+        }
+    }
+
+    /** Observe through individual queue per observer. */
+    private static final class ObserveOnSubscriber&lt;T&gt; extends Subscriber&lt;T&gt; implements Action0 {
+        final Subscriber&lt;? super T&gt; child;
+        final Scheduler.Worker recursiveScheduler;
+        final NotificationLite&lt;T&gt; on;
+        final boolean delayError;
+        final Queue&lt;Object&gt; queue;
+        
+        // the status of the current stream
+        volatile boolean finished;
+
+<span class="fc" id="L79">        final AtomicLong requested = new AtomicLong();</span>
+        
+<span class="fc" id="L81">        final AtomicLong counter = new AtomicLong();</span>
+        
+        /** 
+         * The single exception if not null, should be written before setting finished (release) and read after
+         * reading finished (acquire).
+         */
+        Throwable error;
+
+        // do NOT pass the Subscriber through to couple the subscription chain ... unsubscribing on the parent should
+        // not prevent anything downstream from consuming, which will happen if the Subscription is chained
+<span class="fc" id="L91">        public ObserveOnSubscriber(Scheduler scheduler, Subscriber&lt;? super T&gt; child, boolean delayError) {</span>
+<span class="fc" id="L92">            this.child = child;</span>
+<span class="fc" id="L93">            this.recursiveScheduler = scheduler.createWorker();</span>
+<span class="fc" id="L94">            this.delayError = delayError;</span>
+<span class="fc" id="L95">            this.on = NotificationLite.instance();</span>
+<span class="pc bpc" id="L96" title="1 of 2 branches missed.">            if (UnsafeAccess.isUnsafeAvailable()) {</span>
+<span class="fc" id="L97">                queue = new SpscArrayQueue&lt;Object&gt;(RxRingBuffer.SIZE);</span>
+            } else {
+<span class="nc" id="L99">                queue = new SpscAtomicArrayQueue&lt;Object&gt;(RxRingBuffer.SIZE);</span>
+            }
+<span class="fc" id="L101">        }</span>
+        
+        void init() {
+            // don't want this code in the constructor because `this` can escape through the 
+            // setProducer call
+<span class="fc" id="L106">            Subscriber&lt;? super T&gt; localChild = child;</span>
+            
+<span class="fc" id="L108">            localChild.setProducer(new Producer() {</span>
+
+                @Override
+                public void request(long n) {
+<span class="fc bfc" id="L112" title="All 2 branches covered.">                    if (n &gt; 0L) {</span>
+<span class="fc" id="L113">                        BackpressureUtils.getAndAddRequest(requested, n);</span>
+<span class="fc" id="L114">                        schedule();</span>
+                    }
+<span class="fc" id="L116">                }</span>
+
+            });
+<span class="fc" id="L119">            localChild.add(recursiveScheduler);</span>
+<span class="fc" id="L120">            localChild.add(this);</span>
+<span class="fc" id="L121">        }</span>
+
+        @Override
+        public void onStart() {
+            // signal that this is an async operator capable of receiving this many
+<span class="fc" id="L126">            request(RxRingBuffer.SIZE);</span>
+<span class="fc" id="L127">        }</span>
+
+        @Override
+        public void onNext(final T t) {
+<span class="fc bfc" id="L131" title="All 4 branches covered.">            if (isUnsubscribed() || finished) {</span>
+<span class="fc" id="L132">                return;</span>
+            }
+<span class="fc bfc" id="L134" title="All 2 branches covered.">            if (!queue.offer(on.next(t))) {</span>
+<span class="fc" id="L135">                onError(new MissingBackpressureException());</span>
+<span class="fc" id="L136">                return;</span>
+            }
+<span class="fc" id="L138">            schedule();</span>
+<span class="fc" id="L139">        }</span>
+
+        @Override
+        public void onCompleted() {
+<span class="fc bfc" id="L143" title="All 4 branches covered.">            if (isUnsubscribed() || finished) {</span>
+<span class="fc" id="L144">                return;</span>
+            }
+<span class="fc" id="L146">            finished = true;</span>
+<span class="fc" id="L147">            schedule();</span>
+<span class="fc" id="L148">        }</span>
+
+        @Override
+        public void onError(final Throwable e) {
+<span class="pc bpc" id="L152" title="2 of 4 branches missed.">            if (isUnsubscribed() || finished) {</span>
+<span class="nc" id="L153">                RxJavaPlugins.getInstance().getErrorHandler().handleError(e);</span>
+<span class="nc" id="L154">                return;</span>
+            }
+<span class="fc" id="L156">            error = e;</span>
+<span class="fc" id="L157">            finished = true;</span>
+<span class="fc" id="L158">            schedule();</span>
+<span class="fc" id="L159">        }</span>
+
+        protected void schedule() {
+<span class="fc bfc" id="L162" title="All 2 branches covered.">            if (counter.getAndIncrement() == 0) {</span>
+<span class="fc" id="L163">                recursiveScheduler.schedule(this);</span>
+            }
+<span class="fc" id="L165">        }</span>
+
+        // only execute this from schedule()
+        @Override
+        public void call() {
+<span class="fc" id="L170">            long emitted = 0L;</span>
+
+<span class="fc" id="L172">            long missed = 1L;</span>
+
+            // these are accessed in a tight loop around atomics so
+            // loading them into local variables avoids the mandatory re-reading
+            // of the constant fields
+<span class="fc" id="L177">            final Queue&lt;Object&gt; q = this.queue;</span>
+<span class="fc" id="L178">            final Subscriber&lt;? super T&gt; localChild = this.child;</span>
+<span class="fc" id="L179">            final NotificationLite&lt;T&gt; localOn = this.on;</span>
+            
+            // requested and counter are not included to avoid JIT issues with register spilling
+            // and their access is is amortized because they are part of the outer loop which runs
+            // less frequently (usually after each RxRingBuffer.SIZE elements)
+            
+            for (;;) {
+<span class="fc bfc" id="L186" title="All 2 branches covered.">                if (checkTerminated(finished, q.isEmpty(), localChild, q)) {</span>
+<span class="fc" id="L187">                    return;</span>
+                }
+
+<span class="fc" id="L190">                long requestAmount = requested.get();</span>
+<span class="fc bfc" id="L191" title="All 2 branches covered.">                boolean unbounded = requestAmount == Long.MAX_VALUE;</span>
+<span class="fc" id="L192">                long currentEmission = 0L;</span>
+                
+<span class="fc bfc" id="L194" title="All 2 branches covered.">                while (requestAmount != 0L) {</span>
+<span class="fc" id="L195">                    boolean done = finished;</span>
+<span class="fc" id="L196">                    Object v = q.poll();</span>
+<span class="fc bfc" id="L197" title="All 2 branches covered.">                    boolean empty = v == null;</span>
+                    
+<span class="fc bfc" id="L199" title="All 2 branches covered.">                    if (checkTerminated(done, empty, localChild, q)) {</span>
+<span class="fc" id="L200">                        return;</span>
+                    }
+                    
+<span class="fc bfc" id="L203" title="All 2 branches covered.">                    if (empty) {</span>
+<span class="fc" id="L204">                        break;</span>
+                    }
+                    
+<span class="fc" id="L207">                    localChild.onNext(localOn.getValue(v));</span>
+                    
+<span class="fc" id="L209">                    requestAmount--;</span>
+<span class="fc" id="L210">                    currentEmission--;</span>
+<span class="fc" id="L211">                    emitted++;</span>
+<span class="fc" id="L212">                }</span>
+                
+<span class="fc bfc" id="L214" title="All 4 branches covered.">                if (currentEmission != 0L &amp;&amp; !unbounded) {</span>
+<span class="fc" id="L215">                    requested.addAndGet(currentEmission);</span>
+                }
+                
+<span class="fc" id="L218">                missed = counter.addAndGet(-missed);</span>
+<span class="fc bfc" id="L219" title="All 2 branches covered.">                if (missed == 0L) {</span>
+<span class="fc" id="L220">                    break;</span>
+                }
+<span class="fc" id="L222">            }</span>
+            
+<span class="fc bfc" id="L224" title="All 2 branches covered.">            if (emitted != 0L) {</span>
+<span class="fc" id="L225">                request(emitted);</span>
+            }
+<span class="fc" id="L227">        }</span>
+        
+        boolean checkTerminated(boolean done, boolean isEmpty, Subscriber&lt;? super T&gt; a, Queue&lt;Object&gt; q) {
+<span class="fc bfc" id="L230" title="All 2 branches covered.">            if (a.isUnsubscribed()) {</span>
+<span class="fc" id="L231">                q.clear();</span>
+<span class="fc" id="L232">                return true;</span>
+            }
+            
+<span class="fc bfc" id="L235" title="All 2 branches covered.">            if (done) {</span>
+<span class="fc bfc" id="L236" title="All 2 branches covered.">                if (delayError) {</span>
+<span class="fc bfc" id="L237" title="All 2 branches covered.">                    if (isEmpty) {</span>
+<span class="fc" id="L238">                        Throwable e = error;</span>
+                        try {
+<span class="pc bpc" id="L240" title="1 of 2 branches missed.">                            if (e != null) {</span>
+<span class="fc" id="L241">                                a.onError(e);</span>
+                            } else {
+<span class="nc" id="L243">                                a.onCompleted();</span>
+                            }
+                        } finally {
+<span class="pc" id="L246">                            recursiveScheduler.unsubscribe();</span>
+<span class="fc" id="L247">                        }</span>
+<span class="fc" id="L248">                    }</span>
+                } else {
+<span class="fc" id="L250">                    Throwable e = error;</span>
+<span class="fc bfc" id="L251" title="All 2 branches covered.">                    if (e != null) {</span>
+<span class="fc" id="L252">                        q.clear();</span>
+                        try {
+<span class="fc" id="L254">                            a.onError(e);</span>
+                        } finally {
+<span class="pc" id="L256">                            recursiveScheduler.unsubscribe();</span>
+<span class="fc" id="L257">                        }</span>
+<span class="fc" id="L258">                        return true;</span>
+                    } else
+<span class="fc bfc" id="L260" title="All 2 branches covered.">                    if (isEmpty) {</span>
+                        try {
+<span class="fc" id="L262">                            a.onCompleted();</span>
+                        } finally {
+<span class="pc" id="L264">                            recursiveScheduler.unsubscribe();</span>
+<span class="fc" id="L265">                        }</span>
+<span class="fc" id="L266">                        return true;</span>
+                    }
+                }
+                    
+            }
+            
+<span class="fc" id="L272">            return false;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

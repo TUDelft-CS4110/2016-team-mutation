@@ -1,0 +1,187 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>ConcurrentCircularArrayQueue.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.internal.util.unsafe</a> &gt; <span class="el_source">ConcurrentCircularArrayQueue.java</span></div><h1>ConcurrentCircularArrayQueue.java</h1><pre class="source lang-java linenums">/*
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ * 
+ * Original License: https://github.com/JCTools/JCTools/blob/master/LICENSE
+ * Original location: https://github.com/JCTools/JCTools/blob/master/jctools-core/src/main/java/org/jctools/queues/ConcurrentCircularArrayQueue.java
+ */
+package rx.internal.util.unsafe;
+
+import static rx.internal.util.unsafe.UnsafeAccess.UNSAFE;
+
+import java.util.AbstractQueue;
+import java.util.Iterator;
+
+<span class="fc" id="L24">abstract class ConcurrentCircularArrayQueueL0Pad&lt;E&gt; extends AbstractQueue&lt;E&gt; implements MessagePassingQueue&lt;E&gt; {</span>
+    long p00, p01, p02, p03, p04, p05, p06, p07;
+    long p30, p31, p32, p33, p34, p35, p36, p37;
+}
+
+/**
+ * A concurrent access enabling class used by circular array based queues this class exposes an offset computation
+ * method along with differently memory fenced load/store methods into the underlying array. The class is pre-padded and
+ * the array is padded on either side to help with False sharing prvention. It is expected theat subclasses handle post
+ * padding.
+ * &lt;p&gt;
+ * Offset calculation is separate from access to enable the reuse of a give compute offset.
+ * &lt;p&gt;
+ * Load/Store methods using a &lt;i&gt;buffer&lt;/i&gt; parameter are provided to allow the prevention of final field reload after a
+ * LoadLoad barrier.
+ * &lt;p&gt;
+ * 
+ * @author nitsanw
+ * 
+ * @param &lt;E&gt;
+ */
+public abstract class ConcurrentCircularArrayQueue&lt;E&gt; extends ConcurrentCircularArrayQueueL0Pad&lt;E&gt; {
+<span class="fc" id="L46">    protected static final int SPARSE_SHIFT = Integer.getInteger(&quot;sparse.shift&quot;, 0);</span>
+    protected static final int BUFFER_PAD = 32;
+    private static final long REF_ARRAY_BASE;
+    private static final int REF_ELEMENT_SHIFT;
+    static {
+<span class="fc" id="L51">        final int scale = UnsafeAccess.UNSAFE.arrayIndexScale(Object[].class);</span>
+<span class="pc bpc" id="L52" title="1 of 2 branches missed.">        if (4 == scale) {</span>
+<span class="fc" id="L53">            REF_ELEMENT_SHIFT = 2 + SPARSE_SHIFT;</span>
+<span class="nc bnc" id="L54" title="All 2 branches missed.">        } else if (8 == scale) {</span>
+<span class="nc" id="L55">            REF_ELEMENT_SHIFT = 3 + SPARSE_SHIFT;</span>
+        } else {
+<span class="nc" id="L57">            throw new IllegalStateException(&quot;Unknown pointer size&quot;);</span>
+        }
+        // Including the buffer pad in the array base offset
+<span class="fc" id="L60">        REF_ARRAY_BASE = UnsafeAccess.UNSAFE.arrayBaseOffset(Object[].class)</span>
+                + (BUFFER_PAD &lt;&lt; (REF_ELEMENT_SHIFT - SPARSE_SHIFT));
+<span class="fc" id="L62">    }</span>
+    protected final long mask;
+    // @Stable :(
+    protected final E[] buffer;
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+<span class="fc" id="L68">    public ConcurrentCircularArrayQueue(int capacity) {</span>
+<span class="fc" id="L69">        int actualCapacity = Pow2.roundToPowerOfTwo(capacity);</span>
+<span class="fc" id="L70">        mask = actualCapacity - 1;</span>
+        // pad data on either end with some empty slots.
+<span class="fc" id="L72">        buffer = (E[]) new Object[(actualCapacity &lt;&lt; SPARSE_SHIFT) + BUFFER_PAD * 2];</span>
+<span class="fc" id="L73">    }</span>
+
+    /**
+     * @param index desirable element index
+     * @return the offset in bytes within the array for a given index.
+     */
+    protected final long calcElementOffset(long index) {
+<span class="fc" id="L80">        return calcElementOffset(index, mask);</span>
+    }
+    /**
+     * @param index desirable element index
+     * @param mask 
+     * @return the offset in bytes within the array for a given index.
+     */
+    protected final long calcElementOffset(long index, long mask) {
+<span class="fc" id="L88">        return REF_ARRAY_BASE + ((index &amp; mask) &lt;&lt; REF_ELEMENT_SHIFT);</span>
+    }
+    /**
+     * A plain store (no ordering/fences) of an element to a given offset
+     * 
+     * @param offset computed via {@link ConcurrentCircularArrayQueue#calcElementOffset(long)}
+     * @param e a kitty
+     */
+    protected final void spElement(long offset, E e) {
+<span class="fc" id="L97">        spElement(buffer, offset, e);</span>
+<span class="fc" id="L98">    }</span>
+
+    /**
+     * A plain store (no ordering/fences) of an element to a given offset
+     * 
+     * @param buffer this.buffer
+     * @param offset computed via {@link ConcurrentCircularArrayQueue#calcElementOffset(long)}
+     * @param e an orderly kitty
+     */
+    protected final void spElement(E[] buffer, long offset, E e) {
+<span class="fc" id="L108">        UNSAFE.putObject(buffer, offset, e);</span>
+<span class="fc" id="L109">    }</span>
+
+    /**
+     * An ordered store(store + StoreStore barrier) of an element to a given offset
+     * 
+     * @param offset computed via {@link ConcurrentCircularArrayQueue#calcElementOffset(long)}
+     * @param e an orderly kitty
+     */
+    protected final void soElement(long offset, E e) {
+<span class="nc" id="L118">        soElement(buffer, offset, e);</span>
+<span class="nc" id="L119">    }</span>
+
+    /**
+     * An ordered store(store + StoreStore barrier) of an element to a given offset
+     * 
+     * @param buffer this.buffer
+     * @param offset computed via {@link ConcurrentCircularArrayQueue#calcElementOffset(long)}
+     * @param e an orderly kitty
+     */
+    protected final void soElement(E[] buffer, long offset, E e) {
+<span class="fc" id="L129">        UNSAFE.putOrderedObject(buffer, offset, e);</span>
+<span class="fc" id="L130">    }</span>
+
+    /**
+     * A plain load (no ordering/fences) of an element from a given offset.
+     * 
+     * @param offset computed via {@link ConcurrentCircularArrayQueue#calcElementOffset(long)}
+     * @return the element at the offset
+     */
+    protected final E lpElement(long offset) {
+<span class="fc" id="L139">        return lpElement(buffer, offset);</span>
+    }
+
+    /**
+     * A plain load (no ordering/fences) of an element from a given offset.
+     * 
+     * @param buffer this.buffer
+     * @param offset computed via {@link ConcurrentCircularArrayQueue#calcElementOffset(long)}
+     * @return the element at the offset
+     */
+    @SuppressWarnings(&quot;unchecked&quot;)
+    protected final E lpElement(E[] buffer, long offset) {
+<span class="fc" id="L151">        return (E) UNSAFE.getObject(buffer, offset);</span>
+    }
+
+    /**
+     * A volatile load (load + LoadLoad barrier) of an element from a given offset.
+     * 
+     * @param offset computed via {@link ConcurrentCircularArrayQueue#calcElementOffset(long)}
+     * @return the element at the offset
+     */
+    protected final E lvElement(long offset) {
+<span class="fc" id="L161">        return lvElement(buffer, offset);</span>
+    }
+
+    /**
+     * A volatile load (load + LoadLoad barrier) of an element from a given offset.
+     * 
+     * @param buffer this.buffer
+     * @param offset computed via {@link ConcurrentCircularArrayQueue#calcElementOffset(long)}
+     * @return the element at the offset
+     */
+    @SuppressWarnings(&quot;unchecked&quot;)
+    protected final E lvElement(E[] buffer, long offset) {
+<span class="fc" id="L173">        return (E) UNSAFE.getObjectVolatile(buffer, offset);</span>
+    }
+
+    @Override
+    public Iterator&lt;E&gt; iterator() {
+<span class="fc" id="L178">        throw new UnsupportedOperationException();</span>
+    }
+    @Override
+    public void clear() {
+        // we have to test isEmpty because of the weaker poll() guarantee
+<span class="pc bpc" id="L183" title="1 of 4 branches missed.">        while (poll() != null || !isEmpty())</span>
+<span class="nc" id="L184">            ;</span>
+<span class="fc" id="L185">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

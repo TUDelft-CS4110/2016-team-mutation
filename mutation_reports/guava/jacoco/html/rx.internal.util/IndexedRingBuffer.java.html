@@ -1,0 +1,543 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>IndexedRingBuffer.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.internal.util</a> &gt; <span class="el_source">IndexedRingBuffer.java</span></div><h1>IndexedRingBuffer.java</h1><pre class="source lang-java linenums">/**
+ * Copyright 2014 Netflix, Inc.
+ * 
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package rx.internal.util;
+
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicIntegerArray;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicReferenceArray;
+
+import rx.Subscription;
+import rx.functions.Func1;
+
+/**
+ * Add/Remove without object allocation (after initial construction).
+ * &lt;p&gt;
+ * This is meant for hundreds or single-digit thousands of elements that need
+ * to be rapidly added and randomly or sequentially removed while avoiding object allocation.
+ * &lt;p&gt;
+ * On Intel Core i7, 2.3Mhz, Mac Java 8:
+ * &lt;p&gt;
+ * - adds per second single-threaded =&gt; ~32,598,500 for 100
+ * - adds per second single-threaded =&gt; ~23,200,000 for 10,000
+ * - adds + removes per second single-threaded =&gt; 15,562,100 for 100
+ * - adds + removes per second single-threaded =&gt; 8,760,000 for 10,000
+ * 
+ * &lt;pre&gt; {@code
+ * Benchmark                                              (size)   Mode   Samples        Score  Score error    Units
+ * r.i.IndexedRingBufferPerf.indexedRingBufferAdd            100  thrpt         5   263571.721     9856.994    ops/s
+ * r.i.IndexedRingBufferPerf.indexedRingBufferAdd          10000  thrpt         5     1763.417      211.998    ops/s
+ * r.i.IndexedRingBufferPerf.indexedRingBufferAddRemove      100  thrpt         5   139850.115    17143.705    ops/s
+ * r.i.IndexedRingBufferPerf.indexedRingBufferAddRemove    10000  thrpt         5      809.982       72.931    ops/s
+ * } &lt;/pre&gt;
+ * 
+ * @param &lt;E&gt;
+ */
+public final class IndexedRingBuffer&lt;E&gt; implements Subscription {
+
+<span class="fc" id="L51">    private static final ObjectPool&lt;IndexedRingBuffer&lt;?&gt;&gt; POOL = new ObjectPool&lt;IndexedRingBuffer&lt;?&gt;&gt;() {</span>
+
+        @Override
+        protected IndexedRingBuffer&lt;?&gt; createObject() {
+<span class="fc" id="L55">            return new IndexedRingBuffer&lt;Object&gt;();</span>
+        }
+
+    };
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    public static &lt;T&gt; IndexedRingBuffer&lt;T&gt; getInstance() {
+<span class="fc" id="L62">        return (IndexedRingBuffer&lt;T&gt;) POOL.borrowObject();</span>
+    }
+
+<span class="fc" id="L65">    private final ElementSection&lt;E&gt; elements = new ElementSection&lt;E&gt;();</span>
+<span class="fc" id="L66">    private final IndexSection removed = new IndexSection();</span>
+<span class="fc" id="L67">    /* package for unit testing */final AtomicInteger index = new AtomicInteger();</span>
+<span class="fc" id="L68">    /* package for unit testing */final AtomicInteger removedIndex = new AtomicInteger();</span>
+    
+    // default size of ring buffer
+    /**
+     * Set at 256 ... Android defaults far smaller which likely will never hit the use cases that require the higher buffers.
+     * &lt;p&gt;
+     * The 10000 size test represents something that should be a rare use case (merging 10000 concurrent Observables for example) 
+     * 
+     * &lt;pre&gt; {@code
+     * ./gradlew benchmarks '-Pjmh=-f 1 -tu s -bm thrpt -wi 5 -i 5 -r 1 .*IndexedRingBufferPerf.*'
+     * 
+     * 1024
+     * 
+     * Benchmark                                              (size)   Mode   Samples        Score  Score error    Units
+     * r.i.IndexedRingBufferPerf.indexedRingBufferAdd            100  thrpt         5   269292.006     6013.347    ops/s
+     * r.i.IndexedRingBufferPerf.indexedRingBufferAdd          10000  thrpt         5     2217.103      163.396    ops/s
+     * r.i.IndexedRingBufferPerf.indexedRingBufferAddRemove      100  thrpt         5   139349.608     9397.232    ops/s
+     * r.i.IndexedRingBufferPerf.indexedRingBufferAddRemove    10000  thrpt         5     1045.323       30.991    ops/s
+     * 
+     * 512
+     * 
+     * Benchmark                                              (size)   Mode   Samples        Score  Score error    Units
+     * r.i.IndexedRingBufferPerf.indexedRingBufferAdd            100  thrpt         5   270919.870     5381.793    ops/s
+     * r.i.IndexedRingBufferPerf.indexedRingBufferAdd          10000  thrpt         5     1724.436       42.287    ops/s
+     * r.i.IndexedRingBufferPerf.indexedRingBufferAddRemove      100  thrpt         5   141478.813     3696.030    ops/s
+     * r.i.IndexedRingBufferPerf.indexedRingBufferAddRemove    10000  thrpt         5      719.447       75.629    ops/s
+     * 
+     * 
+     * 256
+     * 
+     * Benchmark                                              (size)   Mode   Samples        Score  Score error    Units
+     * r.i.IndexedRingBufferPerf.indexedRingBufferAdd            100  thrpt         5   272042.605     7954.982    ops/s
+     * r.i.IndexedRingBufferPerf.indexedRingBufferAdd          10000  thrpt         5     1101.329       23.566    ops/s
+     * r.i.IndexedRingBufferPerf.indexedRingBufferAddRemove      100  thrpt         5   140479.804     6389.060    ops/s
+     * r.i.IndexedRingBufferPerf.indexedRingBufferAddRemove    10000  thrpt         5      397.306       24.222    ops/s
+     * 
+     * 128
+     * 
+     * Benchmark                                              (size)   Mode   Samples        Score  Score error    Units
+     * r.i.IndexedRingBufferPerf.indexedRingBufferAdd            100  thrpt         5   263065.312    11168.941    ops/s
+     * r.i.IndexedRingBufferPerf.indexedRingBufferAdd          10000  thrpt         5      581.708       17.397    ops/s
+     * r.i.IndexedRingBufferPerf.indexedRingBufferAddRemove      100  thrpt         5   138051.488     4618.935    ops/s
+     * r.i.IndexedRingBufferPerf.indexedRingBufferAddRemove    10000  thrpt         5      176.873       35.669    ops/s
+     * 
+     * 32
+     * 
+     * Benchmark                                              (size)   Mode   Samples        Score  Score error    Units
+     * r.i.IndexedRingBufferPerf.indexedRingBufferAdd            100  thrpt         5   250737.473    17260.148    ops/s
+     * r.i.IndexedRingBufferPerf.indexedRingBufferAdd          10000  thrpt         5      144.725       26.284    ops/s
+     * r.i.IndexedRingBufferPerf.indexedRingBufferAddRemove      100  thrpt         5   118832.832     9082.658    ops/s
+     * r.i.IndexedRingBufferPerf.indexedRingBufferAddRemove    10000  thrpt         5       32.133        8.048    ops/s
+     * 
+     * 8
+     * 
+     * Benchmark                                              (size)   Mode   Samples        Score  Score error    Units
+     * r.i.IndexedRingBufferPerf.indexedRingBufferAdd            100  thrpt         5   209192.847    25558.124    ops/s
+     * r.i.IndexedRingBufferPerf.indexedRingBufferAdd          10000  thrpt         5       26.520        3.100    ops/s
+     * r.i.IndexedRingBufferPerf.indexedRingBufferAddRemove      100  thrpt         5   100200.463     1854.259    ops/s
+     * r.i.IndexedRingBufferPerf.indexedRingBufferAddRemove    10000  thrpt         5        8.456        2.114    ops/s
+     * 
+     * 2
+     * 
+     * Benchmark                                              (size)   Mode   Samples        Score  Score error    Units
+     * r.i.IndexedRingBufferPerf.indexedRingBufferAdd            100  thrpt         5    96549.208     4427.239    ops/s
+     * r.i.IndexedRingBufferPerf.indexedRingBufferAdd          10000  thrpt         5        6.637        2.025    ops/s
+     * r.i.IndexedRingBufferPerf.indexedRingBufferAddRemove      100  thrpt         5    34553.169     4904.197    ops/s
+     * r.i.IndexedRingBufferPerf.indexedRingBufferAddRemove    10000  thrpt         5        2.159        0.700    ops/s
+     * } &lt;/pre&gt;
+     * 
+     * Impact of IndexedRingBuffer size on merge
+     * 
+     * &lt;pre&gt; {@code
+     * ./gradlew benchmarks '-Pjmh=-f 1 -tu s -bm thrpt -wi 5 -i 5 -r 1 .*OperatorMergePerf.*'
+     * 
+     * 512
+     * 
+     * Benchmark                                          (size)   Mode   Samples        Score  Score error    Units
+     * r.o.OperatorMergePerf.merge1SyncStreamOfN               1  thrpt         5  5282500.038   530541.761    ops/s
+     * r.o.OperatorMergePerf.merge1SyncStreamOfN            1000  thrpt         5    49327.272     6382.189    ops/s
+     * r.o.OperatorMergePerf.merge1SyncStreamOfN         1000000  thrpt         5       53.025        4.724    ops/s
+     * r.o.OperatorMergePerf.mergeNAsyncStreamsOfN             1  thrpt         5    97395.148     2489.303    ops/s
+     * r.o.OperatorMergePerf.mergeNAsyncStreamsOfN          1000  thrpt         5        4.723        1.479    ops/s
+     * r.o.OperatorMergePerf.mergeNSyncStreamsOf1              1  thrpt         5  4534067.250   116321.725    ops/s
+     * r.o.OperatorMergePerf.mergeNSyncStreamsOf1            100  thrpt         5   458561.098    27652.081    ops/s
+     * r.o.OperatorMergePerf.mergeNSyncStreamsOf1           1000  thrpt         5    43267.381     2648.107    ops/s
+     * r.o.OperatorMergePerf.mergeNSyncStreamsOfN              1  thrpt         5  5581051.672   144191.849    ops/s
+     * r.o.OperatorMergePerf.mergeNSyncStreamsOfN           1000  thrpt         5       50.643        4.354    ops/s
+     * r.o.OperatorMergePerf.mergeTwoAsyncStreamsOfN           1  thrpt         5    76437.644      959.748    ops/s
+     * r.o.OperatorMergePerf.mergeTwoAsyncStreamsOfN        1000  thrpt         5     2965.306      272.928    ops/s
+     * r.o.OperatorMergePerf.oneStreamOfNthatMergesIn1         1  thrpt         5  5026522.098   364196.255    ops/s
+     * r.o.OperatorMergePerf.oneStreamOfNthatMergesIn1      1000  thrpt         5    34926.819      938.612    ops/s
+     * r.o.OperatorMergePerf.oneStreamOfNthatMergesIn1   1000000  thrpt         5       33.342        1.701    ops/s
+     * 
+     * 
+     * 128
+     * 
+     * Benchmark                                          (size)   Mode   Samples        Score  Score error    Units
+     * r.o.OperatorMergePerf.merge1SyncStreamOfN               1  thrpt         5  5144891.776   271990.561    ops/s
+     * r.o.OperatorMergePerf.merge1SyncStreamOfN            1000  thrpt         5    53580.161     2370.204    ops/s
+     * r.o.OperatorMergePerf.merge1SyncStreamOfN         1000000  thrpt         5       53.265        2.236    ops/s
+     * r.o.OperatorMergePerf.mergeNAsyncStreamsOfN             1  thrpt         5    96634.426     1417.430    ops/s
+     * r.o.OperatorMergePerf.mergeNAsyncStreamsOfN          1000  thrpt         5        4.648        0.255    ops/s
+     * r.o.OperatorMergePerf.mergeNSyncStreamsOf1              1  thrpt         5  4601280.220    53157.938    ops/s
+     * r.o.OperatorMergePerf.mergeNSyncStreamsOf1            100  thrpt         5   463394.568    58612.882    ops/s
+     * r.o.OperatorMergePerf.mergeNSyncStreamsOf1           1000  thrpt         5    50503.565     2394.168    ops/s
+     * r.o.OperatorMergePerf.mergeNSyncStreamsOfN              1  thrpt         5  5490315.842   228654.817    ops/s
+     * r.o.OperatorMergePerf.mergeNSyncStreamsOfN           1000  thrpt         5       50.661        3.385    ops/s
+     * r.o.OperatorMergePerf.mergeTwoAsyncStreamsOfN           1  thrpt         5    74716.169     7413.642    ops/s
+     * r.o.OperatorMergePerf.mergeTwoAsyncStreamsOfN        1000  thrpt         5     3009.476      277.075    ops/s
+     * r.o.OperatorMergePerf.oneStreamOfNthatMergesIn1         1  thrpt         5  4953313.642   307512.126    ops/s
+     * r.o.OperatorMergePerf.oneStreamOfNthatMergesIn1      1000  thrpt         5    35335.579     2368.377    ops/s
+     * r.o.OperatorMergePerf.oneStreamOfNthatMergesIn1   1000000  thrpt         5       37.450        0.655    ops/s
+     * 
+     * 32
+     * 
+     * Benchmark                                          (size)   Mode   Samples        Score  Score error    Units
+     * r.o.OperatorMergePerf.merge1SyncStreamOfN               1  thrpt         5  4975957.497   365423.694    ops/s
+     * r.o.OperatorMergePerf.merge1SyncStreamOfN            1000  thrpt         5    52141.226     5056.658    ops/s
+     * r.o.OperatorMergePerf.merge1SyncStreamOfN         1000000  thrpt         5       53.663        2.671    ops/s
+     * r.o.OperatorMergePerf.mergeNAsyncStreamsOfN             1  thrpt         5    96507.893     1833.371    ops/s
+     * r.o.OperatorMergePerf.mergeNAsyncStreamsOfN          1000  thrpt         5        4.850        0.782    ops/s
+     * r.o.OperatorMergePerf.mergeNSyncStreamsOf1              1  thrpt         5  4557128.302   118516.934    ops/s
+     * r.o.OperatorMergePerf.mergeNSyncStreamsOf1            100  thrpt         5   339005.037    10594.737    ops/s
+     * r.o.OperatorMergePerf.mergeNSyncStreamsOf1           1000  thrpt         5    50781.535     6071.787    ops/s
+     * r.o.OperatorMergePerf.mergeNSyncStreamsOfN              1  thrpt         5  5604920.068   209285.840    ops/s
+     * r.o.OperatorMergePerf.mergeNSyncStreamsOfN           1000  thrpt         5       50.413        7.496    ops/s
+     * r.o.OperatorMergePerf.mergeTwoAsyncStreamsOfN           1  thrpt         5    76098.942      558.187    ops/s
+     * r.o.OperatorMergePerf.mergeTwoAsyncStreamsOfN        1000  thrpt         5     2988.137      193.255    ops/s
+     * r.o.OperatorMergePerf.oneStreamOfNthatMergesIn1         1  thrpt         5  5177255.256   150253.086    ops/s
+     * r.o.OperatorMergePerf.oneStreamOfNthatMergesIn1      1000  thrpt         5    34772.490      909.967    ops/s
+     * r.o.OperatorMergePerf.oneStreamOfNthatMergesIn1   1000000  thrpt         5       34.847        0.606    ops/s
+     * 
+     * 8
+     * 
+     * Benchmark                                          (size)   Mode   Samples        Score  Score error    Units
+     * r.o.OperatorMergePerf.merge1SyncStreamOfN               1  thrpt         5  5027331.903   337986.410    ops/s
+     * r.o.OperatorMergePerf.merge1SyncStreamOfN            1000  thrpt         5    51746.540     3585.450    ops/s
+     * r.o.OperatorMergePerf.merge1SyncStreamOfN         1000000  thrpt         5       52.682        4.026    ops/s
+     * r.o.OperatorMergePerf.mergeNAsyncStreamsOfN             1  thrpt         5    96805.587     2868.112    ops/s
+     * r.o.OperatorMergePerf.mergeNAsyncStreamsOfN          1000  thrpt         5        4.598        0.290    ops/s
+     * r.o.OperatorMergePerf.mergeNSyncStreamsOf1              1  thrpt         5  4390912.630   300687.310    ops/s
+     * r.o.OperatorMergePerf.mergeNSyncStreamsOf1            100  thrpt         5   458615.731    56125.958    ops/s
+     * r.o.OperatorMergePerf.mergeNSyncStreamsOf1           1000  thrpt         5    49033.105     6132.936    ops/s
+     * r.o.OperatorMergePerf.mergeNSyncStreamsOfN              1  thrpt         5  5090614.100   649439.778    ops/s
+     * r.o.OperatorMergePerf.mergeNSyncStreamsOfN           1000  thrpt         5       48.548        3.586    ops/s
+     * r.o.OperatorMergePerf.mergeTwoAsyncStreamsOfN           1  thrpt         5    72285.482    16820.952    ops/s
+     * r.o.OperatorMergePerf.mergeTwoAsyncStreamsOfN        1000  thrpt         5     2981.576      316.140    ops/s
+     * r.o.OperatorMergePerf.oneStreamOfNthatMergesIn1         1  thrpt         5  4993609.293   267975.397    ops/s
+     * r.o.OperatorMergePerf.oneStreamOfNthatMergesIn1      1000  thrpt         5    33228.972     1554.924    ops/s
+     * r.o.OperatorMergePerf.oneStreamOfNthatMergesIn1   1000000  thrpt         5       32.994        3.615    ops/s
+     * 
+     * 
+     * 2
+     * 
+     * Benchmark                                          (size)   Mode   Samples        Score  Score error    Units
+     * r.o.OperatorMergePerf.merge1SyncStreamOfN               1  thrpt         5  5103812.234   939461.192    ops/s
+     * r.o.OperatorMergePerf.merge1SyncStreamOfN            1000  thrpt         5    51491.116     3790.056    ops/s
+     * r.o.OperatorMergePerf.merge1SyncStreamOfN         1000000  thrpt         5       54.043        2.340    ops/s
+     * r.o.OperatorMergePerf.mergeNAsyncStreamsOfN             1  thrpt         5    96575.834    13416.541    ops/s
+     * r.o.OperatorMergePerf.mergeNAsyncStreamsOfN          1000  thrpt         5        4.740        0.047    ops/s
+     * r.o.OperatorMergePerf.mergeNSyncStreamsOf1              1  thrpt         5  4435909.832   899133.671    ops/s
+     * r.o.OperatorMergePerf.mergeNSyncStreamsOf1            100  thrpt         5   392382.445    59814.783    ops/s
+     * r.o.OperatorMergePerf.mergeNSyncStreamsOf1           1000  thrpt         5    50429.258     7489.849    ops/s
+     * r.o.OperatorMergePerf.mergeNSyncStreamsOfN              1  thrpt         5  5637321.803   161838.195    ops/s
+     * r.o.OperatorMergePerf.mergeNSyncStreamsOfN           1000  thrpt         5       51.065        2.138    ops/s
+     * r.o.OperatorMergePerf.mergeTwoAsyncStreamsOfN           1  thrpt         5    76366.764     2631.710    ops/s
+     * r.o.OperatorMergePerf.mergeTwoAsyncStreamsOfN        1000  thrpt         5     2978.302      296.418    ops/s
+     * r.o.OperatorMergePerf.oneStreamOfNthatMergesIn1         1  thrpt         5  5280829.290  1602542.493    ops/s
+     * r.o.OperatorMergePerf.oneStreamOfNthatMergesIn1      1000  thrpt         5    35070.518     3565.672    ops/s
+     * r.o.OperatorMergePerf.oneStreamOfNthatMergesIn1   1000000  thrpt         5       34.501        0.991    ops/s
+     * 
+     * } &lt;/pre&gt;
+     */
+<span class="fc" id="L241">    static int _size = 256;</span>
+    static {
+        // lower default for Android (https://github.com/ReactiveX/RxJava/issues/1820)
+<span class="pc bpc" id="L244" title="1 of 2 branches missed.">        if (PlatformDependent.isAndroid()) {</span>
+<span class="nc" id="L245">            _size = 8;</span>
+        }
+
+        // possible system property for overriding
+<span class="fc" id="L249">        String sizeFromProperty = System.getProperty(&quot;rx.indexed-ring-buffer.size&quot;); // also see RxRingBuffer</span>
+<span class="pc bpc" id="L250" title="1 of 2 branches missed.">        if (sizeFromProperty != null) {</span>
+            try {
+<span class="nc" id="L252">                _size = Integer.parseInt(sizeFromProperty);</span>
+<span class="nc" id="L253">            } catch (Exception e) {</span>
+<span class="nc" id="L254">                System.err.println(&quot;Failed to set 'rx.indexed-ring-buffer.size' with value &quot; + sizeFromProperty + &quot; =&gt; &quot; + e.getMessage());</span>
+<span class="nc" id="L255">            }</span>
+        }
+    }
+    
+<span class="fc" id="L259">    /* package for unit testing */static final int SIZE = _size;</span>
+
+    /**
+     * This resets the arrays, nulls out references and returns it to the pool.
+     * This extra CPU cost is far smaller than the object allocation cost of not pooling.
+     */
+    public void releaseToPool() {
+        // need to clear all elements so we don't leak memory
+<span class="nc" id="L267">        int maxIndex = index.get();</span>
+<span class="nc" id="L268">        int realIndex = 0;</span>
+<span class="nc" id="L269">        ElementSection&lt;E&gt; section = elements;</span>
+<span class="nc bnc" id="L270" title="All 2 branches missed.">        outer: while (section != null) {</span>
+<span class="nc bnc" id="L271" title="All 2 branches missed.">            for (int i = 0; i &lt; SIZE; i++, realIndex++) {</span>
+<span class="nc bnc" id="L272" title="All 2 branches missed.">                if (realIndex &gt;= maxIndex) {</span>
+<span class="nc" id="L273">                    section = null;</span>
+<span class="nc" id="L274">                    break outer;</span>
+                }
+                // we can use lazySet here because we are nulling things out and not accessing them again
+                // (relative on Mac Intel i7) lazySet gets us ~30m vs ~26m ops/second in the JMH test (100 adds per release)
+<span class="nc" id="L278">                section.array.set(i, null);</span>
+            }
+<span class="nc" id="L280">            section = section.next.get();</span>
+        }
+
+<span class="nc" id="L283">        index.set(0);</span>
+<span class="nc" id="L284">        removedIndex.set(0);</span>
+<span class="nc" id="L285">        POOL.returnObject(this);</span>
+<span class="nc" id="L286">    }</span>
+
+    @Override
+    public void unsubscribe() {
+<span class="nc" id="L290">        releaseToPool();</span>
+<span class="nc" id="L291">    }</span>
+
+<span class="fc" id="L293">    IndexedRingBuffer() {</span>
+<span class="fc" id="L294">    }</span>
+
+    /**
+     * Add an element and return the index where it was added to allow removal.
+     * 
+     * @param e
+     * @return
+     */
+    public int add(E e) {
+<span class="fc" id="L303">        int i = getIndexForAdd();</span>
+<span class="fc bfc" id="L304" title="All 2 branches covered.">        if (i &lt; SIZE) {</span>
+            // fast-path when we are in the first section
+<span class="fc" id="L306">            elements.array.set(i, e);</span>
+<span class="fc" id="L307">            return i;</span>
+        } else {
+<span class="fc" id="L309">            int sectionIndex = i % SIZE;</span>
+<span class="fc" id="L310">            getElementSection(i).array.set(sectionIndex, e);</span>
+<span class="fc" id="L311">            return i;</span>
+        }
+    }
+
+    public E remove(int index) {
+        E e;
+<span class="fc bfc" id="L317" title="All 2 branches covered.">        if (index &lt; SIZE) {</span>
+            // fast-path when we are in the first section
+<span class="fc" id="L319">            e = elements.array.getAndSet(index, null);</span>
+        } else {
+<span class="fc" id="L321">            int sectionIndex = index % SIZE;</span>
+<span class="fc" id="L322">            e = getElementSection(index).array.getAndSet(sectionIndex, null);</span>
+        }
+<span class="fc" id="L324">        pushRemovedIndex(index);</span>
+<span class="fc" id="L325">        return e;</span>
+    }
+
+    private IndexSection getIndexSection(int index) {
+        // short-cut the normal case
+<span class="nc bnc" id="L330" title="All 2 branches missed.">        if (index &lt; SIZE) {</span>
+<span class="nc" id="L331">            return removed;</span>
+        }
+
+        // if we have passed the first array we get more complicated and do recursive chaining
+<span class="nc" id="L335">        int numSections = index / SIZE;</span>
+<span class="nc" id="L336">        IndexSection a = removed;</span>
+<span class="nc bnc" id="L337" title="All 2 branches missed.">        for (int i = 0; i &lt; numSections; i++) {</span>
+<span class="nc" id="L338">            a = a.getNext();</span>
+        }
+<span class="nc" id="L340">        return a;</span>
+    }
+
+    private ElementSection&lt;E&gt; getElementSection(int index) {
+        // short-cut the normal case
+<span class="pc bpc" id="L345" title="1 of 2 branches missed.">        if (index &lt; SIZE) {</span>
+<span class="nc" id="L346">            return elements;</span>
+        }
+
+        // if we have passed the first array we get more complicated and do recursive chaining
+<span class="fc" id="L350">        int numSections = index / SIZE;</span>
+<span class="fc" id="L351">        ElementSection&lt;E&gt; a = elements;</span>
+<span class="fc bfc" id="L352" title="All 2 branches covered.">        for (int i = 0; i &lt; numSections; i++) {</span>
+<span class="fc" id="L353">            a = a.getNext();</span>
+        }
+<span class="fc" id="L355">        return a;</span>
+    }
+
+    private synchronized int getIndexForAdd() {
+        /*
+         * Synchronized as I haven't yet figured out a way to do this in an atomic way that doesn't involve object allocation
+         */
+        int i;
+<span class="fc" id="L363">        int ri = getIndexFromPreviouslyRemoved();</span>
+<span class="fc bfc" id="L364" title="All 2 branches covered.">        if (ri &gt;= 0) {</span>
+<span class="pc bpc" id="L365" title="1 of 2 branches missed.">            if (ri &lt; SIZE) {</span>
+                // fast-path when we are in the first section
+<span class="fc" id="L367">                i = removed.getAndSet(ri, -1);</span>
+            } else {
+<span class="nc" id="L369">                int sectionIndex = ri % SIZE;</span>
+<span class="nc" id="L370">                i = getIndexSection(ri).getAndSet(sectionIndex, -1);</span>
+            }
+<span class="pc bpc" id="L372" title="1 of 2 branches missed.">            if (i == index.get()) {</span>
+                // if it was the last index removed, when we pick it up again we want to increment
+<span class="nc" id="L374">                index.getAndIncrement();</span>
+            }
+        } else {
+<span class="fc" id="L377">            i = index.getAndIncrement();</span>
+        }
+<span class="fc" id="L379">        return i;</span>
+    }
+
+    /**
+     * Returns -1 if nothing, 0 or greater if the index should be used
+     * 
+     * @return
+     */
+    private synchronized int getIndexFromPreviouslyRemoved() {
+        /*
+         * Synchronized as I haven't yet figured out a way to do this in an atomic way that doesn't involve object allocation
+         */
+
+        // loop because of CAS
+        while (true) {
+<span class="fc" id="L394">            int currentRi = removedIndex.get();</span>
+<span class="fc bfc" id="L395" title="All 2 branches covered.">            if (currentRi &gt; 0) {</span>
+                // claim it
+<span class="pc bpc" id="L397" title="1 of 2 branches missed.">                if (removedIndex.compareAndSet(currentRi, currentRi - 1)) {</span>
+<span class="fc" id="L398">                    return currentRi - 1;</span>
+                }
+            } else {
+                // do nothing
+<span class="fc" id="L402">                return -1;</span>
+            }
+<span class="nc" id="L404">        }</span>
+    }
+
+    private synchronized void pushRemovedIndex(int elementIndex) {
+        /*
+         * Synchronized as I haven't yet figured out a way to do this in an atomic way that doesn't involve object allocation
+         */
+
+<span class="fc" id="L412">        int i = removedIndex.getAndIncrement();</span>
+<span class="pc bpc" id="L413" title="1 of 2 branches missed.">        if (i &lt; SIZE) {</span>
+            // fast-path when we are in the first section
+<span class="fc" id="L415">            removed.set(i, elementIndex);</span>
+        } else {
+<span class="nc" id="L417">            int sectionIndex = i % SIZE;</span>
+<span class="nc" id="L418">            getIndexSection(i).set(sectionIndex, elementIndex);</span>
+        }
+<span class="fc" id="L420">    }</span>
+
+    @Override
+    public boolean isUnsubscribed() {
+<span class="nc" id="L424">        return false;</span>
+    }
+
+    public int forEach(Func1&lt;? super E, Boolean&gt; action) {
+<span class="fc" id="L428">        return forEach(action, 0);</span>
+    }
+
+    /**
+     * 
+     * @param action
+     *            that processes each item and returns true if it wants to continue to the next
+     * @return int of next index to process, or last index seen if it exited early
+     */
+    public int forEach(Func1&lt;? super E, Boolean&gt; action, int startIndex) {
+<span class="fc" id="L438">        int endedAt = forEach(action, startIndex, index.get());</span>
+<span class="fc bfc" id="L439" title="All 4 branches covered.">        if (startIndex &gt; 0 &amp;&amp; endedAt == index.get()) {</span>
+            // start at the beginning again and go up to startIndex
+<span class="fc" id="L441">            endedAt = forEach(action, 0, startIndex);</span>
+<span class="fc bfc" id="L442" title="All 2 branches covered.">        } else if (endedAt == index.get()) {</span>
+            // start back at the beginning
+<span class="fc" id="L444">            endedAt = 0;</span>
+        }
+<span class="fc" id="L446">        return endedAt;</span>
+    }
+
+    private int forEach(Func1&lt;? super E, Boolean&gt; action, int startIndex, int endIndex) {
+<span class="fc" id="L450">        int lastIndex = startIndex;</span>
+<span class="fc" id="L451">        int maxIndex = index.get();</span>
+<span class="fc" id="L452">        int realIndex = startIndex;</span>
+<span class="fc" id="L453">        ElementSection&lt;E&gt; section = elements;</span>
+
+<span class="fc bfc" id="L455" title="All 2 branches covered.">        if (startIndex &gt;= SIZE) {</span>
+            // move into the correct section
+<span class="fc" id="L457">            section = getElementSection(startIndex);</span>
+<span class="fc" id="L458">            startIndex = startIndex % SIZE;</span>
+        }
+
+<span class="pc bpc" id="L461" title="1 of 2 branches missed.">        outer: while (section != null) {</span>
+<span class="fc bfc" id="L462" title="All 2 branches covered.">            for (int i = startIndex; i &lt; SIZE; i++, realIndex++) {</span>
+<span class="fc bfc" id="L463" title="All 4 branches covered.">                if (realIndex &gt;= maxIndex || realIndex &gt;= endIndex) {</span>
+<span class="fc" id="L464">                    section = null;</span>
+<span class="fc" id="L465">                    break outer;</span>
+                }
+<span class="fc" id="L467">                E element = section.array.get(i);</span>
+<span class="fc bfc" id="L468" title="All 2 branches covered.">                if (element == null) {</span>
+<span class="fc" id="L469">                    continue;</span>
+                }
+<span class="fc" id="L471">                lastIndex = realIndex;</span>
+<span class="fc" id="L472">                boolean continueLoop = action.call(element);</span>
+<span class="fc bfc" id="L473" title="All 2 branches covered.">                if (!continueLoop) {</span>
+<span class="fc" id="L474">                    return lastIndex;</span>
+                }
+            }
+<span class="fc" id="L477">            section = section.next.get();</span>
+<span class="fc" id="L478">            startIndex = 0; // reset to start for next section</span>
+        }
+
+        // return the OutOfBounds index position if we processed all of them ... the one we should be less-than
+<span class="fc" id="L482">        return realIndex;</span>
+    }
+
+    private static class ElementSection&lt;E&gt; {
+<span class="fc" id="L486">        final AtomicReferenceArray&lt;E&gt; array = new AtomicReferenceArray&lt;E&gt;(SIZE);</span>
+<span class="fc" id="L487">        final AtomicReference&lt;ElementSection&lt;E&gt;&gt; next = new AtomicReference&lt;ElementSection&lt;E&gt;&gt;();</span>
+
+<span class="fc" id="L489">        ElementSection() {</span>
+<span class="fc" id="L490">        }</span>
+
+        ElementSection&lt;E&gt; getNext() {
+<span class="fc bfc" id="L493" title="All 2 branches covered.">            if (next.get() != null) {</span>
+<span class="fc" id="L494">                return next.get();</span>
+            } else {
+<span class="fc" id="L496">                ElementSection&lt;E&gt; newSection = new ElementSection&lt;E&gt;();</span>
+<span class="fc bfc" id="L497" title="All 2 branches covered.">                if (next.compareAndSet(null, newSection)) {</span>
+                    // we won
+<span class="fc" id="L499">                    return newSection;</span>
+                } else {
+                    // we lost so get the value that won
+<span class="fc" id="L502">                    return next.get();</span>
+                }
+            }
+        }
+    }
+
+    private static class IndexSection {
+
+<span class="fc" id="L510">        private final AtomicIntegerArray unsafeArray = new AtomicIntegerArray(SIZE);</span>
+
+<span class="fc" id="L512">        IndexSection() {</span>
+<span class="fc" id="L513">        }</span>
+
+        public int getAndSet(int expected, int newValue) {
+<span class="fc" id="L516">            return unsafeArray.getAndSet(expected, newValue);</span>
+        }
+
+        public void set(int i, int elementIndex) {
+<span class="fc" id="L520">            unsafeArray.set(i, elementIndex);</span>
+<span class="fc" id="L521">        }</span>
+
+<span class="fc" id="L523">        private final AtomicReference&lt;IndexSection&gt; _next = new AtomicReference&lt;IndexSection&gt;();</span>
+
+        IndexSection getNext() {
+<span class="nc bnc" id="L526" title="All 2 branches missed.">            if (_next.get() != null) {</span>
+<span class="nc" id="L527">                return _next.get();</span>
+            } else {
+<span class="nc" id="L529">                IndexSection newSection = new IndexSection();</span>
+<span class="nc bnc" id="L530" title="All 2 branches missed.">                if (_next.compareAndSet(null, newSection)) {</span>
+                    // we won
+<span class="nc" id="L532">                    return newSection;</span>
+                } else {
+                    // we lost so get the value that won
+<span class="nc" id="L535">                    return _next.get();</span>
+                }
+            }
+        }
+
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

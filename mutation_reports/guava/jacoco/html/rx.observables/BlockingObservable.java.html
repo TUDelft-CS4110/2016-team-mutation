@@ -1,0 +1,683 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>BlockingObservable.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.observables</a> &gt; <span class="el_source">BlockingObservable.java</span></div><h1>BlockingObservable.java</h1><pre class="source lang-java linenums">/**
+ * Copyright 2014 Netflix, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package rx.observables;
+
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicReference;
+
+import rx.*;
+import rx.Observable;
+import rx.Observer;
+import rx.annotations.Experimental;
+import rx.exceptions.OnErrorNotImplementedException;
+import rx.functions.*;
+import rx.internal.operators.*;
+import rx.internal.util.BlockingUtils;
+import rx.internal.util.UtilityFunctions;
+import rx.subscriptions.Subscriptions;
+
+/**
+ * {@code BlockingObservable} is a variety of {@link Observable} that provides blocking operators. It can be
+ * useful for testing and demo purposes, but is generally inappropriate for production applications (if you
+ * think you need to use a {@code BlockingObservable} this is usually a sign that you should rethink your
+ * design).
+ * &lt;p&gt;
+ * You construct a {@code BlockingObservable} from an {@code Observable} with {@link #from(Observable)} or
+ * {@link Observable#toBlocking()}.
+ * &lt;p&gt;
+ * The documentation for this interface makes use of a form of marble diagram that has been modified to
+ * illustrate blocking operators. The following legend explains these marble diagrams:
+ * &lt;p&gt;
+ * &lt;img width=&quot;640&quot; height=&quot;301&quot; src=&quot;https://github.com/ReactiveX/RxJava/wiki/images/rx-operators/B.legend.png&quot; alt=&quot;&quot;&gt;
+ *
+ * @see &lt;a href=&quot;https://github.com/ReactiveX/RxJava/wiki/Blocking-Observable-Operators&quot;&gt;RxJava wiki: Blocking
+ *      Observable Operators&lt;/a&gt;
+ * @param &lt;T&gt;
+ *           the type of item emitted by the {@code BlockingObservable}
+ */
+public final class BlockingObservable&lt;T&gt; {
+
+    private final Observable&lt;? extends T&gt; o;
+
+<span class="fc" id="L56">    private BlockingObservable(Observable&lt;? extends T&gt; o) {</span>
+<span class="fc" id="L57">        this.o = o;</span>
+<span class="fc" id="L58">    }</span>
+
+    /**
+     * Converts an {@link Observable} into a {@code BlockingObservable}.
+     *
+     * @param o
+     *          the {@link Observable} you want to convert
+     * @return a {@code BlockingObservable} version of {@code o}
+     */
+    public static &lt;T&gt; BlockingObservable&lt;T&gt; from(final Observable&lt;? extends T&gt; o) {
+<span class="fc" id="L68">        return new BlockingObservable&lt;T&gt;(o);</span>
+    }
+
+    /**
+     * Invokes a method on each item emitted by this {@code BlockingObservable} and blocks until the Observable
+     * completes.
+     * &lt;p&gt;
+     * &lt;em&gt;Note:&lt;/em&gt; This will block even if the underlying Observable is asynchronous.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;330&quot; src=&quot;https://github.com/ReactiveX/RxJava/wiki/images/rx-operators/B.forEach.png&quot; alt=&quot;&quot;&gt;
+     * &lt;p&gt;
+     * This is similar to {@link Observable#subscribe(Subscriber)}, but it blocks. Because it blocks it does not
+     * need the {@link Subscriber#onCompleted()} or {@link Subscriber#onError(Throwable)} methods. If the
+     * underlying Observable terminates with an error, rather than calling {@code onError}, this method will
+     * throw an exception.
+     * 
+     * &lt;p&gt;The difference between this method and {@link #subscribe(Action1)} is that the {@code onNext} action
+     * is executed on the emission thread instead of the current thread.
+     * 
+     * @param onNext
+     *            the {@link Action1} to invoke for each item emitted by the {@code BlockingObservable}
+     * @throws RuntimeException
+     *             if an error occurs
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/subscribe.html&quot;&gt;ReactiveX documentation: Subscribe&lt;/a&gt;
+     * @see #subscribe(Action1)
+     */
+    public void forEach(final Action1&lt;? super T&gt; onNext) {
+<span class="fc" id="L95">        final CountDownLatch latch = new CountDownLatch(1);</span>
+<span class="fc" id="L96">        final AtomicReference&lt;Throwable&gt; exceptionFromOnError = new AtomicReference&lt;Throwable&gt;();</span>
+
+        /*
+         * Use 'subscribe' instead of 'unsafeSubscribe' for Rx contract behavior
+         * (see http://reactivex.io/documentation/contract.html) as this is the final subscribe in the chain.
+         */
+<span class="fc" id="L102">        Subscription subscription = o.subscribe(new Subscriber&lt;T&gt;() {</span>
+            @Override
+            public void onCompleted() {
+<span class="fc" id="L105">                latch.countDown();</span>
+<span class="fc" id="L106">            }</span>
+
+            @Override
+            public void onError(Throwable e) {
+                /*
+                 * If we receive an onError event we set the reference on the
+                 * outer thread so we can git it and throw after the
+                 * latch.await().
+                 * 
+                 * We do this instead of throwing directly since this may be on
+                 * a different thread and the latch is still waiting.
+                 */
+<span class="fc" id="L118">                exceptionFromOnError.set(e);</span>
+<span class="fc" id="L119">                latch.countDown();</span>
+<span class="fc" id="L120">            }</span>
+
+            @Override
+            public void onNext(T args) {
+<span class="fc" id="L124">                onNext.call(args);</span>
+<span class="fc" id="L125">            }</span>
+        });
+<span class="fc" id="L127">        BlockingUtils.awaitForComplete(latch, subscription);</span>
+
+<span class="fc bfc" id="L129" title="All 2 branches covered.">        if (exceptionFromOnError.get() != null) {</span>
+<span class="pc bpc" id="L130" title="1 of 2 branches missed.">            if (exceptionFromOnError.get() instanceof RuntimeException) {</span>
+<span class="fc" id="L131">                throw (RuntimeException) exceptionFromOnError.get();</span>
+            } else {
+<span class="nc" id="L133">                throw new RuntimeException(exceptionFromOnError.get());</span>
+            }
+        }
+<span class="fc" id="L136">    }</span>
+
+    /**
+     * Returns an {@link Iterator} that iterates over all items emitted by this {@code BlockingObservable}.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;315&quot; src=&quot;https://github.com/ReactiveX/RxJava/wiki/images/rx-operators/B.getIterator.png&quot; alt=&quot;&quot;&gt;
+     *
+     * @return an {@link Iterator} that can iterate over the items emitted by this {@code BlockingObservable}
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/to.html&quot;&gt;ReactiveX documentation: To&lt;/a&gt;
+     */
+    public Iterator&lt;T&gt; getIterator() {
+<span class="fc" id="L147">        return BlockingOperatorToIterator.toIterator(o);</span>
+    }
+
+    /**
+     * Returns the first item emitted by this {@code BlockingObservable}, or throws
+     * {@code NoSuchElementException} if it emits no items.
+     *
+     * @return the first item emitted by this {@code BlockingObservable}
+     * @throws NoSuchElementException
+     *             if this {@code BlockingObservable} emits no items
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/first.html&quot;&gt;ReactiveX documentation: First&lt;/a&gt;
+     */
+    public T first() {
+<span class="fc" id="L160">        return blockForSingle(o.first());</span>
+    }
+
+    /**
+     * Returns the first item emitted by this {@code BlockingObservable} that matches a predicate, or throws
+     * {@code NoSuchElementException} if it emits no such item.
+     *
+     * @param predicate
+     *            a predicate function to evaluate items emitted by this {@code BlockingObservable}
+     * @return the first item emitted by this {@code BlockingObservable} that matches the predicate
+     * @throws NoSuchElementException
+     *             if this {@code BlockingObservable} emits no such items
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/first.html&quot;&gt;ReactiveX documentation: First&lt;/a&gt;
+     */
+    public T first(Func1&lt;? super T, Boolean&gt; predicate) {
+<span class="fc" id="L175">        return blockForSingle(o.first(predicate));</span>
+    }
+
+    /**
+     * Returns the first item emitted by this {@code BlockingObservable}, or a default value if it emits no
+     * items.
+     *
+     * @param defaultValue
+     *            a default value to return if this {@code BlockingObservable} emits no items
+     * @return the first item emitted by this {@code BlockingObservable}, or the default value if it emits no
+     *         items
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/first.html&quot;&gt;ReactiveX documentation: First&lt;/a&gt;
+     */
+    public T firstOrDefault(T defaultValue) {
+<span class="fc" id="L189">        return blockForSingle(o.map(UtilityFunctions.&lt;T&gt;identity()).firstOrDefault(defaultValue));</span>
+    }
+
+    /**
+     * Returns the first item emitted by this {@code BlockingObservable} that matches a predicate, or a default
+     * value if it emits no such items.
+     *
+     * @param defaultValue
+     *            a default value to return if this {@code BlockingObservable} emits no matching items
+     * @param predicate
+     *            a predicate function to evaluate items emitted by this {@code BlockingObservable}
+     * @return the first item emitted by this {@code BlockingObservable} that matches the predicate, or the
+     *         default value if this {@code BlockingObservable} emits no matching items
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/first.html&quot;&gt;ReactiveX documentation: First&lt;/a&gt;
+     */
+    public T firstOrDefault(T defaultValue, Func1&lt;? super T, Boolean&gt; predicate) {
+<span class="fc" id="L205">        return blockForSingle(o.filter(predicate).map(UtilityFunctions.&lt;T&gt;identity()).firstOrDefault(defaultValue));</span>
+    }
+
+    /**
+     * Returns the last item emitted by this {@code BlockingObservable}, or throws
+     * {@code NoSuchElementException} if this {@code BlockingObservable} emits no items.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;315&quot; src=&quot;https://github.com/ReactiveX/RxJava/wiki/images/rx-operators/B.last.png&quot; alt=&quot;&quot;&gt;
+     *
+     * @return the last item emitted by this {@code BlockingObservable}
+     * @throws NoSuchElementException
+     *             if this {@code BlockingObservable} emits no items
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/last.html&quot;&gt;ReactiveX documentation: Last&lt;/a&gt;
+     */
+    public T last() {
+<span class="fc" id="L220">        return blockForSingle(o.last());</span>
+    }
+
+    /**
+     * Returns the last item emitted by this {@code BlockingObservable} that matches a predicate, or throws
+     * {@code NoSuchElementException} if it emits no such items.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;315&quot; src=&quot;https://github.com/ReactiveX/RxJava/wiki/images/rx-operators/B.last.p.png&quot; alt=&quot;&quot;&gt;
+     *
+     * @param predicate
+     *            a predicate function to evaluate items emitted by the {@code BlockingObservable}
+     * @return the last item emitted by the {@code BlockingObservable} that matches the predicate
+     * @throws NoSuchElementException
+     *             if this {@code BlockingObservable} emits no items
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/last.html&quot;&gt;ReactiveX documentation: Last&lt;/a&gt;
+     */
+    public T last(final Func1&lt;? super T, Boolean&gt; predicate) {
+<span class="fc" id="L237">        return blockForSingle(o.last(predicate));</span>
+    }
+
+    /**
+     * Returns the last item emitted by this {@code BlockingObservable}, or a default value if it emits no
+     * items.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;310&quot; src=&quot;https://github.com/ReactiveX/RxJava/wiki/images/rx-operators/B.lastOrDefault.png&quot; alt=&quot;&quot;&gt;
+     *
+     * @param defaultValue
+     *            a default value to return if this {@code BlockingObservable} emits no items
+     * @return the last item emitted by the {@code BlockingObservable}, or the default value if it emits no
+     *         items
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/last.html&quot;&gt;ReactiveX documentation: Last&lt;/a&gt;
+     */
+    public T lastOrDefault(T defaultValue) {
+<span class="fc" id="L253">        return blockForSingle(o.map(UtilityFunctions.&lt;T&gt;identity()).lastOrDefault(defaultValue));</span>
+    }
+
+    /**
+     * Returns the last item emitted by this {@code BlockingObservable} that matches a predicate, or a default
+     * value if it emits no such items.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;315&quot; src=&quot;https://github.com/ReactiveX/RxJava/wiki/images/rx-operators/B.lastOrDefault.p.png&quot; alt=&quot;&quot;&gt;
+     *
+     * @param defaultValue
+     *            a default value to return if this {@code BlockingObservable} emits no matching items
+     * @param predicate
+     *            a predicate function to evaluate items emitted by this {@code BlockingObservable}
+     * @return the last item emitted by this {@code BlockingObservable} that matches the predicate, or the
+     *         default value if it emits no matching items
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/last.html&quot;&gt;ReactiveX documentation: Last&lt;/a&gt;
+     */
+    public T lastOrDefault(T defaultValue, Func1&lt;? super T, Boolean&gt; predicate) {
+<span class="fc" id="L271">        return blockForSingle(o.filter(predicate).map(UtilityFunctions.&lt;T&gt;identity()).lastOrDefault(defaultValue));</span>
+    }
+
+    /**
+     * Returns an {@link Iterable} that always returns the item most recently emitted by this
+     * {@code BlockingObservable}.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;490&quot; src=&quot;https://github.com/ReactiveX/RxJava/wiki/images/rx-operators/B.mostRecent.png&quot; alt=&quot;&quot;&gt;
+     *
+     * @param initialValue
+     *            the initial value that the {@link Iterable} sequence will yield if this
+     *            {@code BlockingObservable} has not yet emitted an item
+     * @return an {@link Iterable} that on each iteration returns the item that this {@code BlockingObservable}
+     *         has most recently emitted
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/first.html&quot;&gt;ReactiveX documentation: First&lt;/a&gt;
+     */
+    public Iterable&lt;T&gt; mostRecent(T initialValue) {
+<span class="fc" id="L288">        return BlockingOperatorMostRecent.mostRecent(o, initialValue);</span>
+    }
+
+    /**
+     * Returns an {@link Iterable} that blocks until this {@code BlockingObservable} emits another item, then
+     * returns that item.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;490&quot; src=&quot;https://github.com/ReactiveX/RxJava/wiki/images/rx-operators/B.next.png&quot; alt=&quot;&quot;&gt;
+     *
+     * @return an {@link Iterable} that blocks upon each iteration until this {@code BlockingObservable} emits
+     *         a new item, whereupon the Iterable returns that item
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/takelast.html&quot;&gt;ReactiveX documentation: TakeLast&lt;/a&gt;
+     */
+    public Iterable&lt;T&gt; next() {
+<span class="fc" id="L302">        return BlockingOperatorNext.next(o);</span>
+    }
+
+    /**
+     * Returns an {@link Iterable} that returns the latest item emitted by this {@code BlockingObservable},
+     * waiting if necessary for one to become available.
+     * &lt;p&gt;
+     * If this {@code BlockingObservable} produces items faster than {@code Iterator.next} takes them,
+     * {@code onNext} events might be skipped, but {@code onError} or {@code onCompleted} events are not.
+     * &lt;p&gt;
+     * Note also that an {@code onNext} directly followed by {@code onCompleted} might hide the {@code onNext}
+     * event.
+     *
+     * @return an Iterable that always returns the latest item emitted by this {@code BlockingObservable}
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/first.html&quot;&gt;ReactiveX documentation: First&lt;/a&gt;
+     */
+    public Iterable&lt;T&gt; latest() {
+<span class="fc" id="L319">        return BlockingOperatorLatest.latest(o);</span>
+    }
+
+    /**
+     * If this {@code BlockingObservable} completes after emitting a single item, return that item, otherwise
+     * throw a {@code NoSuchElementException}.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;315&quot; src=&quot;https://github.com/ReactiveX/RxJava/wiki/images/rx-operators/B.single.png&quot; alt=&quot;&quot;&gt;
+     *
+     * @return the single item emitted by this {@code BlockingObservable}
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/first.html&quot;&gt;ReactiveX documentation: First&lt;/a&gt;
+     */
+    public T single() {
+<span class="fc" id="L332">        return blockForSingle(o.single());</span>
+    }
+
+    /**
+     * If this {@code BlockingObservable} completes after emitting a single item that matches a given predicate,
+     * return that item, otherwise throw a {@code NoSuchElementException}.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;315&quot; src=&quot;https://github.com/ReactiveX/RxJava/wiki/images/rx-operators/B.single.p.png&quot; alt=&quot;&quot;&gt;
+     *
+     * @param predicate
+     *            a predicate function to evaluate items emitted by this {@link BlockingObservable}
+     * @return the single item emitted by this {@code BlockingObservable} that matches the predicate
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/first.html&quot;&gt;ReactiveX documentation: First&lt;/a&gt;
+     */
+    public T single(Func1&lt;? super T, Boolean&gt; predicate) {
+<span class="fc" id="L347">        return blockForSingle(o.single(predicate));</span>
+    }
+
+    /**
+     * If this {@code BlockingObservable} completes after emitting a single item, return that item; if it emits
+     * more than one item, throw an {@code IllegalArgumentException}; if it emits no items, return a default
+     * value.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;315&quot; src=&quot;https://github.com/ReactiveX/RxJava/wiki/images/rx-operators/B.singleOrDefault.png&quot; alt=&quot;&quot;&gt;
+     *
+     * @param defaultValue
+     *            a default value to return if this {@code BlockingObservable} emits no items
+     * @return the single item emitted by this {@code BlockingObservable}, or the default value if it emits no
+     *         items
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/first.html&quot;&gt;ReactiveX documentation: First&lt;/a&gt;
+     */
+    public T singleOrDefault(T defaultValue) {
+<span class="fc" id="L364">        return blockForSingle(o.map(UtilityFunctions.&lt;T&gt;identity()).singleOrDefault(defaultValue));</span>
+    }
+
+    /**
+     * If this {@code BlockingObservable} completes after emitting a single item that matches a predicate,
+     * return that item; if it emits more than one such item, throw an {@code IllegalArgumentException}; if it
+     * emits no items, return a default value.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;315&quot; src=&quot;https://github.com/ReactiveX/RxJava/wiki/images/rx-operators/B.singleOrDefault.p.png&quot; alt=&quot;&quot;&gt;
+     *
+     * @param defaultValue
+     *            a default value to return if this {@code BlockingObservable} emits no matching items
+     * @param predicate
+     *            a predicate function to evaluate items emitted by this {@code BlockingObservable}
+     * @return the single item emitted by the {@code BlockingObservable} that matches the predicate, or the
+     *         default value if no such items are emitted
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/first.html&quot;&gt;ReactiveX documentation: First&lt;/a&gt;
+     */
+    public T singleOrDefault(T defaultValue, Func1&lt;? super T, Boolean&gt; predicate) {
+<span class="fc" id="L383">        return blockForSingle(o.filter(predicate).map(UtilityFunctions.&lt;T&gt;identity()).singleOrDefault(defaultValue));</span>
+    }
+
+    /**
+     * Returns a {@link Future} representing the single value emitted by this {@code BlockingObservable}.
+     * &lt;p&gt;
+     * If {@link BlockingObservable} emits more than one item, {@link java.util.concurrent.Future} will receive an
+     * {@link java.lang.IllegalArgumentException}. If {@link BlockingObservable} is empty, {@link java.util.concurrent.Future}
+     * will receive an {@link java.util.NoSuchElementException}.
+     * &lt;p&gt;
+     * If the {@code BlockingObservable} may emit more than one item, use {@code Observable.toList().toBlocking().toFuture()}.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;395&quot; src=&quot;https://github.com/ReactiveX/RxJava/wiki/images/rx-operators/B.toFuture.png&quot; alt=&quot;&quot;&gt;
+     *
+     * @return a {@link Future} that expects a single item to be emitted by this {@code BlockingObservable}
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/to.html&quot;&gt;ReactiveX documentation: To&lt;/a&gt;
+     */
+    public Future&lt;T&gt; toFuture() {
+<span class="fc" id="L401">        return BlockingOperatorToFuture.toFuture(o);</span>
+    }
+
+    /**
+     * Converts this {@code BlockingObservable} into an {@link Iterable}.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;315&quot; src=&quot;https://github.com/ReactiveX/RxJava/wiki/images/rx-operators/B.toIterable.png&quot; alt=&quot;&quot;&gt;
+     *
+     * @return an {@link Iterable} version of this {@code BlockingObservable}
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/to.html&quot;&gt;ReactiveX documentation: To&lt;/a&gt;
+     */
+    public Iterable&lt;T&gt; toIterable() {
+<span class="fc" id="L413">        return new Iterable&lt;T&gt;() {</span>
+            @Override
+            public Iterator&lt;T&gt; iterator() {
+<span class="fc" id="L416">                return getIterator();</span>
+            }
+        };
+    }
+
+    /**
+     * Helper method which handles the actual blocking for a single response.
+     * &lt;p&gt;
+     * If the {@link Observable} errors, it will be thrown right away.
+     *
+     * @return the actual item
+     */
+    private T blockForSingle(final Observable&lt;? extends T&gt; observable) {
+<span class="fc" id="L429">        final AtomicReference&lt;T&gt; returnItem = new AtomicReference&lt;T&gt;();</span>
+<span class="fc" id="L430">        final AtomicReference&lt;Throwable&gt; returnException = new AtomicReference&lt;Throwable&gt;();</span>
+<span class="fc" id="L431">        final CountDownLatch latch = new CountDownLatch(1);</span>
+
+<span class="fc" id="L433">        Subscription subscription = observable.subscribe(new Subscriber&lt;T&gt;() {</span>
+            @Override
+            public void onCompleted() {
+<span class="fc" id="L436">                latch.countDown();</span>
+<span class="fc" id="L437">            }</span>
+
+            @Override
+            public void onError(final Throwable e) {
+<span class="fc" id="L441">                returnException.set(e);</span>
+<span class="fc" id="L442">                latch.countDown();</span>
+<span class="fc" id="L443">            }</span>
+
+            @Override
+            public void onNext(final T item) {
+<span class="fc" id="L447">                returnItem.set(item);</span>
+<span class="fc" id="L448">            }</span>
+        });
+<span class="fc" id="L450">        BlockingUtils.awaitForComplete(latch, subscription);</span>
+
+<span class="fc bfc" id="L452" title="All 2 branches covered.">        if (returnException.get() != null) {</span>
+<span class="fc bfc" id="L453" title="All 2 branches covered.">            if (returnException.get() instanceof RuntimeException) {</span>
+<span class="fc" id="L454">                throw (RuntimeException) returnException.get();</span>
+            } else {
+<span class="fc" id="L456">                throw new RuntimeException(returnException.get());</span>
+            }
+        }
+
+<span class="fc" id="L460">        return returnItem.get();</span>
+    }
+    
+    /**
+     * Runs the source observable to a terminal event, ignoring any values and rethrowing any exception.
+     */
+    @Experimental
+    public void subscribe() {
+<span class="fc" id="L468">        final CountDownLatch cdl = new CountDownLatch(1);</span>
+<span class="fc" id="L469">        final Throwable[] error = { null };</span>
+<span class="fc" id="L470">        Subscription s = o.subscribe(new Subscriber&lt;T&gt;() {</span>
+            @Override
+            public void onNext(T t) {
+                
+<span class="fc" id="L474">            }</span>
+            @Override
+            public void onError(Throwable e) {
+<span class="fc" id="L477">                error[0] = e;</span>
+<span class="fc" id="L478">                cdl.countDown();</span>
+<span class="fc" id="L479">            }</span>
+            
+            @Override
+            public void onCompleted() {
+<span class="fc" id="L483">                cdl.countDown();</span>
+<span class="fc" id="L484">            }</span>
+        });
+        
+<span class="fc" id="L487">        BlockingUtils.awaitForComplete(cdl, s);</span>
+<span class="fc" id="L488">        Throwable e = error[0];</span>
+<span class="fc bfc" id="L489" title="All 2 branches covered.">        if (e != null) {</span>
+<span class="fc bfc" id="L490" title="All 2 branches covered.">            if (e instanceof RuntimeException) {</span>
+<span class="fc" id="L491">                throw (RuntimeException)e;</span>
+            } else {
+<span class="fc" id="L493">                throw new RuntimeException(e);</span>
+            }
+        }
+<span class="fc" id="L496">    }</span>
+    
+    /**
+     * Subscribes to the source and calls back the Observer methods on the current thread.
+     * @param observer the observer to call event methods on
+     */
+    @Experimental
+    public void subscribe(Observer&lt;? super T&gt; observer) {
+<span class="fc" id="L504">        final NotificationLite&lt;T&gt; nl = NotificationLite.instance();</span>
+<span class="fc" id="L505">        final BlockingQueue&lt;Object&gt; queue = new LinkedBlockingQueue&lt;Object&gt;();</span>
+        
+<span class="fc" id="L507">        Subscription s = o.subscribe(new Subscriber&lt;T&gt;() {</span>
+            @Override
+            public void onNext(T t) {
+<span class="fc" id="L510">                queue.offer(nl.next(t));</span>
+<span class="fc" id="L511">            }</span>
+            @Override
+            public void onError(Throwable e) {
+<span class="fc" id="L514">                queue.offer(nl.error(e));</span>
+<span class="fc" id="L515">            }</span>
+            @Override
+            public void onCompleted() {
+<span class="fc" id="L518">                queue.offer(nl.completed());</span>
+<span class="fc" id="L519">            }</span>
+        });
+        
+        try {
+            for (;;) {
+<span class="fc" id="L524">                Object o = queue.poll();</span>
+<span class="fc bfc" id="L525" title="All 2 branches covered.">                if (o == null) {</span>
+<span class="fc" id="L526">                    o = queue.take();</span>
+                }
+<span class="fc bfc" id="L528" title="All 2 branches covered.">                if (nl.accept(observer, o)) {</span>
+                    return;
+                }
+<span class="fc" id="L531">            }</span>
+<span class="nc" id="L532">        } catch (InterruptedException e) {</span>
+<span class="nc" id="L533">            Thread.currentThread().interrupt();</span>
+<span class="nc" id="L534">            observer.onError(e);</span>
+        } finally {
+<span class="pc" id="L536">            s.unsubscribe();</span>
+<span class="nc" id="L537">        }</span>
+<span class="nc" id="L538">    }</span>
+    
+    /** Constant to indicate the onStart method should be called. */
+<span class="fc" id="L541">    static final Object ON_START = new Object();</span>
+
+    /** Constant indicating the setProducer method should be called. */
+<span class="fc" id="L544">    static final Object SET_PRODUCER = new Object();</span>
+
+    /** Indicates an unsubscripton happened */
+<span class="fc" id="L547">    static final Object UNSUBSCRIBE = new Object();</span>
+
+    /**
+     * Subscribes to the source and calls the Subscriber methods on the current thread.
+     * &lt;p&gt;
+     * The unsubscription and backpressure is composed through.
+     * @param subscriber the subscriber to forward events and calls to in the current thread
+     */
+    @Experimental
+    public void subscribe(Subscriber&lt;? super T&gt; subscriber) {
+<span class="fc" id="L557">        final NotificationLite&lt;T&gt; nl = NotificationLite.instance();</span>
+<span class="fc" id="L558">        final BlockingQueue&lt;Object&gt; queue = new LinkedBlockingQueue&lt;Object&gt;();</span>
+<span class="fc" id="L559">        final Producer[] theProducer = { null }; </span>
+        
+<span class="fc" id="L561">        Subscriber&lt;T&gt; s = new Subscriber&lt;T&gt;() {</span>
+            @Override
+            public void onNext(T t) {
+<span class="fc" id="L564">                queue.offer(nl.next(t));</span>
+<span class="fc" id="L565">            }</span>
+            @Override
+            public void onError(Throwable e) {
+<span class="nc" id="L568">                queue.offer(nl.error(e));</span>
+<span class="nc" id="L569">            }</span>
+            @Override
+            public void onCompleted() {
+<span class="nc" id="L572">                queue.offer(nl.completed());</span>
+<span class="nc" id="L573">            }</span>
+            
+            @Override
+            public void setProducer(Producer p) {
+<span class="fc" id="L577">                theProducer[0] = p;</span>
+<span class="fc" id="L578">                queue.offer(SET_PRODUCER);</span>
+<span class="fc" id="L579">            }</span>
+            
+            @Override
+            public void onStart() {
+<span class="fc" id="L583">                queue.offer(ON_START);</span>
+<span class="fc" id="L584">            }</span>
+        };
+        
+<span class="fc" id="L587">        subscriber.add(s);</span>
+<span class="fc" id="L588">        subscriber.add(Subscriptions.create(new Action0() {</span>
+            @Override
+            public void call() {
+<span class="fc" id="L591">                queue.offer(UNSUBSCRIBE);</span>
+<span class="fc" id="L592">            }</span>
+        }));
+        
+<span class="fc" id="L595">        o.subscribe(s);</span>
+        
+        try {
+            for (;;) {
+<span class="fc bfc" id="L599" title="All 2 branches covered.">                if (subscriber.isUnsubscribed()) {</span>
+<span class="fc" id="L600">                    break;</span>
+                }
+<span class="fc" id="L602">                Object o = queue.poll();</span>
+<span class="fc bfc" id="L603" title="All 2 branches covered.">                if (o == null) {</span>
+<span class="fc" id="L604">                    o = queue.take();</span>
+                }
+<span class="pc bpc" id="L606" title="2 of 4 branches missed.">                if (subscriber.isUnsubscribed() || o == UNSUBSCRIBE) {</span>
+<span class="nc" id="L607">                    break;</span>
+                }
+<span class="fc bfc" id="L609" title="All 2 branches covered.">                if (o == ON_START) {</span>
+<span class="fc" id="L610">                    subscriber.onStart();</span>
+                } else
+<span class="fc bfc" id="L612" title="All 2 branches covered.">                if (o == SET_PRODUCER) {</span>
+<span class="fc" id="L613">                    subscriber.setProducer(theProducer[0]);</span>
+                } else
+<span class="pc bpc" id="L615" title="1 of 2 branches missed.">                if (nl.accept(subscriber, o)) {</span>
+                    return;
+                }
+<span class="fc" id="L618">            }</span>
+<span class="nc" id="L619">        } catch (InterruptedException e) {</span>
+<span class="nc" id="L620">            Thread.currentThread().interrupt();</span>
+<span class="nc" id="L621">            subscriber.onError(e);</span>
+        } finally {
+<span class="pc" id="L623">            s.unsubscribe();</span>
+<span class="pc" id="L624">        }</span>
+<span class="fc" id="L625">    }</span>
+    
+    /**
+     * Subscribes to the source and calls the given action on the current thread and rethrows any exception wrapped
+     * into OnErrorNotImplementedException.
+     * 
+     * &lt;p&gt;The difference between this method and {@link #forEach(Action1)} is that the
+     * action is always executed on the current thread.
+     * 
+     * @param onNext the callback action for each source value
+     * @see #forEach(Action1)
+     */
+    @Experimental
+    public void subscribe(final Action1&lt;? super T&gt; onNext) {
+<span class="fc" id="L639">        subscribe(onNext, new Action1&lt;Throwable&gt;() {</span>
+            @Override
+            public void call(Throwable t) {
+<span class="fc" id="L642">                throw new OnErrorNotImplementedException(t);</span>
+            }
+        }, Actions.empty());
+<span class="fc" id="L645">    }</span>
+    
+    /**
+     * Subscribes to the source and calls the given actions on the current thread.
+     * @param onNext the callback action for each source value
+     * @param onError the callback action for an error event
+     */
+    @Experimental
+    public void subscribe(final Action1&lt;? super T&gt; onNext, final Action1&lt;? super Throwable&gt; onError) {
+<span class="fc" id="L654">        subscribe(onNext, onError, Actions.empty());</span>
+<span class="fc" id="L655">    }</span>
+    
+    /**
+     * Subscribes to the source and calls the given actions on the current thread.
+     * @param onNext the callback action for each source value
+     * @param onError the callback action for an error event
+     * @param onCompleted the callback action for the completion event.
+     */
+    @Experimental
+    public void subscribe(final Action1&lt;? super T&gt; onNext, final Action1&lt;? super Throwable&gt; onError, final Action0 onCompleted) {
+<span class="fc" id="L665">        subscribe(new Observer&lt;T&gt;() {</span>
+            @Override
+            public void onNext(T t) {
+<span class="fc" id="L668">                onNext.call(t);</span>
+<span class="fc" id="L669">            }</span>
+            
+            @Override
+            public void onError(Throwable e) {
+<span class="fc" id="L673">                onError.call(e);</span>
+<span class="fc" id="L674">            }</span>
+            
+            @Override
+            public void onCompleted() {
+<span class="fc" id="L678">                onCompleted.call();</span>
+<span class="fc" id="L679">            }</span>
+        });
+<span class="fc" id="L681">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

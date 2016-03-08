@@ -1,0 +1,130 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>SpscAtomicArrayQueue.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.internal.util.atomic</a> &gt; <span class="el_source">SpscAtomicArrayQueue.java</span></div><h1>SpscAtomicArrayQueue.java</h1><pre class="source lang-java linenums">/*
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ * 
+ * Original License: https://github.com/JCTools/JCTools/blob/master/LICENSE
+ * Original location: https://github.com/JCTools/JCTools/blob/master/jctools-core/src/main/java/org/jctools/queues/atomic/SpscAtomicArrayQueue.java
+ */
+package rx.internal.util.atomic;
+
+import java.util.concurrent.atomic.*;
+
+/**
+ * A Single-Producer-Single-Consumer queue backed by a pre-allocated buffer.
+ * &lt;p&gt;
+ * This implementation is a mashup of the &lt;a href=&quot;http://sourceforge.net/projects/mc-fastflow/&quot;&gt;Fast Flow&lt;/a&gt;
+ * algorithm with an optimization of the offer method taken from the &lt;a
+ * href=&quot;http://staff.ustc.edu.cn/~bhua/publications/IJPP_draft.pdf&quot;&gt;BQueue&lt;/a&gt; algorithm (a variation on Fast
+ * Flow), and adjusted to comply with Queue.offer semantics with regards to capacity.&lt;br&gt;
+ * For convenience the relevant papers are available in the resources folder:&lt;br&gt;
+ * &lt;i&gt;2010 - Pisa - SPSC Queues on Shared Cache Multi-Core Systems.pdf&lt;br&gt;
+ * 2012 - Junchang- BQueue- Efficient and Practical Queuing.pdf &lt;br&gt;
+ * &lt;/i&gt; This implementation is wait free.
+ * 
+ * @param &lt;E&gt;
+ */
+public final class SpscAtomicArrayQueue&lt;E&gt; extends AtomicReferenceArrayQueue&lt;E&gt; {
+<span class="fc" id="L36">    private static final Integer MAX_LOOK_AHEAD_STEP = Integer.getInteger(&quot;jctools.spsc.max.lookahead.step&quot;, 4096);</span>
+    final AtomicLong producerIndex;
+    protected long producerLookAhead;
+    final AtomicLong consumerIndex;
+    final int lookAheadStep;
+    public SpscAtomicArrayQueue(int capacity) {
+<span class="fc" id="L42">        super(capacity);</span>
+<span class="fc" id="L43">        this.producerIndex = new AtomicLong();</span>
+<span class="fc" id="L44">        this.consumerIndex = new AtomicLong();</span>
+<span class="fc" id="L45">        lookAheadStep = Math.min(capacity / 4, MAX_LOOK_AHEAD_STEP);</span>
+<span class="fc" id="L46">    }</span>
+
+    @Override
+    public boolean offer(E e) {
+<span class="fc bfc" id="L50" title="All 2 branches covered.">        if (null == e) {</span>
+<span class="fc" id="L51">            throw new NullPointerException(&quot;Null is not a valid element&quot;);</span>
+        }
+        // local load of field to avoid repeated loads after volatile reads
+<span class="fc" id="L54">        final AtomicReferenceArray&lt;E&gt; buffer = this.buffer;</span>
+<span class="fc" id="L55">        final int mask = this.mask;</span>
+<span class="fc" id="L56">        final long index = producerIndex.get();</span>
+<span class="fc" id="L57">        final int offset = calcElementOffset(index, mask);</span>
+<span class="fc bfc" id="L58" title="All 2 branches covered.">        if (index &gt;= producerLookAhead) {</span>
+<span class="fc" id="L59">            int step = lookAheadStep;</span>
+<span class="pc bpc" id="L60" title="1 of 2 branches missed.">            if (null == lvElement(buffer, calcElementOffset(index + step, mask))) {// LoadLoad</span>
+<span class="fc" id="L61">                producerLookAhead = index + step;</span>
+            }
+<span class="nc bnc" id="L63" title="All 2 branches missed.">            else if (null != lvElement(buffer, offset)){</span>
+<span class="nc" id="L64">                return false;</span>
+            }
+        }
+<span class="fc" id="L67">        soProducerIndex(index + 1); // ordered store -&gt; atomic and ordered for size()</span>
+<span class="fc" id="L68">        soElement(buffer, offset, e); // StoreStore</span>
+<span class="fc" id="L69">        return true;</span>
+    }
+
+    @Override
+    public E poll() {
+<span class="fc" id="L74">        final long index = consumerIndex.get();</span>
+<span class="fc" id="L75">        final int offset = calcElementOffset(index);</span>
+        // local load of field to avoid repeated loads after volatile reads
+<span class="fc" id="L77">        final AtomicReferenceArray&lt;E&gt; lElementBuffer = buffer;</span>
+<span class="fc" id="L78">        final E e = lvElement(lElementBuffer, offset);// LoadLoad</span>
+<span class="fc bfc" id="L79" title="All 2 branches covered.">        if (null == e) {</span>
+<span class="fc" id="L80">            return null;</span>
+        }
+<span class="fc" id="L82">        soConsumerIndex(index + 1); // ordered store -&gt; atomic and ordered for size()</span>
+<span class="fc" id="L83">        soElement(lElementBuffer, offset, null);// StoreStore</span>
+<span class="fc" id="L84">        return e;</span>
+    }
+
+    @Override
+    public E peek() {
+<span class="fc" id="L89">        return lvElement(calcElementOffset(consumerIndex.get()));</span>
+    }
+
+    @Override
+    public int size() {
+        /*
+         * It is possible for a thread to be interrupted or reschedule between the read of the producer and consumer
+         * indices, therefore protection is required to ensure size is within valid range. In the event of concurrent
+         * polls/offers to this method the size is OVER estimated as we read consumer index BEFORE the producer index.
+         */
+<span class="fc" id="L99">        long after = lvConsumerIndex();</span>
+        while (true) {
+<span class="fc" id="L101">            final long before = after;</span>
+<span class="fc" id="L102">            final long currentProducerIndex = lvProducerIndex();</span>
+<span class="fc" id="L103">            after = lvConsumerIndex();</span>
+<span class="pc bpc" id="L104" title="1 of 2 branches missed.">            if (before == after) {</span>
+<span class="fc" id="L105">                return (int) (currentProducerIndex - after);</span>
+            }
+<span class="nc" id="L107">        }</span>
+    }
+
+    @Override
+    public boolean isEmpty() {
+<span class="fc bfc" id="L112" title="All 2 branches covered.">        return lvProducerIndex() == lvConsumerIndex();</span>
+    }
+
+    private void soProducerIndex(long newIndex) {
+<span class="fc" id="L116">        producerIndex.lazySet(newIndex);</span>
+<span class="fc" id="L117">    }</span>
+
+    private void soConsumerIndex(long newIndex) {
+<span class="fc" id="L120">        consumerIndex.lazySet(newIndex);</span>
+<span class="fc" id="L121">    }</span>
+    
+    private long lvConsumerIndex() {
+<span class="fc" id="L124">        return consumerIndex.get();</span>
+    }
+    private long lvProducerIndex() {
+<span class="fc" id="L127">        return producerIndex.get();</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

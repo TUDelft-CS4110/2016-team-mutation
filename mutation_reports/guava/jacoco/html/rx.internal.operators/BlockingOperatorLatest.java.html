@@ -1,0 +1,131 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>BlockingOperatorLatest.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.internal.operators</a> &gt; <span class="el_source">BlockingOperatorLatest.java</span></div><h1>BlockingOperatorLatest.java</h1><pre class="source lang-java linenums">/**
+ * Copyright 2014 Netflix, Inc.
+ * 
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package rx.internal.operators;
+
+import java.util.Iterator;
+import java.util.NoSuchElementException;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicReference;
+
+import rx.Notification;
+import rx.Observable;
+import rx.Subscriber;
+import rx.exceptions.Exceptions;
+
+/**
+ * Wait for and iterate over the latest values of the source observable. If the source works faster than the
+ * iterator, values may be skipped, but not the {@code onError} or {@code onCompleted} events.
+ */
+public final class BlockingOperatorLatest {
+    /** Utility class. */
+<span class="nc" id="L34">    private BlockingOperatorLatest() {</span>
+<span class="nc" id="L35">        throw new IllegalStateException(&quot;No instances!&quot;);</span>
+    }
+
+    /**
+     * Returns an {@code Iterable} that blocks until or unless the {@code Observable} emits an item that has not
+     * been returned by the {@code Iterable}, then returns that item
+     *
+     * @param source
+     *            the source {@code Observable}
+     * @return an {@code Iterable} that blocks until or unless the {@code Observable} emits an item that has not
+     *         been returned by the {@code Iterable}, then returns that item
+     */
+    public static &lt;T&gt; Iterable&lt;T&gt; latest(final Observable&lt;? extends T&gt; source) {
+<span class="fc" id="L48">        return new Iterable&lt;T&gt;() {</span>
+            @Override
+            public Iterator&lt;T&gt; iterator() {
+<span class="fc" id="L51">                LatestObserverIterator&lt;T&gt; lio = new LatestObserverIterator&lt;T&gt;();</span>
+<span class="fc" id="L52">                source.materialize().subscribe(lio);</span>
+<span class="fc" id="L53">                return lio;</span>
+            }
+        };
+    }
+
+    /** Observer of source, iterator for output. */
+<span class="fc" id="L59">    static final class LatestObserverIterator&lt;T&gt; extends Subscriber&lt;Notification&lt;? extends T&gt;&gt; implements Iterator&lt;T&gt; {</span>
+<span class="fc" id="L60">        final Semaphore notify = new Semaphore(0);</span>
+        // observer's notification
+<span class="fc" id="L62">        final AtomicReference&lt;Notification&lt;? extends T&gt;&gt; value = new AtomicReference&lt;Notification&lt;? extends T&gt;&gt;();</span>
+
+        @Override
+        public void onNext(Notification&lt;? extends T&gt; args) {
+<span class="fc bfc" id="L66" title="All 2 branches covered.">            boolean wasntAvailable = value.getAndSet(args) == null;</span>
+<span class="fc bfc" id="L67" title="All 2 branches covered.">            if (wasntAvailable) {</span>
+<span class="fc" id="L68">                notify.release();</span>
+            }
+<span class="fc" id="L70">        }</span>
+
+        @Override
+        public void onError(Throwable e) {
+            // not expected
+<span class="nc" id="L75">        }</span>
+
+        @Override
+        public void onCompleted() {
+            // not expected
+<span class="fc" id="L80">        }</span>
+
+        // iterator's notification
+        Notification&lt;? extends T&gt; iNotif;
+
+        @Override
+        public boolean hasNext() {
+<span class="pc bpc" id="L87" title="1 of 4 branches missed.">            if (iNotif != null &amp;&amp; iNotif.isOnError()) {</span>
+<span class="nc" id="L88">                throw Exceptions.propagate(iNotif.getThrowable());</span>
+            }
+<span class="fc bfc" id="L90" title="All 4 branches covered.">            if (iNotif == null || !iNotif.isOnCompleted()) {</span>
+<span class="fc bfc" id="L91" title="All 2 branches covered.">                if (iNotif == null) {</span>
+                    try {
+<span class="fc" id="L93">                        notify.acquire();</span>
+<span class="nc" id="L94">                    } catch (InterruptedException ex) {</span>
+<span class="nc" id="L95">                        unsubscribe();</span>
+<span class="nc" id="L96">                        Thread.currentThread().interrupt();</span>
+<span class="nc" id="L97">                        iNotif = Notification.createOnError(ex);</span>
+<span class="nc" id="L98">                        throw Exceptions.propagate(ex);</span>
+<span class="fc" id="L99">                    }</span>
+
+                    @SuppressWarnings(&quot;unchecked&quot;)
+<span class="fc" id="L102">                    Notification&lt;? extends T&gt; n = value.getAndSet(null);</span>
+<span class="fc" id="L103">                    iNotif = n;</span>
+<span class="pc bpc" id="L104" title="1 of 2 branches missed.">                    if (iNotif.isOnError()) {</span>
+<span class="nc" id="L105">                        throw Exceptions.propagate(iNotif.getThrowable());</span>
+                    }
+                }
+            }
+<span class="fc bfc" id="L109" title="All 2 branches covered.">            return !iNotif.isOnCompleted();</span>
+        }
+
+        @Override
+        public T next() {
+<span class="fc bfc" id="L114" title="All 2 branches covered.">            if (hasNext()) {</span>
+<span class="pc bpc" id="L115" title="1 of 2 branches missed.">                if (iNotif.isOnNext()) {</span>
+<span class="fc" id="L116">                    T v = iNotif.getValue();</span>
+<span class="fc" id="L117">                    iNotif = null;</span>
+<span class="fc" id="L118">                    return v;</span>
+                }
+            }
+<span class="fc" id="L121">            throw new NoSuchElementException();</span>
+        }
+
+        @Override
+        public void remove() {
+<span class="nc" id="L126">            throw new UnsupportedOperationException(&quot;Read-only iterator.&quot;);</span>
+        }
+
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

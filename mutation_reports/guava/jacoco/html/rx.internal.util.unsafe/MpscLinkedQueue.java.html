@@ -1,0 +1,137 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>MpscLinkedQueue.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.internal.util.unsafe</a> &gt; <span class="el_source">MpscLinkedQueue.java</span></div><h1>MpscLinkedQueue.java</h1><pre class="source lang-java linenums">/*
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ * 
+ * Original License: https://github.com/JCTools/JCTools/blob/master/LICENSE
+ * Original location: https://github.com/JCTools/JCTools/blob/master/jctools-core/src/main/java/org/jctools/queues/MpscLinkedQueue.java
+ */
+package rx.internal.util.unsafe;
+
+import static rx.internal.util.unsafe.UnsafeAccess.UNSAFE;
+import rx.internal.util.atomic.LinkedQueueNode;
+/**
+ * This is a direct Java port of the MPSC algorithm as presented &lt;a
+ * href=&quot;http://www.1024cores.net/home/lock-free-algorithms/queues/non-intrusive-mpsc-node-based-queue&quot;&gt; on 1024
+ * Cores&lt;/a&gt; by D. Vyukov. The original has been adapted to Java and it's quirks with regards to memory model and
+ * layout:
+ * &lt;ol&gt;
+ * &lt;li&gt;Use inheritance to ensure no false sharing occurs between producer/consumer node reference fields.
+ * &lt;li&gt;Use XCHG functionality to the best of the JDK ability (see differences in JDK7/8 impls).
+ * &lt;/ol&gt;
+ * The queue is initialized with a stub node which is set to both the producer and consumer node references. From this
+ * point follow the notes on offer/poll.
+ * 
+ * @author nitsanw
+ * 
+ * @param &lt;E&gt;
+ */
+public final class MpscLinkedQueue&lt;E&gt; extends BaseLinkedQueue&lt;E&gt; {
+    
+<span class="fc" id="L39">    public MpscLinkedQueue() {</span>
+<span class="fc" id="L40">        consumerNode = new LinkedQueueNode&lt;E&gt;();</span>
+<span class="fc" id="L41">        xchgProducerNode(consumerNode);// this ensures correct construction: StoreLoad</span>
+<span class="fc" id="L42">    }</span>
+    
+    @SuppressWarnings(&quot;unchecked&quot;)
+    protected final LinkedQueueNode&lt;E&gt; xchgProducerNode(LinkedQueueNode&lt;E&gt; newVal) {
+        Object oldVal;
+        do {
+<span class="fc" id="L48">            oldVal = producerNode;</span>
+<span class="fc bfc" id="L49" title="All 2 branches covered.">        } while(!UNSAFE.compareAndSwapObject(this, P_NODE_OFFSET, oldVal, newVal));</span>
+<span class="fc" id="L50">        return (LinkedQueueNode&lt;E&gt;) oldVal;</span>
+    }
+    
+    /**
+     * {@inheritDoc} &lt;br&gt;
+     * &lt;p&gt;
+     * IMPLEMENTATION NOTES:&lt;br&gt;
+     * Offer is allowed from multiple threads.&lt;br&gt;
+     * Offer allocates a new node and:
+     * &lt;ol&gt;
+     * &lt;li&gt;Swaps it atomically with current producer node (only one producer 'wins')
+     * &lt;li&gt;Sets the new node as the node following from the swapped producer node
+     * &lt;/ol&gt;
+     * This works because each producer is guaranteed to 'plant' a new node and link the old node. No 2 producers can
+     * get the same producer node as part of XCHG guarantee.
+     * 
+     * @see MessagePassingQueue#offer(Object)
+     * @see java.util.Queue#offer(java.lang.Object)
+     */
+    @Override
+    public final boolean offer(final E nextValue) {
+<span class="fc bfc" id="L71" title="All 2 branches covered.">        if (nextValue == null) {</span>
+<span class="fc" id="L72">            throw new NullPointerException(&quot;null elements not allowed&quot;);</span>
+        }
+<span class="fc" id="L74">        final LinkedQueueNode&lt;E&gt; nextNode = new LinkedQueueNode&lt;E&gt;(nextValue);</span>
+<span class="fc" id="L75">        final LinkedQueueNode&lt;E&gt; prevProducerNode = xchgProducerNode(nextNode);</span>
+        // Should a producer thread get interrupted here the chain WILL be broken until that thread is resumed
+        // and completes the store in prev.next.
+<span class="fc" id="L78">        prevProducerNode.soNext(nextNode); // StoreStore</span>
+<span class="fc" id="L79">        return true;</span>
+    }
+
+    /**
+     * {@inheritDoc} &lt;br&gt;
+     * &lt;p&gt;
+     * IMPLEMENTATION NOTES:&lt;br&gt;
+     * Poll is allowed from a SINGLE thread.&lt;br&gt;
+     * Poll reads the next node from the consumerNode and:
+     * &lt;ol&gt;
+     * &lt;li&gt;If it is null, the queue is assumed empty (though it might not be).
+     * &lt;li&gt;If it is not null set it as the consumer node and return it's now evacuated value.
+     * &lt;/ol&gt;
+     * This means the consumerNode.value is always null, which is also the starting point for the queue. Because null
+     * values are not allowed to be offered this is the only node with it's value set to null at any one time.
+     * 
+     * @see MessagePassingQueue#poll()
+     * @see java.util.Queue#poll()
+     */
+    @Override
+    public final E poll() {
+<span class="fc" id="L100">        LinkedQueueNode&lt;E&gt; currConsumerNode = lpConsumerNode(); // don't load twice, it's alright</span>
+<span class="fc" id="L101">        LinkedQueueNode&lt;E&gt; nextNode = currConsumerNode.lvNext();</span>
+<span class="fc bfc" id="L102" title="All 2 branches covered.">        if (nextNode != null) {</span>
+            // we have to null out the value because we are going to hang on to the node
+<span class="fc" id="L104">            final E nextValue = nextNode.getAndNullValue();</span>
+<span class="fc" id="L105">            spConsumerNode(nextNode);</span>
+<span class="fc" id="L106">            return nextValue;</span>
+        }
+<span class="pc bpc" id="L108" title="1 of 2 branches missed.">        else if (currConsumerNode != lvProducerNode()) {</span>
+            // spin, we are no longer wait free
+<span class="nc bnc" id="L110" title="All 2 branches missed.">            while((nextNode = currConsumerNode.lvNext()) == null);</span>
+            // got the next node...
+            
+            // we have to null out the value because we are going to hang on to the node
+<span class="nc" id="L114">            final E nextValue = nextNode.getAndNullValue();</span>
+<span class="nc" id="L115">            consumerNode = nextNode;</span>
+<span class="nc" id="L116">            return nextValue;</span>
+        }
+<span class="fc" id="L118">        return null;</span>
+    }
+
+    @Override
+    public final E peek() {
+<span class="fc" id="L123">        LinkedQueueNode&lt;E&gt; currConsumerNode = consumerNode; // don't load twice, it's alright</span>
+<span class="fc" id="L124">        LinkedQueueNode&lt;E&gt; nextNode = currConsumerNode.lvNext();</span>
+<span class="fc bfc" id="L125" title="All 2 branches covered.">        if (nextNode != null) {</span>
+<span class="fc" id="L126">            return nextNode.lpValue();</span>
+        }
+<span class="pc bpc" id="L128" title="1 of 2 branches missed.">        else if (currConsumerNode != lvProducerNode()) {</span>
+            // spin, we are no longer wait free
+<span class="nc bnc" id="L130" title="All 2 branches missed.">            while((nextNode = currConsumerNode.lvNext()) == null);</span>
+            // got the next node...
+<span class="nc" id="L132">            return nextNode.lpValue();</span>
+        }
+<span class="fc" id="L134">        return null;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

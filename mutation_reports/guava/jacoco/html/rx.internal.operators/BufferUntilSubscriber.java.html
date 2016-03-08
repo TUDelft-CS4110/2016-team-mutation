@@ -1,0 +1,210 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>BufferUntilSubscriber.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.internal.operators</a> &gt; <span class="el_source">BufferUntilSubscriber.java</span></div><h1>BufferUntilSubscriber.java</h1><pre class="source lang-java linenums">/**
+ * Copyright 2014 Netflix, Inc.
+ * 
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package rx.internal.operators;
+
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicReference;
+
+import rx.Observer;
+import rx.Subscriber;
+import rx.functions.Action0;
+import rx.subjects.Subject;
+import rx.subscriptions.Subscriptions;
+
+/**
+ * A solution to the &quot;time gap&quot; problem that occurs with {@code groupBy} and {@code pivot}.
+ * &lt;p&gt;
+ * This currently has temporary unbounded buffers. It needs to become bounded and then do one of two things:
+ * &lt;ol&gt;
+ * &lt;li&gt;blow up and make the user do something about it&lt;/li&gt;
+ * &lt;li&gt;work with the backpressure solution ... still to be implemented (such as co-routines)&lt;/li&gt;
+ * &lt;/ol&gt;&lt;p&gt;
+ * Generally the buffer should be very short lived (milliseconds) and then stops being involved. It can become a
+ * memory leak though if a {@code GroupedObservable} backed by this class is emitted but never subscribed to
+ * (such as filtered out). In that case, either a time-bomb to throw away the buffer, or just blowing up and
+ * making the user do something about it is needed.
+ * &lt;p&gt;
+ * For example, to filter out {@code GroupedObservable}s, perhaps they need a silent {@code subscribe()} on them
+ * to just blackhole the data.
+ * &lt;p&gt;
+ * This is an initial start at solving this problem and solves the immediate problem of {@code groupBy} and
+ * {@code pivot} and trades off the possibility of memory leak for deterministic functionality.
+ *
+ * @see &lt;a href=&quot;https://github.com/ReactiveX/RxJava/issues/844&quot;&gt;the Github issue describing the time gap problem&lt;/a&gt;
+ * @param &lt;T&gt;
+ *            the type of the items to be buffered
+ */
+public final class BufferUntilSubscriber&lt;T&gt; extends Subject&lt;T, T&gt; {
+
+    /**
+     * @warn create() undescribed
+     * @return
+     */
+    public static &lt;T&gt; BufferUntilSubscriber&lt;T&gt; create() {
+<span class="fc" id="L57">        State&lt;T&gt; state = new State&lt;T&gt;();</span>
+<span class="fc" id="L58">        return new BufferUntilSubscriber&lt;T&gt;(state);</span>
+    }
+
+    /** The common state. */
+<span class="fc" id="L62">    static final class State&lt;T&gt; extends AtomicReference&lt;Observer&lt;? super T&gt;&gt; {</span>
+        boolean casObserverRef(Observer&lt;? super T&gt;  expected, Observer&lt;? super T&gt;  next) {
+<span class="fc" id="L64">            return compareAndSet(expected, next);</span>
+        }
+
+<span class="fc" id="L67">        final Object guard = new Object();</span>
+        /* protected by guard */
+<span class="fc" id="L69">        boolean emitting = false;</span>
+
+<span class="fc" id="L71">        final ConcurrentLinkedQueue&lt;Object&gt; buffer = new ConcurrentLinkedQueue&lt;Object&gt;();</span>
+<span class="fc" id="L72">        final NotificationLite&lt;T&gt; nl = NotificationLite.instance();</span>
+    }
+    
+    static final class OnSubscribeAction&lt;T&gt; implements OnSubscribe&lt;T&gt; {
+        final State&lt;T&gt; state;
+
+<span class="fc" id="L78">        public OnSubscribeAction(State&lt;T&gt; state) {</span>
+<span class="fc" id="L79">            this.state = state;</span>
+<span class="fc" id="L80">        }</span>
+
+        @Override
+        public void call(final Subscriber&lt;? super T&gt; s) {
+<span class="pc bpc" id="L84" title="1 of 2 branches missed.">            if (state.casObserverRef(null, s)) {</span>
+<span class="fc" id="L85">                s.add(Subscriptions.create(new Action0() {</span>
+                    @SuppressWarnings(&quot;unchecked&quot;)
+                    @Override
+                    public void call() {
+<span class="fc" id="L89">                        state.set(EMPTY_OBSERVER);</span>
+<span class="fc" id="L90">                    }</span>
+                }));
+<span class="fc" id="L92">                boolean win = false;</span>
+<span class="fc" id="L93">                synchronized (state.guard) {</span>
+<span class="pc bpc" id="L94" title="1 of 2 branches missed.">                    if (!state.emitting) {</span>
+<span class="fc" id="L95">                        state.emitting = true;</span>
+<span class="fc" id="L96">                        win = true;</span>
+                    }
+<span class="pc" id="L98">                }</span>
+<span class="pc bpc" id="L99" title="1 of 2 branches missed.">                if (win) {</span>
+<span class="fc" id="L100">                    final NotificationLite&lt;T&gt; nl = NotificationLite.instance();</span>
+                    while(true) {
+                        Object o;
+<span class="fc bfc" id="L103" title="All 2 branches covered.">                        while ((o = state.buffer.poll()) != null) {</span>
+<span class="fc" id="L104">                            nl.accept(state.get(), o);</span>
+                        }
+<span class="fc" id="L106">                        synchronized (state.guard) {</span>
+<span class="pc bpc" id="L107" title="1 of 2 branches missed.">                            if (state.buffer.isEmpty()) {</span>
+                                // Although the buffer is empty, there is still a chance
+                                // that further events may be put into the `buffer`.
+                                // `emit(Object v)` should handle it.
+<span class="fc" id="L111">                                state.emitting = false;</span>
+<span class="fc" id="L112">                                break;</span>
+                            }
+<span class="nc" id="L114">                        }</span>
+<span class="nc" id="L115">                    }</span>
+                }
+<span class="fc" id="L117">            } else {</span>
+<span class="nc" id="L118">                s.onError(new IllegalStateException(&quot;Only one subscriber allowed!&quot;));</span>
+            }
+<span class="fc" id="L120">        }</span>
+        
+    }
+    final State&lt;T&gt; state;
+
+<span class="fc" id="L125">    private boolean forward = false;</span>
+
+    private BufferUntilSubscriber(State&lt;T&gt; state) {
+<span class="fc" id="L128">        super(new OnSubscribeAction&lt;T&gt;(state));</span>
+<span class="fc" id="L129">        this.state = state;</span>
+<span class="fc" id="L130">    }</span>
+
+    private void emit(Object v) {
+<span class="fc" id="L133">        synchronized (state.guard) {</span>
+<span class="fc" id="L134">            state.buffer.add(v);</span>
+<span class="pc bpc" id="L135" title="1 of 4 branches missed.">            if (state.get() != null &amp;&amp; !state.emitting) {</span>
+                // Have an observer and nobody is emitting,
+                // should drain the `buffer`
+<span class="fc" id="L138">                forward = true;</span>
+<span class="fc" id="L139">                state.emitting = true;</span>
+            }
+<span class="pc" id="L141">        }</span>
+<span class="fc bfc" id="L142" title="All 2 branches covered.">        if (forward) {</span>
+            Object o;
+<span class="fc bfc" id="L144" title="All 2 branches covered.">            while ((o = state.buffer.poll()) != null) {</span>
+<span class="fc" id="L145">                state.nl.accept(state.get(), o);</span>
+            }
+            // Because `emit(Object v)` will be called in sequence,
+            // no event will be put into `buffer` after we drain it.
+        }
+<span class="fc" id="L150">    }</span>
+
+    @Override
+    public void onCompleted() {
+<span class="fc bfc" id="L154" title="All 2 branches covered.">        if (forward) {</span>
+<span class="fc" id="L155">            state.get().onCompleted();</span>
+        }
+        else {
+<span class="fc" id="L158">            emit(state.nl.completed());</span>
+        }
+<span class="fc" id="L160">    }</span>
+
+    @Override
+    public void onError(Throwable e) {
+<span class="nc bnc" id="L164" title="All 2 branches missed.">        if (forward) {</span>
+<span class="nc" id="L165">            state.get().onError(e);</span>
+        }
+        else {
+<span class="nc" id="L168">            emit(state.nl.error(e));</span>
+        }
+<span class="nc" id="L170">    }</span>
+
+    @Override
+    public void onNext(T t) {
+<span class="fc bfc" id="L174" title="All 2 branches covered.">        if (forward) {</span>
+<span class="fc" id="L175">            state.get().onNext(t);</span>
+        }
+        else {
+<span class="fc" id="L178">            emit(state.nl.next(t));</span>
+        }
+<span class="fc" id="L180">    }</span>
+
+    @Override
+    public boolean hasObservers() {
+<span class="nc" id="L184">        synchronized (state.guard) {</span>
+<span class="nc bnc" id="L185" title="All 2 branches missed.">            return state.get() != null;</span>
+<span class="nc" id="L186">        }</span>
+    }
+
+    @SuppressWarnings(&quot;rawtypes&quot;)
+<span class="fc" id="L190">    final static Observer EMPTY_OBSERVER = new Observer() {</span>
+
+        @Override
+        public void onCompleted() {
+            
+<span class="nc" id="L195">        }</span>
+
+        @Override
+        public void onError(Throwable e) {
+            
+<span class="nc" id="L200">        }</span>
+
+        @Override
+        public void onNext(Object t) {
+            
+<span class="nc" id="L205">        }</span>
+        
+    };
+    
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

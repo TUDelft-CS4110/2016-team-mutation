@@ -1,0 +1,2545 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>Single.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx</a> &gt; <span class="el_source">Single.java</span></div><h1>Single.java</h1><pre class="source lang-java linenums">/**
+ * Copyright 2015 Netflix, Inc.
+ * 
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except in
+ * compliance with the License. You may obtain a copy of the License at
+ * 
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software distributed under the License is
+ * distributed on an &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See
+ * the License for the specific language governing permissions and limitations under the License.
+ */
+package rx;
+
+import java.util.Collection;
+import java.util.concurrent.*;
+
+import rx.Observable.Operator;
+import rx.annotations.Beta;
+import rx.annotations.Experimental;
+import rx.exceptions.Exceptions;
+import rx.exceptions.OnErrorNotImplementedException;
+import rx.functions.*;
+import rx.internal.operators.*;
+import rx.internal.producers.SingleDelayedProducer;
+import rx.internal.util.ScalarSynchronousSingle;
+import rx.internal.util.UtilityFunctions;
+import rx.observers.SafeSubscriber;
+import rx.observers.SerializedSubscriber;
+import rx.plugins.RxJavaObservableExecutionHook;
+import rx.plugins.RxJavaPlugins;
+import rx.schedulers.Schedulers;
+import rx.singles.BlockingSingle;
+import rx.subscriptions.Subscriptions;
+
+/**
+ * The Single class implements the Reactive Pattern for a single value response. See {@link Observable} for the
+ * implementation of the Reactive Pattern for a stream or vector of values.
+ * &lt;p&gt;
+ * {@code Single} behaves the same as {@link Observable} except that it can only emit either a single successful
+ * value, or an error (there is no &quot;onComplete&quot; notification as there is for {@link Observable})
+ * &lt;p&gt;
+ * Like an {@link Observable}, a {@code Single} is lazy, can be either &quot;hot&quot; or &quot;cold&quot;, synchronous or
+ * asynchronous.
+ * &lt;p&gt;
+ * The documentation for this class makes use of marble diagrams. The following legend explains these diagrams:
+ * &lt;p&gt;
+ * &lt;img width=&quot;605&quot; height=&quot;285&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.legend.png&quot; alt=&quot;&quot;&gt;
+ * &lt;p&gt;
+ * For more information see the &lt;a href=&quot;http://reactivex.io/documentation/observable.html&quot;&gt;ReactiveX
+ * documentation&lt;/a&gt;.
+ * 
+ * @param &lt;T&gt;
+ *            the type of the item emitted by the Single
+ * @since (If this class graduates from &quot;Experimental&quot; replace this parenthetical with the release number)
+ */
+@Beta
+public class Single&lt;T&gt; {
+
+    final Observable.OnSubscribe&lt;T&gt; onSubscribe;
+
+    /**
+     * Creates a Single with a Function to execute when it is subscribed to (executed).
+     * &lt;p&gt;
+     * &lt;em&gt;Note:&lt;/em&gt; Use {@link #create(OnSubscribe)} to create a Single, instead of this constructor,
+     * unless you specifically have a need for inheritance.
+     * 
+     * @param f
+     *            {@code OnExecute} to be executed when {@code execute(SingleSubscriber)} or
+     *            {@code subscribe(Subscriber)} is called
+     */
+<span class="fc" id="L72">    protected Single(final OnSubscribe&lt;T&gt; f) {</span>
+        // bridge between OnSubscribe (which all Operators and Observables use) and OnExecute (for Single)
+<span class="fc" id="L74">        this.onSubscribe = new Observable.OnSubscribe&lt;T&gt;() {</span>
+
+            @Override
+            public void call(final Subscriber&lt;? super T&gt; child) {
+<span class="fc" id="L78">                final SingleDelayedProducer&lt;T&gt; producer = new SingleDelayedProducer&lt;T&gt;(child);</span>
+<span class="fc" id="L79">                child.setProducer(producer);</span>
+<span class="fc" id="L80">                SingleSubscriber&lt;T&gt; ss = new SingleSubscriber&lt;T&gt;() {</span>
+
+                    @Override
+                    public void onSuccess(T value) {
+<span class="fc" id="L84">                        producer.setValue(value);</span>
+<span class="fc" id="L85">                    }</span>
+
+                    @Override
+                    public void onError(Throwable error) {
+<span class="fc" id="L89">                        child.onError(error);</span>
+<span class="fc" id="L90">                    }</span>
+
+                };
+<span class="fc" id="L93">                child.add(ss);</span>
+<span class="fc" id="L94">                f.call(ss);</span>
+<span class="fc" id="L95">            }</span>
+
+        };
+<span class="fc" id="L98">    }</span>
+
+<span class="fc" id="L100">    private Single(final Observable.OnSubscribe&lt;T&gt; f) {</span>
+<span class="fc" id="L101">        this.onSubscribe = f;</span>
+<span class="fc" id="L102">    }</span>
+
+<span class="fc" id="L104">    static final RxJavaObservableExecutionHook hook = RxJavaPlugins.getInstance().getObservableExecutionHook();</span>
+
+    /**
+     * Returns a Single that will execute the specified function when a {@link SingleSubscriber} executes it or
+     * a {@link Subscriber} subscribes to it.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;200&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.create.png&quot; alt=&quot;&quot;&gt;
+     * &lt;p&gt;
+     * Write the function you pass to {@code create} so that it behaves as a Single: It should invoke the
+     * SingleSubscriber {@link SingleSubscriber#onSuccess onSuccess} and/or
+     * {@link SingleSubscriber#onError onError} methods appropriately.
+     * &lt;p&gt;
+     * A well-formed Single must invoke either the SingleSubscriber's {@code onSuccess} method exactly once or
+     * its {@code onError} method exactly once.
+     * &lt;p&gt;
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code create} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param &lt;T&gt;
+     *            the type of the item that this Single emits
+     * @param f
+     *            a function that accepts an {@code SingleSubscriber&lt;T&gt;}, and invokes its {@code onSuccess} or
+     *            {@code onError} methods as appropriate
+     * @return a Single that, when a {@link Subscriber} subscribes to it, will execute the specified function
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/create.html&quot;&gt;ReactiveX operators documentation: Create&lt;/a&gt;
+     */
+    public static &lt;T&gt; Single&lt;T&gt; create(OnSubscribe&lt;T&gt; f) {
+<span class="fc" id="L133">        return new Single&lt;T&gt;(f); // TODO need hook </span>
+    }
+
+    /**
+     * Invoked when Single.execute is called.
+     */
+    public interface OnSubscribe&lt;T&gt; extends Action1&lt;SingleSubscriber&lt;? super T&gt;&gt; {
+        // cover for generics insanity
+    }
+
+    /**
+     * Lifts a function to the current Single and returns a new Single that when subscribed to will pass the
+     * values of the current Single through the Operator function.
+     * &lt;p&gt;
+     * In other words, this allows chaining TaskExecutors together on a Single for acting on the values within
+     * the Single.
+     * &lt;p&gt;
+     * {@code task.map(...).filter(...).lift(new OperatorA()).lift(new OperatorB(...)).subscribe() }
+     * &lt;p&gt;
+     * If the operator you are creating is designed to act on the item emitted by a source Single, use
+     * {@code lift}. If your operator is designed to transform the source Single as a whole (for instance, by
+     * applying a particular set of existing RxJava operators to it) use {@link #compose}.
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code lift} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param lift
+     *            the Operator that implements the Single-operating function to be applied to the source Single
+     * @return a Single that is the result of applying the lifted Operator to the source Single
+     * @see &lt;a href=&quot;https://github.com/ReactiveX/RxJava/wiki/Implementing-Your-Own-Operators&quot;&gt;RxJava wiki: Implementing Your Own Operators&lt;/a&gt;
+     */
+    private &lt;R&gt; Single&lt;R&gt; lift(final Operator&lt;? extends R, ? super T&gt; lift) {
+        // This method is private because not sure if we want to expose the Observable.Operator in this public API rather than a Single.Operator 
+
+<span class="fc" id="L168">        return new Single&lt;R&gt;(new Observable.OnSubscribe&lt;R&gt;() {</span>
+            @Override
+            public void call(Subscriber&lt;? super R&gt; o) {
+                try {
+<span class="fc" id="L172">                    final Subscriber&lt;? super T&gt; st = hook.onLift(lift).call(o);</span>
+                    try {
+                        // new Subscriber created and being subscribed with so 'onStart' it
+<span class="fc" id="L175">                        st.onStart();</span>
+<span class="fc" id="L176">                        onSubscribe.call(st);</span>
+<span class="nc" id="L177">                    } catch (Throwable e) {</span>
+                        // localized capture of errors rather than it skipping all operators
+                        // and ending up in the try/catch of the subscribe method which then
+                        // prevents onErrorResumeNext and other similar approaches to error handling
+<span class="nc" id="L181">                        Exceptions.throwOrReport(e, st);</span>
+<span class="fc" id="L182">                    }</span>
+<span class="nc" id="L183">                } catch (Throwable e) {</span>
+                    // if the lift function failed all we can do is pass the error to the final Subscriber
+                    // as we don't have the operator available to us
+<span class="nc" id="L186">                    Exceptions.throwOrReport(e, o);</span>
+<span class="fc" id="L187">                }</span>
+<span class="fc" id="L188">            }</span>
+        });
+    }
+
+    /**
+     * Transform a Single by applying a particular Transformer function to it.
+     * &lt;p&gt;
+     * This method operates on the Single itself whereas {@link #lift} operates on the Single's Subscribers or
+     * Observers.
+     * &lt;p&gt;
+     * If the operator you are creating is designed to act on the individual item emitted by a Single, use
+     * {@link #lift}. If your operator is designed to transform the source Single as a whole (for instance, by
+     * applying a particular set of existing RxJava operators to it) use {@code compose}.
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code compose} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param transformer
+     *            implements the function that transforms the source Single
+     * @return the source Single, transformed by the transformer function
+     * @see &lt;a href=&quot;https://github.com/ReactiveX/RxJava/wiki/Implementing-Your-Own-Operators&quot;&gt;RxJava wiki: Implementing Your Own Operators&lt;/a&gt;
+     */
+    @SuppressWarnings(&quot;unchecked&quot;)
+    public &lt;R&gt; Single&lt;R&gt; compose(Transformer&lt;? super T, ? extends R&gt; transformer) {
+<span class="nc" id="L213">        return ((Transformer&lt;T, R&gt;) transformer).call(this);</span>
+    }
+
+    /**
+     * Transformer function used by {@link #compose}.
+     * 
+     * @warn more complete description needed
+     */
+    public interface Transformer&lt;T, R&gt; extends Func1&lt;Single&lt;T&gt;, Single&lt;R&gt;&gt; {
+        // cover for generics insanity
+    }
+
+    /**
+     * &lt;img width=&quot;640&quot; height=&quot;305&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.toObservable.png&quot; alt=&quot;&quot;&gt;
+     *
+     * @warn more complete description needed
+     */
+    private static &lt;T&gt; Observable&lt;T&gt; asObservable(Single&lt;T&gt; t) {
+        // is this sufficient, or do I need to keep the outer Single and subscribe to it?
+<span class="fc" id="L232">        return Observable.create(t.onSubscribe);</span>
+    }
+
+    /**
+     * INTERNAL: Used with lift and operators.
+     * 
+     * Converts the source {@code Single&lt;T&gt;} into an {@code Single&lt;Observable&lt;T&gt;&gt;} that emits an Observable
+     * that emits the same emission as the source Single.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;310&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.nest.png&quot; alt=&quot;&quot;&gt;
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code nest} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @return a Single that emits an Observable that emits the same item as the source Single
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/to.html&quot;&gt;ReactiveX operators documentation: To&lt;/a&gt;
+     */
+    private Single&lt;Observable&lt;T&gt;&gt; nest() {
+<span class="nc" id="L251">        return Single.just(asObservable(this));</span>
+    }
+
+    /* *********************************************************************************************************
+     * Operators Below Here
+     * *********************************************************************************************************
+     */
+
+    /**
+     * Returns an Observable that emits the items emitted by two Singles, one after the other.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;380&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.concat.png&quot; alt=&quot;&quot;&gt;
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code concat} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     *
+     * @param t1
+     *            an Single to be concatenated
+     * @param t2
+     *            an Single to be concatenated
+     * @return an Observable that emits items emitted by the two source Singles, one after the other.
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/concat.html&quot;&gt;ReactiveX operators documentation: Concat&lt;/a&gt;
+     */
+    public static &lt;T&gt; Observable&lt;T&gt; concat(Single&lt;? extends T&gt; t1, Single&lt;? extends T&gt; t2) {
+<span class="nc" id="L276">        return Observable.concat(asObservable(t1), asObservable(t2));</span>
+    }
+
+    /**
+     * Returns an Observable that emits the items emitted by three Singles, one after the other.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;380&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.concat.png&quot; alt=&quot;&quot;&gt;
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code concat} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     *
+     * @param t1
+     *            a Single to be concatenated
+     * @param t2
+     *            a Single to be concatenated
+     * @param t3
+     *            a Single to be concatenated
+     * @return an Observable that emits items emitted by the three source Singles, one after the other.
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/concat.html&quot;&gt;ReactiveX operators documentation: Concat&lt;/a&gt;
+     */
+    public static &lt;T&gt; Observable&lt;T&gt; concat(Single&lt;? extends T&gt; t1, Single&lt;? extends T&gt; t2, Single&lt;? extends T&gt; t3) {
+<span class="nc" id="L298">        return Observable.concat(asObservable(t1), asObservable(t2), asObservable(t3));</span>
+    }
+
+    /**
+     * Returns an Observable that emits the items emitted by four Singles, one after the other.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;380&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.concat.png&quot; alt=&quot;&quot;&gt;
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code concat} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param t1
+     *            a Single to be concatenated
+     * @param t2
+     *            a Single to be concatenated
+     * @param t3
+     *            a Single to be concatenated
+     * @param t4
+     *            a Single to be concatenated
+     * @return an Observable that emits items emitted by the four source Singles, one after the other.
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/concat.html&quot;&gt;ReactiveX operators documentation: Concat&lt;/a&gt;
+     */
+    public static &lt;T&gt; Observable&lt;T&gt; concat(Single&lt;? extends T&gt; t1, Single&lt;? extends T&gt; t2, Single&lt;? extends T&gt; t3, Single&lt;? extends T&gt; t4) {
+<span class="nc" id="L322">        return Observable.concat(asObservable(t1), asObservable(t2), asObservable(t3), asObservable(t4));</span>
+    }
+
+    /**
+     * Returns an Observable that emits the items emitted by five Singles, one after the other.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;380&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.concat.png&quot; alt=&quot;&quot;&gt;
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code concat} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     *
+     * @param t1
+     *            a Single to be concatenated
+     * @param t2
+     *            a Single to be concatenated
+     * @param t3
+     *            a Single to be concatenated
+     * @param t4
+     *            a Single to be concatenated
+     * @param t5
+     *            a Single to be concatenated
+     * @return an Observable that emits items emitted by the five source Singles, one after the other.
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/concat.html&quot;&gt;ReactiveX operators documentation: Concat&lt;/a&gt;
+     */
+    public static &lt;T&gt; Observable&lt;T&gt; concat(Single&lt;? extends T&gt; t1, Single&lt;? extends T&gt; t2, Single&lt;? extends T&gt; t3, Single&lt;? extends T&gt; t4, Single&lt;? extends T&gt; t5) {
+<span class="nc" id="L348">        return Observable.concat(asObservable(t1), asObservable(t2), asObservable(t3), asObservable(t4), asObservable(t5));</span>
+    }
+
+    /**
+     * Returns an Observable that emits the items emitted by six Singles, one after the other.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;380&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.concat.png&quot; alt=&quot;&quot;&gt;
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code concat} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     *
+     * @param t1
+     *            a Single to be concatenated
+     * @param t2
+     *            a Single to be concatenated
+     * @param t3
+     *            a Single to be concatenated
+     * @param t4
+     *            a Single to be concatenated
+     * @param t5
+     *            a Single to be concatenated
+     * @param t6
+     *            a Single to be concatenated
+     * @return an Observable that emits items emitted by the six source Singles, one after the other.
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/concat.html&quot;&gt;ReactiveX operators documentation: Concat&lt;/a&gt;
+     */
+    public static &lt;T&gt; Observable&lt;T&gt; concat(Single&lt;? extends T&gt; t1, Single&lt;? extends T&gt; t2, Single&lt;? extends T&gt; t3, Single&lt;? extends T&gt; t4, Single&lt;? extends T&gt; t5, Single&lt;? extends T&gt; t6) {
+<span class="nc" id="L376">        return Observable.concat(asObservable(t1), asObservable(t2), asObservable(t3), asObservable(t4), asObservable(t5), asObservable(t6));</span>
+    }
+
+    /**
+     * Returns an Observable that emits the items emitted by seven Singles, one after the other.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;380&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.concat.png&quot; alt=&quot;&quot;&gt;
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code concat} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     *
+     * @param t1
+     *            a Single to be concatenated
+     * @param t2
+     *            a Single to be concatenated
+     * @param t3
+     *            a Single to be concatenated
+     * @param t4
+     *            a Single to be concatenated
+     * @param t5
+     *            a Single to be concatenated
+     * @param t6
+     *            a Single to be concatenated
+     * @param t7
+     *            a Single to be concatenated
+     * @return an Observable that emits items emitted by the seven source Singles, one after the other.
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/concat.html&quot;&gt;ReactiveX operators documentation: Concat&lt;/a&gt;
+     */
+    public static &lt;T&gt; Observable&lt;T&gt; concat(Single&lt;? extends T&gt; t1, Single&lt;? extends T&gt; t2, Single&lt;? extends T&gt; t3, Single&lt;? extends T&gt; t4, Single&lt;? extends T&gt; t5, Single&lt;? extends T&gt; t6, Single&lt;? extends T&gt; t7) {
+<span class="nc" id="L406">        return Observable.concat(asObservable(t1), asObservable(t2), asObservable(t3), asObservable(t4), asObservable(t5), asObservable(t6), asObservable(t7));</span>
+    }
+
+    /**
+     * Returns an Observable that emits the items emitted by eight Singles, one after the other.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;380&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.concat.png&quot; alt=&quot;&quot;&gt;
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code concat} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param t1
+     *            a Single to be concatenated
+     * @param t2
+     *            a Single to be concatenated
+     * @param t3
+     *            a Single to be concatenated
+     * @param t4
+     *            a Single to be concatenated
+     * @param t5
+     *            a Single to be concatenated
+     * @param t6
+     *            a Single to be concatenated
+     * @param t7
+     *            a Single to be concatenated
+     * @param t8
+     *            a Single to be concatenated
+     * @return an Observable that emits items emitted by the eight source Singles, one after the other.
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/concat.html&quot;&gt;ReactiveX operators documentation: Concat&lt;/a&gt;
+     */
+    public static &lt;T&gt; Observable&lt;T&gt; concat(Single&lt;? extends T&gt; t1, Single&lt;? extends T&gt; t2, Single&lt;? extends T&gt; t3, Single&lt;? extends T&gt; t4, Single&lt;? extends T&gt; t5, Single&lt;? extends T&gt; t6, Single&lt;? extends T&gt; t7, Single&lt;? extends T&gt; t8) {
+<span class="nc" id="L438">        return Observable.concat(asObservable(t1), asObservable(t2), asObservable(t3), asObservable(t4), asObservable(t5), asObservable(t6), asObservable(t7), asObservable(t8));</span>
+    }
+
+    /**
+     * Returns an Observable that emits the items emitted by nine Singles, one after the other.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;380&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.concat.png&quot; alt=&quot;&quot;&gt;
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code concat} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param t1
+     *            a Single to be concatenated
+     * @param t2
+     *            a Single to be concatenated
+     * @param t3
+     *            a Single to be concatenated
+     * @param t4
+     *            a Single to be concatenated
+     * @param t5
+     *            a Single to be concatenated
+     * @param t6
+     *            a Single to be concatenated
+     * @param t7
+     *            a Single to be concatenated
+     * @param t8
+     *            a Single to be concatenated
+     * @param t9
+     *            a Single to be concatenated
+     * @return an Observable that emits items emitted by the nine source Singles, one after the other.
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/concat.html&quot;&gt;ReactiveX operators documentation: Concat&lt;/a&gt;
+     */
+    public static &lt;T&gt; Observable&lt;T&gt; concat(Single&lt;? extends T&gt; t1, Single&lt;? extends T&gt; t2, Single&lt;? extends T&gt; t3, Single&lt;? extends T&gt; t4, Single&lt;? extends T&gt; t5, Single&lt;? extends T&gt; t6, Single&lt;? extends T&gt; t7, Single&lt;? extends T&gt; t8, Single&lt;? extends T&gt; t9) {
+<span class="nc" id="L472">        return Observable.concat(asObservable(t1), asObservable(t2), asObservable(t3), asObservable(t4), asObservable(t5), asObservable(t6), asObservable(t7), asObservable(t8), asObservable(t9));</span>
+    }
+
+    /**
+     * Returns a Single that invokes a subscriber's {@link SingleSubscriber#onError onError} method when the
+     * subscriber subscribes to it.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;190&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.error.png&quot; alt=&quot;&quot;&gt;
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code error} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param exception
+     *            the particular Throwable to pass to {@link SingleSubscriber#onError onError}
+     * @param &lt;T&gt;
+     *            the type of the item (ostensibly) emitted by the Single
+     * @return a Single that invokes the subscriber's {@link SingleSubscriber#onError onError} method when
+     *         the subscriber subscribes to it
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/empty-never-throw.html&quot;&gt;ReactiveX operators documentation: Throw&lt;/a&gt;
+     */
+    public static &lt;T&gt; Single&lt;T&gt; error(final Throwable exception) {
+<span class="fc" id="L494">        return Single.create(new OnSubscribe&lt;T&gt;() {</span>
+
+            @Override
+            public void call(SingleSubscriber&lt;? super T&gt; te) {
+<span class="fc" id="L498">                te.onError(exception);</span>
+<span class="fc" id="L499">            }</span>
+
+        });
+    }
+
+    /**
+     * Converts a {@link Future} into a {@code Single}.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;315&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.from.Future.png&quot; alt=&quot;&quot;&gt;
+     * &lt;p&gt;
+     * You can convert any object that supports the {@link Future} interface into a Single that emits the return
+     * value of the {@link Future#get} method of that object, by passing the object into the {@code from}
+     * method.
+     * &lt;p&gt;
+     * &lt;em&gt;Important note:&lt;/em&gt; This Single is blocking; you cannot unsubscribe from it.
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code from} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param future
+     *            the source {@link Future}
+     * @param &lt;T&gt;
+     *            the type of object that the {@link Future} returns, and also the type of item to be emitted by
+     *            the resulting {@code Single}
+     * @return a {@code Single} that emits the item from the source {@link Future}
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/from.html&quot;&gt;ReactiveX operators documentation: From&lt;/a&gt;
+     */
+    public static &lt;T&gt; Single&lt;T&gt; from(Future&lt;? extends T&gt; future) {
+<span class="nc" id="L528">        return new Single&lt;T&gt;(OnSubscribeToObservableFuture.toObservableFuture(future));</span>
+    }
+
+    /**
+     * Converts a {@link Future} into a {@code Single}, with a timeout on the Future.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;315&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.from.Future.png&quot; alt=&quot;&quot;&gt;
+     * &lt;p&gt;
+     * You can convert any object that supports the {@link Future} interface into a {@code Single} that emits
+     * the return value of the {@link Future#get} method of that object, by passing the object into the
+     * {@code from} method.
+     * &lt;p&gt;
+     * &lt;em&gt;Important note:&lt;/em&gt; This {@code Single} is blocking; you cannot unsubscribe from it.
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code from} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param future
+     *            the source {@link Future}
+     * @param timeout
+     *            the maximum time to wait before calling {@code get}
+     * @param unit
+     *            the {@link TimeUnit} of the {@code timeout} argument
+     * @param &lt;T&gt;
+     *            the type of object that the {@link Future} returns, and also the type of item to be emitted by
+     *            the resulting {@code Single}
+     * @return a {@code Single} that emits the item from the source {@link Future}
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/from.html&quot;&gt;ReactiveX operators documentation: From&lt;/a&gt;
+     */
+    public static &lt;T&gt; Single&lt;T&gt; from(Future&lt;? extends T&gt; future, long timeout, TimeUnit unit) {
+<span class="nc" id="L559">        return new Single&lt;T&gt;(OnSubscribeToObservableFuture.toObservableFuture(future, timeout, unit));</span>
+    }
+
+    /**
+     * Converts a {@link Future}, operating on a specified {@link Scheduler}, into a {@code Single}.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;315&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.from.Future.s.png&quot; alt=&quot;&quot;&gt;
+     * &lt;p&gt;
+     * You can convert any object that supports the {@link Future} interface into a {@code Single} that emits
+     * the return value of the {@link Future#get} method of that object, by passing the object into the
+     * {@code from} method.
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;you specify which {@link Scheduler} this operator will use&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param future
+     *            the source {@link Future}
+     * @param scheduler
+     *            the {@link Scheduler} to wait for the Future on. Use a Scheduler such as
+     *            {@link Schedulers#io()} that can block and wait on the Future
+     * @param &lt;T&gt;
+     *            the type of object that the {@link Future} returns, and also the type of item to be emitted by
+     *            the resulting {@code Single}
+     * @return a {@code Single} that emits the item from the source {@link Future}
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/from.html&quot;&gt;ReactiveX operators documentation: From&lt;/a&gt;
+     */
+    public static &lt;T&gt; Single&lt;T&gt; from(Future&lt;? extends T&gt; future, Scheduler scheduler) {
+<span class="nc" id="L587">        return new Single&lt;T&gt;(OnSubscribeToObservableFuture.toObservableFuture(future)).subscribeOn(scheduler);</span>
+    }
+
+    /**
+     * Returns a {@link Single} that invokes passed function and emits its result for each new Observer that subscribes.
+     * &lt;p&gt;
+     * Allows you to defer execution of passed function until Observer subscribes to the {@link Single}.
+     * It makes passed function &quot;lazy&quot;.
+     * Result of the function invocation will be emitted by the {@link Single}.
+     * &lt;dl&gt;
+     *   &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     *   &lt;dd&gt;{@code fromCallable} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     *
+     * @param func
+     *         function which execution should be deferred, it will be invoked when Observer will subscribe to the {@link Single}.
+     * @param &lt;T&gt;
+     *         the type of the item emitted by the {@link Single}.
+     * @return a {@link Single} whose {@link Observer}s' subscriptions trigger an invocation of the given function.
+     */
+    @Experimental
+    public static &lt;T&gt; Single&lt;T&gt; fromCallable(final Callable&lt;? extends T&gt; func) {
+<span class="fc" id="L609">        return create(new OnSubscribe&lt;T&gt;() {</span>
+            @Override
+            public void call(SingleSubscriber&lt;? super T&gt; singleSubscriber) {
+                final T value;
+
+                try {
+<span class="fc" id="L615">                    value = func.call();</span>
+<span class="fc" id="L616">                } catch (Throwable t) {</span>
+<span class="fc" id="L617">                    Exceptions.throwIfFatal(t);</span>
+<span class="fc" id="L618">                    singleSubscriber.onError(t);</span>
+<span class="fc" id="L619">                    return;</span>
+<span class="fc" id="L620">                }</span>
+
+<span class="fc" id="L622">                singleSubscriber.onSuccess(value);</span>
+<span class="fc" id="L623">            }</span>
+        });
+    }
+
+    /**
+     * Returns a {@code Single} that emits a specified item.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;310&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.just.png&quot; alt=&quot;&quot;&gt;
+     * &lt;p&gt;
+     * To convert any object into a {@code Single} that emits that object, pass that object into the
+     * {@code just} method.
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code just} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param value
+     *            the item to emit
+     * @param &lt;T&gt;
+     *            the type of that item
+     * @return a {@code Single} that emits {@code value}
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/just.html&quot;&gt;ReactiveX operators documentation: Just&lt;/a&gt;
+     */
+    public static &lt;T&gt; Single&lt;T&gt; just(final T value) {
+<span class="fc" id="L647">        return ScalarSynchronousSingle.create(value);</span>
+    }
+
+    /**
+     * Flattens a {@code Single} that emits a {@code Single} into a single {@code Single} that emits the item
+     * emitted by the nested {@code Single}, without any transformation.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;370&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.merge.oo.png&quot; alt=&quot;&quot;&gt;
+     * &lt;p&gt;
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code merge} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     *
+     * @param source
+     *            a {@code Single} that emits a {@code Single}
+     * @return a {@code Single} that emits the item that is the result of flattening the {@code Single} emitted
+     *         by {@code source}
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/merge.html&quot;&gt;ReactiveX operators documentation: Merge&lt;/a&gt;
+     */
+    public static &lt;T&gt; Single&lt;T&gt; merge(final Single&lt;? extends Single&lt;? extends T&gt;&gt; source) {
+<span class="pc bpc" id="L668" title="1 of 2 branches missed.">        if (source instanceof ScalarSynchronousSingle) {</span>
+<span class="fc" id="L669">            return ((ScalarSynchronousSingle&lt;T&gt;) source).scalarFlatMap((Func1) UtilityFunctions.identity());</span>
+        }
+<span class="nc" id="L671">        return Single.create(new OnSubscribe&lt;T&gt;() {</span>
+
+            @Override
+            public void call(final SingleSubscriber&lt;? super T&gt; child) {
+<span class="nc" id="L675">                source.subscribe(new SingleSubscriber&lt;Single&lt;? extends T&gt;&gt;() {</span>
+
+                    @Override
+                    public void onSuccess(Single&lt;? extends T&gt; innerSingle) {
+<span class="nc" id="L679">                        innerSingle.subscribe(child);</span>
+<span class="nc" id="L680">                    }</span>
+
+                    @Override
+                    public void onError(Throwable error) {
+<span class="nc" id="L684">                        child.onError(error);</span>
+<span class="nc" id="L685">                    }</span>
+
+                });
+<span class="nc" id="L688">            }</span>
+        });
+    }
+
+    /**
+     * Flattens two Singles into a single Observable, without any transformation.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;380&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.merge.png&quot; alt=&quot;&quot;&gt;
+     * &lt;p&gt;
+     * You can combine items emitted by multiple Singles so that they appear as a single Observable, by
+     * using the {@code merge} method.
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code merge} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param t1
+     *            a Single to be merged
+     * @param t2
+     *            a Single to be merged
+     * @return an Observable that emits all of the items emitted by the source Singles
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/merge.html&quot;&gt;ReactiveX operators documentation: Merge&lt;/a&gt;
+     */
+    public static &lt;T&gt; Observable&lt;T&gt; merge(Single&lt;? extends T&gt; t1, Single&lt;? extends T&gt; t2) {
+<span class="fc" id="L712">        return Observable.merge(asObservable(t1), asObservable(t2));</span>
+    }
+
+    /**
+     * Flattens three Singles into a single Observable, without any transformation.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;380&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.merge.png&quot; alt=&quot;&quot;&gt;
+     * &lt;p&gt;
+     * You can combine items emitted by multiple Singles so that they appear as a single Observable, by using
+     * the {@code merge} method.
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code merge} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param t1
+     *            a Single to be merged
+     * @param t2
+     *            a Single to be merged
+     * @param t3
+     *            a Single to be merged
+     * @return an Observable that emits all of the items emitted by the source Singles
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/merge.html&quot;&gt;ReactiveX operators documentation: Merge&lt;/a&gt;
+     */
+    public static &lt;T&gt; Observable&lt;T&gt; merge(Single&lt;? extends T&gt; t1, Single&lt;? extends T&gt; t2, Single&lt;? extends T&gt; t3) {
+<span class="nc" id="L737">        return Observable.merge(asObservable(t1), asObservable(t2), asObservable(t3));</span>
+    }
+
+    /**
+     * Flattens four Singles into a single Observable, without any transformation.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;380&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.merge.png&quot; alt=&quot;&quot;&gt;
+     * &lt;p&gt;
+     * You can combine items emitted by multiple Singles so that they appear as a single Observable, by using
+     * the {@code merge} method.
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code merge} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param t1
+     *            a Single to be merged
+     * @param t2
+     *            a Single to be merged
+     * @param t3
+     *            a Single to be merged
+     * @param t4
+     *            a Single to be merged
+     * @return an Observable that emits all of the items emitted by the source Singles
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/merge.html&quot;&gt;ReactiveX operators documentation: Merge&lt;/a&gt;
+     */
+    public static &lt;T&gt; Observable&lt;T&gt; merge(Single&lt;? extends T&gt; t1, Single&lt;? extends T&gt; t2, Single&lt;? extends T&gt; t3, Single&lt;? extends T&gt; t4) {
+<span class="nc" id="L764">        return Observable.merge(asObservable(t1), asObservable(t2), asObservable(t3), asObservable(t4));</span>
+    }
+
+    /**
+     * Flattens five Singles into a single Observable, without any transformation.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;380&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.merge.png&quot; alt=&quot;&quot;&gt;
+     * &lt;p&gt;
+     * You can combine items emitted by multiple Singles so that they appear as a single Observable, by using
+     * the {@code merge} method.
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code merge} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param t1
+     *            a Single to be merged
+     * @param t2
+     *            a Single to be merged
+     * @param t3
+     *            a Single to be merged
+     * @param t4
+     *            a Single to be merged
+     * @param t5
+     *            a Single to be merged
+     * @return an Observable that emits all of the items emitted by the source Singles
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/merge.html&quot;&gt;ReactiveX operators documentation: Merge&lt;/a&gt;
+     */
+    public static &lt;T&gt; Observable&lt;T&gt; merge(Single&lt;? extends T&gt; t1, Single&lt;? extends T&gt; t2, Single&lt;? extends T&gt; t3, Single&lt;? extends T&gt; t4, Single&lt;? extends T&gt; t5) {
+<span class="nc" id="L793">        return Observable.merge(asObservable(t1), asObservable(t2), asObservable(t3), asObservable(t4), asObservable(t5));</span>
+    }
+
+    /**
+     * Flattens six Singles into a single Observable, without any transformation.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;380&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.merge.png&quot; alt=&quot;&quot;&gt;
+     * &lt;p&gt;
+     * You can combine items emitted by multiple Singles so that they appear as a single Observable, by using
+     * the {@code merge} method.
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code merge} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param t1
+     *            a Single to be merged
+     * @param t2
+     *            a Single to be merged
+     * @param t3
+     *            a Single to be merged
+     * @param t4
+     *            a Single to be merged
+     * @param t5
+     *            a Single to be merged
+     * @param t6
+     *            a Single to be merged
+     * @return an Observable that emits all of the items emitted by the source Singles
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/merge.html&quot;&gt;ReactiveX operators documentation: Merge&lt;/a&gt;
+     */
+    public static &lt;T&gt; Observable&lt;T&gt; merge(Single&lt;? extends T&gt; t1, Single&lt;? extends T&gt; t2, Single&lt;? extends T&gt; t3, Single&lt;? extends T&gt; t4, Single&lt;? extends T&gt; t5, Single&lt;? extends T&gt; t6) {
+<span class="nc" id="L824">        return Observable.merge(asObservable(t1), asObservable(t2), asObservable(t3), asObservable(t4), asObservable(t5), asObservable(t6));</span>
+    }
+
+    /**
+     * Flattens seven Singles into a single Observable, without any transformation.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;380&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.merge.png&quot; alt=&quot;&quot;&gt;
+     * &lt;p&gt;
+     * You can combine items emitted by multiple Singles so that they appear as a single Observable, by using
+     * the {@code merge} method.
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code merge} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param t1
+     *            a Single to be merged
+     * @param t2
+     *            a Single to be merged
+     * @param t3
+     *            a Single to be merged
+     * @param t4
+     *            a Single to be merged
+     * @param t5
+     *            a Single to be merged
+     * @param t6
+     *            a Single to be merged
+     * @param t7
+     *            a Single to be merged
+     * @return an Observable that emits all of the items emitted by the source Singles
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/merge.html&quot;&gt;ReactiveX operators documentation: Merge&lt;/a&gt;
+     */
+    public static &lt;T&gt; Observable&lt;T&gt; merge(Single&lt;? extends T&gt; t1, Single&lt;? extends T&gt; t2, Single&lt;? extends T&gt; t3, Single&lt;? extends T&gt; t4, Single&lt;? extends T&gt; t5, Single&lt;? extends T&gt; t6, Single&lt;? extends T&gt; t7) {
+<span class="nc" id="L857">        return Observable.merge(asObservable(t1), asObservable(t2), asObservable(t3), asObservable(t4), asObservable(t5), asObservable(t6), asObservable(t7));</span>
+    }
+
+    /**
+     * Flattens eight Singles into a single Observable, without any transformation.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;380&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.merge.png&quot; alt=&quot;&quot;&gt;
+     * &lt;p&gt;
+     * You can combine items emitted by multiple Singles so that they appear as a single Observable, by using
+     * the {@code merge} method.
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code merge} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param t1
+     *            a Single to be merged
+     * @param t2
+     *            a Single to be merged
+     * @param t3
+     *            a Single to be merged
+     * @param t4
+     *            a Single to be merged
+     * @param t5
+     *            a Single to be merged
+     * @param t6
+     *            a Single to be merged
+     * @param t7
+     *            a Single to be merged
+     * @param t8
+     *            a Single to be merged
+     * @return an Observable that emits all of the items emitted by the source Singles
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/merge.html&quot;&gt;ReactiveX operators documentation: Merge&lt;/a&gt;
+     */
+    public static &lt;T&gt; Observable&lt;T&gt; merge(Single&lt;? extends T&gt; t1, Single&lt;? extends T&gt; t2, Single&lt;? extends T&gt; t3, Single&lt;? extends T&gt; t4, Single&lt;? extends T&gt; t5, Single&lt;? extends T&gt; t6, Single&lt;? extends T&gt; t7, Single&lt;? extends T&gt; t8) {
+<span class="nc" id="L892">        return Observable.merge(asObservable(t1), asObservable(t2), asObservable(t3), asObservable(t4), asObservable(t5), asObservable(t6), asObservable(t7), asObservable(t8));</span>
+    }
+
+    /**
+     * Flattens nine Singles into a single Observable, without any transformation.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;380&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.merge.png&quot; alt=&quot;&quot;&gt;
+     * &lt;p&gt;
+     * You can combine items emitted by multiple Singles so that they appear as a single Observable, by using
+     * the {@code merge} method.
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code merge} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param t1
+     *            a Single to be merged
+     * @param t2
+     *            a Single to be merged
+     * @param t3
+     *            a Single to be merged
+     * @param t4
+     *            a Single to be merged
+     * @param t5
+     *            a Single to be merged
+     * @param t6
+     *            a Single to be merged
+     * @param t7
+     *            a Single to be merged
+     * @param t8
+     *            a Single to be merged
+     * @param t9
+     *            a Single to be merged
+     * @return an Observable that emits all of the items emitted by the source Singles
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/merge.html&quot;&gt;ReactiveX operators documentation: Merge&lt;/a&gt;
+     */
+    public static &lt;T&gt; Observable&lt;T&gt; merge(Single&lt;? extends T&gt; t1, Single&lt;? extends T&gt; t2, Single&lt;? extends T&gt; t3, Single&lt;? extends T&gt; t4, Single&lt;? extends T&gt; t5, Single&lt;? extends T&gt; t6, Single&lt;? extends T&gt; t7, Single&lt;? extends T&gt; t8, Single&lt;? extends T&gt; t9) {
+<span class="nc" id="L929">        return Observable.merge(asObservable(t1), asObservable(t2), asObservable(t3), asObservable(t4), asObservable(t5), asObservable(t6), asObservable(t7), asObservable(t8), asObservable(t9));</span>
+    }
+
+    /**
+     * Returns a Single that emits the results of a specified combiner function applied to two items emitted by
+     * two other Singles.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;380&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.zip.png&quot; alt=&quot;&quot;&gt;
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code zip} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param s1
+     *            the first source Single
+     * @param s2
+     *            a second source Single
+     * @param zipFunction
+     *            a function that, when applied to the item emitted by each of the source Singles, results in an
+     *            item that will be emitted by the resulting Single
+     * @return a Single that emits the zipped results
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/zip.html&quot;&gt;ReactiveX operators documentation: Zip&lt;/a&gt;
+     */
+    public static &lt;T1, T2, R&gt; Single&lt;R&gt; zip(Single&lt;? extends T1&gt; s1, Single&lt;? extends T2&gt; s2, final Func2&lt;? super T1, ? super T2, ? extends R&gt; zipFunction) {
+<span class="fc" id="L953">        return SingleOperatorZip.zip(new Single&lt;?&gt;[] {s1, s2}, new FuncN&lt;R&gt;() {</span>
+            @Override
+            public R call(Object... args) {
+<span class="fc" id="L956">                return zipFunction.call((T1) args[0], (T2) args[1]);</span>
+            }
+        });
+    }
+
+    /**
+     * Returns a Single that emits the results of a specified combiner function applied to three items emitted
+     * by three other Singles.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;380&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.zip.png&quot; alt=&quot;&quot;&gt;
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code zip} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param s1
+     *            the first source Single
+     * @param s2
+     *            a second source Single
+     * @param s3
+     *            a third source Single
+     * @param zipFunction
+     *            a function that, when applied to the item emitted by each of the source Singles, results in an
+     *            item that will be emitted by the resulting Single
+     * @return a Single that emits the zipped results
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/zip.html&quot;&gt;ReactiveX operators documentation: Zip&lt;/a&gt;
+     */
+    public static &lt;T1, T2, T3, R&gt; Single&lt;R&gt; zip(Single&lt;? extends T1&gt; s1, Single&lt;? extends T2&gt; s2, Single&lt;? extends T3&gt; s3, final Func3&lt;? super T1, ? super T2, ? super T3, ? extends R&gt; zipFunction) {
+<span class="fc" id="L984">        return SingleOperatorZip.zip(new Single&lt;?&gt;[] {s1, s2, s3}, new FuncN&lt;R&gt;() {</span>
+            @Override
+            public R call(Object... args) {
+<span class="fc" id="L987">                return zipFunction.call((T1) args[0], (T2) args[1], (T3) args[2]);</span>
+            }
+        });
+    }
+
+    /**
+     * Returns an Observable that emits the results of a specified combiner function applied to four items
+     * emitted by four other Singles.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;380&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.zip.png&quot; alt=&quot;&quot;&gt;
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code zip} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param s1
+     *            the first source Single
+     * @param s2
+     *            a second source Single
+     * @param s3
+     *            a third source Single
+     * @param s4
+     *            a fourth source Single
+     * @param zipFunction
+     *            a function that, when applied to the item emitted by each of the source Singles, results in an
+     *            item that will be emitted by the resulting Single
+     * @return a Single that emits the zipped results
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/zip.html&quot;&gt;ReactiveX operators documentation: Zip&lt;/a&gt;
+     */
+    public static &lt;T1, T2, T3, T4, R&gt; Single&lt;R&gt; zip(Single&lt;? extends T1&gt; s1, Single&lt;? extends T2&gt; s2, Single&lt;? extends T3&gt; s3, Single&lt;? extends T4&gt; s4, final Func4&lt;? super T1, ? super T2, ? super T3, ? super T4, ? extends R&gt; zipFunction) {
+<span class="fc" id="L1017">        return SingleOperatorZip.zip(new Single&lt;?&gt;[] {s1, s2, s3, s4}, new FuncN&lt;R&gt;() {</span>
+            @Override
+            public R call(Object... args) {
+<span class="fc" id="L1020">                return zipFunction.call((T1) args[0], (T2) args[1], (T3) args[2], (T4) args[3]);</span>
+            }
+        });
+    }
+
+    /**
+     * Returns an Observable that emits the results of a specified combiner function applied to five items
+     * emitted by five other Singles.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;380&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.zip.png&quot; alt=&quot;&quot;&gt;
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code zip} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param s1
+     *            the first source Single
+     * @param s2
+     *            a second source Single
+     * @param s3
+     *            a third source Single
+     * @param s4
+     *            a fourth source Single
+     * @param s5
+     *            a fifth source Single
+     * @param zipFunction
+     *            a function that, when applied to the item emitted by each of the source Singles, results in an
+     *            item that will be emitted by the resulting Single
+     * @return a Single that emits the zipped results
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/zip.html&quot;&gt;ReactiveX operators documentation: Zip&lt;/a&gt;
+     */
+    public static &lt;T1, T2, T3, T4, T5, R&gt; Single&lt;R&gt; zip(Single&lt;? extends T1&gt; s1, Single&lt;? extends T2&gt; s2, Single&lt;? extends T3&gt; s3, Single&lt;? extends T4&gt; s4, Single&lt;? extends T5&gt; s5, final Func5&lt;? super T1, ? super T2, ? super T3, ? super T4, ? super T5, ? extends R&gt; zipFunction) {
+<span class="fc" id="L1052">        return SingleOperatorZip.zip(new Single&lt;?&gt;[] {s1, s2, s3, s4, s5}, new FuncN&lt;R&gt;() {</span>
+            @Override
+            public R call(Object... args) {
+<span class="fc" id="L1055">                return zipFunction.call((T1) args[0], (T2) args[1], (T3) args[2], (T4) args[3], (T5) args[4]);</span>
+            }
+        });
+    }
+
+    /**
+     * Returns an Observable that emits the results of a specified combiner function applied to six items
+     * emitted by six other Singles.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;380&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.zip.png&quot; alt=&quot;&quot;&gt;
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code zip} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param s1
+     *            the first source Single
+     * @param s2
+     *            a second source Single
+     * @param s3
+     *            a third source Single
+     * @param s4
+     *            a fourth source Single
+     * @param s5
+     *            a fifth source Single
+     * @param s6
+     *            a sixth source Single
+     * @param zipFunction
+     *            a function that, when applied to the item emitted by each of the source Singles, results in an
+     *            item that will be emitted by the resulting Single
+     * @return a Single that emits the zipped results
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/zip.html&quot;&gt;ReactiveX operators documentation: Zip&lt;/a&gt;
+     */
+    public static &lt;T1, T2, T3, T4, T5, T6, R&gt; Single&lt;R&gt; zip(Single&lt;? extends T1&gt; s1, Single&lt;? extends T2&gt; s2, Single&lt;? extends T3&gt; s3, Single&lt;? extends T4&gt; s4, Single&lt;? extends T5&gt; s5, Single&lt;? extends T6&gt; s6,
+                                                            final Func6&lt;? super T1, ? super T2, ? super T3, ? super T4, ? super T5, ? super T6, ? extends R&gt; zipFunction) {
+<span class="fc" id="L1090">        return SingleOperatorZip.zip(new Single&lt;?&gt;[] {s1, s2, s3, s4, s5, s6}, new FuncN&lt;R&gt;() {</span>
+            @Override
+            public R call(Object... args) {
+<span class="fc" id="L1093">                return zipFunction.call((T1) args[0], (T2) args[1], (T3) args[2], (T4) args[3], (T5) args[4], (T6) args[5]);</span>
+            }
+        });
+    }
+
+    /**
+     * Returns an Observable that emits the results of a specified combiner function applied to seven items
+     * emitted by seven other Singles.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;380&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.zip.png&quot; alt=&quot;&quot;&gt;
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code zip} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param s1
+     *            the first source Single
+     * @param s2
+     *            a second source Single
+     * @param s3
+     *            a third source Single
+     * @param s4
+     *            a fourth source Single
+     * @param s5
+     *            a fifth source Single
+     * @param s6
+     *            a sixth source Single
+     * @param s7
+     *            a seventh source Single
+     * @param zipFunction
+     *            a function that, when applied to the item emitted by each of the source Singles, results in an
+     *            item that will be emitted by the resulting Single
+     * @return a Single that emits the zipped results
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/zip.html&quot;&gt;ReactiveX operators documentation: Zip&lt;/a&gt;
+     */
+    public static &lt;T1, T2, T3, T4, T5, T6, T7, R&gt; Single&lt;R&gt; zip(Single&lt;? extends T1&gt; s1, Single&lt;? extends T2&gt; s2, Single&lt;? extends T3&gt; s3, Single&lt;? extends T4&gt; s4, Single&lt;? extends T5&gt; s5, Single&lt;? extends T6&gt; s6, Single&lt;? extends T7&gt; s7,
+                                                                final Func7&lt;? super T1, ? super T2, ? super T3, ? super T4, ? super T5, ? super T6, ? super T7, ? extends R&gt; zipFunction) {
+<span class="fc" id="L1130">        return SingleOperatorZip.zip(new Single&lt;?&gt;[] {s1, s2, s3, s4, s5, s6, s7}, new FuncN&lt;R&gt;() {</span>
+            @Override
+            public R call(Object... args) {
+<span class="fc" id="L1133">                return zipFunction.call((T1) args[0], (T2) args[1], (T3) args[2], (T4) args[3], (T5) args[4], (T6) args[5], (T7) args[6]);</span>
+            }
+        });
+    }
+
+    /**
+     * Returns an Observable that emits the results of a specified combiner function applied to eight items
+     * emitted by eight other Singles.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;380&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.zip.png&quot; alt=&quot;&quot;&gt;
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code zip} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param s1
+     *            the first source Single
+     * @param s2
+     *            a second source Single
+     * @param s3
+     *            a third source Single
+     * @param s4
+     *            a fourth source Single
+     * @param s5
+     *            a fifth source Single
+     * @param s6
+     *            a sixth source Single
+     * @param s7
+     *            a seventh source Single
+     * @param s8
+     *            an eighth source Single
+     * @param zipFunction
+     *            a function that, when applied to the item emitted by each of the source Singles, results in an
+     *            item that will be emitted by the resulting Single
+     * @return a Single that emits the zipped results
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/zip.html&quot;&gt;ReactiveX operators documentation: Zip&lt;/a&gt;
+     */
+    public static &lt;T1, T2, T3, T4, T5, T6, T7, T8, R&gt; Single&lt;R&gt; zip(Single&lt;? extends T1&gt; s1, Single&lt;? extends T2&gt; s2, Single&lt;? extends T3&gt; s3, Single&lt;? extends T4&gt; s4, Single&lt;? extends T5&gt; s5, Single&lt;? extends T6&gt; s6, Single&lt;? extends T7&gt; s7, Single&lt;? extends T8&gt; s8,
+                                                                    final Func8&lt;? super T1, ? super T2, ? super T3, ? super T4, ? super T5, ? super T6, ? super T7, ? super T8, ? extends R&gt; zipFunction) {
+<span class="fc" id="L1172">        return SingleOperatorZip.zip(new Single&lt;?&gt;[] {s1, s2, s3, s4, s5, s6, s7, s8}, new FuncN&lt;R&gt;() {</span>
+            @Override
+            public R call(Object... args) {
+<span class="fc" id="L1175">                return zipFunction.call((T1) args[0], (T2) args[1], (T3) args[2], (T4) args[3], (T5) args[4], (T6) args[5], (T7) args[6], (T8) args[7]);</span>
+            }
+        });
+    }
+
+    /**
+     * Returns an Observable that emits the results of a specified combiner function applied to nine items
+     * emitted by nine other Singles.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;380&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.zip.png&quot; alt=&quot;&quot;&gt;
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code zip} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param s1
+     *            the first source Single
+     * @param s2
+     *            a second source Single
+     * @param s3
+     *            a third source Single
+     * @param s4
+     *            a fourth source Single
+     * @param s5
+     *            a fifth source Single
+     * @param s6
+     *            a sixth source Single
+     * @param s7
+     *            a seventh source Single
+     * @param s8
+     *            an eighth source Single
+     * @param s9
+     *            a ninth source Single
+     * @param zipFunction
+     *            a function that, when applied to the item emitted by each of the source Singles, results in an
+     *            item that will be emitted by the resulting Single
+     * @return a Single that emits the zipped results
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/zip.html&quot;&gt;ReactiveX operators documentation: Zip&lt;/a&gt;
+     */
+    public static &lt;T1, T2, T3, T4, T5, T6, T7, T8, T9, R&gt; Single&lt;R&gt; zip(Single&lt;? extends T1&gt; s1, Single&lt;? extends T2&gt; s2, Single&lt;? extends T3&gt; s3, Single&lt;? extends T4&gt; s4, Single&lt;? extends T5&gt; s5, Single&lt;? extends T6&gt; s6, Single&lt;? extends T7&gt; s7, Single&lt;? extends T8&gt; s8,
+                                                                        Single&lt;? extends T9&gt; s9, final Func9&lt;? super T1, ? super T2, ? super T3, ? super T4, ? super T5, ? super T6, ? super T7, ? super T8, ? super T9, ? extends R&gt; zipFunction) {
+<span class="fc" id="L1216">        return SingleOperatorZip.zip(new Single&lt;?&gt;[] {s1, s2, s3, s4, s5, s6, s7, s8, s9}, new FuncN&lt;R&gt;() {</span>
+            @Override
+            public R call(Object... args) {
+<span class="fc" id="L1219">                return zipFunction.call((T1) args[0], (T2) args[1], (T3) args[2], (T4) args[3], (T5) args[4], (T6) args[5], (T7) args[6], (T8) args[7], (T9) args[8]);</span>
+            }
+        });
+    }
+
+    /**
+     * Returns a Single that emits the result of specified combiner function applied to combination of
+     * items emitted, in sequence, by an Iterable of other Singles.
+     * &lt;p&gt;
+     * {@code zip} applies this function in strict sequence.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;380&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/zip.png&quot; alt=&quot;&quot;&gt;
+     * &lt;dl&gt;
+     *  &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     *  &lt;dd&gt;{@code zip} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     *
+     * @param singles
+     *            an Iterable of source Singles
+     * @param zipFunction
+     *            a function that, when applied to an item emitted by each of the source Singles, results in
+     *            an item that will be emitted by the resulting Single
+     * @return a Single that emits the zipped results
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/zip.html&quot;&gt;ReactiveX operators documentation: Zip&lt;/a&gt;
+     */
+    public static &lt;R&gt; Single&lt;R&gt; zip(Iterable&lt;? extends Single&lt;?&gt;&gt; singles, FuncN&lt;? extends R&gt; zipFunction) {
+<span class="fc" id="L1245">        return SingleOperatorZip.zip(iterableToArray(singles), zipFunction);</span>
+    }
+
+    /**
+     * Returns an Observable that emits the item emitted by the source Single, then the item emitted by the
+     * specified Single.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;335&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.concatWith.png&quot; alt=&quot;&quot;&gt;
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code concat} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param t1
+     *            a Single to be concatenated after the current
+     * @return an Observable that emits the item emitted by the source Single, followed by the item emitted by
+     *         {@code t1}
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/concat.html&quot;&gt;ReactiveX operators documentation: Concat&lt;/a&gt;
+     */
+    public final Observable&lt;T&gt; concatWith(Single&lt;? extends T&gt; t1) {
+<span class="nc" id="L1265">        return concat(this, t1);</span>
+    }
+
+    /**
+     * Returns a Single that is based on applying a specified function to the item emitted by the source Single,
+     * where that function returns a Single.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;300&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.flatMap.png&quot; alt=&quot;&quot;&gt;
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code flatMap} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param func
+     *            a function that, when applied to the item emitted by the source Single, returns a Single
+     * @return the Single returned from {@code func} when applied to the item emitted by the source Single
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/flatmap.html&quot;&gt;ReactiveX operators documentation: FlatMap&lt;/a&gt;
+     */
+    public final &lt;R&gt; Single&lt;R&gt; flatMap(final Func1&lt;? super T, ? extends Single&lt;? extends R&gt;&gt; func) {
+<span class="pc bpc" id="L1284" title="1 of 2 branches missed.">        if (this instanceof ScalarSynchronousSingle) {</span>
+<span class="fc" id="L1285">            return ((ScalarSynchronousSingle&lt;T&gt;) this).scalarFlatMap(func);</span>
+        }
+<span class="nc" id="L1287">        return merge(map(func));</span>
+    }
+
+    /**
+     * Returns an Observable that emits items based on applying a specified function to the item emitted by the
+     * source Observable, where that function returns an Observable.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;305&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.flatMapObservable.png&quot; alt=&quot;&quot;&gt;
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code flatMapObservable} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param func
+     *            a function that, when applied to the item emitted by the source Single, returns an
+     *            Observable
+     * @return the Observable returned from {@code func} when applied to the item emitted by the source Single
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/flatmap.html&quot;&gt;ReactiveX operators documentation: FlatMap&lt;/a&gt;
+     */
+    public final &lt;R&gt; Observable&lt;R&gt; flatMapObservable(Func1&lt;? super T, ? extends Observable&lt;? extends R&gt;&gt; func) {
+<span class="nc" id="L1307">        return Observable.merge(asObservable(map(func)));</span>
+    }
+
+    /**
+     * Returns a Single that applies a specified function to the item emitted by the source Single and
+     * emits the result of this function application.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;305&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.map.png&quot; alt=&quot;&quot;&gt;
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code map} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     *
+     * @param func
+     *            a function to apply to the item emitted by the Single
+     * @return a Single that emits the item from the source Single, transformed by the specified function
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/map.html&quot;&gt;ReactiveX operators documentation: Map&lt;/a&gt;
+     */
+    public final &lt;R&gt; Single&lt;R&gt; map(Func1&lt;? super T, ? extends R&gt; func) {
+<span class="fc" id="L1326">        return lift(new OperatorMap&lt;T, R&gt;(func));</span>
+    }
+
+    /**
+     * Flattens this and another Single into a single Observable, without any transformation.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;380&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.merge.png&quot; alt=&quot;&quot;&gt;
+     * &lt;p&gt;
+     * You can combine items emitted by multiple Singles so that they appear as a single Observable, by using
+     * the {@code mergeWith} method.
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code mergeWith} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param t1
+     *            a Single to be merged
+     * @return an Observable that emits all of the items emitted by the source Singles
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/merge.html&quot;&gt;ReactiveX operators documentation: Merge&lt;/a&gt;
+     */
+    public final Observable&lt;T&gt; mergeWith(Single&lt;? extends T&gt; t1) {
+<span class="fc" id="L1347">        return merge(this, t1);</span>
+    }
+
+    /**
+     * Modifies a Single to emit its item (or notify of its error) on a specified {@link Scheduler},
+     * asynchronously.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;305&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.observeOn.png&quot; alt=&quot;&quot;&gt;
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;you specify which {@link Scheduler} this operator will use&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param scheduler
+     *            the {@link Scheduler} to notify subscribers on
+     * @return the source Single modified so that its subscribers are notified on the specified
+     *         {@link Scheduler}
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/observeon.html&quot;&gt;ReactiveX operators documentation: ObserveOn&lt;/a&gt;
+     * @see &lt;a href=&quot;http://www.grahamlea.com/2014/07/rxjava-threading-examples/&quot;&gt;RxJava Threading Examples&lt;/a&gt;
+     * @see #subscribeOn
+     */
+    public final Single&lt;T&gt; observeOn(Scheduler scheduler) {
+<span class="fc bfc" id="L1369" title="All 2 branches covered.">        if (this instanceof ScalarSynchronousSingle) {</span>
+<span class="fc" id="L1370">            return ((ScalarSynchronousSingle&lt;T&gt;)this).scalarScheduleOn(scheduler);</span>
+        }
+        // Note that since Single emits onSuccess xor onError, 
+        // there is no cut-ahead possible like with regular Observable sequences.
+<span class="fc" id="L1374">        return lift(new OperatorObserveOn&lt;T&gt;(scheduler, false));</span>
+    }
+
+    /**
+     * Instructs a Single to emit an item (returned by a specified function) rather than invoking
+     * {@link SingleSubscriber#onError onError} if it encounters an error.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;310&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.onErrorReturn.png&quot; alt=&quot;&quot;&gt;
+     * &lt;p&gt;
+     * By default, when a Single encounters an error that prevents it from emitting the expected item to its
+     * subscriber, the Single invokes its subscriber's {@link Subscriber#onError} method, and then quits
+     * without invoking any more of its subscriber's methods. The {@code onErrorReturn} method changes this
+     * behavior. If you pass a function ({@code resumeFunction}) to a Single's {@code onErrorReturn} method, if
+     * the original Single encounters an error, instead of invoking its subscriber's
+     * {@link Subscriber#onError} method, it will instead emit the return value of {@code resumeFunction}.
+     * &lt;p&gt;
+     * You can use this to prevent errors from propagating or to supply fallback data should errors be
+     * encountered.
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code onErrorReturn} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param resumeFunction
+     *            a function that returns an item that the new Single will emit if the source Single encounters
+     *            an error
+     * @return the original Single with appropriately modified behavior
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/catch.html&quot;&gt;ReactiveX operators documentation: Catch&lt;/a&gt;
+     */
+    public final Single&lt;T&gt; onErrorReturn(Func1&lt;Throwable, ? extends T&gt; resumeFunction) {
+<span class="nc" id="L1404">        return lift(OperatorOnErrorResumeNextViaFunction.withSingle(resumeFunction));</span>
+    }
+
+    /**
+     * Instructs a Single to pass control to another Single rather than invoking
+     * {@link Observer#onError(Throwable)} if it encounters an error.
+     * &lt;p/&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;310&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/onErrorResumeNext.png&quot; alt=&quot;&quot;&gt;
+     * &lt;p/&gt;
+     * By default, when a Single encounters an error that prevents it from emitting the expected item to
+     * its {@link Observer}, the Single invokes its Observer's {@code onError} method, and then quits
+     * without invoking any more of its Observer's methods. The {@code onErrorResumeNext} method changes this
+     * behavior. If you pass another Single ({@code resumeSingleInCaseOfError}) to an Single's
+     * {@code onErrorResumeNext} method, if the original Single encounters an error, instead of invoking its
+     * Observer's {@code onError} method, it will instead relinquish control to {@code resumeSingleInCaseOfError} which
+     * will invoke the Observer's {@link Observer#onNext onNext} method if it is able to do so. In such a case,
+     * because no Single necessarily invokes {@code onError}, the Observer may never know that an error
+     * happened.
+     * &lt;p/&gt;
+     * You can use this to prevent errors from propagating or to supply fallback data should errors be
+     * encountered.
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code onErrorResumeNext} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     *
+     * @param resumeSingleInCaseOfError a Single that will take control if source Single encounters an error.
+     * @return the original Single, with appropriately modified behavior.
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/catch.html&quot;&gt;ReactiveX operators documentation: Catch&lt;/a&gt;
+     */
+    public final Single&lt;T&gt; onErrorResumeNext(Single&lt;? extends T&gt; resumeSingleInCaseOfError) {
+<span class="fc" id="L1435">        return new Single&lt;T&gt;(new SingleOperatorOnErrorResumeNextViaSingle&lt;T&gt;(this, resumeSingleInCaseOfError));</span>
+    }
+
+    /**
+     * Subscribes to a Single but ignore its emission or notification.
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code subscribe} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @return a {@link Subscription} reference can request the {@link Single} stop work.
+     * @throws OnErrorNotImplementedException
+     *             if the Single tries to call {@link Subscriber#onError}
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/subscribe.html&quot;&gt;ReactiveX operators documentation: Subscribe&lt;/a&gt;
+     */
+    public final Subscription subscribe() {
+<span class="fc" id="L1451">        return subscribe(new Subscriber&lt;T&gt;() {</span>
+
+            @Override
+            public final void onCompleted() {
+                // do nothing
+<span class="fc" id="L1456">            }</span>
+
+            @Override
+            public final void onError(Throwable e) {
+<span class="nc" id="L1460">                throw new OnErrorNotImplementedException(e);</span>
+            }
+
+            @Override
+            public final void onNext(T args) {
+                // do nothing
+<span class="fc" id="L1466">            }</span>
+
+        });
+    }
+
+    /**
+     * Subscribes to a Single and provides a callback to handle the item it emits.
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code subscribe} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param onSuccess
+     *            the {@code Action1&lt;T&gt;} you have designed to accept the emission from the Single
+     * @return a {@link Subscription} reference can request the {@link Single} stop work.
+     * @throws IllegalArgumentException
+     *             if {@code onNext} is null
+     * @throws OnErrorNotImplementedException
+     *             if the Single tries to call {@link Subscriber#onError}
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/subscribe.html&quot;&gt;ReactiveX operators documentation: Subscribe&lt;/a&gt;
+     */
+    public final Subscription subscribe(final Action1&lt;? super T&gt; onSuccess) {
+<span class="nc bnc" id="L1488" title="All 2 branches missed.">        if (onSuccess == null) {</span>
+<span class="nc" id="L1489">            throw new IllegalArgumentException(&quot;onSuccess can not be null&quot;);</span>
+        }
+
+<span class="nc" id="L1492">        return subscribe(new Subscriber&lt;T&gt;() {</span>
+
+            @Override
+            public final void onCompleted() {
+                // do nothing
+<span class="nc" id="L1497">            }</span>
+
+            @Override
+            public final void onError(Throwable e) {
+<span class="nc" id="L1501">                throw new OnErrorNotImplementedException(e);</span>
+            }
+
+            @Override
+            public final void onNext(T args) {
+<span class="nc" id="L1506">                onSuccess.call(args);</span>
+<span class="nc" id="L1507">            }</span>
+
+        });
+    }
+
+    /**
+     * Subscribes to a Single and provides callbacks to handle the item it emits or any error notification it
+     * issues.
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code subscribe} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param onSuccess
+     *            the {@code Action1&lt;T&gt;} you have designed to accept the emission from the Single
+     * @param onError
+     *            the {@code Action1&lt;Throwable&gt;} you have designed to accept any error notification from the
+     *            Single
+     * @return a {@link Subscription} reference can request the {@link Single} stop work.
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/subscribe.html&quot;&gt;ReactiveX operators documentation: Subscribe&lt;/a&gt;
+     * @throws IllegalArgumentException
+     *             if {@code onNext} is null, or
+     *             if {@code onError} is null
+     */
+    public final Subscription subscribe(final Action1&lt;? super T&gt; onSuccess, final Action1&lt;Throwable&gt; onError) {
+<span class="nc bnc" id="L1532" title="All 2 branches missed.">        if (onSuccess == null) {</span>
+<span class="nc" id="L1533">            throw new IllegalArgumentException(&quot;onSuccess can not be null&quot;);</span>
+        }
+<span class="nc bnc" id="L1535" title="All 2 branches missed.">        if (onError == null) {</span>
+<span class="nc" id="L1536">            throw new IllegalArgumentException(&quot;onError can not be null&quot;);</span>
+        }
+
+<span class="nc" id="L1539">        return subscribe(new Subscriber&lt;T&gt;() {</span>
+
+            @Override
+            public final void onCompleted() {
+                // do nothing
+<span class="nc" id="L1544">            }</span>
+
+            @Override
+            public final void onError(Throwable e) {
+<span class="nc" id="L1548">                onError.call(e);</span>
+<span class="nc" id="L1549">            }</span>
+
+            @Override
+            public final void onNext(T args) {
+<span class="nc" id="L1553">                onSuccess.call(args);</span>
+<span class="nc" id="L1554">            }</span>
+
+        });
+    }
+
+    /**
+     * Subscribes to a Single and invokes the {@link OnSubscribe} function without any contract protection,
+     * error handling, unsubscribe, or execution hooks.
+     * &lt;p&gt;
+     * Use this only for implementing an {@link Operator} that requires nested subscriptions. For other
+     * purposes, use {@link #subscribe(Subscriber)} which ensures the Rx contract and other functionality.
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code unsafeSubscribe} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param subscriber
+     *            the Subscriber that will handle the emission or notification from the Single
+     */
+    public final void unsafeSubscribe(Subscriber&lt;? super T&gt; subscriber) {
+        try {
+            // new Subscriber so onStart it
+<span class="fc" id="L1576">            subscriber.onStart();</span>
+            // TODO add back the hook
+            //            hook.onSubscribeStart(this, onSubscribe).call(subscriber);
+<span class="fc" id="L1579">            onSubscribe.call(subscriber);</span>
+<span class="fc" id="L1580">            hook.onSubscribeReturn(subscriber);</span>
+<span class="fc" id="L1581">        } catch (Throwable e) {</span>
+            // special handling for certain Throwable/Error/Exception types
+<span class="fc" id="L1583">            Exceptions.throwIfFatal(e);</span>
+            // if an unhandled error occurs executing the onSubscribe we will propagate it
+            try {
+<span class="nc" id="L1586">                subscriber.onError(hook.onSubscribeError(e));</span>
+<span class="nc" id="L1587">            } catch (Throwable e2) {</span>
+<span class="nc" id="L1588">                Exceptions.throwIfFatal(e2);</span>
+                // if this happens it means the onError itself failed (perhaps an invalid function implementation)
+                // so we are unable to propagate the error correctly and will just throw
+<span class="nc" id="L1591">                RuntimeException r = new RuntimeException(&quot;Error occurred attempting to subscribe [&quot; + e.getMessage() + &quot;] and then again while trying to pass to onError.&quot;, e2);</span>
+                // TODO could the hook be the cause of the error in the on error handling.
+<span class="nc" id="L1593">                hook.onSubscribeError(r);</span>
+                // TODO why aren't we throwing the hook's return value.
+<span class="nc" id="L1595">                throw r;</span>
+<span class="nc" id="L1596">            }</span>
+<span class="fc" id="L1597">        }</span>
+<span class="fc" id="L1598">    }</span>
+
+    /**
+     * Subscribes to a Single and provides a Subscriber that implements functions to handle the item the Single
+     * emits or any error notification it issues.
+     * &lt;p&gt;
+     * A typical implementation of {@code subscribe} does the following:
+     * &lt;ol&gt;
+     * &lt;li&gt;It stores a reference to the Subscriber in a collection object, such as a {@code List&lt;T&gt;} object.&lt;/li&gt;
+     * &lt;li&gt;It returns a reference to the {@link Subscription} interface. This enables Subscribers to
+     * unsubscribe, that is, to stop receiving the item or notification before the Single completes.&lt;/li&gt;
+     * &lt;/ol&gt;&lt;p&gt;
+     * A {@code Single&lt;T&gt;} instance is responsible for accepting all subscriptions and notifying all
+     * Subscribers. Unless the documentation for a particular {@code Single&lt;T&gt;} implementation indicates
+     * otherwise, Subscribers should make no assumptions about the order in which multiple Subscribers will
+     * receive their notifications.
+     * &lt;p&gt;
+     * For more information see the
+     * &lt;a href=&quot;http://reactivex.io/documentation/observable.html&quot;&gt;ReactiveX documentation&lt;/a&gt;.
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code subscribe} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param subscriber
+     *            the {@link Subscriber} that will handle the emission or notification from the Single
+     * @return a {@link Subscription} reference can request the {@link Single} stop work.
+     * @throws IllegalStateException
+     *             if {@code subscribe} is unable to obtain an {@code OnSubscribe&lt;&gt;} function
+     * @throws IllegalArgumentException
+     *             if the {@link Subscriber} provided as the argument to {@code subscribe} is {@code null}
+     * @throws OnErrorNotImplementedException
+     *             if the {@link Subscriber}'s {@code onError} method is null
+     * @throws RuntimeException
+     *             if the {@link Subscriber}'s {@code onError} method itself threw a {@code Throwable}
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/subscribe.html&quot;&gt;ReactiveX operators documentation: Subscribe&lt;/a&gt;
+     */
+    public final Subscription subscribe(Subscriber&lt;? super T&gt; subscriber) {
+        // validate and proceed
+<span class="pc bpc" id="L1637" title="1 of 2 branches missed.">        if (subscriber == null) {</span>
+<span class="nc" id="L1638">            throw new IllegalArgumentException(&quot;observer can not be null&quot;);</span>
+        }
+<span class="pc bpc" id="L1640" title="1 of 2 branches missed.">        if (onSubscribe == null) {</span>
+<span class="nc" id="L1641">            throw new IllegalStateException(&quot;onSubscribe function can not be null.&quot;);</span>
+            /*
+             * the subscribe function can also be overridden but generally that's not the appropriate approach
+             * so I won't mention that in the exception
+             */
+        }
+
+        // new Subscriber so onStart it
+<span class="fc" id="L1649">        subscriber.onStart();</span>
+
+        /*
+         * See https://github.com/ReactiveX/RxJava/issues/216 for discussion on &quot;Guideline 6.4: Protect calls
+         * to user code from within an Observer&quot;
+         */
+        // if not already wrapped
+<span class="pc bpc" id="L1656" title="1 of 2 branches missed.">        if (!(subscriber instanceof SafeSubscriber)) {</span>
+            // assign to `observer` so we return the protected version
+<span class="fc" id="L1658">            subscriber = new SafeSubscriber&lt;T&gt;(subscriber);</span>
+        }
+
+        // The code below is exactly the same an unsafeSubscribe but not used because it would add a sigificent depth to alreay huge call stacks.
+        try {
+            // allow the hook to intercept and/or decorate
+            // TODO add back the hook
+            //            hook.onSubscribeStart(this, onSubscribe).call(subscriber);
+<span class="fc" id="L1666">            onSubscribe.call(subscriber);</span>
+<span class="fc" id="L1667">            return hook.onSubscribeReturn(subscriber);</span>
+<span class="fc" id="L1668">        } catch (Throwable e) {</span>
+            // special handling for certain Throwable/Error/Exception types
+<span class="fc" id="L1670">            Exceptions.throwIfFatal(e);</span>
+            // if an unhandled error occurs executing the onSubscribe we will propagate it
+            try {
+<span class="fc" id="L1673">                subscriber.onError(hook.onSubscribeError(e));</span>
+<span class="nc" id="L1674">            } catch (Throwable e2) {</span>
+<span class="nc" id="L1675">                Exceptions.throwIfFatal(e2);</span>
+                // if this happens it means the onError itself failed (perhaps an invalid function implementation)
+                // so we are unable to propagate the error correctly and will just throw
+<span class="nc" id="L1678">                RuntimeException r = new RuntimeException(&quot;Error occurred attempting to subscribe [&quot; + e.getMessage() + &quot;] and then again while trying to pass to onError.&quot;, e2);</span>
+                // TODO could the hook be the cause of the error in the on error handling.
+<span class="nc" id="L1680">                hook.onSubscribeError(r);</span>
+                // TODO why aren't we throwing the hook's return value.
+<span class="nc" id="L1682">                throw r;</span>
+<span class="fc" id="L1683">            }</span>
+<span class="fc" id="L1684">            return Subscriptions.empty();</span>
+        }
+    }
+
+    /**
+     * Subscribes to a Single and provides a {@link SingleSubscriber} that implements functions to handle the
+     * item the Single emits or any error notification it issues.
+     * &lt;p&gt;
+     * A typical implementation of {@code subscribe} does the following:
+     * &lt;ol&gt;
+     * &lt;li&gt;It stores a reference to the Subscriber in a collection object, such as a {@code List&lt;T&gt;} object.&lt;/li&gt;
+     * &lt;li&gt;It returns a reference to the {@link Subscription} interface. This enables Subscribers to
+     * unsubscribe, that is, to stop receiving the item or notification before the Single completes.&lt;/li&gt;
+     * &lt;/ol&gt;&lt;p&gt;
+     * A {@code Single&lt;T&gt;} instance is responsible for accepting all subscriptions and notifying all
+     * Subscribers. Unless the documentation for a particular {@code Single&lt;T&gt;} implementation indicates
+     * otherwise, Subscribers should make no assumptions about the order in which multiple Subscribers will
+     * receive their notifications.
+     * &lt;p&gt;
+     * For more information see the
+     * &lt;a href=&quot;http://reactivex.io/documentation/observable.html&quot;&gt;ReactiveX documentation&lt;/a&gt;.
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code subscribe} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param te
+     *            the {@link SingleSubscriber} that will handle the emission or notification from the Single
+     * @return a {@link Subscription} reference can request the {@link Single} stop work.
+     * @throws IllegalStateException
+     *             if {@code subscribe} is unable to obtain an {@code OnSubscribe&lt;&gt;} function
+     * @throws IllegalArgumentException
+     *             if the {@link SingleSubscriber} provided as the argument to {@code subscribe} is {@code null}
+     * @throws OnErrorNotImplementedException
+     *             if the {@link SingleSubscriber}'s {@code onError} method is null
+     * @throws RuntimeException
+     *             if the {@link SingleSubscriber}'s {@code onError} method itself threw a {@code Throwable}
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/subscribe.html&quot;&gt;ReactiveX operators documentation: Subscribe&lt;/a&gt;
+     */
+    public final Subscription subscribe(final SingleSubscriber&lt;? super T&gt; te) {
+<span class="fc" id="L1724">        Subscriber&lt;T&gt; s = new Subscriber&lt;T&gt;() {</span>
+
+            @Override
+            public void onCompleted() {
+
+<span class="fc" id="L1729">            }</span>
+
+            @Override
+            public void onError(Throwable e) {
+<span class="fc" id="L1733">                te.onError(e);</span>
+<span class="fc" id="L1734">            }</span>
+
+            @Override
+            public void onNext(T t) {
+<span class="fc" id="L1738">                te.onSuccess(t);</span>
+<span class="fc" id="L1739">            }</span>
+
+        };
+<span class="fc" id="L1742">        te.add(s);</span>
+<span class="fc" id="L1743">        subscribe(s);</span>
+<span class="fc" id="L1744">        return s;</span>
+    }
+
+    /**
+     * Asynchronously subscribes subscribers to this Single on the specified {@link Scheduler}.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;305&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.subscribeOn.png&quot; alt=&quot;&quot;&gt;
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;you specify which {@link Scheduler} this operator will use&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param scheduler
+     *            the {@link Scheduler} to perform subscription actions on
+     * @return the source Single modified so that its subscriptions happen on the specified {@link Scheduler}
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/subscribeon.html&quot;&gt;ReactiveX operators documentation: SubscribeOn&lt;/a&gt;
+     * @see &lt;a href=&quot;http://www.grahamlea.com/2014/07/rxjava-threading-examples/&quot;&gt;RxJava Threading Examples&lt;/a&gt;
+     * @see #observeOn
+     */
+    public final Single&lt;T&gt; subscribeOn(final Scheduler scheduler) {
+<span class="fc bfc" id="L1764" title="All 2 branches covered.">        if (this instanceof ScalarSynchronousSingle) {</span>
+<span class="fc" id="L1765">            return ((ScalarSynchronousSingle&lt;T&gt;)this).scalarScheduleOn(scheduler);</span>
+        }
+<span class="fc" id="L1767">        return create(new OnSubscribe&lt;T&gt;() {</span>
+            @Override
+            public void call(final SingleSubscriber&lt;? super T&gt; t) {
+<span class="fc" id="L1770">                final Scheduler.Worker w = scheduler.createWorker();</span>
+<span class="fc" id="L1771">                t.add(w);</span>
+
+<span class="fc" id="L1773">                w.schedule(new Action0() {</span>
+                    @Override
+                    public void call() {
+<span class="fc" id="L1776">                        SingleSubscriber&lt;T&gt; ssub = new SingleSubscriber&lt;T&gt;() {</span>
+                            @Override
+                            public void onSuccess(T value) {
+                                try {
+<span class="nc" id="L1780">                                    t.onSuccess(value);</span>
+                                } finally {
+<span class="nc" id="L1782">                                    w.unsubscribe();</span>
+<span class="nc" id="L1783">                                }</span>
+<span class="nc" id="L1784">                            }</span>
+
+                            @Override
+                            public void onError(Throwable error) {
+                                try {
+<span class="nc" id="L1789">                                    t.onError(error);</span>
+                                } finally {
+<span class="nc" id="L1791">                                    w.unsubscribe();</span>
+<span class="nc" id="L1792">                                }</span>
+<span class="nc" id="L1793">                            }</span>
+                        };
+
+<span class="fc" id="L1796">                        t.add(ssub);</span>
+
+<span class="fc" id="L1798">                        Single.this.subscribe(ssub);</span>
+<span class="fc" id="L1799">                    }</span>
+                });
+<span class="fc" id="L1801">            }</span>
+        });
+    }
+
+    /**
+     * Returns a Single that emits the item emitted by the source Single until a Completable terminates. Upon
+     * termination of {@code other}, this will emit a {@link CancellationException} rather than go to
+     * {@link SingleSubscriber#onSuccess(Object)}.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;380&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/takeUntil.png&quot; alt=&quot;&quot;&gt;
+     * &lt;dl&gt;
+     *  &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     *  &lt;dd&gt;{@code takeUntil} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     *
+     * @param other
+     *            the Completable whose termination will cause {@code takeUntil} to emit the item from the source
+     *            Single
+     * @return a Single that emits the item emitted by the source Single until such time as {@code other} terminates.
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/takeuntil.html&quot;&gt;ReactiveX operators documentation: TakeUntil&lt;/a&gt;
+     */
+    public final Single&lt;T&gt; takeUntil(final Completable other) {
+<span class="fc" id="L1823">        return lift(new Operator&lt;T, T&gt;() {</span>
+            @Override
+            public Subscriber&lt;? super T&gt; call(Subscriber&lt;? super T&gt; child) {
+<span class="fc" id="L1826">                final Subscriber&lt;T&gt; serial = new SerializedSubscriber&lt;T&gt;(child, false);</span>
+
+<span class="fc" id="L1828">                final Subscriber&lt;T&gt; main = new Subscriber&lt;T&gt;(serial, false) {</span>
+                    @Override
+                    public void onNext(T t) {
+<span class="fc" id="L1831">                        serial.onNext(t);</span>
+<span class="fc" id="L1832">                    }</span>
+                    @Override
+                    public void onError(Throwable e) {
+                        try {
+<span class="fc" id="L1836">                            serial.onError(e);</span>
+                        } finally {
+<span class="pc" id="L1838">                            serial.unsubscribe();</span>
+<span class="fc" id="L1839">                        }</span>
+<span class="fc" id="L1840">                    }</span>
+                    @Override
+                    public void onCompleted() {
+                        try {
+<span class="fc" id="L1844">                            serial.onCompleted();</span>
+                        } finally {
+<span class="pc" id="L1846">                            serial.unsubscribe();</span>
+<span class="fc" id="L1847">                        }</span>
+<span class="fc" id="L1848">                    }</span>
+                };
+
+<span class="fc" id="L1851">                final Completable.CompletableSubscriber so = new Completable.CompletableSubscriber() {</span>
+                    @Override
+                    public void onCompleted() {
+<span class="fc" id="L1854">                        onError(new CancellationException(&quot;Stream was canceled before emitting a terminal event.&quot;));</span>
+<span class="fc" id="L1855">                    }</span>
+
+                    @Override
+                    public void onError(Throwable e) {
+<span class="fc" id="L1859">                        main.onError(e);</span>
+<span class="fc" id="L1860">                    }</span>
+
+                    @Override
+                    public void onSubscribe(Subscription d) {
+<span class="fc" id="L1864">                        serial.add(d);</span>
+<span class="fc" id="L1865">                    }</span>
+                };
+
+<span class="fc" id="L1868">                serial.add(main);</span>
+<span class="fc" id="L1869">                child.add(serial);</span>
+
+<span class="fc" id="L1871">                other.subscribe(so);</span>
+
+<span class="fc" id="L1873">                return main;</span>
+            }
+        });
+    }
+
+    /**
+     * Returns a Single that emits the item emitted by the source Single until an Observable emits an item. Upon
+     * emission of an item from {@code other}, this will emit a {@link CancellationException} rather than go to
+     * {@link SingleSubscriber#onSuccess(Object)}.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;380&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/takeUntil.png&quot; alt=&quot;&quot;&gt;
+     * &lt;dl&gt;
+     *  &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     *  &lt;dd&gt;{@code takeUntil} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     *
+     * @param other
+     *            the Observable whose first emitted item will cause {@code takeUntil} to emit the item from the source
+     *            Single
+     * @param &lt;E&gt;
+     *            the type of items emitted by {@code other}
+     * @return a Single that emits the item emitted by the source Single until such time as {@code other} emits
+     * its first item
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/takeuntil.html&quot;&gt;ReactiveX operators documentation: TakeUntil&lt;/a&gt;
+     */
+    public final &lt;E&gt; Single&lt;T&gt; takeUntil(final Observable&lt;? extends E&gt; other) {
+<span class="fc" id="L1899">        return lift(new Operator&lt;T, T&gt;() {</span>
+            @Override
+            public Subscriber&lt;? super T&gt; call(Subscriber&lt;? super T&gt; child) {
+<span class="fc" id="L1902">                final Subscriber&lt;T&gt; serial = new SerializedSubscriber&lt;T&gt;(child, false);</span>
+
+<span class="fc" id="L1904">                final Subscriber&lt;T&gt; main = new Subscriber&lt;T&gt;(serial, false) {</span>
+                    @Override
+                    public void onNext(T t) {
+<span class="fc" id="L1907">                        serial.onNext(t);</span>
+<span class="fc" id="L1908">                    }</span>
+                    @Override
+                    public void onError(Throwable e) {
+                        try {
+<span class="fc" id="L1912">                            serial.onError(e);</span>
+                        } finally {
+<span class="pc" id="L1914">                            serial.unsubscribe();</span>
+<span class="fc" id="L1915">                        }</span>
+<span class="fc" id="L1916">                    }</span>
+                    @Override
+                    public void onCompleted() {
+                        try {
+<span class="fc" id="L1920">                            serial.onCompleted();</span>
+                        } finally {
+<span class="pc" id="L1922">                            serial.unsubscribe();</span>
+<span class="fc" id="L1923">                        }</span>
+<span class="fc" id="L1924">                    }</span>
+                };
+
+<span class="fc" id="L1927">                final Subscriber&lt;E&gt; so = new Subscriber&lt;E&gt;() {</span>
+
+                    @Override
+                    public void onCompleted() {
+<span class="fc" id="L1931">                        onError(new CancellationException(&quot;Stream was canceled before emitting a terminal event.&quot;));</span>
+<span class="fc" id="L1932">                    }</span>
+
+                    @Override
+                    public void onError(Throwable e) {
+<span class="fc" id="L1936">                        main.onError(e);</span>
+<span class="fc" id="L1937">                    }</span>
+
+                    @Override
+                    public void onNext(E e) {
+<span class="fc" id="L1941">                        onError(new CancellationException(&quot;Stream was canceled before emitting a terminal event.&quot;));</span>
+<span class="fc" id="L1942">                    }</span>
+                };
+
+<span class="fc" id="L1945">                serial.add(main);</span>
+<span class="fc" id="L1946">                serial.add(so);</span>
+
+<span class="fc" id="L1948">                child.add(serial);</span>
+
+<span class="fc" id="L1950">                other.unsafeSubscribe(so);</span>
+
+<span class="fc" id="L1952">                return main;</span>
+            }
+        });
+    }
+
+    /**
+     * Returns a Single that emits the item emitted by the source Single until a second Single emits an item. Upon
+     * emission of an item from {@code other}, this will emit a {@link CancellationException} rather than go to
+     * {@link SingleSubscriber#onSuccess(Object)}.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;380&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/takeUntil.png&quot; alt=&quot;&quot;&gt;
+     * &lt;dl&gt;
+     *  &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     *  &lt;dd&gt;{@code takeUntil} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     *
+     * @param other
+     *            the Single whose emitted item will cause {@code takeUntil} to emit the item from the source Single
+     * @param &lt;E&gt;
+     *            the type of item emitted by {@code other}
+     * @return a Single that emits the item emitted by the source Single until such time as {@code other} emits its item
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/takeuntil.html&quot;&gt;ReactiveX operators documentation: TakeUntil&lt;/a&gt;
+     */
+    public final &lt;E&gt; Single&lt;T&gt; takeUntil(final Single&lt;? extends E&gt; other) {
+<span class="fc" id="L1976">        return lift(new Operator&lt;T, T&gt;() {</span>
+            @Override
+            public Subscriber&lt;? super T&gt; call(Subscriber&lt;? super T&gt; child) {
+<span class="fc" id="L1979">                final Subscriber&lt;T&gt; serial = new SerializedSubscriber&lt;T&gt;(child, false);</span>
+
+<span class="fc" id="L1981">                final Subscriber&lt;T&gt; main = new Subscriber&lt;T&gt;(serial, false) {</span>
+                    @Override
+                    public void onNext(T t) {
+<span class="fc" id="L1984">                        serial.onNext(t);</span>
+<span class="fc" id="L1985">                    }</span>
+                    @Override
+                    public void onError(Throwable e) {
+                        try {
+<span class="fc" id="L1989">                            serial.onError(e);</span>
+                        } finally {
+<span class="pc" id="L1991">                            serial.unsubscribe();</span>
+<span class="fc" id="L1992">                        }</span>
+<span class="fc" id="L1993">                    }</span>
+                    @Override
+                    public void onCompleted() {
+                        try {
+<span class="fc" id="L1997">                            serial.onCompleted();</span>
+                        } finally {
+<span class="pc" id="L1999">                            serial.unsubscribe();</span>
+<span class="fc" id="L2000">                        }</span>
+<span class="fc" id="L2001">                    }</span>
+                };
+
+<span class="fc" id="L2004">                final SingleSubscriber&lt;E&gt; so = new SingleSubscriber&lt;E&gt;() {</span>
+                    @Override
+                    public void onSuccess(E value) {
+<span class="fc" id="L2007">                        onError(new CancellationException(&quot;Stream was canceled before emitting a terminal event.&quot;));</span>
+<span class="fc" id="L2008">                    }</span>
+
+                    @Override
+                    public void onError(Throwable e) {
+<span class="fc" id="L2012">                        main.onError(e);</span>
+<span class="fc" id="L2013">                    }</span>
+                };
+
+<span class="fc" id="L2016">                serial.add(main);</span>
+<span class="fc" id="L2017">                serial.add(so);</span>
+
+<span class="fc" id="L2019">                child.add(serial);</span>
+
+<span class="fc" id="L2021">                other.subscribe(so);</span>
+
+<span class="fc" id="L2023">                return main;</span>
+            }
+        });
+    }
+    
+    /**
+     * Converts this Single into an {@link Observable}.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;305&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.toObservable.png&quot; alt=&quot;&quot;&gt;
+     * 
+     * @return an {@link Observable} that emits a single item T.
+     */
+    public final Observable&lt;T&gt; toObservable() {
+<span class="fc" id="L2036">        return asObservable(this);</span>
+    }
+
+    /**
+     * Returns a Single that mirrors the source Single but applies a timeout policy for its emitted item. If it
+     * is not emitted within the specified timeout duration, the resulting Single terminates and notifies
+     * subscribers of a {@code TimeoutException}.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;300&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.timeout.1.png&quot; alt=&quot;&quot;&gt;
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;This version of {@code timeout} operates by default on the {@code computation} {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param timeout
+     *            maximum duration before the Single times out
+     * @param timeUnit
+     *            the unit of time that applies to the {@code timeout} argument.
+     * @return the source Single modified to notify subscribers of a {@code TimeoutException} in case of a
+     *         timeout
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/timeout.html&quot;&gt;ReactiveX operators documentation: Timeout&lt;/a&gt;
+     */
+    public final Single&lt;T&gt; timeout(long timeout, TimeUnit timeUnit) {
+<span class="fc" id="L2059">        return timeout(timeout, timeUnit, null, Schedulers.computation());</span>
+    }
+
+    /**
+     * Returns a Single that mirrors the source Single but applies a timeout policy for its emitted item, where
+     * this policy is governed on a specified Scheduler. If the item is not emitted within the specified timeout
+     * duration, the resulting Single terminates and notifies subscribers of a {@code TimeoutException}.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;300&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.timeout.1s.png&quot; alt=&quot;&quot;&gt;
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;you specify which {@link Scheduler} this operator will use&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param timeout
+     *            maximum duration before the Single times out
+     * @param timeUnit
+     *            the unit of time that applies to the {@code timeout} argument
+     * @param scheduler
+     *            the Scheduler to run the timeout timers on
+     * @return the source Single modified to notify subscribers of a {@code TimeoutException} in case of a
+     *         timeout
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/timeout.html&quot;&gt;ReactiveX operators documentation: Timeout&lt;/a&gt;
+     */
+    public final Single&lt;T&gt; timeout(long timeout, TimeUnit timeUnit, Scheduler scheduler) {
+<span class="nc" id="L2084">        return timeout(timeout, timeUnit, null, scheduler);</span>
+    }
+
+    /**
+     * Returns a Single that mirrors the source Single but applies a timeout policy for its emitted item. If it
+     * is not emitted within the specified timeout duration, the resulting Single instead mirrors a fallback
+     * Single.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;305&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.timeout.2.png&quot; alt=&quot;&quot;&gt;
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;This version of {@code timeout} operates by default on the {@code computation} {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param timeout
+     *            maximum time before a timeout occurs
+     * @param timeUnit
+     *            the unit of time that applies to the {@code timeout} argument
+     * @param other
+     *            the fallback Single to use in case of a timeout
+     * @return the source Single modified to switch to the fallback Single in case of a timeout
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/timeout.html&quot;&gt;ReactiveX operators documentation: Timeout&lt;/a&gt;
+     */
+    public final Single&lt;T&gt; timeout(long timeout, TimeUnit timeUnit, Single&lt;? extends T&gt; other) {
+<span class="fc" id="L2108">        return timeout(timeout, timeUnit, other, Schedulers.computation());</span>
+    }
+
+    /**
+     * Returns a Single that mirrors the source Single but applies a timeout policy for its emitted item, using
+     * a specified Scheduler. If the item isn't emitted within the specified timeout duration, the resulting
+     * Single instead mirrors a fallback Single.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;305&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.timeout.2s.png&quot; alt=&quot;&quot;&gt;
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;you specify which {@link Scheduler} this operator will use&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param timeout
+     *            maximum duration before a timeout occurs
+     * @param timeUnit
+     *            the unit of time that applies to the {@code timeout} argument
+     * @param other
+     *            the Single to use as the fallback in case of a timeout
+     * @param scheduler
+     *            the {@link Scheduler} to run the timeout timers on
+     * @return the source Single modified so that it will switch to the fallback Singlein case of a timeout
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/timeout.html&quot;&gt;ReactiveX operators documentation: Timeout&lt;/a&gt;
+     */
+    public final Single&lt;T&gt; timeout(long timeout, TimeUnit timeUnit, Single&lt;? extends T&gt; other, Scheduler scheduler) {
+<span class="fc bfc" id="L2134" title="All 2 branches covered.">        if (other == null) {</span>
+<span class="fc" id="L2135">            other = Single.&lt;T&gt; error(new TimeoutException());</span>
+        }
+<span class="fc" id="L2137">        return lift(new OperatorTimeout&lt;T&gt;(timeout, timeUnit, asObservable(other), scheduler));</span>
+    }
+
+    /**
+     * Converts a Single into a {@link BlockingSingle} (a Single with blocking operators).
+     * &lt;dl&gt;
+     *  &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     *  &lt;dd&gt;{@code toBlocking} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     *
+     * @return a {@code BlockingSingle} version of this Single.
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/to.html&quot;&gt;ReactiveX operators documentation: To&lt;/a&gt;
+     */
+    @Experimental
+    public final BlockingSingle&lt;T&gt; toBlocking() {
+<span class="fc" id="L2152">        return BlockingSingle.from(this);</span>
+    }
+
+    /**
+     * Returns a Single that emits the result of applying a specified function to the pair of items emitted by
+     * the source Single and another specified Single.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;380&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/Single.zip.png&quot; alt=&quot;&quot;&gt;
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code zipWith} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     * 
+     * @param &lt;T2&gt;
+     *            the type of items emitted by the {@code other} Single
+     * @param &lt;R&gt;
+     *            the type of items emitted by the resulting Single
+     * @param other
+     *            the other Observable
+     * @param zipFunction
+     *            a function that combines the pairs of items from the two Observables to generate the items to
+     *            be emitted by the resulting Single
+     * @return an Observable that pairs up values from the source Observable and the {@code other} Observable
+     *         and emits the results of {@code zipFunction} applied to these pairs
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/zip.html&quot;&gt;ReactiveX operators documentation: Zip&lt;/a&gt;
+     */
+    public final &lt;T2, R&gt; Single&lt;R&gt; zipWith(Single&lt;? extends T2&gt; other, Func2&lt;? super T, ? super T2, ? extends R&gt; zipFunction) {
+<span class="fc" id="L2179">        return zip(this, other, zipFunction);</span>
+    }
+
+    /**
+     * Modifies the source {@link Single} so that it invokes an action if it calls {@code onError}.
+     * &lt;p&gt;
+     * In case the onError action throws, the downstream will receive a composite exception containing
+     * the original exception and the exception thrown by onError.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;305&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/doOnError.png&quot; alt=&quot;&quot;&gt;
+     * &lt;dl&gt;
+     *  &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     *  &lt;dd&gt;{@code doOnError} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     *
+     * @param onError
+     *            the action to invoke if the source {@link Single} calls {@code onError}
+     * @return the source {@link Single} with the side-effecting behavior applied
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/do.html&quot;&gt;ReactiveX operators documentation: Do&lt;/a&gt;
+     */
+    @Experimental
+    public final Single&lt;T&gt; doOnError(final Action1&lt;Throwable&gt; onError) {
+<span class="fc" id="L2201">        Observer&lt;T&gt; observer = new Observer&lt;T&gt;() {</span>
+            @Override
+            public void onCompleted() {
+<span class="fc" id="L2204">            }</span>
+
+            @Override
+            public void onError(Throwable e) {
+<span class="fc" id="L2208">                onError.call(e);</span>
+<span class="fc" id="L2209">            }</span>
+
+            @Override
+            public void onNext(T t) {
+<span class="fc" id="L2213">            }</span>
+        };
+
+<span class="fc" id="L2216">        return lift(new OperatorDoOnEach&lt;T&gt;(observer));</span>
+    }
+    
+    /**
+     * Modifies the source {@link Single} so that it invokes an action when it calls {@code onSuccess}.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;310&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/doOnNext.png&quot; alt=&quot;&quot;&gt;
+     * &lt;dl&gt;
+     *  &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     *  &lt;dd&gt;{@code doOnSuccess} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     *
+     * @param onSuccess
+     *            the action to invoke when the source {@link Single} calls {@code onSuccess}
+     * @return the source {@link Single} with the side-effecting behavior applied
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/do.html&quot;&gt;ReactiveX operators documentation: Do&lt;/a&gt;
+     */
+    @Experimental
+    public final Single&lt;T&gt; doOnSuccess(final Action1&lt;? super T&gt; onSuccess) {
+<span class="fc" id="L2235">        Observer&lt;T&gt; observer = new Observer&lt;T&gt;() {</span>
+            @Override
+            public void onCompleted() {
+<span class="fc" id="L2238">            }</span>
+
+            @Override
+            public void onError(Throwable e) {
+<span class="fc" id="L2242">            }</span>
+
+            @Override
+            public void onNext(T t) {
+<span class="fc" id="L2246">                onSuccess.call(t);</span>
+<span class="fc" id="L2247">            }</span>
+        };
+
+<span class="fc" id="L2250">        return lift(new OperatorDoOnEach&lt;T&gt;(observer));</span>
+    }
+
+    /**
+     * Modifies the source {@code Single} so that it invokes the given action when it is subscribed from
+     * its subscribers. Each subscription will result in an invocation of the given action except when the
+     * source {@code Single} is reference counted, in which case the source {@code Single} will invoke
+     * the given action for the first subscription.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;390&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/doOnSubscribe.png&quot; alt=&quot;&quot;&gt;
+     * &lt;dl&gt;
+     *  &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     *  &lt;dd&gt;{@code doOnSubscribe} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     *
+     * @param subscribe
+     *            the action that gets called when an observer subscribes to this {@code Single}
+     * @return the source {@code Single} modified so as to call this Action when appropriate
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/do.html&quot;&gt;ReactiveX operators documentation: Do&lt;/a&gt;
+     */
+    @Experimental
+    public final Single&lt;T&gt; doOnSubscribe(final Action0 subscribe) {
+<span class="fc" id="L2272">        return lift(new OperatorDoOnSubscribe&lt;T&gt;(subscribe));</span>
+    }
+
+    /**
+     * Returns an Single that emits the items emitted by the source Single shifted forward in time by a
+     * specified delay. Error notifications from the source Single are not delayed.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;310&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/delay.s.png&quot; alt=&quot;&quot;&gt;
+     * &lt;dl&gt;
+     *  &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     *  &lt;dd&gt;you specify which {@link Scheduler} this operator will use&lt;/dd&gt;
+     * &lt;/dl&gt;
+     *
+     * @param delay
+     *            the delay to shift the source by
+     * @param unit
+     *            the time unit of {@code delay}
+     * @param scheduler
+     *            the {@link Scheduler} to use for delaying
+     * @return the source Single shifted in time by the specified delay
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/delay.html&quot;&gt;ReactiveX operators documentation: Delay&lt;/a&gt;
+     */
+    @Experimental
+    public final Single&lt;T&gt; delay(long delay, TimeUnit unit, Scheduler scheduler) {
+<span class="fc" id="L2296">        return lift(new OperatorDelay&lt;T&gt;(delay, unit, scheduler));</span>
+    }
+
+    /**
+     * Returns an Single that emits the items emitted by the source Single shifted forward in time by a
+     * specified delay. Error notifications from the source Observable are not delayed.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;310&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/delay.png&quot; alt=&quot;&quot;&gt;
+     * &lt;dl&gt;
+     *  &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     *  &lt;dd&gt;This version of {@code delay} operates by default on the {@code compuation} {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     *
+     * @param delay
+     *            the delay to shift the source by
+     * @param unit
+     *            the {@link TimeUnit} in which {@code period} is defined
+     * @return the source Single shifted in time by the specified delay
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/delay.html&quot;&gt;ReactiveX operators documentation: Delay&lt;/a&gt;
+     */
+    @Experimental
+    public final Single&lt;T&gt; delay(long delay, TimeUnit unit) {
+<span class="nc" id="L2318">        return delay(delay, unit, Schedulers.computation());</span>
+    }
+
+    /**
+     * Returns a {@link Single} that calls a {@link Single} factory to create a {@link Single} for each new Observer
+     * that subscribes. That is, for each subscriber, the actual {@link Single} that subscriber observes is
+     * determined by the factory function.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;340&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/defer.png&quot; alt=&quot;&quot;&gt;
+     * &lt;p&gt;
+     * The defer Observer allows you to defer or delay emitting value from a {@link Single} until such time as an
+     * Observer subscribes to the {@link Single}. This allows an {@link Observer} to easily obtain updates or a
+     * refreshed version of the sequence.
+     * &lt;dl&gt;
+     *  &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     *  &lt;dd&gt;{@code defer} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     *
+     * @param singleFactory
+     *            the {@link Single} factory function to invoke for each {@link Observer} that subscribes to the
+     *            resulting {@link Single}.
+     * @param &lt;T&gt;
+     *            the type of the items emitted by the {@link Single}.
+     * @return a {@link Single} whose {@link Observer}s' subscriptions trigger an invocation of the given
+     *         {@link Single} factory function.
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/defer.html&quot;&gt;ReactiveX operators documentation: Defer&lt;/a&gt;
+     */
+    @Experimental
+    public static &lt;T&gt; Single&lt;T&gt; defer(final Callable&lt;Single&lt;T&gt;&gt; singleFactory) {
+<span class="fc" id="L2347">        return create(new OnSubscribe&lt;T&gt;() {</span>
+            @Override
+            public void call(SingleSubscriber&lt;? super T&gt; singleSubscriber) {
+                Single&lt;? extends T&gt; single;
+
+                try {
+<span class="fc" id="L2353">                    single = singleFactory.call();</span>
+<span class="fc" id="L2354">                } catch (Throwable t) {</span>
+<span class="fc" id="L2355">                    Exceptions.throwIfFatal(t);</span>
+<span class="fc" id="L2356">                    singleSubscriber.onError(t);</span>
+<span class="fc" id="L2357">                    return;</span>
+<span class="fc" id="L2358">                }</span>
+
+<span class="fc" id="L2360">                single.subscribe(singleSubscriber);</span>
+<span class="fc" id="L2361">            }</span>
+        });
+    }
+
+    /**
+     * Modifies the source {@link Single} so that it invokes the given action when it is unsubscribed from
+     * its subscribers.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;310&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/doOnUnsubscribe.png&quot; alt=&quot;&quot;&gt;
+     * &lt;dl&gt;
+     *  &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     *  &lt;dd&gt;{@code doOnUnsubscribe} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     *
+     * @param action
+     *            the action that gets called when this {@link Single} is unsubscribed.
+     * @return the source {@link Single} modified so as to call this Action when appropriate.
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/do.html&quot;&gt;ReactiveX operators documentation: Do&lt;/a&gt;
+     */
+    @Experimental
+    public final Single&lt;T&gt; doOnUnsubscribe(final Action0 action) {
+<span class="fc" id="L2382">        return lift(new OperatorDoOnUnsubscribe&lt;T&gt;(action));</span>
+    }
+
+    /**
+     * Registers an {@link Action0} to be called when this {@link Single} invokes either
+     * {@link SingleSubscriber#onSuccess(Object)}  onSuccess} or {@link SingleSubscriber#onError onError}.
+     * &lt;p&gt;
+     * &lt;img width=&quot;640&quot; height=&quot;310&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/finallyDo.png&quot; alt=&quot;&quot;&gt;
+     * &lt;dl&gt;
+     *  &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     *  &lt;dd&gt;{@code doAfterTerminate} does not operate by default on a particular {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     *
+     * @param action
+     *            an {@link Action0} to be invoked when the source {@link Single} finishes.
+     * @return a {@link Single} that emits the same item or error as the source {@link Single}, then invokes the
+     *         {@link Action0}
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/do.html&quot;&gt;ReactiveX operators documentation: Do&lt;/a&gt;
+     */
+    @Experimental
+    public final Single&lt;T&gt; doAfterTerminate(Action0 action) {
+<span class="fc" id="L2403">        return lift(new OperatorDoAfterTerminate&lt;T&gt;(action));</span>
+    }
+
+    /**
+     * FOR INTERNAL USE ONLY.
+     * &lt;p&gt;
+     * Converts {@link Iterable} of {@link Single} to array of {@link Single}.
+     *
+     * @param singlesIterable
+     *         non null iterable of {@link Single}.
+     * @return array of {@link Single} with same length as passed iterable.
+     */
+    @SuppressWarnings(&quot;unchecked&quot;)
+    static &lt;T&gt; Single&lt;? extends T&gt;[] iterableToArray(final Iterable&lt;? extends Single&lt;? extends T&gt;&gt; singlesIterable) {
+        final Single&lt;? extends T&gt;[] singlesArray;
+        int count;
+
+<span class="pc bpc" id="L2420" title="1 of 2 branches missed.">        if (singlesIterable instanceof Collection) {</span>
+<span class="fc" id="L2421">            Collection&lt;? extends Single&lt;? extends T&gt;&gt; list = (Collection&lt;? extends Single&lt;? extends T&gt;&gt;) singlesIterable;</span>
+<span class="fc" id="L2422">            count = list.size();</span>
+<span class="fc" id="L2423">            singlesArray = list.toArray(new Single[count]);</span>
+<span class="fc" id="L2424">        } else {</span>
+<span class="nc" id="L2425">            Single&lt;? extends T&gt;[] tempArray = new Single[8]; // Magic number used just to reduce number of allocations.</span>
+<span class="nc" id="L2426">            count = 0;</span>
+<span class="nc bnc" id="L2427" title="All 2 branches missed.">            for (Single&lt;? extends T&gt; s : singlesIterable) {</span>
+<span class="nc bnc" id="L2428" title="All 2 branches missed.">                if (count == tempArray.length) {</span>
+<span class="nc" id="L2429">                    Single&lt;? extends T&gt;[] sb = new Single[count + (count &gt;&gt; 2)];</span>
+<span class="nc" id="L2430">                    System.arraycopy(tempArray, 0, sb, 0, count);</span>
+<span class="nc" id="L2431">                    tempArray = sb;</span>
+                }
+<span class="nc" id="L2433">                tempArray[count] = s;</span>
+<span class="nc" id="L2434">                count++;</span>
+<span class="nc" id="L2435">            }</span>
+
+<span class="nc bnc" id="L2437" title="All 2 branches missed.">            if (tempArray.length == count) {</span>
+<span class="nc" id="L2438">                singlesArray = tempArray;</span>
+            } else {
+<span class="nc" id="L2440">                singlesArray = new Single[count];</span>
+<span class="nc" id="L2441">                System.arraycopy(tempArray, 0, singlesArray, 0, count);</span>
+            }
+        }
+
+<span class="fc" id="L2445">        return singlesArray;</span>
+    }
+
+    /**
+     * Returns a Single that mirrors the source Single, resubscribing to it if it calls {@code onError}
+     * (infinite retry count).
+     *
+     * &lt;img width=&quot;640&quot; height=&quot;315&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/retry.png&quot; alt=&quot;&quot;&gt;
+     *
+     * If the source Single calls {@link SingleSubscriber#onError}, this method will resubscribe to the source
+     * Single rather than propagating the {@code onError} call.
+     *
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code retry} operates by default on the {@code trampoline} {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     *
+     * @return the source Single modified with retry logic
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/retry.html&quot;&gt;ReactiveX operators documentation: Retry&lt;/a&gt;
+     */
+    public final Single&lt;T&gt; retry() {
+<span class="fc" id="L2466">        return toObservable().retry().toSingle();</span>
+    }
+
+    /**
+     * Returns an Single that mirrors the source Single, resubscribing to it if it calls {@code onError}
+     * up to a specified number of retries.
+     *
+     * &lt;img width=&quot;640&quot; height=&quot;315&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/retry.png&quot; alt=&quot;&quot;&gt;
+     *
+     * If the source Single calls {@link SingleSubscriber#onError}, this method will resubscribe to the source
+     * Single for a maximum of {@code count} resubscriptions rather than propagating the
+     * {@code onError} call.
+     *
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code retry} operates by default on the {@code trampoline} {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     *
+     * @param count
+     *         number of retry attempts before failing
+     *
+     * @return the source Single modified with retry logic
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/retry.html&quot;&gt;ReactiveX operators documentation: Retry&lt;/a&gt;
+     */
+    public final Single&lt;T&gt; retry(final long count) {
+<span class="fc" id="L2491">        return toObservable().retry(count).toSingle();</span>
+    }
+
+    /**
+     * Returns an Single that mirrors the source Single, resubscribing to it if it calls {@code onError}
+     * and the predicate returns true for that specific exception and retry count.
+     *
+     * &lt;img width=&quot;640&quot; height=&quot;315&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/retry.png&quot; alt=&quot;&quot;&gt;
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Backpressure Support:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;This operator honors backpressure.&lt;/td&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code retry} operates by default on the {@code trampoline} {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     *
+     * @param predicate
+     *         the predicate that determines if a resubscription may happen in case of a specific exception
+     *         and retry count
+     *
+     * @return the source Single modified with retry logic
+     * @see #retry()
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/retry.html&quot;&gt;ReactiveX operators documentation: Retry&lt;/a&gt;
+     */
+    public final Single&lt;T&gt; retry(Func2&lt;Integer, Throwable, Boolean&gt; predicate) {
+<span class="fc" id="L2515">        return toObservable().retry(predicate).toSingle();</span>
+    }
+
+    /**
+     * Returns a Single that emits the same values as the source Single with the exception of an
+     * {@code onError}. An {@code onError} notification from the source will result in the emission of a
+     * {@link Throwable} item to the Observable provided as an argument to the {@code notificationHandler}
+     * function. If that Observable calls {@code onComplete} or {@code onError} then {@code retry} will call
+     * {@code onCompleted} or {@code onError} on the child subscription. Otherwise, this Observable will
+     * resubscribe to the source Single.
+     *
+     * &lt;img width=&quot;640&quot; height=&quot;430&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/retryWhen.f.png&quot; alt=&quot;&quot;&gt;
+     *
+     * &lt;dl&gt;
+     * &lt;dt&gt;&lt;b&gt;Scheduler:&lt;/b&gt;&lt;/dt&gt;
+     * &lt;dd&gt;{@code retryWhen} operates by default on the {@code trampoline} {@link Scheduler}.&lt;/dd&gt;
+     * &lt;/dl&gt;
+     *
+     * @param notificationHandler
+     *         receives an Observable of notifications with which a user can complete or error, aborting the
+     *         retry
+     *
+     * @return the source Single modified with retry logic
+     * @see &lt;a href=&quot;http://reactivex.io/documentation/operators/retry.html&quot;&gt;ReactiveX operators documentation: Retry&lt;/a&gt;
+     */
+    public final Single&lt;T&gt; retryWhen(final Func1&lt;Observable&lt;? extends Throwable&gt;, ? extends Observable&lt;?&gt;&gt; notificationHandler) {
+<span class="fc" id="L2541">        return toObservable().retryWhen(notificationHandler).toSingle();</span>
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

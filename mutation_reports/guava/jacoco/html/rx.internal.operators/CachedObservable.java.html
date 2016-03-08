@@ -1,0 +1,456 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>CachedObservable.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.internal.operators</a> &gt; <span class="el_source">CachedObservable.java</span></div><h1>CachedObservable.java</h1><pre class="source lang-java linenums">/**
+ * Copyright 2014 Netflix, Inc.
+ * 
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package rx.internal.operators;
+
+import java.util.concurrent.atomic.*;
+
+import rx.*;
+import rx.exceptions.*;
+import rx.internal.util.LinkedArrayList;
+import rx.subscriptions.SerialSubscription;
+
+/**
+ * An observable which auto-connects to another observable, caches the elements
+ * from that observable but allows terminating the connection and completing the cache.
+ *
+ * @param &lt;T&gt; the source element type
+ */
+public final class CachedObservable&lt;T&gt; extends Observable&lt;T&gt; {
+
+    /** The cache and replay state. */
+    private final CacheState&lt;T&gt; state;
+
+    /**
+     * Creates a cached Observable with a default capacity hint of 16.
+     * @param source the source Observable to cache
+     * @return the CachedObservable instance
+     */
+    public static &lt;T&gt; CachedObservable&lt;T&gt; from(Observable&lt;? extends T&gt; source) {
+<span class="fc" id="L42">        return from(source, 16);</span>
+    }
+    
+    /**
+     * Creates a cached Observable with the given capacity hint.
+     * @param source the source Observable to cache
+     * @param capacityHint the hint for the internal buffer size
+     * @return the CachedObservable instance
+     */
+    public static &lt;T&gt; CachedObservable&lt;T&gt; from(Observable&lt;? extends T&gt; source, int capacityHint) {
+<span class="pc bpc" id="L52" title="1 of 2 branches missed.">        if (capacityHint &lt; 1) {</span>
+<span class="nc" id="L53">            throw new IllegalArgumentException(&quot;capacityHint &gt; 0 required&quot;);</span>
+        }
+<span class="fc" id="L55">        CacheState&lt;T&gt; state = new CacheState&lt;T&gt;(source, capacityHint);</span>
+<span class="fc" id="L56">        CachedSubscribe&lt;T&gt; onSubscribe = new CachedSubscribe&lt;T&gt;(state);</span>
+<span class="fc" id="L57">        return new CachedObservable&lt;T&gt;(onSubscribe, state);</span>
+    }
+    
+    /**
+     * Private constructor because state needs to be shared between the Observable body and
+     * the onSubscribe function.
+     * @param onSubscribe
+     * @param state
+     */
+    private CachedObservable(OnSubscribe&lt;T&gt; onSubscribe, CacheState&lt;T&gt; state) {
+<span class="fc" id="L67">        super(onSubscribe);</span>
+<span class="fc" id="L68">        this.state = state;</span>
+<span class="fc" id="L69">    }</span>
+
+    /**
+     * Check if this cached observable is connected to its source.
+     * @return true if already connected
+     */
+    /* public */boolean isConnected() {
+<span class="fc" id="L76">        return state.isConnected;</span>
+    }
+    
+    /**
+     * Returns true if there are observers subscribed to this observable.
+     * @return
+     */
+    /* public */ boolean hasObservers() {
+<span class="fc bfc" id="L84" title="All 2 branches covered.">        return state.producers.length != 0;</span>
+    }
+
+    /**
+     * Contains the active child producers and the values to replay.
+     *
+     * @param &lt;T&gt;
+     */
+    static final class CacheState&lt;T&gt; extends LinkedArrayList implements Observer&lt;T&gt; {
+        /** The source observable to connect to. */
+        final Observable&lt;? extends T&gt; source;
+        /** Holds onto the subscriber connected to source. */
+        final SerialSubscription connection;
+        /** Guarded by connection (not this). */
+        volatile ReplayProducer&lt;?&gt;[] producers;
+        /** The default empty array of producers. */
+<span class="fc" id="L100">        static final ReplayProducer&lt;?&gt;[] EMPTY = new ReplayProducer&lt;?&gt;[0];</span>
+        
+        final NotificationLite&lt;T&gt; nl;
+        
+        /** Set to true after connection. */
+        volatile boolean isConnected;
+        /** 
+         * Indicates that the source has completed emitting values or the
+         * Observable was forcefully terminated.
+         */
+        boolean sourceDone;
+        
+        public CacheState(Observable&lt;? extends T&gt; source, int capacityHint) {
+<span class="fc" id="L113">            super(capacityHint);</span>
+<span class="fc" id="L114">            this.source = source;</span>
+<span class="fc" id="L115">            this.producers = EMPTY;</span>
+<span class="fc" id="L116">            this.nl = NotificationLite.instance();</span>
+<span class="fc" id="L117">            this.connection = new SerialSubscription();</span>
+<span class="fc" id="L118">        }</span>
+        /**
+         * Adds a ReplayProducer to the producers array atomically.
+         * @param p
+         */
+        public void addProducer(ReplayProducer&lt;T&gt; p) {
+            // guarding by connection to save on allocating another object
+            // thus there are two distinct locks guarding the value-addition and child come-and-go
+<span class="fc" id="L126">            synchronized (connection) {</span>
+<span class="fc" id="L127">                ReplayProducer&lt;?&gt;[] a = producers;</span>
+<span class="fc" id="L128">                int n = a.length;</span>
+<span class="fc" id="L129">                ReplayProducer&lt;?&gt;[] b = new ReplayProducer&lt;?&gt;[n + 1];</span>
+<span class="fc" id="L130">                System.arraycopy(a, 0, b, 0, n);</span>
+<span class="fc" id="L131">                b[n] = p;</span>
+<span class="fc" id="L132">                producers = b;</span>
+<span class="pc" id="L133">            }</span>
+<span class="fc" id="L134">        }</span>
+        /**
+         * Removes the ReplayProducer (if present) from the producers array atomically.
+         * @param p
+         */
+        public void removeProducer(ReplayProducer&lt;T&gt; p) {
+<span class="fc" id="L140">            synchronized (connection) {</span>
+<span class="fc" id="L141">                ReplayProducer&lt;?&gt;[] a = producers;</span>
+<span class="fc" id="L142">                int n = a.length;</span>
+<span class="fc" id="L143">                int j = -1;</span>
+<span class="pc bpc" id="L144" title="1 of 2 branches missed.">                for (int i = 0; i &lt; n; i++) {</span>
+<span class="pc bpc" id="L145" title="1 of 2 branches missed.">                    if (a[i].equals(p)) {</span>
+<span class="fc" id="L146">                        j = i;</span>
+<span class="fc" id="L147">                        break;</span>
+                    }
+                }
+<span class="pc bpc" id="L150" title="1 of 2 branches missed.">                if (j &lt; 0) {</span>
+<span class="nc" id="L151">                    return;</span>
+                }
+<span class="fc bfc" id="L153" title="All 2 branches covered.">                if (n == 1) {</span>
+<span class="fc" id="L154">                    producers = EMPTY;</span>
+<span class="fc" id="L155">                    return;</span>
+                }
+<span class="fc" id="L157">                ReplayProducer&lt;?&gt;[] b = new ReplayProducer&lt;?&gt;[n - 1];</span>
+<span class="fc" id="L158">                System.arraycopy(a, 0, b, 0, j);</span>
+<span class="fc" id="L159">                System.arraycopy(a, j + 1, b, j, n - j - 1);</span>
+<span class="fc" id="L160">                producers = b;</span>
+<span class="pc" id="L161">            }</span>
+<span class="fc" id="L162">        }</span>
+        /**
+         * Connects the cache to the source.
+         * Make sure this is called only once.
+         */
+        public void connect() {
+<span class="fc" id="L168">            Subscriber&lt;T&gt; subscriber = new Subscriber&lt;T&gt;() {</span>
+                @Override
+                public void onNext(T t) {
+<span class="fc" id="L171">                    CacheState.this.onNext(t);</span>
+<span class="fc" id="L172">                }</span>
+                @Override
+                public void onError(Throwable e) {
+<span class="fc" id="L175">                    CacheState.this.onError(e);</span>
+<span class="fc" id="L176">                }</span>
+                @Override
+                public void onCompleted() {
+<span class="fc" id="L179">                    CacheState.this.onCompleted();</span>
+<span class="fc" id="L180">                }</span>
+            };
+<span class="fc" id="L182">            connection.set(subscriber);</span>
+<span class="fc" id="L183">            source.unsafeSubscribe(subscriber);</span>
+<span class="fc" id="L184">            isConnected = true;</span>
+<span class="fc" id="L185">        }</span>
+        @Override
+        public void onNext(T t) {
+<span class="pc bpc" id="L188" title="1 of 2 branches missed.">            if (!sourceDone) {</span>
+<span class="fc" id="L189">                Object o = nl.next(t);</span>
+<span class="fc" id="L190">                add(o);</span>
+<span class="fc" id="L191">                dispatch();</span>
+            }
+<span class="fc" id="L193">        }</span>
+        @Override
+        public void onError(Throwable e) {
+<span class="pc bpc" id="L196" title="1 of 2 branches missed.">            if (!sourceDone) {</span>
+<span class="fc" id="L197">                sourceDone = true;</span>
+<span class="fc" id="L198">                Object o = nl.error(e);</span>
+<span class="fc" id="L199">                add(o);</span>
+<span class="fc" id="L200">                connection.unsubscribe();</span>
+<span class="fc" id="L201">                dispatch();</span>
+            }
+<span class="fc" id="L203">        }</span>
+        @Override
+        public void onCompleted() {
+<span class="pc bpc" id="L206" title="1 of 2 branches missed.">            if (!sourceDone) {</span>
+<span class="fc" id="L207">                sourceDone = true;</span>
+<span class="fc" id="L208">                Object o = nl.completed();</span>
+<span class="fc" id="L209">                add(o);</span>
+<span class="fc" id="L210">                connection.unsubscribe();</span>
+<span class="fc" id="L211">                dispatch();</span>
+            }
+<span class="fc" id="L213">        }</span>
+        /**
+         * Signals all known children there is work to do.
+         */
+        void dispatch() {
+<span class="fc" id="L218">            ReplayProducer&lt;?&gt;[] a = producers;</span>
+<span class="fc bfc" id="L219" title="All 2 branches covered.">            for (ReplayProducer&lt;?&gt; rp : a) {</span>
+<span class="fc" id="L220">                rp.replay();</span>
+            }
+<span class="fc" id="L222">        }</span>
+    }
+    
+    /**
+     * Manages the subscription of child subscribers by setting up a replay producer and
+     * performs auto-connection of the very first subscription.
+     * @param &lt;T&gt; the value type emitted
+     */
+    static final class CachedSubscribe&lt;T&gt; extends AtomicBoolean implements OnSubscribe&lt;T&gt; {
+        /** */
+        private static final long serialVersionUID = -2817751667698696782L;
+        final CacheState&lt;T&gt; state;
+<span class="fc" id="L234">        public CachedSubscribe(CacheState&lt;T&gt; state) {</span>
+<span class="fc" id="L235">            this.state = state;</span>
+<span class="fc" id="L236">        }</span>
+        @Override
+        public void call(Subscriber&lt;? super T&gt; t) {
+            // we can connect first because we replay everything anyway
+<span class="fc" id="L240">            ReplayProducer&lt;T&gt; rp = new ReplayProducer&lt;T&gt;(t, state);</span>
+<span class="fc" id="L241">            state.addProducer(rp);</span>
+            
+<span class="fc" id="L243">            t.add(rp);</span>
+<span class="fc" id="L244">            t.setProducer(rp);</span>
+
+            // we ensure a single connection here to save an instance field of AtomicBoolean in state.
+<span class="pc bpc" id="L247" title="1 of 4 branches missed.">            if (!get() &amp;&amp; compareAndSet(false, true)) {</span>
+<span class="fc" id="L248">                state.connect();</span>
+            }
+            
+            // no need to call rp.replay() here because the very first request will trigger it anyway
+<span class="fc" id="L252">        }</span>
+    }
+    
+    /**
+     * Keeps track of the current request amount and the replay position for a child Subscriber.
+     *
+     * @param &lt;T&gt;
+     */
+    static final class ReplayProducer&lt;T&gt; extends AtomicLong implements Producer, Subscription {
+        /** */
+        private static final long serialVersionUID = -2557562030197141021L;
+        /** The actual child subscriber. */
+        final Subscriber&lt;? super T&gt; child;
+        /** The cache state object. */
+        final CacheState&lt;T&gt; state;
+        
+        /** 
+         * Contains the reference to the buffer segment in replay.
+         * Accessed after reading state.size() and when emitting == true.
+         */
+        Object[] currentBuffer;
+        /** 
+         * Contains the index into the currentBuffer where the next value is expected. 
+         * Accessed after reading state.size() and when emitting == true.
+         */
+        int currentIndexInBuffer;
+        /**
+         * Contains the absolute index up until the values have been replayed so far.
+         */
+        int index;
+
+        /** Indicates there is a replay going on; guarded by this. */
+        boolean emitting;
+        /** Indicates there were some state changes/replay attempts; guarded by this. */
+        boolean missed;
+        
+<span class="fc" id="L288">        public ReplayProducer(Subscriber&lt;? super T&gt; child, CacheState&lt;T&gt; state) {</span>
+<span class="fc" id="L289">            this.child = child;</span>
+<span class="fc" id="L290">            this.state = state;</span>
+<span class="fc" id="L291">        }</span>
+        @Override
+        public void request(long n) {
+            for (;;) {
+<span class="fc" id="L295">                long r = get();</span>
+<span class="fc bfc" id="L296" title="All 2 branches covered.">                if (r &lt; 0) {</span>
+<span class="fc" id="L297">                    return;</span>
+                }
+<span class="fc" id="L299">                long u = r + n;</span>
+<span class="pc bpc" id="L300" title="1 of 2 branches missed.">                if (u &lt; 0) {</span>
+<span class="nc" id="L301">                    u = Long.MAX_VALUE;</span>
+                }
+<span class="fc bfc" id="L303" title="All 2 branches covered.">                if (compareAndSet(r, u)) {</span>
+<span class="fc" id="L304">                    replay();</span>
+<span class="fc" id="L305">                    return;</span>
+                }
+<span class="fc" id="L307">            }</span>
+        }
+        /**
+         * Updates the request count to reflect values have been produced.
+         * @param n
+         * @return
+         */
+        public long produced(long n) {
+<span class="fc" id="L315">            return addAndGet(-n);</span>
+        }
+        
+        @Override
+        public boolean isUnsubscribed() {
+<span class="pc bpc" id="L320" title="1 of 2 branches missed.">            return get() &lt; 0;</span>
+        }
+        @Override
+        public void unsubscribe() {
+<span class="fc" id="L324">            long r = get();</span>
+<span class="fc bfc" id="L325" title="All 2 branches covered.">            if (r &gt;= 0) {</span>
+<span class="fc" id="L326">                r = getAndSet(-1L); // unsubscribed state is negative</span>
+<span class="pc bpc" id="L327" title="1 of 2 branches missed.">                if (r &gt;= 0) {</span>
+<span class="fc" id="L328">                    state.removeProducer(this);</span>
+                }
+            }
+<span class="fc" id="L331">        }</span>
+        
+        /**
+         * Continue replaying available values if there are requests for them.
+         */
+        public void replay() {
+            // make sure there is only a single thread emitting
+<span class="fc" id="L338">            synchronized (this) {</span>
+<span class="fc bfc" id="L339" title="All 2 branches covered.">                if (emitting) {</span>
+<span class="fc" id="L340">                    missed = true;</span>
+<span class="fc" id="L341">                    return;</span>
+                }
+<span class="fc" id="L343">                emitting = true;</span>
+<span class="pc" id="L344">            }</span>
+<span class="fc" id="L345">            boolean skipFinal = false;</span>
+            try {
+<span class="fc" id="L347">                final NotificationLite&lt;T&gt; nl = state.nl;</span>
+<span class="fc" id="L348">                final Subscriber&lt;? super T&gt; child = this.child;</span>
+                
+                for (;;) {
+                    
+<span class="fc" id="L352">                    long r = get();</span>
+                    
+<span class="pc bpc" id="L354" title="1 of 2 branches missed.">                    if (r &lt; 0L) {</span>
+<span class="nc" id="L355">                        skipFinal = true;</span>
+                        return;
+                    }
+                        
+                    // read the size, if it is non-zero, we can safely read the head and
+                    // read values up to the given absolute index
+<span class="fc" id="L361">                    int s = state.size();</span>
+<span class="fc bfc" id="L362" title="All 2 branches covered.">                    if (s != 0) {</span>
+<span class="fc" id="L363">                        Object[] b = currentBuffer;</span>
+                        
+                        // latch onto the very first buffer now that it is available.
+<span class="fc bfc" id="L366" title="All 2 branches covered.">                        if (b == null) {</span>
+<span class="fc" id="L367">                            b = state.head();</span>
+<span class="fc" id="L368">                            currentBuffer = b;</span>
+                        }
+<span class="fc" id="L370">                        final int n = b.length - 1;</span>
+<span class="fc" id="L371">                        int j = index;</span>
+<span class="fc" id="L372">                        int k = currentIndexInBuffer;</span>
+                        // eagerly emit any terminal event
+<span class="fc bfc" id="L374" title="All 2 branches covered.">                        if (r == 0) {</span>
+<span class="fc" id="L375">                            Object o = b[k];</span>
+<span class="pc bpc" id="L376" title="1 of 2 branches missed.">                            if (nl.isCompleted(o)) {</span>
+<span class="nc" id="L377">                                child.onCompleted();</span>
+<span class="nc" id="L378">                                skipFinal = true;</span>
+<span class="nc" id="L379">                                unsubscribe();</span>
+                                return;
+                            } else
+<span class="pc bpc" id="L382" title="1 of 2 branches missed.">                            if (nl.isError(o)) {</span>
+<span class="nc" id="L383">                                child.onError(nl.getError(o));</span>
+<span class="nc" id="L384">                                skipFinal = true;</span>
+<span class="nc" id="L385">                                unsubscribe();</span>
+                                return;
+                            }
+<span class="fc" id="L388">                        } else</span>
+<span class="pc bpc" id="L389" title="1 of 2 branches missed.">                        if (r &gt; 0) {</span>
+<span class="fc" id="L390">                            int valuesProduced = 0;</span>
+                            
+<span class="fc bfc" id="L392" title="All 4 branches covered.">                            while (j &lt; s &amp;&amp; r &gt; 0) {</span>
+<span class="pc bpc" id="L393" title="1 of 2 branches missed.">                                if (child.isUnsubscribed()) {</span>
+<span class="nc" id="L394">                                    skipFinal = true;</span>
+                                    return;
+                                }
+<span class="fc bfc" id="L397" title="All 2 branches covered.">                                if (k == n) {</span>
+<span class="fc" id="L398">                                    b = (Object[])b[n];</span>
+<span class="fc" id="L399">                                    k = 0;</span>
+                                }
+<span class="fc" id="L401">                                Object o = b[k];</span>
+                                
+                                try {
+<span class="fc bfc" id="L404" title="All 2 branches covered.">                                    if (nl.accept(child, o)) {</span>
+<span class="fc" id="L405">                                        skipFinal = true;</span>
+<span class="fc" id="L406">                                        unsubscribe();</span>
+                                        return;
+                                    }
+<span class="fc" id="L409">                                } catch (Throwable err) {</span>
+<span class="fc" id="L410">                                    Exceptions.throwIfFatal(err);</span>
+<span class="fc" id="L411">                                    skipFinal = true;</span>
+<span class="fc" id="L412">                                    unsubscribe();</span>
+<span class="pc bpc" id="L413" title="2 of 4 branches missed.">                                    if (!nl.isError(o) &amp;&amp; !nl.isCompleted(o)) {</span>
+<span class="fc" id="L414">                                        child.onError(OnErrorThrowable.addValueAsLastCause(err, nl.getValue(o)));</span>
+                                    }
+                                    return;
+<span class="fc" id="L417">                                }</span>
+                                
+<span class="fc" id="L419">                                k++;</span>
+<span class="fc" id="L420">                                j++;</span>
+<span class="fc" id="L421">                                r--;</span>
+<span class="fc" id="L422">                                valuesProduced++;</span>
+<span class="fc" id="L423">                            }</span>
+                            
+<span class="fc bfc" id="L425" title="All 2 branches covered.">                            if (child.isUnsubscribed()) {</span>
+<span class="fc" id="L426">                                skipFinal = true;</span>
+                                return;
+                            }
+                            
+<span class="fc" id="L430">                            index = j;</span>
+<span class="fc" id="L431">                            currentIndexInBuffer = k;</span>
+<span class="fc" id="L432">                            currentBuffer = b;</span>
+<span class="fc" id="L433">                            produced(valuesProduced);</span>
+                        }
+                    }
+                    
+<span class="fc" id="L437">                    synchronized (this) {</span>
+<span class="fc bfc" id="L438" title="All 2 branches covered.">                        if (!missed) {</span>
+<span class="fc" id="L439">                            emitting = false;</span>
+<span class="fc" id="L440">                            skipFinal = true;</span>
+<span class="fc" id="L441">                            return;</span>
+                        }
+<span class="fc" id="L443">                        missed = false;</span>
+<span class="pc" id="L444">                    }</span>
+<span class="fc" id="L445">                }</span>
+            } finally {
+<span class="pc bpc" id="L447" title="14 of 18 branches missed.">                if (!skipFinal) {</span>
+<span class="nc" id="L448">                    synchronized (this) {</span>
+<span class="nc" id="L449">                        emitting = false;</span>
+<span class="pc" id="L450">                    }</span>
+                }
+            }
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

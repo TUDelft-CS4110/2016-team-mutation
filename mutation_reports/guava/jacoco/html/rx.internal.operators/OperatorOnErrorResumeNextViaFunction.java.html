@@ -1,0 +1,171 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>OperatorOnErrorResumeNextViaFunction.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.internal.operators</a> &gt; <span class="el_source">OperatorOnErrorResumeNextViaFunction.java</span></div><h1>OperatorOnErrorResumeNextViaFunction.java</h1><pre class="source lang-java linenums">/**
+ * Copyright 2014 Netflix, Inc.
+ * 
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package rx.internal.operators;
+
+import rx.*;
+import rx.Observable.Operator;
+import rx.exceptions.Exceptions;
+import rx.functions.Func1;
+import rx.internal.producers.ProducerArbiter;
+import rx.plugins.RxJavaPlugins;
+import rx.subscriptions.SerialSubscription;
+
+/**
+ * Instruct an Observable to pass control to another Observable (the return value of a function)
+ * rather than invoking {@code onError} if it encounters an error.
+ * &lt;p&gt;
+ * &lt;img width=&quot;640&quot; src=&quot;https://github.com/ReactiveX/RxJava/wiki/images/rx-operators/onErrorResumeNext.png&quot; alt=&quot;&quot;&gt;
+ * &lt;p&gt;
+ * By default, when an Observable encounters an error that prevents it from emitting the expected item to its
+ * Observer, the Observable invokes its Observer's {@code onError} method, and then quits without invoking any
+ * more of its Observer's methods. The {@code onErrorResumeNext} operation changes this behavior. If you pass a
+ * function that returns an Observable ({@code resumeFunction}) to {@code onErrorResumeNext}, if the source
+ * Observable encounters an error, instead of invoking its Observer's {@code onError} method, it will instead
+ * relinquish control to this new Observable, which will invoke the Observer's {@code onNext} method if it is
+ * able to do so. In such a case, because no Observable necessarily invokes {@code onError}, the Observer may
+ * never know that an error happened.
+ * &lt;p&gt;
+ * You can use this to prevent errors from propagating or to supply fallback data should errors be
+ * encountered.
+ */
+public final class OperatorOnErrorResumeNextViaFunction&lt;T&gt; implements Operator&lt;T, T&gt; {
+
+    final Func1&lt;Throwable, ? extends Observable&lt;? extends T&gt;&gt; resumeFunction;
+
+    public static &lt;T&gt; OperatorOnErrorResumeNextViaFunction&lt;T&gt; withSingle(final Func1&lt;Throwable, ? extends T&gt; resumeFunction) {
+<span class="fc" id="L49">        return new OperatorOnErrorResumeNextViaFunction&lt;T&gt;(new Func1&lt;Throwable, Observable&lt;? extends T&gt;&gt;() {</span>
+            @Override
+            public Observable&lt;? extends T&gt; call(Throwable t) {
+<span class="fc" id="L52">                return Observable.just(resumeFunction.call(t));</span>
+            }
+        });
+    }
+
+    public static &lt;T&gt; OperatorOnErrorResumeNextViaFunction&lt;T&gt; withOther(final Observable&lt;? extends T&gt; other) {
+<span class="fc" id="L58">        return new OperatorOnErrorResumeNextViaFunction&lt;T&gt;(new Func1&lt;Throwable, Observable&lt;? extends T&gt;&gt;() {</span>
+            @Override
+            public Observable&lt;? extends T&gt; call(Throwable t) {
+<span class="fc" id="L61">                return other;</span>
+            }
+        });
+    }
+
+    public static &lt;T&gt; OperatorOnErrorResumeNextViaFunction&lt;T&gt; withException(final Observable&lt;? extends T&gt; other) {
+<span class="fc" id="L67">        return new OperatorOnErrorResumeNextViaFunction&lt;T&gt;(new Func1&lt;Throwable, Observable&lt;? extends T&gt;&gt;() {</span>
+            @Override
+            public Observable&lt;? extends T&gt; call(Throwable t) {
+<span class="fc bfc" id="L70" title="All 2 branches covered.">                if (t instanceof Exception) {</span>
+<span class="fc" id="L71">                    return other;</span>
+                }
+<span class="fc" id="L73">                return Observable.error(t);</span>
+            }
+        });
+    }
+
+<span class="fc" id="L78">    public OperatorOnErrorResumeNextViaFunction(Func1&lt;Throwable, ? extends Observable&lt;? extends T&gt;&gt; f) {</span>
+<span class="fc" id="L79">        this.resumeFunction = f;</span>
+<span class="fc" id="L80">    }</span>
+
+    @Override
+    public Subscriber&lt;? super T&gt; call(final Subscriber&lt;? super T&gt; child) {
+<span class="fc" id="L84">        final ProducerArbiter pa = new ProducerArbiter();</span>
+        
+<span class="fc" id="L86">        final SerialSubscription ssub = new SerialSubscription();</span>
+        
+<span class="fc" id="L88">        Subscriber&lt;T&gt; parent = new Subscriber&lt;T&gt;() {</span>
+
+            private boolean done;
+        
+            long produced;
+            
+            @Override
+            public void onCompleted() {
+<span class="pc bpc" id="L96" title="1 of 2 branches missed.">                if (done) {</span>
+<span class="nc" id="L97">                    return;</span>
+                }
+<span class="fc" id="L99">                done = true;</span>
+<span class="fc" id="L100">                child.onCompleted();</span>
+<span class="fc" id="L101">            }</span>
+
+            @Override
+            public void onError(Throwable e) {
+<span class="pc bpc" id="L105" title="1 of 2 branches missed.">                if (done) {</span>
+<span class="nc" id="L106">                    Exceptions.throwIfFatal(e);</span>
+<span class="nc" id="L107">                    RxJavaPlugins.getInstance().getErrorHandler().handleError(e);</span>
+<span class="nc" id="L108">                    return;</span>
+                }
+<span class="fc" id="L110">                done = true;</span>
+                try {
+<span class="fc" id="L112">                    unsubscribe();</span>
+
+<span class="fc" id="L114">                    Subscriber&lt;T&gt; next = new Subscriber&lt;T&gt;() {</span>
+                        @Override
+                        public void onNext(T t) {
+<span class="fc" id="L117">                            child.onNext(t);</span>
+<span class="fc" id="L118">                        }</span>
+                        @Override
+                        public void onError(Throwable e) {
+<span class="fc" id="L121">                            child.onError(e);</span>
+<span class="fc" id="L122">                        }</span>
+                        @Override
+                        public void onCompleted() {
+<span class="fc" id="L125">                            child.onCompleted();</span>
+<span class="fc" id="L126">                        }</span>
+                        @Override
+                        public void setProducer(Producer producer) {
+<span class="fc" id="L129">                            pa.setProducer(producer);</span>
+<span class="fc" id="L130">                        }</span>
+                    };
+<span class="fc" id="L132">                    ssub.set(next);</span>
+                    
+<span class="fc" id="L134">                    long p = produced;</span>
+<span class="fc bfc" id="L135" title="All 2 branches covered.">                    if (p != 0L) {</span>
+<span class="fc" id="L136">                        pa.produced(p);</span>
+                    }
+                    
+<span class="fc" id="L139">                    Observable&lt;? extends T&gt; resume = resumeFunction.call(e);</span>
+                    
+<span class="fc" id="L141">                    resume.unsafeSubscribe(next);</span>
+<span class="fc" id="L142">                } catch (Throwable e2) {</span>
+<span class="fc" id="L143">                    Exceptions.throwOrReport(e2, child);</span>
+<span class="fc" id="L144">                }</span>
+<span class="fc" id="L145">            }</span>
+
+            @Override
+            public void onNext(T t) {
+<span class="fc bfc" id="L149" title="All 2 branches covered.">                if (done) {</span>
+<span class="fc" id="L150">                    return;</span>
+                }
+<span class="fc" id="L152">                produced++;</span>
+<span class="fc" id="L153">                child.onNext(t);</span>
+<span class="fc" id="L154">            }</span>
+            
+            @Override
+            public void setProducer(final Producer producer) {
+<span class="fc" id="L158">                pa.setProducer(producer);</span>
+<span class="fc" id="L159">            }</span>
+
+        };
+<span class="fc" id="L162">        ssub.set(parent);</span>
+
+<span class="fc" id="L164">        child.add(ssub);</span>
+<span class="fc" id="L165">        child.setProducer(pa);</span>
+        
+<span class="fc" id="L167">        return parent;</span>
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

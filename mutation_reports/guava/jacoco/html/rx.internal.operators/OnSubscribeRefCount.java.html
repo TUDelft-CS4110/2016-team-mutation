@@ -1,0 +1,169 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>OnSubscribeRefCount.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.internal.operators</a> &gt; <span class="el_source">OnSubscribeRefCount.java</span></div><h1>OnSubscribeRefCount.java</h1><pre class="source lang-java linenums">/**
+ * Copyright 2014 Netflix, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not
+ * use this file except in compliance with the License. You may obtain a copy of
+ * the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations under
+ * the License.
+ */
+package rx.internal.operators;
+
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReentrantLock;
+
+import rx.Observable.OnSubscribe;
+import rx.Subscriber;
+import rx.Subscription;
+import rx.functions.Action0;
+import rx.functions.Action1;
+import rx.observables.ConnectableObservable;
+import rx.subscriptions.CompositeSubscription;
+import rx.subscriptions.Subscriptions;
+
+/**
+ * Returns an observable sequence that stays connected to the source as long as
+ * there is at least one subscription to the observable sequence.
+ * 
+ * @param &lt;T&gt;
+ *            the value type
+ */
+public final class OnSubscribeRefCount&lt;T&gt; implements OnSubscribe&lt;T&gt; {
+
+    private final ConnectableObservable&lt;? extends T&gt; source;
+<span class="fc" id="L41">    volatile CompositeSubscription baseSubscription = new CompositeSubscription();</span>
+<span class="fc" id="L42">    final AtomicInteger subscriptionCount = new AtomicInteger(0);</span>
+
+    /**
+     * Use this lock for every subscription and disconnect action.
+     */
+<span class="fc" id="L47">    final ReentrantLock lock = new ReentrantLock();</span>
+
+    /**
+     * Constructor.
+     * 
+     * @param source
+     *            observable to apply ref count to
+     */
+<span class="fc" id="L55">    public OnSubscribeRefCount(ConnectableObservable&lt;? extends T&gt; source) {</span>
+<span class="fc" id="L56">        this.source = source;</span>
+<span class="fc" id="L57">    }</span>
+
+    @Override
+    public void call(final Subscriber&lt;? super T&gt; subscriber) {
+
+<span class="fc" id="L62">        lock.lock();</span>
+<span class="fc bfc" id="L63" title="All 2 branches covered.">        if (subscriptionCount.incrementAndGet() == 1) {</span>
+
+<span class="fc" id="L65">            final AtomicBoolean writeLocked = new AtomicBoolean(true);</span>
+
+            try {
+                // need to use this overload of connect to ensure that
+                // baseSubscription is set in the case that source is a
+                // synchronous Observable
+<span class="fc" id="L71">                source.connect(onSubscribe(subscriber, writeLocked));</span>
+            } finally {
+                // need to cover the case where the source is subscribed to
+                // outside of this class thus preventing the Action1 passed
+                // to source.connect above being called
+<span class="pc bpc" id="L76" title="3 of 4 branches missed.">                if (writeLocked.get()) {</span>
+                    // Action1 passed to source.connect was not called
+<span class="nc" id="L78">                    lock.unlock();</span>
+                }
+            }
+<span class="fc" id="L81">        } else {</span>
+            try {
+                // ready to subscribe to source so do it
+<span class="fc" id="L84">                doSubscribe(subscriber, baseSubscription);</span>
+            } finally {
+                // release the read lock
+<span class="pc" id="L87">                lock.unlock();</span>
+<span class="fc" id="L88">            }</span>
+        }
+
+<span class="fc" id="L91">    }</span>
+
+    private Action1&lt;Subscription&gt; onSubscribe(final Subscriber&lt;? super T&gt; subscriber,
+            final AtomicBoolean writeLocked) {
+<span class="fc" id="L95">        return new Action1&lt;Subscription&gt;() {</span>
+            @Override
+            public void call(Subscription subscription) {
+
+                try {
+<span class="fc" id="L100">                    baseSubscription.add(subscription);</span>
+                    // ready to subscribe to source so do it
+<span class="fc" id="L102">                    doSubscribe(subscriber, baseSubscription);</span>
+                } finally {
+                    // release the write lock
+<span class="pc" id="L105">                    lock.unlock();</span>
+<span class="pc" id="L106">                    writeLocked.set(false);</span>
+<span class="fc" id="L107">                }</span>
+<span class="fc" id="L108">            }</span>
+        };
+    }
+    
+    void doSubscribe(final Subscriber&lt;? super T&gt; subscriber, final CompositeSubscription currentBase) {
+        // handle unsubscribing from the base subscription
+<span class="fc" id="L114">        subscriber.add(disconnect(currentBase));</span>
+        
+<span class="fc" id="L116">        source.unsafeSubscribe(new Subscriber&lt;T&gt;(subscriber) {</span>
+            @Override
+            public void onError(Throwable e) {
+<span class="fc" id="L119">                cleanup();</span>
+<span class="fc" id="L120">                subscriber.onError(e);</span>
+<span class="fc" id="L121">            }</span>
+            @Override
+            public void onNext(T t) {
+<span class="fc" id="L124">                subscriber.onNext(t);</span>
+<span class="fc" id="L125">            }</span>
+            @Override
+            public void onCompleted() {
+<span class="fc" id="L128">                cleanup();</span>
+<span class="fc" id="L129">                subscriber.onCompleted();</span>
+<span class="fc" id="L130">            }</span>
+            void cleanup() {
+                // on error or completion we need to unsubscribe the base subscription
+                // and set the subscriptionCount to 0 
+<span class="fc" id="L134">                lock.lock();</span>
+                try {
+<span class="fc bfc" id="L136" title="All 2 branches covered.">                    if (baseSubscription == currentBase) {</span>
+<span class="fc" id="L137">                        baseSubscription.unsubscribe();</span>
+<span class="fc" id="L138">                        baseSubscription = new CompositeSubscription();</span>
+<span class="fc" id="L139">                        subscriptionCount.set(0);</span>
+                    }
+                } finally {
+<span class="pc" id="L142">                    lock.unlock();</span>
+<span class="fc" id="L143">                }</span>
+<span class="fc" id="L144">            }</span>
+        });
+<span class="fc" id="L146">    }</span>
+
+    private Subscription disconnect(final CompositeSubscription current) {
+<span class="fc" id="L149">        return Subscriptions.create(new Action0() {</span>
+            @Override
+            public void call() {
+<span class="fc" id="L152">                lock.lock();</span>
+                try {
+<span class="fc bfc" id="L154" title="All 2 branches covered.">                    if (baseSubscription == current) {</span>
+<span class="fc bfc" id="L155" title="All 2 branches covered.">                        if (subscriptionCount.decrementAndGet() == 0) {</span>
+<span class="fc" id="L156">                            baseSubscription.unsubscribe();</span>
+                            // need a new baseSubscription because once
+                            // unsubscribed stays that way
+<span class="fc" id="L159">                            baseSubscription = new CompositeSubscription();</span>
+                        }
+                    }
+                } finally {
+<span class="pc" id="L163">                    lock.unlock();</span>
+<span class="fc" id="L164">                }</span>
+<span class="fc" id="L165">            }</span>
+        });
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

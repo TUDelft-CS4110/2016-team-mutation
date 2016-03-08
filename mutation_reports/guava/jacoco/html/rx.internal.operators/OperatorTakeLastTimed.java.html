@@ -1,0 +1,111 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>OperatorTakeLastTimed.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.internal.operators</a> &gt; <span class="el_source">OperatorTakeLastTimed.java</span></div><h1>OperatorTakeLastTimed.java</h1><pre class="source lang-java linenums">/**
+ * Copyright 2014 Netflix, Inc.
+ * 
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package rx.internal.operators;
+
+import rx.Observable.Operator;
+import rx.Scheduler;
+import rx.Subscriber;
+
+import java.util.ArrayDeque;
+import java.util.Deque;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * Returns an Observable that emits the last &lt;code&gt;count&lt;/code&gt; items emitted by the source Observable.
+ * &lt;p&gt;
+ * &lt;img width=&quot;640&quot; src=&quot;https://github.com/ReactiveX/RxJava/wiki/images/rx-operators/last.png&quot; alt=&quot;&quot;&gt;
+ */
+public final class OperatorTakeLastTimed&lt;T&gt; implements Operator&lt;T, T&gt; {
+
+    final long ageMillis;
+    final Scheduler scheduler;
+    final int count;
+
+<span class="fc" id="L37">    public OperatorTakeLastTimed(long time, TimeUnit unit, Scheduler scheduler) {</span>
+<span class="fc" id="L38">        this.ageMillis = unit.toMillis(time);</span>
+<span class="fc" id="L39">        this.scheduler = scheduler;</span>
+<span class="fc" id="L40">        this.count = -1;</span>
+<span class="fc" id="L41">    }</span>
+
+<span class="fc" id="L43">    public OperatorTakeLastTimed(int count, long time, TimeUnit unit, Scheduler scheduler) {</span>
+<span class="fc bfc" id="L44" title="All 2 branches covered.">        if (count &lt; 0) {</span>
+<span class="fc" id="L45">            throw new IndexOutOfBoundsException(&quot;count could not be negative&quot;);</span>
+        }
+<span class="fc" id="L47">        this.ageMillis = unit.toMillis(time);</span>
+<span class="fc" id="L48">        this.scheduler = scheduler;</span>
+<span class="fc" id="L49">        this.count = count;</span>
+<span class="fc" id="L50">    }</span>
+
+    @Override
+    public Subscriber&lt;? super T&gt; call(final Subscriber&lt;? super T&gt; subscriber) {
+<span class="fc" id="L54">        final Deque&lt;Object&gt; buffer = new ArrayDeque&lt;Object&gt;();</span>
+<span class="fc" id="L55">        final Deque&lt;Long&gt; timestampBuffer = new ArrayDeque&lt;Long&gt;();</span>
+<span class="fc" id="L56">        final NotificationLite&lt;T&gt; notification = NotificationLite.instance();</span>
+<span class="fc" id="L57">        final TakeLastQueueProducer&lt;T&gt; producer = new TakeLastQueueProducer&lt;T&gt;(notification, buffer, subscriber);</span>
+<span class="fc" id="L58">        subscriber.setProducer(producer);</span>
+<span class="fc" id="L59">        return new Subscriber&lt;T&gt;(subscriber) {</span>
+
+            protected void runEvictionPolicy(long now) {
+                // trim size
+<span class="fc bfc" id="L63" title="All 4 branches covered.">                while (count &gt;= 0 &amp;&amp; buffer.size() &gt; count) {</span>
+<span class="fc" id="L64">                    timestampBuffer.pollFirst();</span>
+<span class="fc" id="L65">                    buffer.pollFirst();</span>
+                }
+                // remove old entries
+<span class="fc bfc" id="L68" title="All 2 branches covered.">                while (!buffer.isEmpty()) {</span>
+<span class="fc" id="L69">                    long v = timestampBuffer.peekFirst();</span>
+<span class="fc bfc" id="L70" title="All 2 branches covered.">                    if (v &lt; now - ageMillis) {</span>
+<span class="fc" id="L71">                        timestampBuffer.pollFirst();</span>
+<span class="fc" id="L72">                        buffer.pollFirst();</span>
+                    } else {
+                        break;
+                    }
+<span class="fc" id="L76">                }</span>
+<span class="fc" id="L77">            }</span>
+
+            // no backpressure up as it wants to receive and discard all but the last
+            @Override
+            public void onStart() {
+                // we do this to break the chain of the child subscriber being passed through
+<span class="fc" id="L83">                request(Long.MAX_VALUE);</span>
+<span class="fc" id="L84">            }</span>
+            
+            @Override
+            public void onNext(T args) {
+<span class="fc" id="L88">                long t = scheduler.now();</span>
+<span class="fc" id="L89">                timestampBuffer.add(t);</span>
+<span class="fc" id="L90">                buffer.add(notification.next(args));</span>
+<span class="fc" id="L91">                runEvictionPolicy(t);</span>
+<span class="fc" id="L92">            }</span>
+
+            @Override
+            public void onError(Throwable e) {
+<span class="fc" id="L96">                timestampBuffer.clear();</span>
+<span class="fc" id="L97">                buffer.clear();</span>
+<span class="fc" id="L98">                subscriber.onError(e);</span>
+<span class="fc" id="L99">            }</span>
+
+            @Override
+            public void onCompleted() {
+<span class="fc" id="L103">                runEvictionPolicy(scheduler.now());</span>
+<span class="fc" id="L104">                timestampBuffer.clear();</span>
+<span class="fc" id="L105">                buffer.offer(notification.completed());</span>
+<span class="fc" id="L106">                producer.startEmitting();</span>
+<span class="fc" id="L107">            }</span>
+        };
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

@@ -1,0 +1,489 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>SyncOnSubscribe.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.observables</a> &gt; <span class="el_source">SyncOnSubscribe.java</span></div><h1>SyncOnSubscribe.java</h1><pre class="source lang-java linenums">/**
+ * Copyright 2014 Netflix, Inc.
+ * 
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package rx.observables;
+
+import java.util.concurrent.atomic.AtomicLong;
+
+import rx.Observable.OnSubscribe;
+import rx.Observer;
+import rx.Producer;
+import rx.Subscriber;
+import rx.Subscription;
+import rx.annotations.Experimental;
+import rx.exceptions.Exceptions;
+import rx.functions.Action0;
+import rx.functions.Action1;
+import rx.functions.Action2;
+import rx.functions.Func0;
+import rx.functions.Func2;
+import rx.internal.operators.BackpressureUtils;
+import rx.plugins.RxJavaPlugins;
+
+/**
+ * A utility class to create {@code OnSubscribe&lt;T&gt;} functions that respond correctly to back
+ * pressure requests from subscribers. This is an improvement over
+ * {@link rx.Observable#create(OnSubscribe) Observable.create(OnSubscribe)} which does not provide
+ * any means of managing back pressure requests out-of-the-box.
+ *
+ * @param &lt;S&gt;
+ *            the type of the user-define state used in {@link #generateState() generateState(S)} ,
+ *            {@link #next(Object, Subscriber) next(S, Subscriber)}, and
+ *            {@link #onUnsubscribe(Object) onUnsubscribe(S)}.
+ * @param &lt;T&gt;
+ *            the type of {@code Subscribers} that will be compatible with {@code this}.
+ */
+@Experimental
+<span class="fc" id="L50">public abstract class SyncOnSubscribe&lt;S, T&gt; implements OnSubscribe&lt;T&gt; {</span>
+    
+    /* (non-Javadoc)
+     * @see rx.functions.Action1#call(java.lang.Object)
+     */
+    @Override
+    public final void call(final Subscriber&lt;? super T&gt; subscriber) {
+        S state;
+        
+        try {
+<span class="fc" id="L60">            state = generateState();</span>
+<span class="fc" id="L61">        } catch (Throwable e) {</span>
+<span class="fc" id="L62">            Exceptions.throwIfFatal(e);</span>
+<span class="fc" id="L63">            subscriber.onError(e);</span>
+<span class="fc" id="L64">            return;</span>
+<span class="fc" id="L65">        }</span>
+        
+<span class="fc" id="L67">        SubscriptionProducer&lt;S, T&gt; p = new SubscriptionProducer&lt;S, T&gt;(subscriber, this, state);</span>
+<span class="fc" id="L68">        subscriber.add(p);</span>
+<span class="fc" id="L69">        subscriber.setProducer(p);</span>
+<span class="fc" id="L70">    }</span>
+
+    /**
+     * Executed once when subscribed to by a subscriber (via {@link OnSubscribe#call(Subscriber)})
+     * to produce a state value. This value is passed into {@link #next(Object, Observer) next(S
+     * state, Observer &lt;T&gt; observer)} on the first iteration. Subsequent iterations of {@code next}
+     * will receive the state returned by the previous invocation of {@code next}.
+     * 
+     * @return the initial state value
+     */
+    protected abstract S generateState();
+
+    /**
+     * Called to produce data to the downstream subscribers. To emit data to a downstream subscriber
+     * call {@code observer.onNext(t)}. To signal an error condition call
+     * {@code observer.onError(throwable)} or throw an Exception. To signal the end of a data stream
+     * call {@code 
+     * observer.onCompleted()}. Implementations of this method must follow the following rules.
+     * 
+     * &lt;ul&gt;
+     * &lt;li&gt;Must not call {@code observer.onNext(t)} more than 1 time per invocation.&lt;/li&gt;
+     * &lt;li&gt;Must not call {@code observer.onNext(t)} concurrently.&lt;/li&gt;
+     * &lt;/ul&gt;
+     * 
+     * The value returned from an invocation of this method will be passed in as the {@code state}
+     * argument of the next invocation of this method.
+     * 
+     * @param state
+     *            the state value (from {@link #generateState()} on the first invocation or the
+     *            previous invocation of this method.
+     * @param observer
+     *            the observer of data emitted by
+     * @return the next iteration's state value
+     */
+    protected abstract S next(S state, Observer&lt;? super T&gt; observer);
+
+    /**
+     * Clean up behavior that is executed after the downstream subscriber's subscription is
+     * unsubscribed. This method will be invoked exactly once.
+     * 
+     * @param state
+     *            the last state value prior from {@link #generateState()} or
+     *            {@link #next(Object, Observer) next(S, Observer&amp;lt;T&amp;gt;)} before unsubscribe.
+     */
+    protected void onUnsubscribe(S state) {
+
+<span class="nc" id="L116">    }</span>
+
+    /**
+     * Generates a synchronous {@link SyncOnSubscribe} that calls the provided {@code next} function
+     * to generate data to downstream subscribers.
+     * 
+     * @param generator
+     *            generates the initial state value (see {@link #generateState()})
+     * @param next
+     *            produces data to the downstream subscriber (see {@link #next(Object, Subscriber)
+     *            next(S, Subscriber)})
+     * @return a SyncOnSubscribe that emits data in a protocol compatible with back-pressure.
+     */
+    @Experimental
+    public static &lt;S, T&gt; SyncOnSubscribe&lt;S, T&gt; createSingleState(Func0&lt;? extends S&gt; generator, 
+            final Action2&lt;? super S, ? super Observer&lt;? super T&gt;&gt; next) {
+<span class="fc" id="L132">        Func2&lt;S, ? super Observer&lt;? super T&gt;, S&gt; nextFunc = new Func2&lt;S, Observer&lt;? super T&gt;, S&gt;() {</span>
+            @Override
+            public S call(S state, Observer&lt;? super T&gt; subscriber) {
+<span class="fc" id="L135">                next.call(state, subscriber);</span>
+<span class="fc" id="L136">                return state;</span>
+            }
+        };
+<span class="fc" id="L139">        return new SyncOnSubscribeImpl&lt;S, T&gt;(generator, nextFunc);</span>
+    }
+
+    /**
+     * Generates a synchronous {@link SyncOnSubscribe} that calls the provided {@code next} function
+     * to generate data to downstream subscribers.
+     * 
+     * This overload creates a SyncOnSubscribe without an explicit clean up step.
+     * 
+     * @param generator
+     *            generates the initial state value (see {@link #generateState()})
+     * @param next
+     *            produces data to the downstream subscriber (see {@link #next(Object, Subscriber)
+     *            next(S, Subscriber)})
+     * @param onUnsubscribe
+     *            clean up behavior (see {@link #onUnsubscribe(Object) onUnsubscribe(S)})
+     * @return a SyncOnSubscribe that emits data downstream in a protocol compatible with
+     *         back-pressure.
+     */
+    @Experimental
+    public static &lt;S, T&gt; SyncOnSubscribe&lt;S, T&gt; createSingleState(Func0&lt;? extends S&gt; generator, 
+            final Action2&lt;? super S, ? super Observer&lt;? super T&gt;&gt; next, 
+            final Action1&lt;? super S&gt; onUnsubscribe) {
+<span class="fc" id="L162">        Func2&lt;S, Observer&lt;? super T&gt;, S&gt; nextFunc = new Func2&lt;S, Observer&lt;? super T&gt;, S&gt;() {</span>
+            @Override
+            public S call(S state, Observer&lt;? super T&gt; subscriber) {
+<span class="fc" id="L165">                next.call(state, subscriber);</span>
+<span class="fc" id="L166">                return state;</span>
+            }
+        };
+<span class="fc" id="L169">        return new SyncOnSubscribeImpl&lt;S, T&gt;(generator, nextFunc, onUnsubscribe);</span>
+    }
+
+    /**
+     * Generates a synchronous {@link SyncOnSubscribe} that calls the provided {@code next} function
+     * to generate data to downstream subscribers.
+     * 
+     * @param generator
+     *            generates the initial state value (see {@link #generateState()})
+     * @param next
+     *            produces data to the downstream subscriber (see {@link #next(Object, Subscriber)
+     *            next(S, Subscriber)})
+     * @param onUnsubscribe
+     *            clean up behavior (see {@link #onUnsubscribe(Object) onUnsubscribe(S)})
+     * @return a SyncOnSubscribe that emits data downstream in a protocol compatible with
+     *         back-pressure.
+     */
+    @Experimental
+    public static &lt;S, T&gt; SyncOnSubscribe&lt;S, T&gt; createStateful(Func0&lt;? extends S&gt; generator, 
+            Func2&lt;? super S, ? super Observer&lt;? super T&gt;, ? extends S&gt; next, 
+            Action1&lt;? super S&gt; onUnsubscribe) {
+<span class="fc" id="L190">        return new SyncOnSubscribeImpl&lt;S, T&gt;(generator, next, onUnsubscribe);</span>
+    }
+    
+    /**
+     * Generates a synchronous {@link SyncOnSubscribe} that calls the provided {@code next} function
+     * to generate data to downstream subscribers.
+     * 
+     * @param generator
+     *            generates the initial state value (see {@link #generateState()})
+     * @param next
+     *            produces data to the downstream subscriber (see {@link #next(Object, Subscriber)
+     *            next(S, Subscriber)})
+     * @return a SyncOnSubscribe that emits data downstream in a protocol compatible with
+     *         back-pressure.
+     */
+    @Experimental
+    public static &lt;S, T&gt; SyncOnSubscribe&lt;S, T&gt; createStateful(Func0&lt;? extends S&gt; generator, 
+            Func2&lt;? super S, ? super Observer&lt;? super T&gt;, ? extends S&gt; next) {
+<span class="fc" id="L208">        return new SyncOnSubscribeImpl&lt;S, T&gt;(generator, next);</span>
+    }
+
+    /**
+     * Generates a synchronous {@link SyncOnSubscribe} that calls the provided {@code next} function
+     * to generate data to downstream subscribers.
+     * 
+     * This overload creates a &quot;state-less&quot; SyncOnSubscribe which does not have an explicit state
+     * value. This should be used when the {@code next} function closes over it's state.
+     * 
+     * @param next
+     *            produces data to the downstream subscriber (see {@link #next(Object, Subscriber)
+     *            next(S, Subscriber)})
+     * @return a SyncOnSubscribe that emits data downstream in a protocol compatible with
+     *         back-pressure.
+     */
+    @Experimental
+    public static &lt;T&gt; SyncOnSubscribe&lt;Void, T&gt; createStateless(final Action1&lt;? super Observer&lt;? super T&gt;&gt; next) {
+<span class="fc" id="L226">        Func2&lt;Void, Observer&lt;? super T&gt;, Void&gt; nextFunc = new Func2&lt;Void, Observer&lt;? super T&gt;, Void&gt;() {</span>
+            @Override
+            public Void call(Void state, Observer&lt;? super T&gt; subscriber) {
+<span class="fc" id="L229">                next.call(subscriber);</span>
+<span class="fc" id="L230">                return state;</span>
+            }
+        };
+<span class="fc" id="L233">        return new SyncOnSubscribeImpl&lt;Void, T&gt;(nextFunc);</span>
+    }
+
+    /**
+     * Generates a synchronous {@link SyncOnSubscribe} that calls the provided {@code next} function
+     * to generate data to downstream subscribers.
+     * 
+     * This overload creates a &quot;state-less&quot; SyncOnSubscribe which does not have an explicit state
+     * value. This should be used when the {@code next} function closes over it's state.
+     * 
+     * @param next
+     *            produces data to the downstream subscriber (see {@link #next(Object, Subscriber)
+     *            next(S, Subscriber)})
+     * @param onUnsubscribe
+     *            clean up behavior (see {@link #onUnsubscribe(Object) onUnsubscribe(S)})
+     * @return a SyncOnSubscribe that emits data downstream in a protocol compatible with
+     *         back-pressure.
+     */
+    @Experimental
+    public static &lt;T&gt; SyncOnSubscribe&lt;Void, T&gt; createStateless(final Action1&lt;? super Observer&lt;? super T&gt;&gt; next, 
+            final Action0 onUnsubscribe) {
+<span class="fc" id="L254">        Func2&lt;Void, Observer&lt;? super T&gt;, Void&gt; nextFunc = new Func2&lt;Void, Observer&lt;? super T&gt;, Void&gt;() {</span>
+            @Override
+            public Void call(Void state, Observer&lt;? super T&gt; subscriber) {
+<span class="fc" id="L257">                next.call(subscriber);</span>
+<span class="fc" id="L258">                return null;</span>
+            }
+        };
+<span class="fc" id="L261">        Action1&lt;? super Void&gt; wrappedOnUnsubscribe = new Action1&lt;Void&gt;(){</span>
+            @Override
+            public void call(Void t) {
+<span class="fc" id="L264">                onUnsubscribe.call();</span>
+<span class="fc" id="L265">            }};</span>
+<span class="fc" id="L266">        return new SyncOnSubscribeImpl&lt;Void, T&gt;(nextFunc, wrappedOnUnsubscribe);</span>
+    }
+
+    /**
+     * An implementation of SyncOnSubscribe that delegates
+     * {@link SyncOnSubscribe#next(Object, Subscriber)}, {@link SyncOnSubscribe#generateState()},
+     * and {@link SyncOnSubscribe#onUnsubscribe(Object)} to provided functions/closures.
+     *
+     * @param &lt;S&gt;
+     *            the type of the user-defined state
+     * @param &lt;T&gt;
+     *            the type of compatible Subscribers
+     */
+    private static final class SyncOnSubscribeImpl&lt;S, T&gt; extends SyncOnSubscribe&lt;S, T&gt; {
+        private final Func0&lt;? extends S&gt; generator;
+        private final Func2&lt;? super S, ? super Observer&lt;? super T&gt;, ? extends S&gt; next;
+        private final Action1&lt;? super S&gt; onUnsubscribe;
+
+<span class="fc" id="L284">        SyncOnSubscribeImpl(Func0&lt;? extends S&gt; generator, Func2&lt;? super S, ? super Observer&lt;? super T&gt;, ? extends S&gt; next, Action1&lt;? super S&gt; onUnsubscribe) {</span>
+<span class="fc" id="L285">            this.generator = generator;</span>
+<span class="fc" id="L286">            this.next = next;</span>
+<span class="fc" id="L287">            this.onUnsubscribe = onUnsubscribe;</span>
+<span class="fc" id="L288">        }</span>
+
+        public SyncOnSubscribeImpl(Func0&lt;? extends S&gt; generator, Func2&lt;? super S, ? super Observer&lt;? super T&gt;, ? extends S&gt; next) {
+<span class="fc" id="L291">            this(generator, next, null);</span>
+<span class="fc" id="L292">        }</span>
+
+        public SyncOnSubscribeImpl(Func2&lt;S, Observer&lt;? super T&gt;, S&gt; next, Action1&lt;? super S&gt; onUnsubscribe) {
+<span class="fc" id="L295">            this(null, next, onUnsubscribe);</span>
+<span class="fc" id="L296">        }</span>
+
+        public SyncOnSubscribeImpl(Func2&lt;S, Observer&lt;? super T&gt;, S&gt; nextFunc) {
+<span class="fc" id="L299">            this(null, nextFunc, null);</span>
+<span class="fc" id="L300">        }</span>
+
+        @Override
+        protected S generateState() {
+<span class="fc bfc" id="L304" title="All 2 branches covered.">            return generator == null ? null : generator.call();</span>
+        }
+
+        @Override
+        protected S next(S state, Observer&lt;? super T&gt; observer) {
+<span class="fc" id="L309">            return next.call(state, observer);</span>
+        }
+
+        @Override
+        protected void onUnsubscribe(S state) {
+<span class="fc bfc" id="L314" title="All 2 branches covered.">            if (onUnsubscribe != null)</span>
+<span class="fc" id="L315">                onUnsubscribe.call(state);</span>
+<span class="fc" id="L316">        }</span>
+    }
+
+    /**
+     * Contains the producer loop that reacts to downstream requests of work.
+     *
+     * @param &lt;T&gt;
+     *            the type of compatible Subscribers
+     */
+<span class="fc" id="L325">    private static class SubscriptionProducer&lt;S, T&gt; </span>
+    extends AtomicLong implements Producer, Subscription, Observer&lt;T&gt; {
+        /** */
+        private static final long serialVersionUID = -3736864024352728072L;
+        private final Subscriber&lt;? super T&gt; actualSubscriber;
+        private final SyncOnSubscribe&lt;S, T&gt; parent;
+        private boolean onNextCalled;
+        private boolean hasTerminated;
+        
+        private S state;
+
+<span class="fc" id="L336">        SubscriptionProducer(final Subscriber&lt;? super T&gt; subscriber, SyncOnSubscribe&lt;S, T&gt; parent, S state) {</span>
+<span class="fc" id="L337">            this.actualSubscriber = subscriber;</span>
+<span class="fc" id="L338">            this.parent = parent;</span>
+<span class="fc" id="L339">            this.state = state;</span>
+<span class="fc" id="L340">        }</span>
+
+        @Override
+        public boolean isUnsubscribed() {
+<span class="pc bpc" id="L344" title="1 of 2 branches missed.">            return get() &lt; 0L;</span>
+        }
+        
+        @Override
+        public void unsubscribe() {
+            while(true) {
+<span class="fc" id="L350">                long requestCount = get();</span>
+<span class="fc bfc" id="L351" title="All 2 branches covered.">                if (compareAndSet(0L, -1L)) {</span>
+<span class="fc" id="L352">                    doUnsubscribe();</span>
+<span class="fc" id="L353">                    return;</span>
+                }
+<span class="fc bfc" id="L355" title="All 2 branches covered.">                else if (compareAndSet(requestCount, -2L))</span>
+                    // the loop is iterating concurrently
+                    // need to check if requestCount == -1
+                    // and unsub if so after loop iteration
+<span class="fc" id="L359">                    return;</span>
+<span class="fc" id="L360">            }</span>
+        }
+        
+        private boolean tryUnsubscribe() {
+            // only one thread at a time can iterate over request count
+            // therefore the requestCount atomic cannot be decrement concurrently here
+            // safe to set to -1 atomically (since this check can only be done by 1 thread)
+<span class="fc bfc" id="L367" title="All 4 branches covered.">            if (hasTerminated || get() &lt; -1) {</span>
+<span class="fc" id="L368">                set(-1);</span>
+<span class="fc" id="L369">                doUnsubscribe();</span>
+<span class="fc" id="L370">                return true;</span>
+            }
+<span class="fc" id="L372">            return false;</span>
+        }
+
+        private void doUnsubscribe() {
+            try {
+<span class="fc" id="L377">                parent.onUnsubscribe(state);</span>
+<span class="nc" id="L378">            } catch (Throwable e) {</span>
+<span class="nc" id="L379">                Exceptions.throwIfFatal(e);</span>
+<span class="nc" id="L380">                RxJavaPlugins.getInstance().getErrorHandler().handleError(e);</span>
+<span class="fc" id="L381">            }</span>
+<span class="fc" id="L382">        }</span>
+
+        @Override
+        public void request(long n) {
+<span class="fc bfc" id="L386" title="All 4 branches covered.">            if (n &gt; 0 &amp;&amp; BackpressureUtils.getAndAddRequest(this, n) == 0L) {</span>
+<span class="fc bfc" id="L387" title="All 2 branches covered.">                if (n == Long.MAX_VALUE) {</span>
+<span class="fc" id="L388">                    fastpath();</span>
+                } else {
+<span class="fc" id="L390">                    slowPath(n);</span>
+                }
+            }
+<span class="fc" id="L393">        }</span>
+
+        private void fastpath() {
+<span class="fc" id="L396">            final SyncOnSubscribe&lt;S, T&gt; p = parent;</span>
+<span class="fc" id="L397">            Subscriber&lt;? super T&gt; a = actualSubscriber;</span>
+            
+            for (;;) {
+                try {
+<span class="fc" id="L401">                    onNextCalled = false;</span>
+<span class="fc" id="L402">                    nextIteration(p);</span>
+<span class="fc" id="L403">                } catch (Throwable ex) {</span>
+<span class="fc" id="L404">                    handleThrownError(a, ex);</span>
+<span class="fc" id="L405">                    return;</span>
+<span class="fc" id="L406">                }</span>
+<span class="fc bfc" id="L407" title="All 2 branches covered.">                if (tryUnsubscribe()) {</span>
+<span class="fc" id="L408">                    return;</span>
+                }
+            }
+        }
+
+        private void handleThrownError(Subscriber&lt;? super T&gt; a, Throwable ex) {
+<span class="fc bfc" id="L414" title="All 2 branches covered.">            if (hasTerminated) {</span>
+<span class="fc" id="L415">                RxJavaPlugins.getInstance().getErrorHandler().handleError(ex);</span>
+            } else {
+<span class="fc" id="L417">                hasTerminated = true;</span>
+<span class="fc" id="L418">                a.onError(ex);</span>
+<span class="fc" id="L419">                unsubscribe();</span>
+            }
+<span class="fc" id="L421">        }</span>
+
+        private void slowPath(long n) {
+<span class="fc" id="L424">            final SyncOnSubscribe&lt;S, T&gt; p = parent;</span>
+<span class="fc" id="L425">            Subscriber&lt;? super T&gt; a = actualSubscriber;</span>
+<span class="fc" id="L426">            long numRequested = n;</span>
+            for (;;) {
+<span class="fc" id="L428">                long numRemaining = numRequested;</span>
+                do {
+                    try {
+<span class="fc" id="L431">                        onNextCalled = false;</span>
+<span class="fc" id="L432">                        nextIteration(p);</span>
+<span class="fc" id="L433">                    } catch (Throwable ex) {</span>
+<span class="fc" id="L434">                        handleThrownError(a, ex);</span>
+<span class="fc" id="L435">                        return;</span>
+<span class="fc" id="L436">                    }</span>
+<span class="fc bfc" id="L437" title="All 2 branches covered.">                    if (tryUnsubscribe()) {</span>
+<span class="fc" id="L438">                        return;</span>
+                    }
+<span class="fc bfc" id="L440" title="All 2 branches covered.">                    if (onNextCalled)</span>
+<span class="fc" id="L441">                        numRemaining--;</span>
+<span class="fc bfc" id="L442" title="All 2 branches covered.">                } while (numRemaining != 0L);</span>
+<span class="fc" id="L443">                numRequested = addAndGet(-numRequested);</span>
+<span class="pc bpc" id="L444" title="1 of 2 branches missed.">                if (numRequested &lt;= 0L)</span>
+<span class="fc" id="L445">                    break;</span>
+<span class="nc" id="L446">            }</span>
+            // catches cases where unsubscribe is called before decrementing atomic request count
+<span class="fc" id="L448">            tryUnsubscribe();</span>
+<span class="fc" id="L449">        }</span>
+
+        private void nextIteration(final SyncOnSubscribe&lt;S, T&gt; parent) {
+<span class="fc" id="L452">            state = parent.next(state, this);</span>
+<span class="fc" id="L453">        }</span>
+        
+        @Override
+        public void onCompleted() {
+<span class="fc bfc" id="L457" title="All 2 branches covered.">            if (hasTerminated) {</span>
+<span class="fc" id="L458">                throw new IllegalStateException(&quot;Terminal event already emitted.&quot;);</span>
+            }
+<span class="fc" id="L460">            hasTerminated = true;</span>
+<span class="pc bpc" id="L461" title="1 of 2 branches missed.">            if (!actualSubscriber.isUnsubscribed()) {</span>
+<span class="fc" id="L462">                actualSubscriber.onCompleted();</span>
+            }
+<span class="fc" id="L464">        }</span>
+
+        @Override
+        public void onError(Throwable e) {
+<span class="fc bfc" id="L468" title="All 2 branches covered.">            if (hasTerminated) {</span>
+<span class="fc" id="L469">                throw new IllegalStateException(&quot;Terminal event already emitted.&quot;);</span>
+            }
+<span class="fc" id="L471">            hasTerminated = true;</span>
+<span class="pc bpc" id="L472" title="1 of 2 branches missed.">            if (!actualSubscriber.isUnsubscribed()) {</span>
+<span class="fc" id="L473">                actualSubscriber.onError(e);</span>
+            }
+<span class="fc" id="L475">        }</span>
+
+        @Override
+        public void onNext(T value) {
+<span class="fc bfc" id="L479" title="All 2 branches covered.">            if (onNextCalled) {</span>
+<span class="fc" id="L480">                throw new IllegalStateException(&quot;onNext called multiple times!&quot;);</span>
+            }
+<span class="fc" id="L482">            onNextCalled = true;</span>
+<span class="fc" id="L483">            actualSubscriber.onNext(value);</span>
+<span class="fc" id="L484">        }</span>
+    }
+
+    
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

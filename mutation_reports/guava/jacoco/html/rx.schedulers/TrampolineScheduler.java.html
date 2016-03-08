@@ -1,0 +1,136 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>TrampolineScheduler.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.schedulers</a> &gt; <span class="el_source">TrampolineScheduler.java</span></div><h1>TrampolineScheduler.java</h1><pre class="source lang-java linenums">/**
+ * Copyright 2014 Netflix, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package rx.schedulers;
+
+import java.util.concurrent.PriorityBlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import rx.Scheduler;
+import rx.Subscription;
+import rx.functions.Action0;
+import rx.subscriptions.BooleanSubscription;
+import rx.subscriptions.Subscriptions;
+
+/**
+ * Schedules work on the current thread but does not execute immediately. Work is put in a queue and executed
+ * after the current unit of work is completed.
+ */
+public final class TrampolineScheduler extends Scheduler {
+<span class="fc" id="L33">    private static final TrampolineScheduler INSTANCE = new TrampolineScheduler();</span>
+
+    /* package */static TrampolineScheduler instance() {
+<span class="fc" id="L36">        return INSTANCE;</span>
+    }
+
+    @Override
+    public Worker createWorker() {
+<span class="fc" id="L41">        return new InnerCurrentThreadScheduler();</span>
+    }
+
+<span class="fc" id="L44">    /* package accessible for unit tests */TrampolineScheduler() {</span>
+<span class="fc" id="L45">    }</span>
+
+    private static class InnerCurrentThreadScheduler extends Scheduler.Worker implements Subscription {
+
+<span class="fc" id="L49">        final AtomicInteger counter = new AtomicInteger();</span>
+<span class="fc" id="L50">        final PriorityBlockingQueue&lt;TimedAction&gt; queue = new PriorityBlockingQueue&lt;TimedAction&gt;();</span>
+<span class="fc" id="L51">        private final BooleanSubscription innerSubscription = new BooleanSubscription();</span>
+<span class="fc" id="L52">        private final AtomicInteger wip = new AtomicInteger();</span>
+
+<span class="fc" id="L54">        InnerCurrentThreadScheduler() {</span>
+<span class="fc" id="L55">        }</span>
+
+        @Override
+        public Subscription schedule(Action0 action) {
+<span class="fc" id="L59">            return enqueue(action, now());</span>
+        }
+
+        @Override
+        public Subscription schedule(Action0 action, long delayTime, TimeUnit unit) {
+<span class="fc" id="L64">            long execTime = now() + unit.toMillis(delayTime);</span>
+
+<span class="fc" id="L66">            return enqueue(new SleepingAction(action, this, execTime), execTime);</span>
+        }
+
+        private Subscription enqueue(Action0 action, long execTime) {
+<span class="fc bfc" id="L70" title="All 2 branches covered.">            if (innerSubscription.isUnsubscribed()) {</span>
+<span class="fc" id="L71">                return Subscriptions.unsubscribed();</span>
+            }
+<span class="fc" id="L73">            final TimedAction timedAction = new TimedAction(action, execTime, counter.incrementAndGet());</span>
+<span class="fc" id="L74">            queue.add(timedAction);</span>
+
+<span class="fc bfc" id="L76" title="All 2 branches covered.">            if (wip.getAndIncrement() == 0) {</span>
+                do {
+<span class="fc" id="L78">                    final TimedAction polled = queue.poll();</span>
+<span class="pc bpc" id="L79" title="1 of 2 branches missed.">                    if (polled != null) {</span>
+<span class="fc" id="L80">                        polled.action.call();</span>
+                    }
+<span class="fc bfc" id="L82" title="All 2 branches covered.">                } while (wip.decrementAndGet() &gt; 0);</span>
+<span class="fc" id="L83">                return Subscriptions.unsubscribed();</span>
+            } else {
+                // queue wasn't empty, a parent is already processing so we just add to the end of the queue
+<span class="fc" id="L86">                return Subscriptions.create(new Action0() {</span>
+
+                    @Override
+                    public void call() {
+<span class="nc" id="L90">                        queue.remove(timedAction);</span>
+<span class="nc" id="L91">                    }</span>
+
+                });
+            }
+        }
+
+        @Override
+        public void unsubscribe() {
+<span class="fc" id="L99">            innerSubscription.unsubscribe();</span>
+<span class="fc" id="L100">        }</span>
+
+        @Override
+        public boolean isUnsubscribed() {
+<span class="fc" id="L104">            return innerSubscription.isUnsubscribed();</span>
+        }
+
+    }
+
+    private static final class TimedAction implements Comparable&lt;TimedAction&gt; {
+        final Action0 action;
+        final Long execTime;
+        final int count; // In case if time between enqueueing took less than 1ms
+
+<span class="fc" id="L114">        TimedAction(Action0 action, Long execTime, int count) {</span>
+<span class="fc" id="L115">            this.action = action;</span>
+<span class="fc" id="L116">            this.execTime = execTime;</span>
+<span class="fc" id="L117">            this.count = count;</span>
+<span class="fc" id="L118">        }</span>
+
+        @Override
+        public int compareTo(TimedAction that) {
+<span class="fc" id="L122">            int result = execTime.compareTo(that.execTime);</span>
+<span class="fc bfc" id="L123" title="All 2 branches covered.">            if (result == 0) {</span>
+<span class="fc" id="L124">                return compare(count, that.count);</span>
+            }
+<span class="fc" id="L126">            return result;</span>
+        }
+    }
+
+    // because I can't use Integer.compare from Java 7
+    static int compare(int x, int y) {
+<span class="pc bpc" id="L132" title="1 of 4 branches missed.">        return (x &lt; y) ? -1 : ((x == y) ? 0 : 1);</span>
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

@@ -1,0 +1,1185 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>ReplaySubject.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.subjects</a> &gt; <span class="el_source">ReplaySubject.java</span></div><h1>ReplaySubject.java</h1><pre class="source lang-java linenums">/**
+ * Copyright 2014 Netflix, Inc.
+ * 
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package rx.subjects;
+
+import java.lang.reflect.Array;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import rx.Observer;
+import rx.Scheduler;
+import rx.annotations.Beta;
+import rx.exceptions.Exceptions;
+import rx.functions.Action1;
+import rx.functions.Func1;
+import rx.internal.operators.NotificationLite;
+import rx.internal.util.UtilityFunctions;
+import rx.schedulers.Timestamped;
+import rx.subjects.ReplaySubject.NodeList.Node;
+import rx.subjects.SubjectSubscriptionManager.SubjectObserver;
+
+/**
+ * Subject that buffers all items it observes and replays them to any {@link Observer} that subscribes.
+ * &lt;p&gt;
+ * &lt;img width=&quot;640&quot; src=&quot;https://raw.github.com/wiki/ReactiveX/RxJava/images/rx-operators/S.ReplaySubject.png&quot; alt=&quot;&quot;&gt;
+ * &lt;p&gt;
+ * Example usage:
+ * &lt;p&gt;
+ * &lt;pre&gt; {@code
+
+  ReplaySubject&lt;Object&gt; subject = ReplaySubject.create();
+  subject.onNext(&quot;one&quot;);
+  subject.onNext(&quot;two&quot;);
+  subject.onNext(&quot;three&quot;);
+  subject.onCompleted();
+
+  // both of the following will get the onNext/onCompleted calls from above
+  subject.subscribe(observer1);
+  subject.subscribe(observer2);
+
+  } &lt;/pre&gt;
+ * 
+ * @param &lt;T&gt;
+ *          the type of items observed and emitted by the Subject
+ */
+public final class ReplaySubject&lt;T&gt; extends Subject&lt;T, T&gt; {
+    /**
+     * Creates an unbounded replay subject.
+     * &lt;p&gt;
+     * The internal buffer is backed by an {@link ArrayList} and starts with an initial capacity of 16. Once the
+     * number of items reaches this capacity, it will grow as necessary (usually by 50%). However, as the
+     * number of items grows, this causes frequent array reallocation and copying, and may hurt performance
+     * and latency. This can be avoided with the {@link #create(int)} overload which takes an initial capacity
+     * parameter and can be tuned to reduce the array reallocation frequency as needed.
+     *
+     * @param &lt;T&gt;
+     *          the type of items observed and emitted by the Subject
+     * @return the created subject
+     */
+    public static &lt;T&gt; ReplaySubject&lt;T&gt; create() {
+<span class="fc" id="L75">        return create(16);</span>
+    }
+
+    /**
+     * Creates an unbounded replay subject with the specified initial buffer capacity.
+     * &lt;p&gt;
+     * Use this method to avoid excessive array reallocation while the internal buffer grows to accomodate new
+     * items. For example, if you know that the buffer will hold 32k items, you can ask the
+     * {@code ReplaySubject} to preallocate its internal array with a capacity to hold that many items. Once
+     * the items start to arrive, the internal array won't need to grow, creating less garbage and no overhead
+     * due to frequent array-copying.
+     *
+     * @param &lt;T&gt;
+     *          the type of items observed and emitted by the Subject
+     * @param capacity
+     *          the initial buffer capacity
+     * @return the created subject
+     */
+    public static &lt;T&gt; ReplaySubject&lt;T&gt; create(int capacity) {
+<span class="fc" id="L94">        final UnboundedReplayState&lt;T&gt; state = new UnboundedReplayState&lt;T&gt;(capacity);</span>
+<span class="fc" id="L95">        SubjectSubscriptionManager&lt;T&gt; ssm = new SubjectSubscriptionManager&lt;T&gt;();</span>
+<span class="fc" id="L96">        ssm.onStart = new Action1&lt;SubjectObserver&lt;T&gt;&gt;() {</span>
+            @Override
+            public void call(SubjectObserver&lt;T&gt; o) {
+                // replay history for this observer using the subscribing thread
+<span class="fc" id="L100">                int lastIndex = state.replayObserverFromIndex(0, o);</span>
+
+                // now that it is caught up add to observers
+<span class="fc" id="L103">                o.index(lastIndex);</span>
+<span class="fc" id="L104">            }</span>
+        };
+<span class="fc" id="L106">        ssm.onAdded = new Action1&lt;SubjectObserver&lt;T&gt;&gt;() {</span>
+            @Override
+            public void call(SubjectObserver&lt;T&gt; o) {
+<span class="fc" id="L109">                synchronized (o) {</span>
+<span class="pc bpc" id="L110" title="1 of 4 branches missed.">                    if (!o.first || o.emitting) {</span>
+<span class="fc" id="L111">                        return;</span>
+                    }
+<span class="fc" id="L113">                    o.first = false;</span>
+<span class="fc" id="L114">                    o.emitting = true;</span>
+<span class="pc" id="L115">                }</span>
+<span class="fc" id="L116">                boolean skipFinal = false;</span>
+                try {
+                    //noinspection UnnecessaryLocalVariable - Avoid re-read from outside this scope
+<span class="fc" id="L119">                    final UnboundedReplayState&lt;T&gt; localState = state;</span>
+                    for (;;) {
+<span class="fc" id="L121">                        int idx = o.&lt;Integer&gt;index();</span>
+<span class="fc" id="L122">                        int sidx = localState.get();</span>
+<span class="fc bfc" id="L123" title="All 2 branches covered.">                        if (idx != sidx) {</span>
+<span class="fc" id="L124">                            Integer j = localState.replayObserverFromIndex(idx, o);</span>
+<span class="fc" id="L125">                            o.index(j);</span>
+                        }
+<span class="fc" id="L127">                        synchronized (o) {</span>
+<span class="fc bfc" id="L128" title="All 2 branches covered.">                            if (sidx == localState.get()) {</span>
+<span class="fc" id="L129">                                o.emitting = false;</span>
+<span class="fc" id="L130">                                skipFinal = true;</span>
+<span class="fc" id="L131">                                break;</span>
+                            }
+<span class="pc" id="L133">                        }</span>
+<span class="fc" id="L134">                    }</span>
+                } finally {
+<span class="pc bpc" id="L136" title="3 of 4 branches missed.">                    if (!skipFinal) {</span>
+<span class="nc" id="L137">                        synchronized (o) {</span>
+<span class="nc" id="L138">                            o.emitting = false;</span>
+<span class="nc" id="L139">                        }</span>
+                    }
+                }
+<span class="fc" id="L142">            }</span>
+        };
+<span class="fc" id="L144">        ssm.onTerminated = new Action1&lt;SubjectObserver&lt;T&gt;&gt;() {</span>
+            @Override
+            public void call(SubjectObserver&lt;T&gt; o) {
+<span class="fc" id="L147">                Integer idx = o.index();</span>
+<span class="pc bpc" id="L148" title="1 of 2 branches missed.">                if (idx == null) {</span>
+<span class="nc" id="L149">                    idx = 0;</span>
+                }
+                // we will finish replaying if there is anything left
+<span class="fc" id="L152">                state.replayObserverFromIndex(idx, o);</span>
+<span class="fc" id="L153">            }</span>
+        };
+        
+<span class="fc" id="L156">        return new ReplaySubject&lt;T&gt;(ssm, ssm, state);</span>
+    }
+    /**
+     * Creates an unbounded replay subject with the bounded-implementation for testing purposes.
+     * &lt;p&gt;
+     * This variant behaves like the regular unbounded {@code ReplaySubject} created via {@link #create()} but
+     * uses the structures of the bounded-implementation. This is by no means intended for the replacement of
+     * the original, array-backed and unbounded {@code ReplaySubject} due to the additional overhead of the
+     * linked-list based internal buffer. The sole purpose is to allow testing and reasoning about the behavior
+     * of the bounded implementations without the interference of the eviction policies.
+     *
+     * @param &lt;T&gt;
+     *          the type of items observed and emitted by the Subject
+     * @return the created subject
+     */
+    /* public */ static &lt;T&gt; ReplaySubject&lt;T&gt; createUnbounded() {
+<span class="fc" id="L172">        final BoundedState&lt;T&gt; state = new BoundedState&lt;T&gt;(</span>
+            new EmptyEvictionPolicy(),
+            UtilityFunctions.identity(),
+            UtilityFunctions.identity()
+        );
+<span class="fc" id="L177">        return createWithState(state, new DefaultOnAdd&lt;T&gt;(state));</span>
+    }
+    /**
+     * Creates a size-bounded replay subject.
+     * &lt;p&gt;
+     * In this setting, the {@code ReplaySubject} holds at most {@code size} items in its internal buffer and
+     * discards the oldest item.
+     * &lt;p&gt;
+     * When observers subscribe to a terminated {@code ReplaySubject}, they are guaranteed to see at most
+     * {@code size} {@code onNext} events followed by a termination event. 
+     * &lt;p&gt;
+     * If an observer subscribes while the {@code ReplaySubject} is active, it will observe all items in the
+     * buffer at that point in time and each item observed afterwards, even if the buffer evicts items due to
+     * the size constraint in the mean time. In other words, once an Observer subscribes, it will receive items
+     * without gaps in the sequence.
+     *
+     * @param &lt;T&gt;
+     *          the type of items observed and emitted by the Subject
+     * @param size
+     *          the maximum number of buffered items
+     * @return the created subject
+     */
+    public static &lt;T&gt; ReplaySubject&lt;T&gt; createWithSize(int size) {
+<span class="fc" id="L200">        final BoundedState&lt;T&gt; state = new BoundedState&lt;T&gt;(</span>
+            new SizeEvictionPolicy(size),
+            UtilityFunctions.identity(),
+            UtilityFunctions.identity()
+        );
+<span class="fc" id="L205">        return createWithState(state, new DefaultOnAdd&lt;T&gt;(state));</span>
+    }
+    /**
+     * Creates a time-bounded replay subject.
+     * &lt;p&gt;
+     * In this setting, the {@code ReplaySubject} internally tags each observed item with a timestamp value
+     * supplied by the {@link Scheduler} and keeps only those whose age is less than the supplied time value
+     * converted to milliseconds. For example, an item arrives at T=0 and the max age is set to 5; at T&amp;gt;=5
+     * this first item is then evicted by any subsequent item or termination event, leaving the buffer empty. 
+     * &lt;p&gt;
+     * Once the subject is terminated, observers subscribing to it will receive items that remained in the
+     * buffer after the terminal event, regardless of their age. 
+     * &lt;p&gt;
+     * If an observer subscribes while the {@code ReplaySubject} is active, it will observe only those items
+     * from within the buffer that have an age less than the specified time, and each item observed thereafter,
+     * even if the buffer evicts items due to the time constraint in the mean time. In other words, once an
+     * observer subscribes, it observes items without gaps in the sequence except for any outdated items at the
+     * beginning of the sequence.
+     * &lt;p&gt;
+     * Note that terminal notifications ({@code onError} and {@code onCompleted}) trigger eviction as well. For
+     * example, with a max age of 5, the first item is observed at T=0, then an {@code onCompleted} notification
+     * arrives at T=10. If an observer subscribes at T=11, it will find an empty {@code ReplaySubject} with just
+     * an {@code onCompleted} notification.
+     *
+     * @param &lt;T&gt;
+     *          the type of items observed and emitted by the Subject
+     * @param time
+     *          the maximum age of the contained items
+     * @param unit
+     *          the time unit of {@code time}
+     * @param scheduler
+     *          the {@link Scheduler} that provides the current time
+     * @return the created subject
+     */
+    public static &lt;T&gt; ReplaySubject&lt;T&gt; createWithTime(long time, TimeUnit unit, final Scheduler scheduler) {
+<span class="fc" id="L240">        final BoundedState&lt;T&gt; state = new BoundedState&lt;T&gt;(</span>
+                new TimeEvictionPolicy(unit.toMillis(time), scheduler),
+                new AddTimestamped(scheduler),
+                new RemoveTimestamped()
+        );
+<span class="fc" id="L245">        return createWithState(state, new TimedOnAdd&lt;T&gt;(state, scheduler));</span>
+    }
+    /**
+     * Creates a time- and size-bounded replay subject.
+     * &lt;p&gt;
+     * In this setting, the {@code ReplaySubject} internally tags each received item with a timestamp value
+     * supplied by the {@link Scheduler} and holds at most {@code size} items in its internal buffer. It evicts
+     * items from the start of the buffer if their age becomes less-than or equal to the supplied age in
+     * milliseconds or the buffer reaches its {@code size} limit.
+     * &lt;p&gt;
+     * When observers subscribe to a terminated {@code ReplaySubject}, they observe the items that remained in
+     * the buffer after the terminal notification, regardless of their age, but at most {@code size} items.
+     * &lt;p&gt;
+     * If an observer subscribes while the {@code ReplaySubject} is active, it will observe only those items
+     * from within the buffer that have age less than the specified time and each subsequent item, even if the
+     * buffer evicts items due to the time constraint in the mean time. In other words, once an observer
+     * subscribes, it observes items without gaps in the sequence except for the outdated items at the beginning
+     * of the sequence.
+     * &lt;p&gt;
+     * Note that terminal notifications ({@code onError} and {@code onCompleted}) trigger eviction as well. For
+     * example, with a max age of 5, the first item is observed at T=0, then an {@code onCompleted} notification
+     * arrives at T=10. If an observer subscribes at T=11, it will find an empty {@code ReplaySubject} with just
+     * an {@code onCompleted} notification.
+     *
+     * @param &lt;T&gt;
+     *          the type of items observed and emitted by the Subject
+     * @param time
+     *          the maximum age of the contained items
+     * @param unit
+     *          the time unit of {@code time}
+     * @param size
+     *          the maximum number of buffered items
+     * @param scheduler
+     *          the {@link Scheduler} that provides the current time
+     * @return the created subject
+     */
+    public static &lt;T&gt; ReplaySubject&lt;T&gt; createWithTimeAndSize(long time, TimeUnit unit, int size, final Scheduler scheduler) {
+<span class="nc" id="L282">        final BoundedState&lt;T&gt; state = new BoundedState&lt;T&gt;(</span>
+                new PairEvictionPolicy(
+                        new SizeEvictionPolicy(size),
+                        new TimeEvictionPolicy(unit.toMillis(time), scheduler)
+                ),
+                new AddTimestamped(scheduler),
+                new RemoveTimestamped()
+        );
+<span class="nc" id="L290">        return createWithState(state, new TimedOnAdd&lt;T&gt;(state, scheduler));</span>
+    }
+    /**
+     * Creates a bounded replay subject with the given state shared between the subject and the
+     * {@link OnSubscribe} functions.
+     *
+     * @param &lt;T&gt;
+     *          the type of items observed and emitted by the Subject
+     * @param state
+     *          the shared state
+     * @return the created subject
+     */
+    static &lt;T&gt; ReplaySubject&lt;T&gt; createWithState(final BoundedState&lt;T&gt; state,
+            Action1&lt;SubjectObserver&lt;T&gt;&gt; onStart) {
+<span class="fc" id="L304">        SubjectSubscriptionManager&lt;T&gt; ssm = new SubjectSubscriptionManager&lt;T&gt;();</span>
+<span class="fc" id="L305">        ssm.onStart = onStart;</span>
+<span class="fc" id="L306">        ssm.onAdded = new Action1&lt;SubjectObserver&lt;T&gt;&gt;() {</span>
+            @Override
+            public void call(SubjectObserver&lt;T&gt; o) {
+<span class="fc" id="L309">                synchronized (o) {</span>
+<span class="pc bpc" id="L310" title="1 of 4 branches missed.">                    if (!o.first || o.emitting) {</span>
+<span class="fc" id="L311">                        return;</span>
+                    }
+<span class="fc" id="L313">                    o.first = false;</span>
+<span class="fc" id="L314">                    o.emitting = true;</span>
+<span class="pc" id="L315">                }</span>
+<span class="fc" id="L316">                boolean skipFinal = false;</span>
+                try {
+                    for (;;) {
+<span class="fc" id="L319">                        NodeList.Node&lt;Object&gt; idx = o.index();</span>
+<span class="fc" id="L320">                        NodeList.Node&lt;Object&gt; sidx = state.tail();</span>
+<span class="fc bfc" id="L321" title="All 2 branches covered.">                        if (idx != sidx) {</span>
+<span class="fc" id="L322">                            NodeList.Node&lt;Object&gt; j = state.replayObserverFromIndex(idx, o);</span>
+<span class="fc" id="L323">                            o.index(j);</span>
+                        }
+<span class="fc" id="L325">                        synchronized (o) {</span>
+<span class="fc bfc" id="L326" title="All 2 branches covered.">                            if (sidx == state.tail()) {</span>
+<span class="fc" id="L327">                                o.emitting = false;</span>
+<span class="fc" id="L328">                                skipFinal = true;</span>
+<span class="fc" id="L329">                                break;</span>
+                            }
+<span class="pc" id="L331">                        }</span>
+<span class="fc" id="L332">                    }</span>
+                } finally {
+<span class="pc bpc" id="L334" title="3 of 4 branches missed.">                    if (!skipFinal) {</span>
+<span class="nc" id="L335">                        synchronized (o) {</span>
+<span class="nc" id="L336">                            o.emitting = false;</span>
+<span class="nc" id="L337">                        }</span>
+                    }
+                }
+<span class="fc" id="L340">            }</span>
+        };
+<span class="fc" id="L342">        ssm.onTerminated = new Action1&lt;SubjectObserver&lt;T&gt;&gt;() {</span>
+
+            @Override
+            public void call(SubjectObserver&lt;T&gt; t1) {
+<span class="fc" id="L346">                NodeList.Node&lt;Object&gt; l = t1.index();</span>
+<span class="pc bpc" id="L347" title="1 of 2 branches missed.">                if (l == null) {</span>
+<span class="nc" id="L348">                    l = state.head();</span>
+                }
+<span class="fc" id="L350">                state.replayObserverFromIndex(l, t1);</span>
+<span class="fc" id="L351">            }</span>
+
+        };
+        
+<span class="fc" id="L355">        return new ReplaySubject&lt;T&gt;(ssm, ssm, state);</span>
+    }
+
+    /** The state storing the history and the references. */
+    final ReplayState&lt;T, ?&gt; state;
+    /** The manager of subscribers. */
+    final SubjectSubscriptionManager&lt;T&gt; ssm;
+    ReplaySubject(OnSubscribe&lt;T&gt; onSubscribe, SubjectSubscriptionManager&lt;T&gt; ssm, ReplayState&lt;T, ?&gt; state) {
+<span class="fc" id="L363">        super(onSubscribe);</span>
+<span class="fc" id="L364">        this.ssm = ssm;</span>
+<span class="fc" id="L365">        this.state = state;</span>
+<span class="fc" id="L366">    }</span>
+    
+    @Override
+    public void onNext(T t) {
+<span class="fc bfc" id="L370" title="All 2 branches covered.">        if (ssm.active) {</span>
+<span class="fc" id="L371">            state.next(t);</span>
+<span class="fc bfc" id="L372" title="All 2 branches covered.">            for (SubjectSubscriptionManager.SubjectObserver&lt;? super T&gt; o : ssm.observers()) {</span>
+<span class="fc bfc" id="L373" title="All 2 branches covered.">                if (caughtUp(o)) {</span>
+<span class="fc" id="L374">                    o.onNext(t);</span>
+                }
+            }
+        }
+<span class="fc" id="L378">    }</span>
+    
+    @Override
+    public void onError(final Throwable e) {
+<span class="fc bfc" id="L382" title="All 2 branches covered.">        if (ssm.active) {</span>
+<span class="fc" id="L383">            state.error(e);</span>
+<span class="fc" id="L384">            List&lt;Throwable&gt; errors = null;</span>
+<span class="fc bfc" id="L385" title="All 2 branches covered.">            for (SubjectObserver&lt;? super T&gt; o : ssm.terminate(NotificationLite.instance().error(e))) {</span>
+                try {
+<span class="fc bfc" id="L387" title="All 2 branches covered.">                    if (caughtUp(o)) {</span>
+<span class="fc" id="L388">                        o.onError(e);</span>
+                    }
+<span class="fc" id="L390">                } catch (Throwable e2) {</span>
+<span class="fc bfc" id="L391" title="All 2 branches covered.">                    if (errors == null) {</span>
+<span class="fc" id="L392">                        errors = new ArrayList&lt;Throwable&gt;();</span>
+                    }
+<span class="fc" id="L394">                    errors.add(e2);</span>
+<span class="fc" id="L395">                }</span>
+            }
+
+<span class="fc" id="L398">            Exceptions.throwIfAny(errors);</span>
+        }
+<span class="fc" id="L400">    }</span>
+    
+    @Override
+    public void onCompleted() {
+<span class="fc bfc" id="L404" title="All 2 branches covered.">        if (ssm.active) {</span>
+<span class="fc" id="L405">            state.complete();</span>
+<span class="fc bfc" id="L406" title="All 2 branches covered.">            for (SubjectObserver&lt;? super T&gt; o : ssm.terminate(NotificationLite.instance().completed())) {</span>
+<span class="fc bfc" id="L407" title="All 2 branches covered.">                if (caughtUp(o)) {</span>
+<span class="fc" id="L408">                    o.onCompleted();</span>
+                }
+            }
+        }
+<span class="fc" id="L412">    }</span>
+    /**
+     * @return Returns the number of subscribers.
+     */
+    /* Support test. */int subscriberCount() {
+<span class="fc" id="L417">        return ssm.get().observers.length;</span>
+    }
+
+    @Override
+    public boolean hasObservers() {
+<span class="pc bpc" id="L422" title="1 of 2 branches missed.">        return ssm.observers().length &gt; 0;</span>
+    }
+
+    private boolean caughtUp(SubjectObserver&lt;? super T&gt; o) {
+<span class="fc bfc" id="L426" title="All 2 branches covered.">        if (!o.caughtUp) {</span>
+<span class="fc bfc" id="L427" title="All 2 branches covered.">            if (state.replayObserver(o)) {</span>
+<span class="fc" id="L428">                o.caughtUp = true;</span>
+<span class="fc" id="L429">                o.index(null); // once caught up, no need for the index anymore</span>
+            }
+<span class="fc" id="L431">            return false;</span>
+        } else {
+            // it was caught up so proceed the &quot;raw route&quot;
+<span class="fc" id="L434">            return true;</span>
+        }
+    }
+    
+    // *********************
+    // State implementations
+    // *********************
+    
+    /**
+     * The unbounded replay state.
+     * @param &lt;T&gt; the input and output type
+     */
+    static final class UnboundedReplayState&lt;T&gt; extends AtomicInteger implements ReplayState&lt;T, Integer&gt; {
+<span class="fc" id="L447">        private final NotificationLite&lt;T&gt; nl = NotificationLite.instance();</span>
+        /** The buffer. */
+        private final ArrayList&lt;Object&gt; list;
+        /** The termination flag. */
+        private volatile boolean terminated;
+<span class="fc" id="L452">        public UnboundedReplayState(int initialCapacity) {</span>
+<span class="fc" id="L453">            list = new ArrayList&lt;Object&gt;(initialCapacity);</span>
+<span class="fc" id="L454">        }</span>
+
+        @Override
+        public void next(T n) {
+<span class="pc bpc" id="L458" title="1 of 2 branches missed.">            if (!terminated) {</span>
+<span class="fc" id="L459">                list.add(nl.next(n));</span>
+<span class="fc" id="L460">                getAndIncrement(); // release index</span>
+            }
+<span class="fc" id="L462">        }</span>
+
+        public void accept(Observer&lt;? super T&gt; o, int idx) {
+<span class="fc" id="L465">            nl.accept(o, list.get(idx));</span>
+<span class="fc" id="L466">        }</span>
+        
+        @Override
+        public void complete() {
+<span class="pc bpc" id="L470" title="1 of 2 branches missed.">            if (!terminated) {</span>
+<span class="fc" id="L471">                terminated = true;</span>
+<span class="fc" id="L472">                list.add(nl.completed());</span>
+<span class="fc" id="L473">                getAndIncrement(); // release index</span>
+            }
+<span class="fc" id="L475">        }</span>
+        @Override
+        public void error(Throwable e) {
+<span class="pc bpc" id="L478" title="1 of 2 branches missed.">            if (!terminated) {</span>
+<span class="fc" id="L479">                terminated = true;</span>
+<span class="fc" id="L480">                list.add(nl.error(e));</span>
+<span class="fc" id="L481">                getAndIncrement(); // release index</span>
+            }
+<span class="fc" id="L483">        }</span>
+
+        @Override
+        public boolean terminated() {
+<span class="nc" id="L487">            return terminated;</span>
+        }
+
+        @Override
+        public boolean replayObserver(SubjectObserver&lt;? super T&gt; observer) {
+            
+<span class="fc" id="L493">            synchronized (observer) {</span>
+<span class="fc" id="L494">                observer.first = false;</span>
+<span class="fc bfc" id="L495" title="All 2 branches covered.">                if (observer.emitting) {</span>
+<span class="fc" id="L496">                    return false;</span>
+                }
+<span class="pc" id="L498">            }</span>
+            
+<span class="fc" id="L500">            Integer lastEmittedLink = observer.index();</span>
+<span class="pc bpc" id="L501" title="1 of 2 branches missed.">            if (lastEmittedLink != null) {</span>
+<span class="fc" id="L502">                int l = replayObserverFromIndex(lastEmittedLink, observer);</span>
+<span class="fc" id="L503">                observer.index(l);</span>
+<span class="fc" id="L504">                return true;</span>
+            } else {
+<span class="nc" id="L506">                throw new IllegalStateException(&quot;failed to find lastEmittedLink for: &quot; + observer);</span>
+            }
+        }
+
+        @Override
+        public Integer replayObserverFromIndex(Integer idx, SubjectObserver&lt;? super T&gt; observer) {
+<span class="fc" id="L512">            int i = idx;</span>
+<span class="fc bfc" id="L513" title="All 2 branches covered.">            while (i &lt; get()) {</span>
+<span class="fc" id="L514">                accept(observer, i);</span>
+<span class="fc" id="L515">                i++;</span>
+            }
+
+<span class="fc" id="L518">            return i;</span>
+        }
+
+        @Override
+        public Integer replayObserverFromIndexTest(Integer idx, SubjectObserver&lt;? super T&gt; observer, long now) {
+<span class="nc" id="L523">            return replayObserverFromIndex(idx, observer);</span>
+        }
+        
+        @Override
+        public int size() {
+<span class="fc" id="L528">            int idx = get(); // aquire</span>
+<span class="fc bfc" id="L529" title="All 2 branches covered.">            if (idx &gt; 0) {</span>
+<span class="fc" id="L530">                Object o = list.get(idx - 1);</span>
+<span class="fc bfc" id="L531" title="All 4 branches covered.">                if (nl.isCompleted(o) || nl.isError(o)) {</span>
+<span class="fc" id="L532">                    return idx - 1; // do not report a terminal event as part of size</span>
+                }
+            }
+<span class="fc" id="L535">            return idx;</span>
+        }
+        @Override
+        public boolean isEmpty() {
+<span class="fc bfc" id="L539" title="All 2 branches covered.">            return size() == 0;</span>
+        }
+        @Override
+        @SuppressWarnings(&quot;unchecked&quot;)
+        public T[] toArray(T[] a) {
+<span class="fc" id="L544">            int s = size();</span>
+<span class="fc bfc" id="L545" title="All 2 branches covered.">            if (s &gt; 0) {</span>
+<span class="fc bfc" id="L546" title="All 2 branches covered.">                if (s &gt; a.length) {</span>
+<span class="fc" id="L547">                    a = (T[])Array.newInstance(a.getClass().getComponentType(), s);</span>
+                }
+<span class="fc bfc" id="L549" title="All 2 branches covered.">                for (int i = 0; i &lt; s; i++) {</span>
+<span class="fc" id="L550">                    a[i] = (T)list.get(i);</span>
+                }
+<span class="fc bfc" id="L552" title="All 2 branches covered.">                if (a.length &gt; s) {</span>
+<span class="fc" id="L553">                    a[s] = null;</span>
+                }
+            } else
+<span class="fc bfc" id="L556" title="All 2 branches covered.">            if (a.length &gt; 0) {</span>
+<span class="fc" id="L557">                a[0] = null;</span>
+            }
+<span class="fc" id="L559">            return a;</span>
+        }
+        @Override
+        public T latest() {
+<span class="fc" id="L563">            int idx = get();</span>
+<span class="fc bfc" id="L564" title="All 2 branches covered.">            if (idx &gt; 0) {</span>
+<span class="fc" id="L565">                Object o = list.get(idx - 1);</span>
+<span class="fc bfc" id="L566" title="All 4 branches covered.">                if (nl.isCompleted(o) || nl.isError(o)) {</span>
+<span class="fc bfc" id="L567" title="All 2 branches covered.">                    if (idx &gt; 1) {</span>
+<span class="fc" id="L568">                        return nl.getValue(list.get(idx - 2));</span>
+                    }
+<span class="fc" id="L570">                    return null;</span>
+                }
+<span class="fc" id="L572">                return nl.getValue(o);</span>
+            }
+<span class="fc" id="L574">            return null;</span>
+        }
+    }
+    
+    
+    /** 
+     * The bounded replay state. 
+     * @param &lt;T&gt; the input and output type
+     */
+    static final class BoundedState&lt;T&gt; implements ReplayState&lt;T, NodeList.Node&lt;Object&gt;&gt; {
+        final NodeList&lt;Object&gt; list;
+        final EvictionPolicy evictionPolicy;
+        final Func1&lt;Object, Object&gt; enterTransform;
+        final Func1&lt;Object, Object&gt; leaveTransform;
+<span class="fc" id="L588">        final NotificationLite&lt;T&gt; nl = NotificationLite.instance();</span>
+        volatile boolean terminated;
+        volatile NodeList.Node&lt;Object&gt; tail;
+        
+        public BoundedState(EvictionPolicy evictionPolicy, Func1&lt;Object, Object&gt; enterTransform, 
+<span class="fc" id="L593">                Func1&lt;Object, Object&gt; leaveTransform) {</span>
+<span class="fc" id="L594">            this.list = new NodeList&lt;Object&gt;();</span>
+<span class="fc" id="L595">            this.tail = list.tail;</span>
+<span class="fc" id="L596">            this.evictionPolicy = evictionPolicy;</span>
+<span class="fc" id="L597">            this.enterTransform = enterTransform;</span>
+<span class="fc" id="L598">            this.leaveTransform = leaveTransform;</span>
+<span class="fc" id="L599">        }</span>
+        @Override
+        public void next(T value) {
+<span class="pc bpc" id="L602" title="1 of 2 branches missed.">            if (!terminated) {</span>
+<span class="fc" id="L603">                list.addLast(enterTransform.call(nl.next(value)));</span>
+<span class="fc" id="L604">                evictionPolicy.evict(list);</span>
+<span class="fc" id="L605">                tail = list.tail;</span>
+            }
+<span class="fc" id="L607">        }</span>
+        @Override
+        public void complete() {
+<span class="pc bpc" id="L610" title="1 of 2 branches missed.">            if (!terminated) {</span>
+<span class="fc" id="L611">                terminated = true;</span>
+<span class="fc" id="L612">                list.addLast(enterTransform.call(nl.completed()));</span>
+<span class="fc" id="L613">                evictionPolicy.evictFinal(list);</span>
+<span class="fc" id="L614">                tail = list.tail;</span>
+            }
+            
+<span class="fc" id="L617">        }</span>
+        @Override
+        public void error(Throwable e) {
+<span class="pc bpc" id="L620" title="1 of 2 branches missed.">            if (!terminated) {</span>
+<span class="fc" id="L621">                terminated = true;</span>
+<span class="fc" id="L622">                list.addLast(enterTransform.call(nl.error(e)));</span>
+                // don't evict the terminal value
+<span class="fc" id="L624">                evictionPolicy.evictFinal(list);</span>
+<span class="fc" id="L625">                tail = list.tail;</span>
+            }
+<span class="fc" id="L627">        }</span>
+        public void accept(Observer&lt;? super T&gt; o, NodeList.Node&lt;Object&gt; node) {
+<span class="fc" id="L629">            nl.accept(o, leaveTransform.call(node.value));</span>
+<span class="fc" id="L630">        }</span>
+        /**
+         * Accept only non-stale nodes.
+         * @param o the target observer
+         * @param node the node to accept or reject
+         * @param now the current time
+         */
+        public void acceptTest(Observer&lt;? super T&gt; o, NodeList.Node&lt;Object&gt; node, long now) {
+<span class="fc" id="L638">            Object v = node.value;</span>
+<span class="pc bpc" id="L639" title="1 of 2 branches missed.">            if (!evictionPolicy.test(v, now)) {</span>
+<span class="nc" id="L640">                nl.accept(o, leaveTransform.call(v));</span>
+            }
+<span class="fc" id="L642">        }</span>
+        public Node&lt;Object&gt; head() {
+<span class="fc" id="L644">            return list.head;</span>
+        }
+        public Node&lt;Object&gt; tail() {
+<span class="fc" id="L647">            return tail;</span>
+        }
+        @Override
+        public boolean replayObserver(SubjectObserver&lt;? super T&gt; observer) {
+<span class="fc" id="L651">            synchronized (observer) {</span>
+<span class="fc" id="L652">                observer.first = false;</span>
+<span class="fc bfc" id="L653" title="All 2 branches covered.">                if (observer.emitting) {</span>
+<span class="fc" id="L654">                    return false;</span>
+                }
+<span class="pc" id="L656">            }</span>
+            
+<span class="fc" id="L658">            NodeList.Node&lt;Object&gt; lastEmittedLink = observer.index();</span>
+<span class="fc" id="L659">            NodeList.Node&lt;Object&gt; l = replayObserverFromIndex(lastEmittedLink, observer);</span>
+<span class="fc" id="L660">            observer.index(l);</span>
+<span class="fc" id="L661">            return true;</span>
+        }
+
+        @Override
+        public NodeList.Node&lt;Object&gt; replayObserverFromIndex(
+                NodeList.Node&lt;Object&gt; l, SubjectObserver&lt;? super T&gt; observer) {
+<span class="fc bfc" id="L667" title="All 2 branches covered.">            while (l != tail()) {</span>
+<span class="fc" id="L668">                accept(observer, l.next);</span>
+<span class="fc" id="L669">                l = l.next;</span>
+            }
+<span class="fc" id="L671">            return l;</span>
+        }
+        @Override
+        public NodeList.Node&lt;Object&gt; replayObserverFromIndexTest(
+                NodeList.Node&lt;Object&gt; l, SubjectObserver&lt;? super T&gt; observer, long now) {
+<span class="fc bfc" id="L676" title="All 2 branches covered.">            while (l != tail()) {</span>
+<span class="fc" id="L677">                acceptTest(observer, l.next, now);</span>
+<span class="fc" id="L678">                l = l.next;</span>
+            }
+<span class="fc" id="L680">            return l;</span>
+        }
+
+        @Override
+        public boolean terminated() {
+<span class="nc" id="L685">            return terminated;</span>
+        }
+        
+        @Override
+        public int size() {
+<span class="fc" id="L690">            int size = 0;</span>
+<span class="fc" id="L691">            NodeList.Node&lt;Object&gt; l = head();</span>
+<span class="fc" id="L692">            NodeList.Node&lt;Object&gt; next = l.next;</span>
+<span class="fc bfc" id="L693" title="All 2 branches covered.">            while (next != null) {</span>
+<span class="fc" id="L694">                size++;</span>
+<span class="fc" id="L695">                l = next;</span>
+<span class="fc" id="L696">                next = next.next;</span>
+            }
+<span class="fc bfc" id="L698" title="All 2 branches covered.">            if (l.value != null) {</span>
+<span class="fc" id="L699">                Object value = leaveTransform.call(l.value);</span>
+<span class="pc bpc" id="L700" title="1 of 6 branches missed.">                if (value != null &amp;&amp; (nl.isError(value) || nl.isCompleted(value))) {</span>
+<span class="fc" id="L701">                    return size - 1;</span>
+                }
+            }
+<span class="fc" id="L704">            return size;</span>
+        }
+        @Override
+        public boolean isEmpty() {
+<span class="fc" id="L708">            NodeList.Node&lt;Object&gt; l = head();</span>
+<span class="fc" id="L709">            NodeList.Node&lt;Object&gt; next = l.next;</span>
+<span class="fc bfc" id="L710" title="All 2 branches covered.">            if (next == null) {</span>
+<span class="fc" id="L711">                return true;</span>
+            }
+<span class="fc" id="L713">            Object value = leaveTransform.call(next.value);</span>
+<span class="fc bfc" id="L714" title="All 4 branches covered.">            return nl.isError(value) || nl.isCompleted(value);</span>
+        }
+        @Override
+        @SuppressWarnings(&quot;unchecked&quot;)
+        public T[] toArray(T[] a) {
+<span class="fc" id="L719">            List&lt;T&gt; list = new ArrayList&lt;T&gt;();</span>
+<span class="fc" id="L720">            NodeList.Node&lt;Object&gt; l = head();</span>
+<span class="fc" id="L721">            NodeList.Node&lt;Object&gt; next = l.next;</span>
+<span class="fc bfc" id="L722" title="All 2 branches covered.">            while (next != null) {</span>
+<span class="fc" id="L723">                Object o = leaveTransform.call(next.value);</span>
+
+<span class="fc bfc" id="L725" title="All 6 branches covered.">                if (next.next == null &amp;&amp; (nl.isError(o) || nl.isCompleted(o))) {</span>
+<span class="fc" id="L726">                    break;</span>
+                } else {
+<span class="fc" id="L728">                    list.add((T)o);</span>
+                }
+<span class="fc" id="L730">                l = next;</span>
+<span class="fc" id="L731">                next = next.next;</span>
+<span class="fc" id="L732">            }</span>
+<span class="fc" id="L733">            return list.toArray(a);</span>
+        }
+        @Override
+        public T latest() {
+<span class="fc" id="L737">            Node&lt;Object&gt; h = head().next;</span>
+<span class="fc bfc" id="L738" title="All 2 branches covered.">            if (h == null) {</span>
+<span class="fc" id="L739">                return null;</span>
+            }
+<span class="fc" id="L741">            Node&lt;Object&gt; p = null;</span>
+<span class="fc bfc" id="L742" title="All 2 branches covered.">            while (h != tail()) {</span>
+<span class="fc" id="L743">                p = h;</span>
+<span class="fc" id="L744">                h = h.next;</span>
+            }
+<span class="fc" id="L746">            Object value = leaveTransform.call(h.value);</span>
+<span class="fc bfc" id="L747" title="All 4 branches covered.">            if (nl.isError(value) || nl.isCompleted(value)) {</span>
+<span class="fc bfc" id="L748" title="All 2 branches covered.">                if (p != null) {</span>
+<span class="fc" id="L749">                    value = leaveTransform.call(p.value);</span>
+<span class="fc" id="L750">                    return nl.getValue(value);</span>
+                }
+<span class="fc" id="L752">                return null;</span>
+            }
+<span class="fc" id="L754">            return nl.getValue(value);</span>
+        }
+    }
+    
+    // **************
+    // API interfaces
+    // **************
+    
+    /**
+     * General API for replay state management.
+     * @param &lt;T&gt; the input and output type
+     * @param &lt;I&gt; the index type
+     */
+    interface ReplayState&lt;T, I&gt; {
+        /** @return true if the subject has reached a terminal state. */
+        boolean terminated();
+        /**
+         * Replay contents to the given observer.
+         * @param observer the receiver of events
+         * @return true if the subject has caught up
+         */
+        boolean replayObserver(SubjectObserver&lt;? super T&gt; observer);
+        /**
+         * Replay the buffered values from an index position and return a new index
+         * @param idx the current index position
+         * @param observer the receiver of events
+         * @return the new index position
+         */
+        I replayObserverFromIndex(
+                I idx, SubjectObserver&lt;? super T&gt; observer);
+        /**
+         * Replay the buffered values from an index position while testing for stale entries and return a new index
+         * @param idx the current index position
+         * @param observer the receiver of events
+         * @return the new index position
+         */
+        I replayObserverFromIndexTest(
+                I idx, SubjectObserver&lt;? super T&gt; observer, long now);
+        /**
+         * Add an OnNext value to the buffer
+         * @param value the value to add
+         */
+        void next(T value);
+        /**
+         * Add an OnError exception and terminate the subject
+         * @param e the exception to add
+         */
+        void error(Throwable e);
+        /**
+         * Add an OnCompleted exception and terminate the subject
+         */
+        void complete();
+        /**
+         * @return the number of non-terminal values in the replay buffer.
+         */
+        int size();
+        /**
+         * @return true if the replay buffer is empty of non-terminal values
+         */
+        boolean isEmpty();
+        
+        /**
+         * Copy the current values (minus any terminal value) from the buffer into the array
+         * or create a new array if there isn't enough room.
+         * @param a the array to fill in
+         * @return the array or a new array containing the current values
+         */
+        T[] toArray(T[] a);
+        /**
+         * Returns the latest value that has been buffered or null if no such value
+         * present.
+         * @return the latest value buffered or null if none
+         */
+        T latest();
+    }
+    
+    /** Interface to manage eviction checking. */
+    interface EvictionPolicy {
+        /**
+         * Subscribe-time checking for stale entries.
+         * @param value the value to test
+         * @param now the current time
+         * @return true if the value may be evicted
+         */
+        boolean test(Object value, long now);
+        /**
+         * Evict values from the list.
+         * @param list the node list
+         */
+        void evict(NodeList&lt;Object&gt; list);
+        /**
+         * Evict values from the list except the very last which is considered
+         * a terminal event
+         * @param list the node list
+         */
+        void evictFinal(NodeList&lt;Object&gt; list);
+    }
+
+    
+    // ************************
+    // Callback implementations
+    // ************************
+    
+    /**
+     * Remove elements from the beginning of the list if the size exceeds some threshold.
+     */
+    static final class SizeEvictionPolicy implements EvictionPolicy {
+        final int maxSize;
+        
+<span class="fc" id="L863">        public SizeEvictionPolicy(int maxSize) {</span>
+<span class="fc" id="L864">            this.maxSize = maxSize;</span>
+<span class="fc" id="L865">        }</span>
+        
+        @Override
+        public void evict(NodeList&lt;Object&gt; t1) {
+<span class="fc bfc" id="L869" title="All 2 branches covered.">            while (t1.size() &gt; maxSize) {</span>
+<span class="fc" id="L870">                t1.removeFirst();</span>
+            }
+<span class="fc" id="L872">        }</span>
+
+        @Override
+        public boolean test(Object value, long now) {
+<span class="nc" id="L876">            return false; // size gets never stale</span>
+        }
+        
+        @Override
+        public void evictFinal(NodeList&lt;Object&gt; t1) {
+<span class="pc bpc" id="L881" title="1 of 2 branches missed.">            while (t1.size() &gt; maxSize + 1) {</span>
+<span class="nc" id="L882">                t1.removeFirst();</span>
+            }
+<span class="fc" id="L884">        }</span>
+    }
+    /**
+     * Remove elements from the beginning of the list if the Timestamped value is older than
+     * a threshold.
+     */
+    static final class TimeEvictionPolicy implements EvictionPolicy {
+        final long maxAgeMillis;
+        final Scheduler scheduler;
+        
+<span class="fc" id="L894">        public TimeEvictionPolicy(long maxAgeMillis, Scheduler scheduler) {</span>
+<span class="fc" id="L895">            this.maxAgeMillis = maxAgeMillis;</span>
+<span class="fc" id="L896">            this.scheduler = scheduler;</span>
+<span class="fc" id="L897">        }</span>
+        
+        @Override
+        public void evict(NodeList&lt;Object&gt; t1) {
+<span class="fc" id="L901">            long now = scheduler.now();</span>
+<span class="fc bfc" id="L902" title="All 2 branches covered.">            while (!t1.isEmpty()) {</span>
+<span class="fc" id="L903">                NodeList.Node&lt;Object&gt; n = t1.head.next;</span>
+<span class="fc bfc" id="L904" title="All 2 branches covered.">                if (test(n.value, now)) {</span>
+<span class="fc" id="L905">                    t1.removeFirst();</span>
+                } else {
+                    break;
+                }
+<span class="fc" id="L909">            }</span>
+<span class="fc" id="L910">        }</span>
+        
+        @Override
+        public void evictFinal(NodeList&lt;Object&gt; t1) {
+<span class="fc" id="L914">            long now = scheduler.now();</span>
+<span class="fc bfc" id="L915" title="All 2 branches covered.">            while (t1.size &gt; 1) {</span>
+<span class="fc" id="L916">                NodeList.Node&lt;Object&gt; n = t1.head.next;</span>
+<span class="fc bfc" id="L917" title="All 2 branches covered.">                if (test(n.value, now)) {</span>
+<span class="fc" id="L918">                    t1.removeFirst();</span>
+                } else {
+                    break;
+                }
+<span class="fc" id="L922">            }</span>
+<span class="fc" id="L923">        }</span>
+
+        @Override
+        public boolean test(Object value, long now) {
+<span class="fc" id="L927">            Timestamped&lt;?&gt; ts = (Timestamped&lt;?&gt;)value;</span>
+<span class="fc bfc" id="L928" title="All 2 branches covered.">            return ts.getTimestampMillis() &lt;= now - maxAgeMillis;</span>
+        }
+        
+    }
+    /**
+     * Pairs up two eviction policy callbacks.
+     */
+    static final class PairEvictionPolicy implements EvictionPolicy {
+        final EvictionPolicy first;
+        final EvictionPolicy second;
+        
+<span class="nc" id="L939">        public PairEvictionPolicy(EvictionPolicy first, EvictionPolicy second) {</span>
+<span class="nc" id="L940">            this.first = first;</span>
+<span class="nc" id="L941">            this.second = second;</span>
+<span class="nc" id="L942">        }</span>
+        
+        @Override
+        public void evict(NodeList&lt;Object&gt; t1) {
+<span class="nc" id="L946">            first.evict(t1);</span>
+<span class="nc" id="L947">            second.evict(t1);</span>
+<span class="nc" id="L948">        }</span>
+        
+        @Override
+        public void evictFinal(NodeList&lt;Object&gt; t1) {
+<span class="nc" id="L952">            first.evictFinal(t1);</span>
+<span class="nc" id="L953">            second.evictFinal(t1);</span>
+<span class="nc" id="L954">        }</span>
+
+        @Override
+        public boolean test(Object value, long now) {
+<span class="nc bnc" id="L958" title="All 4 branches missed.">            return first.test(value, now) || second.test(value, now);</span>
+        }
+    }
+    
+    /** Maps the values to Timestamped. */
+    static final class AddTimestamped implements Func1&lt;Object, Object&gt; {
+        final Scheduler scheduler;
+
+<span class="fc" id="L966">        public AddTimestamped(Scheduler scheduler) {</span>
+<span class="fc" id="L967">            this.scheduler = scheduler;</span>
+<span class="fc" id="L968">        }</span>
+
+        @Override
+        public Object call(Object t1) {
+<span class="fc" id="L972">            return new Timestamped&lt;Object&gt;(scheduler.now(), t1);</span>
+        }
+    }
+    /** Maps timestamped values back to raw objects. */
+<span class="fc" id="L976">    static final class RemoveTimestamped implements Func1&lt;Object, Object&gt; {</span>
+        @Override
+        @SuppressWarnings(&quot;unchecked&quot;)
+        public Object call(Object t1) {
+<span class="fc" id="L980">            return ((Timestamped&lt;Object&gt;)t1).getValue();</span>
+        }
+    }
+    /**
+     * Default action of simply replaying the buffer on subscribe.
+     * @param &lt;T&gt; the input and output value type
+     */
+    static final class DefaultOnAdd&lt;T&gt; implements Action1&lt;SubjectObserver&lt;T&gt;&gt; {
+        final BoundedState&lt;T&gt; state;
+
+<span class="fc" id="L990">        public DefaultOnAdd(BoundedState&lt;T&gt; state) {</span>
+<span class="fc" id="L991">            this.state = state;</span>
+<span class="fc" id="L992">        }</span>
+        
+        @Override
+        public void call(SubjectObserver&lt;T&gt; t1) {
+<span class="fc" id="L996">            NodeList.Node&lt;Object&gt; l = state.replayObserverFromIndex(state.head(), t1);</span>
+<span class="fc" id="L997">            t1.index(l);</span>
+<span class="fc" id="L998">        }</span>
+        
+    }
+    /**
+     * Action of replaying non-stale entries of the buffer on subscribe
+     * @param &lt;T&gt; the input and output value
+     */
+    static final class TimedOnAdd&lt;T&gt; implements Action1&lt;SubjectObserver&lt;T&gt;&gt; {
+        final BoundedState&lt;T&gt; state;
+        final Scheduler scheduler;
+
+<span class="fc" id="L1009">        public TimedOnAdd(BoundedState&lt;T&gt; state, Scheduler scheduler) {</span>
+<span class="fc" id="L1010">            this.state = state;</span>
+<span class="fc" id="L1011">            this.scheduler = scheduler;</span>
+<span class="fc" id="L1012">        }</span>
+        
+        @Override
+        public void call(SubjectObserver&lt;T&gt; t1) {
+            NodeList.Node&lt;Object&gt; l;
+<span class="fc bfc" id="L1017" title="All 2 branches covered.">            if (!state.terminated) {</span>
+                // ignore stale entries if still active
+<span class="fc" id="L1019">                l = state.replayObserverFromIndexTest(state.head(), t1, scheduler.now());</span>
+            }  else {
+                // accept all if terminated
+<span class="fc" id="L1022">                l = state.replayObserverFromIndex(state.head(), t1);</span>
+            }
+<span class="fc" id="L1024">            t1.index(l);</span>
+<span class="fc" id="L1025">        }</span>
+        
+    }
+    /**
+     * A singly-linked list with volatile next node pointer.
+     * @param &lt;T&gt; the value type
+     */
+<span class="fc" id="L1032">    static final class NodeList&lt;T&gt; {</span>
+        /**
+         * The node containing the value and references to neighbours.
+         * @param &lt;T&gt; the value type
+         */
+        static final class Node&lt;T&gt; {
+            /** The managed value. */
+            final T value;
+            /** The hard reference to the next node. */
+            volatile Node&lt;T&gt; next;
+<span class="fc" id="L1042">            Node(T value) {</span>
+<span class="fc" id="L1043">                this.value = value;</span>
+<span class="fc" id="L1044">            }</span>
+        }
+        /** The head of the list. */
+<span class="fc" id="L1047">        final Node&lt;T&gt; head = new Node&lt;T&gt;(null);</span>
+        /** The tail of the list. */
+<span class="fc" id="L1049">        Node&lt;T&gt; tail = head;</span>
+        /** The number of elements in the list. */
+        int size;
+        
+        public void addLast(T value) {
+<span class="fc" id="L1054">            Node&lt;T&gt; t = tail;</span>
+<span class="fc" id="L1055">            Node&lt;T&gt; t2 = new Node&lt;T&gt;(value);</span>
+<span class="fc" id="L1056">            t.next = t2;</span>
+<span class="fc" id="L1057">            tail = t2;</span>
+<span class="fc" id="L1058">            size++;</span>
+<span class="fc" id="L1059">        }</span>
+        public T removeFirst() {
+<span class="pc bpc" id="L1061" title="1 of 2 branches missed.">            if (head.next == null) {</span>
+<span class="nc" id="L1062">                throw new IllegalStateException(&quot;Empty!&quot;);</span>
+            }
+<span class="fc" id="L1064">            Node&lt;T&gt; t = head.next;</span>
+<span class="fc" id="L1065">            head.next = t.next;</span>
+<span class="fc bfc" id="L1066" title="All 2 branches covered.">            if (head.next == null) {</span>
+<span class="fc" id="L1067">                tail = head;</span>
+            }
+<span class="fc" id="L1069">            size--;</span>
+<span class="fc" id="L1070">            return t.value;</span>
+        }
+        public boolean isEmpty() {
+<span class="fc bfc" id="L1073" title="All 2 branches covered.">            return size == 0;</span>
+        }
+        public int size() {
+<span class="fc" id="L1076">            return size;</span>
+        }
+        public void clear() {
+<span class="fc" id="L1079">            tail = head;</span>
+<span class="fc" id="L1080">            size = 0;</span>
+<span class="fc" id="L1081">        }</span>
+    }
+    /** Empty eviction policy. */
+<span class="fc" id="L1084">    static final class EmptyEvictionPolicy implements EvictionPolicy {</span>
+        @Override
+        public boolean test(Object value, long now) {
+<span class="nc" id="L1087">            return true;</span>
+        }
+        @Override
+        public void evict(NodeList&lt;Object&gt; list) {
+<span class="fc" id="L1091">        }</span>
+        @Override
+        public void evictFinal(NodeList&lt;Object&gt; list) {
+<span class="fc" id="L1094">        }</span>
+    }    
+    /**
+     * Check if the Subject has terminated with an exception.
+     * @return true if the subject has received a throwable through {@code onError}.
+     */
+    @Beta
+    public boolean hasThrowable() {
+<span class="fc" id="L1102">        NotificationLite&lt;T&gt; nl = ssm.nl;</span>
+<span class="fc" id="L1103">        Object o = ssm.getLatest();</span>
+<span class="fc" id="L1104">        return nl.isError(o);</span>
+    }
+    /**
+     * Check if the Subject has terminated normally.
+     * @return true if the subject completed normally via {@code onCompleted}
+     */
+    @Beta
+    public boolean hasCompleted() {
+<span class="fc" id="L1112">        NotificationLite&lt;T&gt; nl = ssm.nl;</span>
+<span class="fc" id="L1113">        Object o = ssm.getLatest();</span>
+<span class="fc bfc" id="L1114" title="All 4 branches covered.">        return o != null &amp;&amp; !nl.isError(o);</span>
+    }
+    /**
+     * Returns the Throwable that terminated the Subject.
+     * @return the Throwable that terminated the Subject or {@code null} if the
+     * subject hasn't terminated yet or it terminated normally.
+     */
+    @Beta
+    public Throwable getThrowable() {
+<span class="fc" id="L1123">        NotificationLite&lt;T&gt; nl = ssm.nl;</span>
+<span class="fc" id="L1124">        Object o = ssm.getLatest();</span>
+<span class="fc bfc" id="L1125" title="All 2 branches covered.">        if (nl.isError(o)) {</span>
+<span class="fc" id="L1126">            return nl.getError(o);</span>
+        }
+<span class="fc" id="L1128">        return null;</span>
+    }
+    /**
+     * Returns the current number of items (non-terminal events) available for replay.
+     * @return the number of items available
+     */
+    @Beta
+    public int size() {
+<span class="fc" id="L1136">        return state.size();</span>
+    }
+    /**
+     * @return true if the Subject holds at least one non-terminal event available for replay
+     */
+    @Beta
+    public boolean hasAnyValue() {
+<span class="fc bfc" id="L1143" title="All 2 branches covered.">        return !state.isEmpty();</span>
+    }
+    @Beta
+    public boolean hasValue() {
+<span class="fc" id="L1147">        return hasAnyValue();</span>
+    }
+    /**
+     * Returns a snapshot of the currently buffered non-terminal events into 
+     * the provided {@code a} array or creates a new array if it has not enough capacity.
+     * @param a the array to fill in
+     * @return the array {@code a} if it had enough capacity or a new array containing the available values 
+     */
+    @Beta
+    public T[] getValues(T[] a) {
+<span class="fc" id="L1157">        return state.toArray(a);</span>
+    }
+    
+    /** An empty array to trigger getValues() to return a new array. */
+<span class="fc" id="L1161">    private static final Object[] EMPTY_ARRAY = new Object[0];</span>
+    
+    /**
+     * Returns a snapshot of the currently buffered non-terminal events.
+     * &lt;p&gt;The operation is threadsafe.
+     *
+     * @return a snapshot of the currently buffered non-terminal events.
+     * @since (If this graduates from being an Experimental class method, replace this parenthetical with the release number)
+     */
+    @SuppressWarnings(&quot;unchecked&quot;)
+    @Beta
+    public Object[] getValues() {
+<span class="fc" id="L1173">        T[] r = getValues((T[])EMPTY_ARRAY);</span>
+<span class="fc bfc" id="L1174" title="All 2 branches covered.">        if (r == EMPTY_ARRAY) {</span>
+<span class="fc" id="L1175">            return new Object[0]; // don't leak the default empty array.</span>
+        }
+<span class="fc" id="L1177">        return r;</span>
+    }
+    
+    @Beta
+    public T getValue() {
+<span class="fc" id="L1182">        return state.latest();</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>SpscLinkedAtomicQueue.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.internal.util.atomic</a> &gt; <span class="el_source">SpscLinkedAtomicQueue.java</span></div><h1>SpscLinkedAtomicQueue.java</h1><pre class="source lang-java linenums">/*
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ * 
+ * Original License: https://github.com/JCTools/JCTools/blob/master/LICENSE
+ * Original location: https://github.com/JCTools/JCTools/blob/master/jctools-core/src/main/java/org/jctools/queues/atomic/SpscLinkedAtomicQueue.java
+ */
+package rx.internal.util.atomic;
+
+/**
+ * This is a weakened version of the MPSC algorithm as presented &lt;a
+ * href=&quot;http://www.1024cores.net/home/lock-free-algorithms/queues/non-intrusive-mpsc-node-based-queue&quot;&gt; on 1024
+ * Cores&lt;/a&gt; by D. Vyukov. The original has been adapted to Java and it's quirks with regards to memory model and
+ * layout:
+ * &lt;ol&gt;
+ * &lt;li&gt;As this is an SPSC we have no need for XCHG, an ordered store is enough.
+ * &lt;/ol&gt;
+ * The queue is initialized with a stub node which is set to both the producer and consumer node references. From this
+ * point follow the notes on offer/poll.
+ * 
+ * @author nitsanw
+ * 
+ * @param &lt;E&gt;
+ */
+public final class SpscLinkedAtomicQueue&lt;E&gt; extends BaseLinkedAtomicQueue&lt;E&gt; {
+
+    public SpscLinkedAtomicQueue() {
+<span class="fc" id="L37">        super();</span>
+<span class="fc" id="L38">        LinkedQueueNode&lt;E&gt; node = new LinkedQueueNode&lt;E&gt;();</span>
+<span class="fc" id="L39">        spProducerNode(node);</span>
+<span class="fc" id="L40">        spConsumerNode(node);</span>
+<span class="fc" id="L41">        node.soNext(null); // this ensures correct construction: StoreStore</span>
+<span class="fc" id="L42">    }</span>
+
+    /**
+     * {@inheritDoc} &lt;br&gt;
+     * 
+     * IMPLEMENTATION NOTES:&lt;br&gt;
+     * Offer is allowed from a SINGLE thread.&lt;br&gt;
+     * Offer allocates a new node (holding the offered value) and:
+     * &lt;ol&gt;
+     * &lt;li&gt;Sets that node as the producerNode.next
+     * &lt;li&gt;Sets the new node as the producerNode
+     * &lt;/ol&gt;
+     * From this follows that producerNode.next is always null and for all other nodes node.next is not null.
+     * 
+     * @see MessagePassingQueue#offer(Object)
+     * @see java.util.Queue#offer(java.lang.Object)
+     */
+    @Override
+    public boolean offer(final E nextValue) {
+<span class="fc bfc" id="L61" title="All 2 branches covered.">        if (nextValue == null) {</span>
+<span class="fc" id="L62">            throw new NullPointerException(&quot;null elements not allowed&quot;);</span>
+        }
+<span class="fc" id="L64">        final LinkedQueueNode&lt;E&gt; nextNode = new LinkedQueueNode&lt;E&gt;(nextValue);</span>
+<span class="fc" id="L65">        lpProducerNode().soNext(nextNode);</span>
+<span class="fc" id="L66">        spProducerNode(nextNode);</span>
+<span class="fc" id="L67">        return true;</span>
+    }
+
+    /**
+     * {@inheritDoc} &lt;br&gt;
+     * 
+     * IMPLEMENTATION NOTES:&lt;br&gt;
+     * Poll is allowed from a SINGLE thread.&lt;br&gt;
+     * Poll reads the next node from the consumerNode and:
+     * &lt;ol&gt;
+     * &lt;li&gt;If it is null, the queue is empty.
+     * &lt;li&gt;If it is not null set it as the consumer node and return it's now evacuated value.
+     * &lt;/ol&gt;
+     * This means the consumerNode.value is always null, which is also the starting point for the queue. Because null
+     * values are not allowed to be offered this is the only node with it's value set to null at any one time.
+     * 
+     */
+    @Override
+    public E poll() {
+<span class="fc" id="L86">        final LinkedQueueNode&lt;E&gt; nextNode = lpConsumerNode().lvNext();</span>
+<span class="fc bfc" id="L87" title="All 2 branches covered.">        if (nextNode != null) {</span>
+            // we have to null out the value because we are going to hang on to the node
+<span class="fc" id="L89">            final E nextValue = nextNode.getAndNullValue();</span>
+<span class="fc" id="L90">            spConsumerNode(nextNode);</span>
+<span class="fc" id="L91">            return nextValue;</span>
+        }
+<span class="fc" id="L93">        return null;</span>
+    }
+
+    @Override
+    public E peek() {
+<span class="fc" id="L98">        final LinkedQueueNode&lt;E&gt; nextNode = lpConsumerNode().lvNext();</span>
+<span class="fc bfc" id="L99" title="All 2 branches covered.">        if (nextNode != null) {</span>
+<span class="fc" id="L100">            return nextNode.lpValue();</span>
+        } else {
+<span class="fc" id="L102">            return null;</span>
+        }
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

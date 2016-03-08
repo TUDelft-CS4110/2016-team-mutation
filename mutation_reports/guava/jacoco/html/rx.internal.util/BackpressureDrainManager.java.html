@@ -1,0 +1,238 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>BackpressureDrainManager.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.internal.util</a> &gt; <span class="el_source">BackpressureDrainManager.java</span></div><h1>BackpressureDrainManager.java</h1><pre class="source lang-java linenums">/**
+ * Copyright 2014 Netflix, Inc.
+ * 
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package rx.internal.util;
+
+import java.util.concurrent.atomic.AtomicLong;
+
+import rx.Producer;
+import rx.annotations.Experimental;
+
+/**
+ * Manages the producer-backpressure-consumer interplay by
+ * matching up available elements with requested elements and/or
+ * terminal events.
+ * 
+ * @since 1.1.0
+ */
+@Experimental
+public final class BackpressureDrainManager extends AtomicLong implements Producer {
+    /**
+     * Interface representing the minimal callbacks required
+     * to operate the drain part of a backpressure system.
+     */
+    public interface BackpressureQueueCallback {
+        /**
+         * Override this method to peek for the next element,
+         * null meaning no next element available now.
+         * &lt;p&gt;It will be called plain and while holding this object's monitor.
+         * @return the next element or null if no next element available
+         */
+        Object peek();
+        /**
+         * Override this method to poll (consume) the next element,
+         * null meaning no next element available now.
+         * @return the next element or null if no next element available
+         */
+        Object poll();
+        /**
+         * Override this method to deliver an element to downstream.
+         * The logic ensures that this happens only in the right conditions.
+         * @param value the value to deliver, not null
+         * @return true indicates that one should terminate the emission loop unconditionally
+         * and not deliver any further elements or terminal events.
+         */
+        boolean accept(Object value);
+        /**
+         * Override this method to deliver a normal or exceptional
+         * terminal event.
+         * @param exception if not null, contains the terminal exception
+         */
+        void complete(Throwable exception);
+    }
+
+    /** Indicates if one is in emitting phase, guarded by this. */
+    protected boolean emitting;
+    /** Indicates a terminal state. */
+    protected volatile boolean terminated;
+    /** Indicates an error state, barrier is provided via terminated. */
+    protected Throwable exception;
+    /** The callbacks to manage the drain. */
+    protected final BackpressureQueueCallback actual;
+    /**
+     * Constructs a backpressure drain manager with 0 requesedCount,
+     * no terminal event and not emitting.
+     * @param actual he queue callback to check for new element availability
+     */
+<span class="fc" id="L79">    public BackpressureDrainManager(BackpressureQueueCallback actual) {</span>
+<span class="fc" id="L80">        this.actual = actual;</span>
+<span class="fc" id="L81">    }</span>
+    /**
+     * Checks if a terminal state has been reached.
+     * @return true if a terminal state has been reached
+     */
+    public final boolean isTerminated() {
+<span class="nc" id="L87">        return terminated;</span>
+    }
+    /**
+     * Move into a terminal state. 
+     * Call drain() anytime after.
+     */
+    public final void terminate() {
+<span class="nc" id="L94">        terminated = true;</span>
+<span class="nc" id="L95">    }</span>
+    /**
+     * Move into a terminal state with an exception.
+     * Call drain() anytime after.
+     * &lt;p&gt;Serialized access is expected with respect to
+     * element emission.
+     * @param error the exception to deliver
+     */
+    public final void terminate(Throwable error) {
+<span class="nc bnc" id="L104" title="All 2 branches missed.">        if (!terminated) {</span>
+<span class="nc" id="L105">            exception = error;</span>
+<span class="nc" id="L106">            terminated = true;</span>
+        }
+<span class="nc" id="L108">    }</span>
+    /**
+     * Move into a terminal state and drain. 
+     */
+    public final void terminateAndDrain() {
+<span class="fc" id="L113">        terminated = true;</span>
+<span class="fc" id="L114">        drain();</span>
+<span class="fc" id="L115">    }</span>
+    /**
+     * Move into a terminal state with an exception and drain.
+     * &lt;p&gt;Serialized access is expected with respect to
+     * element emission.
+     * @param error the exception to deliver
+     */
+    public final void terminateAndDrain(Throwable error) {
+<span class="pc bpc" id="L123" title="1 of 2 branches missed.">        if (!terminated) {</span>
+<span class="fc" id="L124">            exception = error;</span>
+<span class="fc" id="L125">            terminated = true;</span>
+<span class="fc" id="L126">            drain();</span>
+        }
+<span class="fc" id="L128">    }</span>
+    @Override
+    public final void request(long n) {
+<span class="fc bfc" id="L131" title="All 2 branches covered.">        if (n == 0) {</span>
+<span class="fc" id="L132">            return;</span>
+        }
+        boolean mayDrain;
+        long r;
+        long u;
+        do {
+<span class="fc" id="L138">            r = get();</span>
+<span class="fc bfc" id="L139" title="All 2 branches covered.">            mayDrain = r == 0;</span>
+<span class="pc bpc" id="L140" title="1 of 2 branches missed.">            if (r == Long.MAX_VALUE) {</span>
+<span class="nc" id="L141">                break;</span>
+            }
+<span class="pc bpc" id="L143" title="1 of 2 branches missed.">            if (n == Long.MAX_VALUE) {</span>
+<span class="nc" id="L144">                u = n;</span>
+<span class="nc" id="L145">                mayDrain = true;</span>
+            } else {
+<span class="pc bpc" id="L147" title="1 of 2 branches missed.">                if (r &gt; Long.MAX_VALUE - n) {</span>
+<span class="nc" id="L148">                    u = Long.MAX_VALUE;</span>
+                } else {
+<span class="fc" id="L150">                    u = r + n;</span>
+                }
+            }
+<span class="fc bfc" id="L153" title="All 2 branches covered.">        } while (!compareAndSet(r, u));</span>
+        // since we implement producer, we have to call drain
+        // on a 0-n request transition
+<span class="fc bfc" id="L156" title="All 2 branches covered.">        if (mayDrain) {</span>
+<span class="fc" id="L157">            drain();</span>
+        }
+<span class="fc" id="L159">    }</span>
+    /**
+     * Try to drain the &quot;queued&quot; elements and terminal events
+     * by considering the available and requested event counts.
+     */
+    public final void drain() {
+        long n;
+        boolean term;
+<span class="fc" id="L167">        synchronized (this) {</span>
+<span class="fc bfc" id="L168" title="All 2 branches covered.">            if (emitting) {</span>
+<span class="fc" id="L169">                return;</span>
+            }
+<span class="fc" id="L171">            emitting = true;</span>
+<span class="fc" id="L172">            term = terminated;</span>
+<span class="pc" id="L173">        }</span>
+<span class="fc" id="L174">        n = get();</span>
+<span class="fc" id="L175">        boolean skipFinal = false;</span>
+        try {
+<span class="fc" id="L177">            BackpressureQueueCallback a = actual;</span>
+            while (true) {
+<span class="fc" id="L179">                int emitted = 0;</span>
+<span class="fc bfc" id="L180" title="All 4 branches covered.">                while (n &gt; 0 || term) {</span>
+                    Object o;
+<span class="fc bfc" id="L182" title="All 2 branches covered.">                    if (term) {</span>
+<span class="fc" id="L183">                        o = a.peek();</span>
+<span class="fc bfc" id="L184" title="All 2 branches covered.">                        if (o == null) {</span>
+<span class="fc" id="L185">                            skipFinal = true;</span>
+<span class="fc" id="L186">                            Throwable e = exception;</span>
+<span class="fc" id="L187">                            a.complete(e);</span>
+                            return;
+                        }
+<span class="fc bfc" id="L190" title="All 2 branches covered.">                        if (n == 0) {</span>
+<span class="fc" id="L191">                            break;</span>
+                        }
+                    }
+<span class="fc" id="L194">                    o = a.poll();</span>
+<span class="fc bfc" id="L195" title="All 2 branches covered.">                    if (o == null) {</span>
+<span class="fc" id="L196">                        break;</span>
+                    } else {
+<span class="pc bpc" id="L198" title="1 of 2 branches missed.">                        if (a.accept(o)) {</span>
+<span class="nc" id="L199">                            skipFinal = true;</span>
+                            return;
+                        }
+<span class="fc" id="L202">                        n--;</span>
+<span class="fc" id="L203">                        emitted++;</span>
+                    }
+<span class="fc" id="L205">                }</span>
+<span class="fc" id="L206">                synchronized (this) {</span>
+<span class="fc" id="L207">                    term = terminated;</span>
+<span class="fc bfc" id="L208" title="All 2 branches covered.">                    boolean more = a.peek() != null;</span>
+                    // if no backpressure below
+<span class="pc bpc" id="L210" title="1 of 2 branches missed.">                    if (get() == Long.MAX_VALUE) {</span>
+                        // no new data arrived since the last poll
+<span class="nc bnc" id="L212" title="All 4 branches missed.">                        if (!more &amp;&amp; !term) {</span>
+<span class="nc" id="L213">                            skipFinal = true;</span>
+<span class="nc" id="L214">                            emitting = false;</span>
+<span class="nc" id="L215">                            return;</span>
+                        }
+<span class="nc" id="L217">                        n = Long.MAX_VALUE;</span>
+                    } else {
+<span class="fc" id="L219">                        n = addAndGet(-emitted);</span>
+<span class="pc bpc" id="L220" title="1 of 8 branches missed.">                        if ((n == 0 || !more) &amp;&amp; (!term || more)) {</span>
+<span class="fc" id="L221">                            skipFinal = true;</span>
+<span class="fc" id="L222">                            emitting = false;</span>
+<span class="fc" id="L223">                            return;</span>
+                        }
+                    }
+<span class="pc" id="L226">                }</span>
+<span class="fc" id="L227">            }</span>
+        } finally {
+<span class="pc bpc" id="L229" title="8 of 10 branches missed.">            if (!skipFinal) {</span>
+<span class="nc" id="L230">                synchronized (this) {</span>
+<span class="nc" id="L231">                    emitting = false;</span>
+<span class="pc" id="L232">                }</span>
+            }
+        }
+
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

@@ -1,0 +1,217 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>CompletableOnSubscribeMerge.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.internal.operators</a> &gt; <span class="el_source">CompletableOnSubscribeMerge.java</span></div><h1>CompletableOnSubscribeMerge.java</h1><pre class="source lang-java linenums">/**
+ * Copyright 2014 Netflix, Inc.
+ * 
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package rx.internal.operators;
+
+import java.util.*;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.*;
+
+import rx.*;
+import rx.Completable.*;
+import rx.exceptions.CompositeException;
+import rx.Observable;
+import rx.plugins.RxJavaPlugins;
+import rx.subscriptions.CompositeSubscription;
+
+public final class CompletableOnSubscribeMerge implements CompletableOnSubscribe {
+    final Observable&lt;? extends Completable&gt; source;
+    final int maxConcurrency;
+    final boolean delayErrors;
+    
+<span class="fc" id="L35">    public CompletableOnSubscribeMerge(Observable&lt;? extends Completable&gt; source, int maxConcurrency, boolean delayErrors) {</span>
+<span class="fc" id="L36">        this.source = source;</span>
+<span class="fc" id="L37">        this.maxConcurrency = maxConcurrency;</span>
+<span class="fc" id="L38">        this.delayErrors = delayErrors;</span>
+<span class="fc" id="L39">    }</span>
+    
+    @Override
+    public void call(CompletableSubscriber s) {
+<span class="fc" id="L43">        CompletableMergeSubscriber parent = new CompletableMergeSubscriber(s, maxConcurrency, delayErrors);</span>
+<span class="fc" id="L44">        s.onSubscribe(parent);</span>
+<span class="fc" id="L45">        source.subscribe(parent);</span>
+<span class="fc" id="L46">    }</span>
+    
+    static final class CompletableMergeSubscriber
+    extends Subscriber&lt;Completable&gt; {
+        final CompletableSubscriber actual;
+        final CompositeSubscription set;
+        final int maxConcurrency;
+        final boolean delayErrors;
+        
+        volatile boolean done;
+        
+        volatile Queue&lt;Throwable&gt; errors;
+        @SuppressWarnings(&quot;rawtypes&quot;)
+<span class="fc" id="L59">        static final AtomicReferenceFieldUpdater&lt;CompletableMergeSubscriber, Queue&gt; ERRORS =</span>
+                AtomicReferenceFieldUpdater.newUpdater(CompletableMergeSubscriber.class, Queue.class, &quot;errors&quot;);
+        
+        volatile int once;
+<span class="fc" id="L63">        static final AtomicIntegerFieldUpdater&lt;CompletableMergeSubscriber&gt; ONCE =</span>
+                AtomicIntegerFieldUpdater.newUpdater(CompletableMergeSubscriber.class, &quot;once&quot;);
+        
+        final AtomicInteger wip;
+        
+<span class="fc" id="L68">        public CompletableMergeSubscriber(CompletableSubscriber actual, int maxConcurrency, boolean delayErrors) {</span>
+<span class="fc" id="L69">            this.actual = actual;</span>
+<span class="fc" id="L70">            this.maxConcurrency = maxConcurrency;</span>
+<span class="fc" id="L71">            this.delayErrors = delayErrors;</span>
+<span class="fc" id="L72">            this.set = new CompositeSubscription();</span>
+<span class="fc" id="L73">            this.wip = new AtomicInteger(1);</span>
+<span class="fc bfc" id="L74" title="All 2 branches covered.">            if (maxConcurrency == Integer.MAX_VALUE) {</span>
+<span class="fc" id="L75">                request(Long.MAX_VALUE);</span>
+            } else {
+<span class="fc" id="L77">                request(maxConcurrency);</span>
+            }
+<span class="fc" id="L79">        }</span>
+        
+        Queue&lt;Throwable&gt; getOrCreateErrors() {
+<span class="fc" id="L82">            Queue&lt;Throwable&gt; q = errors;</span>
+            
+<span class="pc bpc" id="L84" title="1 of 2 branches missed.">            if (q != null) {</span>
+<span class="nc" id="L85">                return q;</span>
+            }
+            
+<span class="fc" id="L88">            q = new ConcurrentLinkedQueue&lt;Throwable&gt;();</span>
+<span class="pc bpc" id="L89" title="1 of 2 branches missed.">            if (ERRORS.compareAndSet(this, null, q)) {</span>
+<span class="fc" id="L90">                return q;</span>
+            }
+<span class="nc" id="L92">            return errors;</span>
+        }
+
+        @Override
+        public void onNext(Completable t) {
+<span class="pc bpc" id="L97" title="1 of 2 branches missed.">            if (done) {</span>
+<span class="nc" id="L98">                return;</span>
+            }
+
+<span class="fc" id="L101">            wip.getAndIncrement();</span>
+            
+<span class="fc" id="L103">            t.subscribe(new CompletableSubscriber() {</span>
+                Subscription d;
+                boolean innerDone;
+                @Override
+                public void onSubscribe(Subscription d) {
+<span class="fc" id="L108">                    this.d = d;</span>
+<span class="fc" id="L109">                    set.add(d);</span>
+<span class="fc" id="L110">                }</span>
+                
+                @Override
+                public void onError(Throwable e) {
+<span class="pc bpc" id="L114" title="1 of 2 branches missed.">                    if (innerDone) {</span>
+<span class="nc" id="L115">                        RxJavaPlugins.getInstance().getErrorHandler().handleError(e);</span>
+<span class="nc" id="L116">                        return;</span>
+                    }
+<span class="fc" id="L118">                    innerDone = true;</span>
+<span class="fc" id="L119">                    set.remove(d);</span>
+                    
+<span class="fc" id="L121">                    getOrCreateErrors().offer(e);</span>
+                    
+<span class="fc" id="L123">                    terminate();</span>
+                    
+<span class="pc bpc" id="L125" title="1 of 4 branches missed.">                    if (delayErrors &amp;&amp; !done) {</span>
+<span class="fc" id="L126">                        request(1);</span>
+                    }
+<span class="fc" id="L128">                }</span>
+                
+                @Override
+                public void onCompleted() {
+<span class="pc bpc" id="L132" title="1 of 2 branches missed.">                    if (innerDone) {</span>
+<span class="nc" id="L133">                        return;</span>
+                    }
+<span class="fc" id="L135">                    innerDone = true;</span>
+<span class="fc" id="L136">                    set.remove(d);</span>
+                    
+<span class="fc" id="L138">                    terminate();</span>
+                    
+<span class="pc bpc" id="L140" title="1 of 2 branches missed.">                    if (!done) {</span>
+<span class="fc" id="L141">                        request(1);</span>
+                    }
+<span class="fc" id="L143">                }</span>
+            });
+<span class="fc" id="L145">        }</span>
+
+        @Override
+        public void onError(Throwable t) {
+<span class="pc bpc" id="L149" title="1 of 2 branches missed.">            if (done) {</span>
+<span class="nc" id="L150">                RxJavaPlugins.getInstance().getErrorHandler().handleError(t);</span>
+<span class="nc" id="L151">                return;</span>
+            }
+<span class="fc" id="L153">            getOrCreateErrors().offer(t);</span>
+<span class="fc" id="L154">            done = true;</span>
+<span class="fc" id="L155">            terminate();</span>
+<span class="fc" id="L156">        }</span>
+
+        @Override
+        public void onCompleted() {
+<span class="pc bpc" id="L160" title="1 of 2 branches missed.">            if (done) {</span>
+<span class="nc" id="L161">                return;</span>
+            }
+<span class="fc" id="L163">            done = true;</span>
+<span class="fc" id="L164">            terminate();</span>
+<span class="fc" id="L165">        }</span>
+
+        void terminate() {
+<span class="fc bfc" id="L168" title="All 2 branches covered.">            if (wip.decrementAndGet() == 0) {</span>
+<span class="fc" id="L169">                Queue&lt;Throwable&gt; q = errors;</span>
+<span class="fc bfc" id="L170" title="All 4 branches covered.">                if (q == null || q.isEmpty()) {</span>
+<span class="fc" id="L171">                    actual.onCompleted();</span>
+                } else {
+<span class="fc" id="L173">                    Throwable e = collectErrors(q);</span>
+<span class="pc bpc" id="L174" title="1 of 2 branches missed.">                    if (ONCE.compareAndSet(this, 0, 1)) {</span>
+<span class="fc" id="L175">                        actual.onError(e);</span>
+                    } else {
+<span class="nc" id="L177">                        RxJavaPlugins.getInstance().getErrorHandler().handleError(e);</span>
+                    }
+                }
+<span class="fc" id="L180">            } else</span>
+<span class="fc bfc" id="L181" title="All 2 branches covered.">            if (!delayErrors) {</span>
+<span class="fc" id="L182">                Queue&lt;Throwable&gt; q = errors;</span>
+<span class="pc bpc" id="L183" title="1 of 4 branches missed.">                if (q != null &amp;&amp; !q.isEmpty()) {</span>
+<span class="fc" id="L184">                    Throwable e = collectErrors(q);</span>
+<span class="pc bpc" id="L185" title="1 of 2 branches missed.">                    if (ONCE.compareAndSet(this, 0, 1)) {</span>
+<span class="fc" id="L186">                        actual.onError(e);</span>
+                    } else {
+<span class="nc" id="L188">                        RxJavaPlugins.getInstance().getErrorHandler().handleError(e);</span>
+                    }
+                }
+            }
+<span class="fc" id="L192">        }</span>
+    }
+    
+    /**
+     * Collects the Throwables from the queue, adding subsequent Throwables as suppressed to
+     * the first Throwable and returns it.
+     * @param q the queue to drain
+     * @return the Throwable containing all other Throwables as suppressed
+     */
+    public static Throwable collectErrors(Queue&lt;Throwable&gt; q) {
+<span class="fc" id="L202">        List&lt;Throwable&gt; list = new ArrayList&lt;Throwable&gt;();</span>
+        
+        Throwable t;
+<span class="fc bfc" id="L205" title="All 2 branches covered.">        while ((t = q.poll()) != null) {</span>
+<span class="fc" id="L206">            list.add(t);</span>
+        }
+<span class="pc bpc" id="L208" title="1 of 2 branches missed.">        if (list.isEmpty()) {</span>
+<span class="nc" id="L209">            return null;</span>
+        }
+<span class="pc bpc" id="L211" title="1 of 2 branches missed.">        if (list.size() == 1) {</span>
+<span class="fc" id="L212">            return list.get(0);</span>
+        }
+<span class="nc" id="L214">        return new CompositeException(list);</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

@@ -1,0 +1,382 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>OnSubscribeGroupJoin.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.internal.operators</a> &gt; <span class="el_source">OnSubscribeGroupJoin.java</span></div><h1>OnSubscribeGroupJoin.java</h1><pre class="source lang-java linenums">/**
+ * Copyright 2014 Netflix, Inc.
+ * 
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package rx.internal.operators;
+
+import java.util.*;
+
+import rx.*;
+import rx.Observable;
+import rx.Observable.OnSubscribe;
+import rx.Observer;
+import rx.exceptions.Exceptions;
+import rx.functions.*;
+import rx.observers.*;
+import rx.subjects.*;
+import rx.subscriptions.*;
+
+/**
+ * Corrrelates two sequences when they overlap and groups the results.
+ * 
+ * @see &lt;a href=&quot;http://msdn.microsoft.com/en-us/library/hh244235.aspx&quot;&gt;MSDN: Observable.GroupJoin&lt;/a&gt;
+ * @param &lt;T1&gt; the left value type
+ * @param &lt;T2&gt; the right value type
+ * @param &lt;D1&gt; the value type of the left duration
+ * @param &lt;D2&gt; the value type of the right duration
+ * @param &lt;R&gt; the result value type
+ */
+public final class OnSubscribeGroupJoin&lt;T1, T2, D1, D2, R&gt; implements OnSubscribe&lt;R&gt; {
+    protected final Observable&lt;T1&gt; left;
+    protected final Observable&lt;T2&gt; right;
+    protected final Func1&lt;? super T1, ? extends Observable&lt;D1&gt;&gt; leftDuration;
+    protected final Func1&lt;? super T2, ? extends Observable&lt;D2&gt;&gt; rightDuration;
+    protected final Func2&lt;? super T1, ? super Observable&lt;T2&gt;, ? extends R&gt; resultSelector;
+
+    public OnSubscribeGroupJoin(
+            Observable&lt;T1&gt; left,
+            Observable&lt;T2&gt; right,
+            Func1&lt;? super T1, ? extends Observable&lt;D1&gt;&gt; leftDuration,
+            Func1&lt;? super T2, ? extends Observable&lt;D2&gt;&gt; rightDuration,
+<span class="fc" id="L52">            Func2&lt;? super T1, ? super Observable&lt;T2&gt;, ? extends R&gt; resultSelector) {</span>
+<span class="fc" id="L53">        this.left = left;</span>
+<span class="fc" id="L54">        this.right = right;</span>
+<span class="fc" id="L55">        this.leftDuration = leftDuration;</span>
+<span class="fc" id="L56">        this.rightDuration = rightDuration;</span>
+<span class="fc" id="L57">        this.resultSelector = resultSelector;</span>
+<span class="fc" id="L58">    }</span>
+
+    @Override
+    public void call(Subscriber&lt;? super R&gt; child) {
+<span class="fc" id="L62">        ResultManager ro = new ResultManager(new SerializedSubscriber&lt;R&gt;(child));</span>
+<span class="fc" id="L63">        child.add(ro);</span>
+<span class="fc" id="L64">        ro.init();</span>
+<span class="fc" id="L65">    }</span>
+
+    /** Manages sub-observers and subscriptions. */
+    final class ResultManager implements Subscription {
+        final RefCountSubscription cancel;
+        final Subscriber&lt;? super R&gt; subscriber;
+        final CompositeSubscription group;
+<span class="fc" id="L72">        final Object guard = new Object();</span>
+        /** Guarded by guard. */
+        int leftIds;
+        /** Guarded by guard. */
+        int rightIds;
+        /** Guarded by guard. */
+<span class="fc" id="L78">        final Map&lt;Integer, Observer&lt;T2&gt;&gt; leftMap = new HashMap&lt;Integer, Observer&lt;T2&gt;&gt;();</span>
+        /** Guarded by guard. */
+<span class="fc" id="L80">        final Map&lt;Integer, T2&gt; rightMap = new HashMap&lt;Integer, T2&gt;();</span>
+        /** Guarded by guard. */
+        boolean leftDone;
+        /** Guarded by guard. */
+        boolean rightDone;
+
+<span class="fc" id="L86">        public ResultManager(Subscriber&lt;? super R&gt; subscriber) {</span>
+<span class="fc" id="L87">            this.subscriber = subscriber;</span>
+<span class="fc" id="L88">            this.group = new CompositeSubscription();</span>
+<span class="fc" id="L89">            this.cancel = new RefCountSubscription(group);</span>
+<span class="fc" id="L90">        }</span>
+
+        public void init() {
+
+<span class="fc" id="L94">            Subscriber&lt;T1&gt; s1 = new LeftObserver();</span>
+<span class="fc" id="L95">            Subscriber&lt;T2&gt; s2 = new RightObserver();</span>
+            
+<span class="fc" id="L97">            group.add(s1);</span>
+<span class="fc" id="L98">            group.add(s2);</span>
+
+<span class="fc" id="L100">            left.unsafeSubscribe(s1);</span>
+<span class="fc" id="L101">            right.unsafeSubscribe(s2);</span>
+<span class="fc" id="L102">        }</span>
+
+        @Override
+        public void unsubscribe() {
+<span class="fc" id="L106">            cancel.unsubscribe();</span>
+<span class="fc" id="L107">        }</span>
+        
+        @Override
+        public boolean isUnsubscribed() {
+<span class="fc" id="L111">            return cancel.isUnsubscribed();</span>
+        }
+        /**
+         * Notify everyone and cleanup.
+         * @param e the exception
+         */
+        void errorAll(Throwable e) {
+            List&lt;Observer&lt;T2&gt;&gt; list;
+<span class="fc" id="L119">            synchronized (guard) {</span>
+<span class="fc" id="L120">                list = new ArrayList&lt;Observer&lt;T2&gt;&gt;(leftMap.values());</span>
+<span class="fc" id="L121">                leftMap.clear();</span>
+<span class="fc" id="L122">                rightMap.clear();</span>
+<span class="pc" id="L123">            }</span>
+<span class="fc bfc" id="L124" title="All 2 branches covered.">            for (Observer&lt;T2&gt; o : list) {</span>
+<span class="fc" id="L125">                o.onError(e);</span>
+<span class="fc" id="L126">            }</span>
+<span class="fc" id="L127">            subscriber.onError(e);</span>
+<span class="fc" id="L128">            cancel.unsubscribe();</span>
+<span class="fc" id="L129">        }</span>
+        /**
+         * Notify only the main subscriber and cleanup.
+         * @param e  the exception
+         */
+        void errorMain(Throwable e) {
+<span class="fc" id="L135">            synchronized (guard) {</span>
+<span class="fc" id="L136">                leftMap.clear();</span>
+<span class="fc" id="L137">                rightMap.clear();</span>
+<span class="pc" id="L138">            }            </span>
+<span class="fc" id="L139">            subscriber.onError(e);</span>
+<span class="fc" id="L140">            cancel.unsubscribe();</span>
+<span class="fc" id="L141">        }</span>
+        void complete(List&lt;Observer&lt;T2&gt;&gt; list) {
+<span class="fc bfc" id="L143" title="All 2 branches covered.">            if (list != null) {</span>
+<span class="fc bfc" id="L144" title="All 2 branches covered.">                for (Observer&lt;T2&gt; o : list) {</span>
+<span class="fc" id="L145">                    o.onCompleted();</span>
+<span class="fc" id="L146">                }</span>
+<span class="fc" id="L147">                subscriber.onCompleted();</span>
+<span class="fc" id="L148">                cancel.unsubscribe();</span>
+            }
+<span class="fc" id="L150">        }</span>
+        
+        /** Observe the left source. */
+<span class="fc" id="L153">        final class LeftObserver extends Subscriber&lt;T1&gt; {</span>
+            @Override
+            public void onNext(T1 args) {
+                try {
+                    int id;
+<span class="fc" id="L158">                    Subject&lt;T2, T2&gt; subj = PublishSubject.create();</span>
+<span class="fc" id="L159">                    Observer&lt;T2&gt; subjSerial = new SerializedObserver&lt;T2&gt;(subj);</span>
+                    
+<span class="fc" id="L161">                    synchronized (guard) {</span>
+<span class="fc" id="L162">                        id = leftIds++;</span>
+<span class="fc" id="L163">                        leftMap.put(id, subjSerial);</span>
+<span class="pc" id="L164">                    }</span>
+
+<span class="fc" id="L166">                    Observable&lt;T2&gt; window = Observable.create(new WindowObservableFunc&lt;T2&gt;(subj, cancel));</span>
+
+<span class="fc" id="L168">                    Observable&lt;D1&gt; duration = leftDuration.call(args);</span>
+
+<span class="fc" id="L170">                    Subscriber&lt;D1&gt; d1 = new LeftDurationObserver(id);</span>
+<span class="fc" id="L171">                    group.add(d1);</span>
+<span class="fc" id="L172">                    duration.unsafeSubscribe(d1);</span>
+
+<span class="fc" id="L174">                    R result = resultSelector.call(args, window);</span>
+
+                    List&lt;T2&gt; rightMapValues;
+<span class="fc" id="L177">                    synchronized (guard) {</span>
+<span class="fc" id="L178">                        rightMapValues = new ArrayList&lt;T2&gt;(rightMap.values());</span>
+<span class="pc" id="L179">                    }</span>
+                    
+<span class="fc" id="L181">                    subscriber.onNext(result);</span>
+<span class="pc bpc" id="L182" title="1 of 2 branches missed.">                    for (T2 t2 : rightMapValues) {</span>
+<span class="nc" id="L183">                        subjSerial.onNext(t2);</span>
+<span class="nc" id="L184">                    }</span>
+                    
+                    
+<span class="fc" id="L187">                } catch (Throwable t) {</span>
+<span class="fc" id="L188">                    Exceptions.throwOrReport(t, this);</span>
+<span class="fc" id="L189">                }</span>
+<span class="fc" id="L190">            }</span>
+
+            @Override
+            public void onCompleted() {
+<span class="fc" id="L194">                List&lt;Observer&lt;T2&gt;&gt; list = null;</span>
+<span class="fc" id="L195">                synchronized (guard) {</span>
+<span class="fc" id="L196">                    leftDone = true;</span>
+<span class="pc bpc" id="L197" title="1 of 2 branches missed.">                    if (rightDone) {</span>
+<span class="nc" id="L198">                        list = new ArrayList&lt;Observer&lt;T2&gt;&gt;(leftMap.values());</span>
+<span class="nc" id="L199">                        leftMap.clear();</span>
+<span class="nc" id="L200">                        rightMap.clear();</span>
+                    }
+<span class="pc" id="L202">                }</span>
+<span class="fc" id="L203">                complete(list);</span>
+<span class="fc" id="L204">            }</span>
+
+            @Override
+            public void onError(Throwable e) {
+<span class="fc" id="L208">                errorAll(e);</span>
+<span class="fc" id="L209">            }</span>
+
+        }
+
+        /** Observe the right source. */
+<span class="fc" id="L214">        final class RightObserver extends Subscriber&lt;T2&gt; {</span>
+            @Override
+            public void onNext(T2 args) {
+                try {
+                    int id;
+<span class="fc" id="L219">                    synchronized (guard) {</span>
+<span class="fc" id="L220">                        id = rightIds++;</span>
+<span class="fc" id="L221">                        rightMap.put(id, args);</span>
+<span class="pc" id="L222">                    }</span>
+<span class="fc" id="L223">                    Observable&lt;D2&gt; duration = rightDuration.call(args);</span>
+
+<span class="fc" id="L225">                    Subscriber&lt;D2&gt; d2 = new RightDurationObserver(id);</span>
+                    
+<span class="fc" id="L227">                    group.add(d2);</span>
+<span class="fc" id="L228">                    duration.unsafeSubscribe(d2);</span>
+
+                    List&lt;Observer&lt;T2&gt;&gt; list;
+<span class="fc" id="L231">                    synchronized (guard) {</span>
+<span class="fc" id="L232">                        list = new ArrayList&lt;Observer&lt;T2&gt;&gt;(leftMap.values());</span>
+<span class="pc" id="L233">                    }</span>
+<span class="fc bfc" id="L234" title="All 2 branches covered.">                    for (Observer&lt;T2&gt; o : list) {</span>
+<span class="fc" id="L235">                        o.onNext(args);</span>
+<span class="fc" id="L236">                    }</span>
+<span class="fc" id="L237">                } catch (Throwable t) {</span>
+<span class="fc" id="L238">                    Exceptions.throwOrReport(t, this);</span>
+<span class="fc" id="L239">                }</span>
+<span class="fc" id="L240">            }</span>
+
+            @Override
+            public void onCompleted() {
+<span class="fc" id="L244">                List&lt;Observer&lt;T2&gt;&gt; list = null;</span>
+<span class="fc" id="L245">                synchronized (guard) {</span>
+<span class="fc" id="L246">                    rightDone = true;</span>
+<span class="pc bpc" id="L247" title="1 of 2 branches missed.">                    if (leftDone) {</span>
+<span class="fc" id="L248">                        list = new ArrayList&lt;Observer&lt;T2&gt;&gt;(leftMap.values());</span>
+<span class="fc" id="L249">                        leftMap.clear();</span>
+<span class="fc" id="L250">                        rightMap.clear();</span>
+                    }
+<span class="pc" id="L252">                }</span>
+<span class="fc" id="L253">                complete(list);</span>
+<span class="fc" id="L254">            }</span>
+
+            @Override
+            public void onError(Throwable e) {
+<span class="fc" id="L258">                errorAll(e);</span>
+<span class="fc" id="L259">            }</span>
+        }
+
+        /** Observe left duration and apply termination. */
+        final class LeftDurationObserver extends Subscriber&lt;D1&gt; {
+            final int id;
+<span class="fc" id="L265">            boolean once = true;</span>
+
+<span class="fc" id="L267">            public LeftDurationObserver(int id) {</span>
+<span class="fc" id="L268">                this.id = id;</span>
+<span class="fc" id="L269">            }</span>
+
+            @Override
+            public void onCompleted() {
+<span class="nc bnc" id="L273" title="All 2 branches missed.">                if (once) {</span>
+<span class="nc" id="L274">                    once = false;</span>
+                    Observer&lt;T2&gt; gr;
+<span class="nc" id="L276">                    synchronized (guard) {</span>
+<span class="nc" id="L277">                        gr = leftMap.remove(id);</span>
+<span class="nc" id="L278">                    }</span>
+<span class="nc bnc" id="L279" title="All 2 branches missed.">                    if (gr != null) {</span>
+<span class="nc" id="L280">                        gr.onCompleted();</span>
+                    }
+<span class="nc" id="L282">                    group.remove(this);</span>
+                }
+<span class="nc" id="L284">            }</span>
+
+            @Override
+            public void onError(Throwable e) {
+<span class="fc" id="L288">                errorMain(e);</span>
+<span class="fc" id="L289">            }</span>
+
+            @Override
+            public void onNext(D1 args) {
+<span class="nc" id="L293">                onCompleted();</span>
+<span class="nc" id="L294">            }</span>
+        }
+
+        /** Observe right duration and apply termination. */
+        final class RightDurationObserver extends Subscriber&lt;D2&gt; {
+            final int id;
+<span class="fc" id="L300">            boolean once = true;</span>
+<span class="fc" id="L301">            public RightDurationObserver(int id) {</span>
+<span class="fc" id="L302">                this.id = id;</span>
+<span class="fc" id="L303">            }</span>
+
+            @Override
+            public void onCompleted() {
+<span class="nc bnc" id="L307" title="All 2 branches missed.">                if (once) {</span>
+<span class="nc" id="L308">                    once = false;</span>
+<span class="nc" id="L309">                    synchronized (guard) {</span>
+<span class="nc" id="L310">                        rightMap.remove(id);</span>
+<span class="nc" id="L311">                    }</span>
+<span class="nc" id="L312">                    group.remove(this);</span>
+                }
+<span class="nc" id="L314">            }</span>
+
+            @Override
+            public void onError(Throwable e) {
+<span class="fc" id="L318">                errorMain(e);</span>
+<span class="fc" id="L319">            }</span>
+
+            @Override
+            public void onNext(D2 args) {
+<span class="nc" id="L323">                onCompleted();</span>
+<span class="nc" id="L324">            }</span>
+        }
+
+    }
+
+    /**
+     * The reference-counted window observable.
+     * Subscribes to the underlying Observable by using a reference-counted
+     * subscription.
+     */
+    final static class WindowObservableFunc&lt;T&gt; implements OnSubscribe&lt;T&gt; {
+        final RefCountSubscription refCount;
+        final Observable&lt;T&gt; underlying;
+
+<span class="fc" id="L338">        public WindowObservableFunc(Observable&lt;T&gt; underlying, RefCountSubscription refCount) {</span>
+<span class="fc" id="L339">            this.refCount = refCount;</span>
+<span class="fc" id="L340">            this.underlying = underlying;</span>
+<span class="fc" id="L341">        }</span>
+
+        @Override
+        public void call(Subscriber&lt;? super T&gt; t1) {
+<span class="fc" id="L345">            Subscription ref = refCount.get();</span>
+<span class="fc" id="L346">            WindowSubscriber wo = new WindowSubscriber(t1, ref);</span>
+<span class="fc" id="L347">            wo.add(ref);</span>
+            
+<span class="fc" id="L349">            underlying.unsafeSubscribe(wo);</span>
+<span class="fc" id="L350">        }</span>
+
+        /** Observe activities on the window. */
+        final class WindowSubscriber extends Subscriber&lt;T&gt; {
+            final Subscriber&lt;? super T&gt; subscriber;
+            private final Subscription ref;
+
+<span class="fc" id="L357">            public WindowSubscriber(Subscriber&lt;? super T&gt; subscriber, Subscription ref) {</span>
+<span class="fc" id="L358">                super(subscriber);</span>
+<span class="fc" id="L359">                this.subscriber = subscriber;</span>
+<span class="fc" id="L360">                this.ref = ref;</span>
+<span class="fc" id="L361">            }</span>
+
+            @Override
+            public void onNext(T args) {
+<span class="fc" id="L365">                subscriber.onNext(args);</span>
+<span class="fc" id="L366">            }</span>
+
+            @Override
+            public void onError(Throwable e) {
+<span class="nc" id="L370">                subscriber.onError(e);</span>
+<span class="nc" id="L371">                ref.unsubscribe();</span>
+<span class="nc" id="L372">            }</span>
+
+            @Override
+            public void onCompleted() {
+<span class="fc" id="L376">                subscriber.onCompleted();</span>
+<span class="fc" id="L377">                ref.unsubscribe();</span>
+<span class="fc" id="L378">            }</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>

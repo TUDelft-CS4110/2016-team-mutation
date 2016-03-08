@@ -1,0 +1,182 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>EventLoopsScheduler.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">rxjava</a> &gt; <a href="index.source.html" class="el_package">rx.internal.schedulers</a> &gt; <span class="el_source">EventLoopsScheduler.java</span></div><h1>EventLoopsScheduler.java</h1><pre class="source lang-java linenums">/**
+ * Copyright 2014 Netflix, Inc.
+ * 
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package rx.internal.schedulers;
+
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicReference;
+
+import rx.*;
+import rx.functions.Action0;
+import rx.internal.util.*;
+import rx.subscriptions.*;
+
+public class EventLoopsScheduler extends Scheduler implements SchedulerLifecycle {
+    /** Manages a fixed number of workers. */
+    private static final String THREAD_NAME_PREFIX = &quot;RxComputationThreadPool-&quot;;
+<span class="fc" id="L29">    static final RxThreadFactory THREAD_FACTORY = new RxThreadFactory(THREAD_NAME_PREFIX);</span>
+    /**
+     * Key to setting the maximum number of computation scheduler threads.
+     * Zero or less is interpreted as use available. Capped by available.
+     */
+    static final String KEY_MAX_THREADS = &quot;rx.scheduler.max-computation-threads&quot;;
+    /** The maximum number of computation scheduler threads. */
+    static final int MAX_THREADS;
+    static {
+<span class="fc" id="L38">        int maxThreads = Integer.getInteger(KEY_MAX_THREADS, 0);</span>
+<span class="fc" id="L39">        int ncpu = Runtime.getRuntime().availableProcessors();</span>
+        int max;
+<span class="pc bpc" id="L41" title="3 of 4 branches missed.">        if (maxThreads &lt;= 0 || maxThreads &gt; ncpu) {</span>
+<span class="fc" id="L42">            max = ncpu;</span>
+        } else {
+<span class="nc" id="L44">            max = maxThreads;</span>
+        }
+<span class="fc" id="L46">        MAX_THREADS = max;</span>
+    }
+    
+    static final PoolWorker SHUTDOWN_WORKER;
+    static {
+<span class="fc" id="L51">        SHUTDOWN_WORKER = new PoolWorker(new RxThreadFactory(&quot;RxComputationShutdown-&quot;));</span>
+<span class="fc" id="L52">        SHUTDOWN_WORKER.unsubscribe();</span>
+    }
+    
+    static final class FixedSchedulerPool {
+        final int cores;
+
+        final PoolWorker[] eventLoops;
+        long n;
+
+<span class="fc" id="L61">        FixedSchedulerPool(int maxThreads) {</span>
+            // initialize event loops
+<span class="fc" id="L63">            this.cores = maxThreads;</span>
+<span class="fc" id="L64">            this.eventLoops = new PoolWorker[maxThreads];</span>
+<span class="fc bfc" id="L65" title="All 2 branches covered.">            for (int i = 0; i &lt; maxThreads; i++) {</span>
+<span class="fc" id="L66">                this.eventLoops[i] = new PoolWorker(THREAD_FACTORY);</span>
+            }
+<span class="fc" id="L68">        }</span>
+
+        public PoolWorker getEventLoop() {
+<span class="fc" id="L71">            int c = cores;</span>
+<span class="pc bpc" id="L72" title="1 of 2 branches missed.">            if (c == 0) {</span>
+<span class="nc" id="L73">                return SHUTDOWN_WORKER;</span>
+            }
+            // simple round robin, improvements to come
+<span class="fc" id="L76">            return eventLoops[(int)(n++ % c)];</span>
+        }
+        
+        public void shutdown() {
+<span class="fc bfc" id="L80" title="All 2 branches covered.">            for (PoolWorker w : eventLoops) {</span>
+<span class="fc" id="L81">                w.unsubscribe();</span>
+            }
+<span class="fc" id="L83">        }</span>
+    }
+    /** This will indicate no pool is active. */
+<span class="fc" id="L86">    static final FixedSchedulerPool NONE = new FixedSchedulerPool(0);</span>
+
+    final AtomicReference&lt;FixedSchedulerPool&gt; pool;
+    
+    /**
+     * Create a scheduler with pool size equal to the available processor
+     * count and using least-recent worker selection policy.
+     */
+<span class="fc" id="L94">    public EventLoopsScheduler() {</span>
+<span class="fc" id="L95">        this.pool = new AtomicReference&lt;FixedSchedulerPool&gt;(NONE);</span>
+<span class="fc" id="L96">        start();</span>
+<span class="fc" id="L97">    }</span>
+    
+    @Override
+    public Worker createWorker() {
+<span class="fc" id="L101">        return new EventLoopWorker(pool.get().getEventLoop());</span>
+    }
+    
+    @Override
+    public void start() {
+<span class="fc" id="L106">        FixedSchedulerPool update = new FixedSchedulerPool(MAX_THREADS);</span>
+<span class="fc bfc" id="L107" title="All 2 branches covered.">        if (!pool.compareAndSet(NONE, update)) {</span>
+<span class="fc" id="L108">            update.shutdown();</span>
+        }
+<span class="fc" id="L110">    }</span>
+    
+    @Override
+    public void shutdown() {
+        for (;;) {
+<span class="fc" id="L115">            FixedSchedulerPool curr = pool.get();</span>
+<span class="pc bpc" id="L116" title="1 of 2 branches missed.">            if (curr == NONE) {</span>
+<span class="nc" id="L117">                return;</span>
+            }
+<span class="pc bpc" id="L119" title="1 of 2 branches missed.">            if (pool.compareAndSet(curr, NONE)) {</span>
+<span class="fc" id="L120">                curr.shutdown();</span>
+<span class="fc" id="L121">                return;</span>
+            }
+<span class="nc" id="L123">        }</span>
+    }
+    
+    /**
+     * Schedules the action directly on one of the event loop workers
+     * without the additional infrastructure and checking.
+     * @param action the action to schedule
+     * @return the subscription
+     */
+    public Subscription scheduleDirect(Action0 action) {
+<span class="fc" id="L133">       PoolWorker pw = pool.get().getEventLoop();</span>
+<span class="fc" id="L134">       return pw.scheduleActual(action, -1, TimeUnit.NANOSECONDS);</span>
+    }
+
+    private static class EventLoopWorker extends Scheduler.Worker {
+<span class="fc" id="L138">        private final SubscriptionList serial = new SubscriptionList();</span>
+<span class="fc" id="L139">        private final CompositeSubscription timed = new CompositeSubscription();</span>
+<span class="fc" id="L140">        private final SubscriptionList both = new SubscriptionList(serial, timed);</span>
+        private final PoolWorker poolWorker;
+
+<span class="fc" id="L143">        EventLoopWorker(PoolWorker poolWorker) {</span>
+<span class="fc" id="L144">            this.poolWorker = poolWorker;</span>
+            
+<span class="fc" id="L146">        }</span>
+
+        @Override
+        public void unsubscribe() {
+<span class="fc" id="L150">            both.unsubscribe();</span>
+<span class="fc" id="L151">        }</span>
+
+        @Override
+        public boolean isUnsubscribed() {
+<span class="fc" id="L155">            return both.isUnsubscribed();</span>
+        }
+
+        @Override
+        public Subscription schedule(Action0 action) {
+<span class="fc bfc" id="L160" title="All 2 branches covered.">            if (isUnsubscribed()) {</span>
+<span class="fc" id="L161">                return Subscriptions.unsubscribed();</span>
+            }
+
+<span class="fc" id="L164">            return poolWorker.scheduleActual(action, 0, null, serial);</span>
+        }
+        @Override
+        public Subscription schedule(Action0 action, long delayTime, TimeUnit unit) {
+<span class="fc bfc" id="L168" title="All 2 branches covered.">            if (isUnsubscribed()) {</span>
+<span class="fc" id="L169">                return Subscriptions.unsubscribed();</span>
+            }
+
+<span class="fc" id="L172">            return poolWorker.scheduleActual(action, delayTime, unit, timed);</span>
+        }
+    }
+
+    static final class PoolWorker extends NewThreadWorker {
+        PoolWorker(ThreadFactory threadFactory) {
+<span class="fc" id="L178">            super(threadFactory);</span>
+<span class="fc" id="L179">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.1.201405082137</span></div></body></html>
