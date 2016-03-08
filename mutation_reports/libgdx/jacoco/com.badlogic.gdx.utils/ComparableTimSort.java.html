@@ -1,0 +1,798 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>ComparableTimSort.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">libGDX Core</a> &gt; <a href="index.html" class="el_package">com.badlogic.gdx.utils</a> &gt; <span class="el_source">ComparableTimSort.java</span></div><h1>ComparableTimSort.java</h1><pre class="source lang-java linenums">/*
+ * Copyright (C) 2008 The Android Open Source Project
+ * 
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;); you may not use this file except in compliance with the
+ * License. You may obtain a copy of the License at
+ * 
+ * http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an &quot;AS IS&quot;
+ * BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language
+ * governing permissions and limitations under the License.
+ */
+
+package com.badlogic.gdx.utils;
+
+/** This is a near duplicate of {@link TimSort}, modified for use with arrays of objects that implement {@link Comparable}, instead
+ * of using explicit comparators.
+ * 
+ * &lt;p&gt;
+ * If you are using an optimizing VM, you may find that ComparableTimSort offers no performance benefit over TimSort in
+ * conjunction with a comparator that simply returns {@code ((Comparable)first).compareTo(Second)}. If this is the case, you are
+ * better off deleting ComparableTimSort to eliminate the code duplication. (See Arrays.java for details.) */
+class ComparableTimSort {
+	/** This is the minimum sized sequence that will be merged. Shorter sequences will be lengthened by calling binarySort. If the
+	 * entire array is less than this length, no merges will be performed.
+	 * 
+	 * This constant should be a power of two. It was 64 in Tim Peter's C implementation, but 32 was empirically determined to work
+	 * better in this implementation. In the unlikely event that you set this constant to be a number that's not a power of two,
+	 * you'll need to change the {@link #minRunLength} computation.
+	 * 
+	 * If you decrease this constant, you must change the stackLen computation in the TimSort constructor, or you risk an
+	 * ArrayOutOfBounds exception. See listsort.txt for a discussion of the minimum stack length required as a function of the
+	 * length of the array being sorted and the minimum merge sequence length. */
+	private static final int MIN_MERGE = 32;
+
+	/** The array being sorted. */
+	private Object[] a;
+
+	/** When we get into galloping mode, we stay there until both runs win less often than MIN_GALLOP consecutive times. */
+	private static final int MIN_GALLOP = 7;
+
+	/** This controls when we get *into* galloping mode. It is initialized to MIN_GALLOP. The mergeLo and mergeHi methods nudge it
+	 * higher for random data, and lower for highly structured data. */
+<span class="nc" id="L44">	private int minGallop = MIN_GALLOP;</span>
+
+	/** Maximum initial size of tmp array, which is used for merging. The array can grow to accommodate demand.
+	 * 
+	 * Unlike Tim's original C version, we do not allocate this much storage when sorting smaller arrays. This change was required
+	 * for performance. */
+	private static final int INITIAL_TMP_STORAGE_LENGTH = 256;
+
+	/** Temp storage for merges. */
+	private Object[] tmp;
+
+	/** A stack of pending runs yet to be merged. Run i starts at address base[i] and extends for len[i] elements. It's always true
+	 * (so long as the indices are in bounds) that:
+	 * 
+	 * runBase[i] + runLen[i] == runBase[i + 1]
+	 * 
+	 * so we could cut the storage for this, but it's a minor amount, and keeping all the info explicit simplifies the code. */
+<span class="nc" id="L61">	private int stackSize = 0; // Number of pending runs on stack</span>
+	private final int[] runBase;
+	private final int[] runLen;
+
+	/** Asserts have been placed in if-statements for performace. To enable them, set this field to true and enable them in VM with
+	 * a command line flag. If you modify this class, please do test the asserts! */
+	private static final boolean DEBUG = false;
+
+<span class="nc" id="L69">	ComparableTimSort () {</span>
+<span class="nc" id="L70">		tmp = new Object[INITIAL_TMP_STORAGE_LENGTH];</span>
+<span class="nc" id="L71">		runBase = new int[40];</span>
+<span class="nc" id="L72">		runLen = new int[40];</span>
+<span class="nc" id="L73">	}</span>
+
+	public void doSort (Object[] a, int lo, int hi) {
+<span class="nc" id="L76">		stackSize = 0;</span>
+<span class="nc" id="L77">		rangeCheck(a.length, lo, hi);</span>
+<span class="nc" id="L78">		int nRemaining = hi - lo;</span>
+<span class="nc bnc" id="L79" title="All 2 branches missed.">		if (nRemaining &lt; 2) return; // Arrays of size 0 and 1 are always sorted</span>
+
+		// If array is small, do a &quot;mini-TimSort&quot; with no merges
+<span class="nc bnc" id="L82" title="All 2 branches missed.">		if (nRemaining &lt; MIN_MERGE) {</span>
+<span class="nc" id="L83">			int initRunLen = countRunAndMakeAscending(a, lo, hi);</span>
+<span class="nc" id="L84">			binarySort(a, lo, hi, lo + initRunLen);</span>
+<span class="nc" id="L85">			return;</span>
+		}
+
+<span class="nc" id="L88">		this.a = a;</span>
+
+		/** March over the array once, left to right, finding natural runs, extending short natural runs to minRun elements, and
+		 * merging runs to maintain stack invariant. */
+<span class="nc" id="L92">		int minRun = minRunLength(nRemaining);</span>
+		do {
+			// Identify next run
+<span class="nc" id="L95">			int runLen = countRunAndMakeAscending(a, lo, hi);</span>
+
+			// If run is short, extend to min(minRun, nRemaining)
+<span class="nc bnc" id="L98" title="All 2 branches missed.">			if (runLen &lt; minRun) {</span>
+<span class="nc bnc" id="L99" title="All 2 branches missed.">				int force = nRemaining &lt;= minRun ? nRemaining : minRun;</span>
+<span class="nc" id="L100">				binarySort(a, lo, lo + force, lo + runLen);</span>
+<span class="nc" id="L101">				runLen = force;</span>
+			}
+
+			// Push run onto pending-run stack, and maybe merge
+<span class="nc" id="L105">			pushRun(lo, runLen);</span>
+<span class="nc" id="L106">			mergeCollapse();</span>
+
+			// Advance to find next run
+<span class="nc" id="L109">			lo += runLen;</span>
+<span class="nc" id="L110">			nRemaining -= runLen;</span>
+<span class="nc bnc" id="L111" title="All 2 branches missed.">		} while (nRemaining != 0);</span>
+
+		// Merge all remaining runs to complete sort
+		if (DEBUG) assert lo == hi;
+<span class="nc" id="L115">		mergeForceCollapse();</span>
+		if (DEBUG) assert stackSize == 1;
+<span class="nc" id="L117">	}</span>
+
+	/** Creates a TimSort instance to maintain the state of an ongoing sort.
+	 * 
+	 * @param a the array to be sorted */
+<span class="nc" id="L122">	private ComparableTimSort (Object[] a) {</span>
+<span class="nc" id="L123">		this.a = a;</span>
+
+		// Allocate temp storage (which may be increased later if necessary)
+<span class="nc" id="L126">		int len = a.length;</span>
+<span class="nc bnc" id="L127" title="All 2 branches missed.">		Object[] newArray = new Object[len &lt; 2 * INITIAL_TMP_STORAGE_LENGTH ? len &gt;&gt;&gt; 1 : INITIAL_TMP_STORAGE_LENGTH];</span>
+<span class="nc" id="L128">		tmp = newArray;</span>
+
+		/*
+		 * Allocate runs-to-be-merged stack (which cannot be expanded). The stack length requirements are described in listsort.txt.
+		 * The C version always uses the same stack length (85), but this was measured to be too expensive when sorting &quot;mid-sized&quot;
+		 * arrays (e.g., 100 elements) in Java. Therefore, we use smaller (but sufficiently large) stack lengths for smaller arrays.
+		 * The &quot;magic numbers&quot; in the computation below must be changed if MIN_MERGE is decreased. See the MIN_MERGE declaration
+		 * above for more information.
+		 */
+<span class="nc bnc" id="L137" title="All 6 branches missed.">		int stackLen = (len &lt; 120 ? 5 : len &lt; 1542 ? 10 : len &lt; 119151 ? 19 : 40);</span>
+<span class="nc" id="L138">		runBase = new int[stackLen];</span>
+<span class="nc" id="L139">		runLen = new int[stackLen];</span>
+<span class="nc" id="L140">	}</span>
+
+	/*
+	 * The next two methods (which are package private and static) constitute the entire API of this class. Each of these methods
+	 * obeys the contract of the public method with the same signature in java.util.Arrays.
+	 */
+
+	static void sort (Object[] a) {
+<span class="nc" id="L148">		sort(a, 0, a.length);</span>
+<span class="nc" id="L149">	}</span>
+
+	static void sort (Object[] a, int lo, int hi) {
+<span class="nc" id="L152">		rangeCheck(a.length, lo, hi);</span>
+<span class="nc" id="L153">		int nRemaining = hi - lo;</span>
+<span class="nc bnc" id="L154" title="All 2 branches missed.">		if (nRemaining &lt; 2) return; // Arrays of size 0 and 1 are always sorted</span>
+
+		// If array is small, do a &quot;mini-TimSort&quot; with no merges
+<span class="nc bnc" id="L157" title="All 2 branches missed.">		if (nRemaining &lt; MIN_MERGE) {</span>
+<span class="nc" id="L158">			int initRunLen = countRunAndMakeAscending(a, lo, hi);</span>
+<span class="nc" id="L159">			binarySort(a, lo, hi, lo + initRunLen);</span>
+<span class="nc" id="L160">			return;</span>
+		}
+
+		/** March over the array once, left to right, finding natural runs, extending short natural runs to minRun elements, and
+		 * merging runs to maintain stack invariant. */
+<span class="nc" id="L165">		ComparableTimSort ts = new ComparableTimSort(a);</span>
+<span class="nc" id="L166">		int minRun = minRunLength(nRemaining);</span>
+		do {
+			// Identify next run
+<span class="nc" id="L169">			int runLen = countRunAndMakeAscending(a, lo, hi);</span>
+
+			// If run is short, extend to min(minRun, nRemaining)
+<span class="nc bnc" id="L172" title="All 2 branches missed.">			if (runLen &lt; minRun) {</span>
+<span class="nc bnc" id="L173" title="All 2 branches missed.">				int force = nRemaining &lt;= minRun ? nRemaining : minRun;</span>
+<span class="nc" id="L174">				binarySort(a, lo, lo + force, lo + runLen);</span>
+<span class="nc" id="L175">				runLen = force;</span>
+			}
+
+			// Push run onto pending-run stack, and maybe merge
+<span class="nc" id="L179">			ts.pushRun(lo, runLen);</span>
+<span class="nc" id="L180">			ts.mergeCollapse();</span>
+
+			// Advance to find next run
+<span class="nc" id="L183">			lo += runLen;</span>
+<span class="nc" id="L184">			nRemaining -= runLen;</span>
+<span class="nc bnc" id="L185" title="All 2 branches missed.">		} while (nRemaining != 0);</span>
+
+		// Merge all remaining runs to complete sort
+		if (DEBUG) assert lo == hi;
+<span class="nc" id="L189">		ts.mergeForceCollapse();</span>
+		if (DEBUG) assert ts.stackSize == 1;
+<span class="nc" id="L191">	}</span>
+
+	/** Sorts the specified portion of the specified array using a binary insertion sort. This is the best method for sorting small
+	 * numbers of elements. It requires O(n log n) compares, but O(n^2) data movement (worst case).
+	 * 
+	 * If the initial part of the specified range is already sorted, this method can take advantage of it: the method assumes that
+	 * the elements from index {@code lo}, inclusive, to {@code start}, exclusive are already sorted.
+	 * 
+	 * @param a the array in which a range is to be sorted
+	 * @param lo the index of the first element in the range to be sorted
+	 * @param hi the index after the last element in the range to be sorted
+	 * @param start the index of the first element in the range that is not already known to be sorted (@code lo &lt;= start &lt;= hi} */
+	@SuppressWarnings(&quot;fallthrough&quot;)
+	private static void binarySort (Object[] a, int lo, int hi, int start) {
+		if (DEBUG) assert lo &lt;= start &amp;&amp; start &lt;= hi;
+<span class="nc bnc" id="L206" title="All 2 branches missed.">		if (start == lo) start++;</span>
+<span class="nc bnc" id="L207" title="All 2 branches missed.">		for (; start &lt; hi; start++) {</span>
+			@SuppressWarnings(&quot;unchecked&quot;)
+<span class="nc" id="L209">			Comparable&lt;Object&gt; pivot = (Comparable)a[start];</span>
+
+			// Set left (and right) to the index where a[start] (pivot) belongs
+<span class="nc" id="L212">			int left = lo;</span>
+<span class="nc" id="L213">			int right = start;</span>
+			if (DEBUG) assert left &lt;= right;
+			/*
+			 * Invariants: pivot &gt;= all in [lo, left). pivot &lt; all in [right, start).
+			 */
+<span class="nc bnc" id="L218" title="All 2 branches missed.">			while (left &lt; right) {</span>
+<span class="nc" id="L219">				int mid = (left + right) &gt;&gt;&gt; 1;</span>
+<span class="nc bnc" id="L220" title="All 2 branches missed.">				if (pivot.compareTo(a[mid]) &lt; 0)</span>
+<span class="nc" id="L221">					right = mid;</span>
+				else
+<span class="nc" id="L223">					left = mid + 1;</span>
+<span class="nc" id="L224">			}</span>
+			if (DEBUG) assert left == right;
+
+			/*
+			 * The invariants still hold: pivot &gt;= all in [lo, left) and pivot &lt; all in [left, start), so pivot belongs at left. Note
+			 * that if there are elements equal to pivot, left points to the first slot after them -- that's why this sort is stable.
+			 * Slide elements over to make room to make room for pivot.
+			 */
+<span class="nc" id="L232">			int n = start - left; // The number of elements to move</span>
+			// Switch is just an optimization for arraycopy in default case
+<span class="nc bnc" id="L234" title="All 3 branches missed.">			switch (n) {</span>
+			case 2:
+<span class="nc" id="L236">				a[left + 2] = a[left + 1];</span>
+			case 1:
+<span class="nc" id="L238">				a[left + 1] = a[left];</span>
+<span class="nc" id="L239">				break;</span>
+			default:
+<span class="nc" id="L241">				System.arraycopy(a, left, a, left + 1, n);</span>
+			}
+<span class="nc" id="L243">			a[left] = pivot;</span>
+		}
+<span class="nc" id="L245">	}</span>
+
+	/** Returns the length of the run beginning at the specified position in the specified array and reverses the run if it is
+	 * descending (ensuring that the run will always be ascending when the method returns).
+	 * 
+	 * A run is the longest ascending sequence with:
+	 * 
+	 * a[lo] &lt;= a[lo + 1] &lt;= a[lo + 2] &lt;= ...
+	 * 
+	 * or the longest descending sequence with:
+	 * 
+	 * a[lo] &gt; a[lo + 1] &gt; a[lo + 2] &gt; ...
+	 * 
+	 * For its intended use in a stable mergesort, the strictness of the definition of &quot;descending&quot; is needed so that the call can
+	 * safely reverse a descending sequence without violating stability.
+	 * 
+	 * @param a the array in which a run is to be counted and possibly reversed
+	 * @param lo index of the first element in the run
+	 * @param hi index after the last element that may be contained in the run. It is required that @code{lo &lt; hi}.
+	 * @return the length of the run beginning at the specified position in the specified array */
+	@SuppressWarnings(&quot;unchecked&quot;)
+	private static int countRunAndMakeAscending (Object[] a, int lo, int hi) {
+		if (DEBUG) assert lo &lt; hi;
+<span class="nc" id="L268">		int runHi = lo + 1;</span>
+<span class="nc bnc" id="L269" title="All 2 branches missed.">		if (runHi == hi) return 1;</span>
+
+		// Find end of run, and reverse range if descending
+<span class="nc bnc" id="L272" title="All 2 branches missed.">		if (((Comparable)a[runHi++]).compareTo(a[lo]) &lt; 0) { // Descending</span>
+<span class="nc bnc" id="L273" title="All 4 branches missed.">			while (runHi &lt; hi &amp;&amp; ((Comparable)a[runHi]).compareTo(a[runHi - 1]) &lt; 0)</span>
+<span class="nc" id="L274">				runHi++;</span>
+<span class="nc" id="L275">			reverseRange(a, lo, runHi);</span>
+		} else { // Ascending
+<span class="nc bnc" id="L277" title="All 4 branches missed.">			while (runHi &lt; hi &amp;&amp; ((Comparable)a[runHi]).compareTo(a[runHi - 1]) &gt;= 0)</span>
+<span class="nc" id="L278">				runHi++;</span>
+		}
+
+<span class="nc" id="L281">		return runHi - lo;</span>
+	}
+
+	/** Reverse the specified range of the specified array.
+	 * 
+	 * @param a the array in which a range is to be reversed
+	 * @param lo the index of the first element in the range to be reversed
+	 * @param hi the index after the last element in the range to be reversed */
+	private static void reverseRange (Object[] a, int lo, int hi) {
+<span class="nc" id="L290">		hi--;</span>
+<span class="nc bnc" id="L291" title="All 2 branches missed.">		while (lo &lt; hi) {</span>
+<span class="nc" id="L292">			Object t = a[lo];</span>
+<span class="nc" id="L293">			a[lo++] = a[hi];</span>
+<span class="nc" id="L294">			a[hi--] = t;</span>
+<span class="nc" id="L295">		}</span>
+<span class="nc" id="L296">	}</span>
+
+	/** Returns the minimum acceptable run length for an array of the specified length. Natural runs shorter than this will be
+	 * extended with {@link #binarySort}.
+	 * 
+	 * Roughly speaking, the computation is:
+	 * 
+	 * If n &lt; MIN_MERGE, return n (it's too small to bother with fancy stuff). Else if n is an exact power of 2, return
+	 * MIN_MERGE/2. Else return an int k, MIN_MERGE/2 &lt;= k &lt;= MIN_MERGE, such that n/k is close to, but strictly less than, an
+	 * exact power of 2.
+	 * 
+	 * For the rationale, see listsort.txt.
+	 * 
+	 * @param n the length of the array to be sorted
+	 * @return the length of the minimum run to be merged */
+	private static int minRunLength (int n) {
+		if (DEBUG) assert n &gt;= 0;
+<span class="nc" id="L313">		int r = 0; // Becomes 1 if any 1 bits are shifted off</span>
+<span class="nc bnc" id="L314" title="All 2 branches missed.">		while (n &gt;= MIN_MERGE) {</span>
+<span class="nc" id="L315">			r |= (n &amp; 1);</span>
+<span class="nc" id="L316">			n &gt;&gt;= 1;</span>
+		}
+<span class="nc" id="L318">		return n + r;</span>
+	}
+
+	/** Pushes the specified run onto the pending-run stack.
+	 * 
+	 * @param runBase index of the first element in the run
+	 * @param runLen the number of elements in the run */
+	private void pushRun (int runBase, int runLen) {
+<span class="nc" id="L326">		this.runBase[stackSize] = runBase;</span>
+<span class="nc" id="L327">		this.runLen[stackSize] = runLen;</span>
+<span class="nc" id="L328">		stackSize++;</span>
+<span class="nc" id="L329">	}</span>
+
+	/** Examines the stack of runs waiting to be merged and merges adjacent runs until the stack invariants are reestablished:
+	 * 
+	 * 1. runLen[i - 3] &gt; runLen[i - 2] + runLen[i - 1] 2. runLen[i - 2] &gt; runLen[i - 1]
+	 * 
+	 * This method is called each time a new run is pushed onto the stack, so the invariants are guaranteed to hold for i &lt;
+	 * stackSize upon entry to the method. */
+	private void mergeCollapse () {
+<span class="nc bnc" id="L338" title="All 2 branches missed.">		while (stackSize &gt; 1) {</span>
+<span class="nc" id="L339">			int n = stackSize - 2;</span>
+<span class="nc bnc" id="L340" title="All 4 branches missed.">			if (n &gt; 0 &amp;&amp; runLen[n - 1] &lt;= runLen[n] + runLen[n + 1]) {</span>
+<span class="nc bnc" id="L341" title="All 2 branches missed.">				if (runLen[n - 1] &lt; runLen[n + 1]) n--;</span>
+<span class="nc" id="L342">				mergeAt(n);</span>
+<span class="nc bnc" id="L343" title="All 2 branches missed.">			} else if (runLen[n] &lt;= runLen[n + 1]) {</span>
+<span class="nc" id="L344">				mergeAt(n);</span>
+			} else {
+				break; // Invariant is established
+			}
+<span class="nc" id="L348">		}</span>
+<span class="nc" id="L349">	}</span>
+
+	/** Merges all runs on the stack until only one remains. This method is called once, to complete the sort. */
+	private void mergeForceCollapse () {
+<span class="nc bnc" id="L353" title="All 2 branches missed.">		while (stackSize &gt; 1) {</span>
+<span class="nc" id="L354">			int n = stackSize - 2;</span>
+<span class="nc bnc" id="L355" title="All 4 branches missed.">			if (n &gt; 0 &amp;&amp; runLen[n - 1] &lt; runLen[n + 1]) n--;</span>
+<span class="nc" id="L356">			mergeAt(n);</span>
+<span class="nc" id="L357">		}</span>
+<span class="nc" id="L358">	}</span>
+
+	/** Merges the two runs at stack indices i and i+1. Run i must be the penultimate or antepenultimate run on the stack. In other
+	 * words, i must be equal to stackSize-2 or stackSize-3.
+	 * 
+	 * @param i stack index of the first of the two runs to merge */
+	@SuppressWarnings(&quot;unchecked&quot;)
+	private void mergeAt (int i) {
+		if (DEBUG) assert stackSize &gt;= 2;
+		if (DEBUG) assert i &gt;= 0;
+		if (DEBUG) assert i == stackSize - 2 || i == stackSize - 3;
+
+<span class="nc" id="L370">		int base1 = runBase[i];</span>
+<span class="nc" id="L371">		int len1 = runLen[i];</span>
+<span class="nc" id="L372">		int base2 = runBase[i + 1];</span>
+<span class="nc" id="L373">		int len2 = runLen[i + 1];</span>
+		if (DEBUG) assert len1 &gt; 0 &amp;&amp; len2 &gt; 0;
+		if (DEBUG) assert base1 + len1 == base2;
+
+		/*
+		 * Record the length of the combined runs; if i is the 3rd-last run now, also slide over the last run (which isn't involved
+		 * in this merge). The current run (i+1) goes away in any case.
+		 */
+<span class="nc" id="L381">		runLen[i] = len1 + len2;</span>
+<span class="nc bnc" id="L382" title="All 2 branches missed.">		if (i == stackSize - 3) {</span>
+<span class="nc" id="L383">			runBase[i + 1] = runBase[i + 2];</span>
+<span class="nc" id="L384">			runLen[i + 1] = runLen[i + 2];</span>
+		}
+<span class="nc" id="L386">		stackSize--;</span>
+
+		/*
+		 * Find where the first element of run2 goes in run1. Prior elements in run1 can be ignored (because they're already in
+		 * place).
+		 */
+<span class="nc" id="L392">		int k = gallopRight((Comparable&lt;Object&gt;)a[base2], a, base1, len1, 0);</span>
+		if (DEBUG) assert k &gt;= 0;
+<span class="nc" id="L394">		base1 += k;</span>
+<span class="nc" id="L395">		len1 -= k;</span>
+<span class="nc bnc" id="L396" title="All 2 branches missed.">		if (len1 == 0) return;</span>
+
+		/*
+		 * Find where the last element of run1 goes in run2. Subsequent elements in run2 can be ignored (because they're already in
+		 * place).
+		 */
+<span class="nc" id="L402">		len2 = gallopLeft((Comparable&lt;Object&gt;)a[base1 + len1 - 1], a, base2, len2, len2 - 1);</span>
+		if (DEBUG) assert len2 &gt;= 0;
+<span class="nc bnc" id="L404" title="All 2 branches missed.">		if (len2 == 0) return;</span>
+
+		// Merge remaining runs, using tmp array with min(len1, len2) elements
+<span class="nc bnc" id="L407" title="All 2 branches missed.">		if (len1 &lt;= len2)</span>
+<span class="nc" id="L408">			mergeLo(base1, len1, base2, len2);</span>
+		else
+<span class="nc" id="L410">			mergeHi(base1, len1, base2, len2);</span>
+<span class="nc" id="L411">	}</span>
+
+	/** Locates the position at which to insert the specified key into the specified sorted range; if the range contains an element
+	 * equal to key, returns the index of the leftmost equal element.
+	 * 
+	 * @param key the key whose insertion point to search for
+	 * @param a the array in which to search
+	 * @param base the index of the first element in the range
+	 * @param len the length of the range; must be &gt; 0
+	 * @param hint the index at which to begin the search, 0 &lt;= hint &lt; n. The closer hint is to the result, the faster this method
+	 *           will run.
+	 * @return the int k, 0 &lt;= k &lt;= n such that a[b + k - 1] &lt; key &lt;= a[b + k], pretending that a[b - 1] is minus infinity and a[b
+	 *         + n] is infinity. In other words, key belongs at index b + k; or in other words, the first k elements of a should
+	 *         precede key, and the last n - k should follow it. */
+	private static int gallopLeft (Comparable&lt;Object&gt; key, Object[] a, int base, int len, int hint) {
+		if (DEBUG) assert len &gt; 0 &amp;&amp; hint &gt;= 0 &amp;&amp; hint &lt; len;
+
+<span class="nc" id="L428">		int lastOfs = 0;</span>
+<span class="nc" id="L429">		int ofs = 1;</span>
+<span class="nc bnc" id="L430" title="All 2 branches missed.">		if (key.compareTo(a[base + hint]) &gt; 0) {</span>
+			// Gallop right until a[base+hint+lastOfs] &lt; key &lt;= a[base+hint+ofs]
+<span class="nc" id="L432">			int maxOfs = len - hint;</span>
+<span class="nc bnc" id="L433" title="All 4 branches missed.">			while (ofs &lt; maxOfs &amp;&amp; key.compareTo(a[base + hint + ofs]) &gt; 0) {</span>
+<span class="nc" id="L434">				lastOfs = ofs;</span>
+<span class="nc" id="L435">				ofs = (ofs &lt;&lt; 1) + 1;</span>
+<span class="nc bnc" id="L436" title="All 2 branches missed.">				if (ofs &lt;= 0) // int overflow</span>
+<span class="nc" id="L437">					ofs = maxOfs;</span>
+			}
+<span class="nc bnc" id="L439" title="All 2 branches missed.">			if (ofs &gt; maxOfs) ofs = maxOfs;</span>
+
+			// Make offsets relative to base
+<span class="nc" id="L442">			lastOfs += hint;</span>
+<span class="nc" id="L443">			ofs += hint;</span>
+<span class="nc" id="L444">		} else { // key &lt;= a[base + hint]</span>
+			// Gallop left until a[base+hint-ofs] &lt; key &lt;= a[base+hint-lastOfs]
+<span class="nc" id="L446">			final int maxOfs = hint + 1;</span>
+<span class="nc bnc" id="L447" title="All 4 branches missed.">			while (ofs &lt; maxOfs &amp;&amp; key.compareTo(a[base + hint - ofs]) &lt;= 0) {</span>
+<span class="nc" id="L448">				lastOfs = ofs;</span>
+<span class="nc" id="L449">				ofs = (ofs &lt;&lt; 1) + 1;</span>
+<span class="nc bnc" id="L450" title="All 2 branches missed.">				if (ofs &lt;= 0) // int overflow</span>
+<span class="nc" id="L451">					ofs = maxOfs;</span>
+			}
+<span class="nc bnc" id="L453" title="All 2 branches missed.">			if (ofs &gt; maxOfs) ofs = maxOfs;</span>
+
+			// Make offsets relative to base
+<span class="nc" id="L456">			int tmp = lastOfs;</span>
+<span class="nc" id="L457">			lastOfs = hint - ofs;</span>
+<span class="nc" id="L458">			ofs = hint - tmp;</span>
+		}
+		if (DEBUG) assert -1 &lt;= lastOfs &amp;&amp; lastOfs &lt; ofs &amp;&amp; ofs &lt;= len;
+
+		/*
+		 * Now a[base+lastOfs] &lt; key &lt;= a[base+ofs], so key belongs somewhere to the right of lastOfs but no farther right than ofs.
+		 * Do a binary search, with invariant a[base + lastOfs - 1] &lt; key &lt;= a[base + ofs].
+		 */
+<span class="nc" id="L466">		lastOfs++;</span>
+<span class="nc bnc" id="L467" title="All 2 branches missed.">		while (lastOfs &lt; ofs) {</span>
+<span class="nc" id="L468">			int m = lastOfs + ((ofs - lastOfs) &gt;&gt;&gt; 1);</span>
+
+<span class="nc bnc" id="L470" title="All 2 branches missed.">			if (key.compareTo(a[base + m]) &gt; 0)</span>
+<span class="nc" id="L471">				lastOfs = m + 1; // a[base + m] &lt; key</span>
+			else
+<span class="nc" id="L473">				ofs = m; // key &lt;= a[base + m]</span>
+<span class="nc" id="L474">		}</span>
+		if (DEBUG) assert lastOfs == ofs; // so a[base + ofs - 1] &lt; key &lt;= a[base + ofs]
+<span class="nc" id="L476">		return ofs;</span>
+	}
+
+	/** Like gallopLeft, except that if the range contains an element equal to key, gallopRight returns the index after the
+	 * rightmost equal element.
+	 * 
+	 * @param key the key whose insertion point to search for
+	 * @param a the array in which to search
+	 * @param base the index of the first element in the range
+	 * @param len the length of the range; must be &gt; 0
+	 * @param hint the index at which to begin the search, 0 &lt;= hint &lt; n. The closer hint is to the result, the faster this method
+	 *           will run.
+	 * @return the int k, 0 &lt;= k &lt;= n such that a[b + k - 1] &lt;= key &lt; a[b + k] */
+	private static int gallopRight (Comparable&lt;Object&gt; key, Object[] a, int base, int len, int hint) {
+		if (DEBUG) assert len &gt; 0 &amp;&amp; hint &gt;= 0 &amp;&amp; hint &lt; len;
+
+<span class="nc" id="L492">		int ofs = 1;</span>
+<span class="nc" id="L493">		int lastOfs = 0;</span>
+<span class="nc bnc" id="L494" title="All 2 branches missed.">		if (key.compareTo(a[base + hint]) &lt; 0) {</span>
+			// Gallop left until a[b+hint - ofs] &lt;= key &lt; a[b+hint - lastOfs]
+<span class="nc" id="L496">			int maxOfs = hint + 1;</span>
+<span class="nc bnc" id="L497" title="All 4 branches missed.">			while (ofs &lt; maxOfs &amp;&amp; key.compareTo(a[base + hint - ofs]) &lt; 0) {</span>
+<span class="nc" id="L498">				lastOfs = ofs;</span>
+<span class="nc" id="L499">				ofs = (ofs &lt;&lt; 1) + 1;</span>
+<span class="nc bnc" id="L500" title="All 2 branches missed.">				if (ofs &lt;= 0) // int overflow</span>
+<span class="nc" id="L501">					ofs = maxOfs;</span>
+			}
+<span class="nc bnc" id="L503" title="All 2 branches missed.">			if (ofs &gt; maxOfs) ofs = maxOfs;</span>
+
+			// Make offsets relative to b
+<span class="nc" id="L506">			int tmp = lastOfs;</span>
+<span class="nc" id="L507">			lastOfs = hint - ofs;</span>
+<span class="nc" id="L508">			ofs = hint - tmp;</span>
+<span class="nc" id="L509">		} else { // a[b + hint] &lt;= key</span>
+			// Gallop right until a[b+hint + lastOfs] &lt;= key &lt; a[b+hint + ofs]
+<span class="nc" id="L511">			int maxOfs = len - hint;</span>
+<span class="nc bnc" id="L512" title="All 4 branches missed.">			while (ofs &lt; maxOfs &amp;&amp; key.compareTo(a[base + hint + ofs]) &gt;= 0) {</span>
+<span class="nc" id="L513">				lastOfs = ofs;</span>
+<span class="nc" id="L514">				ofs = (ofs &lt;&lt; 1) + 1;</span>
+<span class="nc bnc" id="L515" title="All 2 branches missed.">				if (ofs &lt;= 0) // int overflow</span>
+<span class="nc" id="L516">					ofs = maxOfs;</span>
+			}
+<span class="nc bnc" id="L518" title="All 2 branches missed.">			if (ofs &gt; maxOfs) ofs = maxOfs;</span>
+
+			// Make offsets relative to b
+<span class="nc" id="L521">			lastOfs += hint;</span>
+<span class="nc" id="L522">			ofs += hint;</span>
+		}
+		if (DEBUG) assert -1 &lt;= lastOfs &amp;&amp; lastOfs &lt; ofs &amp;&amp; ofs &lt;= len;
+
+		/*
+		 * Now a[b + lastOfs] &lt;= key &lt; a[b + ofs], so key belongs somewhere to the right of lastOfs but no farther right than ofs.
+		 * Do a binary search, with invariant a[b + lastOfs - 1] &lt;= key &lt; a[b + ofs].
+		 */
+<span class="nc" id="L530">		lastOfs++;</span>
+<span class="nc bnc" id="L531" title="All 2 branches missed.">		while (lastOfs &lt; ofs) {</span>
+<span class="nc" id="L532">			int m = lastOfs + ((ofs - lastOfs) &gt;&gt;&gt; 1);</span>
+
+<span class="nc bnc" id="L534" title="All 2 branches missed.">			if (key.compareTo(a[base + m]) &lt; 0)</span>
+<span class="nc" id="L535">				ofs = m; // key &lt; a[b + m]</span>
+			else
+<span class="nc" id="L537">				lastOfs = m + 1; // a[b + m] &lt;= key</span>
+<span class="nc" id="L538">		}</span>
+		if (DEBUG) assert lastOfs == ofs; // so a[b + ofs - 1] &lt;= key &lt; a[b + ofs]
+<span class="nc" id="L540">		return ofs;</span>
+	}
+
+	/** Merges two adjacent runs in place, in a stable fashion. The first element of the first run must be greater than the first
+	 * element of the second run (a[base1] &gt; a[base2]), and the last element of the first run (a[base1 + len1-1]) must be greater
+	 * than all elements of the second run.
+	 * 
+	 * For performance, this method should be called only when len1 &lt;= len2; its twin, mergeHi should be called if len1 &gt;= len2.
+	 * (Either method may be called if len1 == len2.)
+	 * 
+	 * @param base1 index of first element in first run to be merged
+	 * @param len1 length of first run to be merged (must be &gt; 0)
+	 * @param base2 index of first element in second run to be merged (must be aBase + aLen)
+	 * @param len2 length of second run to be merged (must be &gt; 0) */
+	@SuppressWarnings(&quot;unchecked&quot;)
+	private void mergeLo (int base1, int len1, int base2, int len2) {
+		if (DEBUG) assert len1 &gt; 0 &amp;&amp; len2 &gt; 0 &amp;&amp; base1 + len1 == base2;
+
+		// Copy first run into temp array
+<span class="nc" id="L559">		Object[] a = this.a; // For performance</span>
+<span class="nc" id="L560">		Object[] tmp = ensureCapacity(len1);</span>
+<span class="nc" id="L561">		System.arraycopy(a, base1, tmp, 0, len1);</span>
+
+<span class="nc" id="L563">		int cursor1 = 0; // Indexes into tmp array</span>
+<span class="nc" id="L564">		int cursor2 = base2; // Indexes int a</span>
+<span class="nc" id="L565">		int dest = base1; // Indexes int a</span>
+
+		// Move first element of second run and deal with degenerate cases
+<span class="nc" id="L568">		a[dest++] = a[cursor2++];</span>
+<span class="nc bnc" id="L569" title="All 2 branches missed.">		if (--len2 == 0) {</span>
+<span class="nc" id="L570">			System.arraycopy(tmp, cursor1, a, dest, len1);</span>
+<span class="nc" id="L571">			return;</span>
+		}
+<span class="nc bnc" id="L573" title="All 2 branches missed.">		if (len1 == 1) {</span>
+<span class="nc" id="L574">			System.arraycopy(a, cursor2, a, dest, len2);</span>
+<span class="nc" id="L575">			a[dest + len2] = tmp[cursor1]; // Last elt of run 1 to end of merge</span>
+<span class="nc" id="L576">			return;</span>
+		}
+
+<span class="nc" id="L579">		int minGallop = this.minGallop; // Use local variable for performance</span>
+		outer:
+		while (true) {
+<span class="nc" id="L582">			int count1 = 0; // Number of times in a row that first run won</span>
+<span class="nc" id="L583">			int count2 = 0; // Number of times in a row that second run won</span>
+
+			/*
+			 * Do the straightforward thing until (if ever) one run starts winning consistently.
+			 */
+			do {
+				if (DEBUG) assert len1 &gt; 1 &amp;&amp; len2 &gt; 0;
+<span class="nc bnc" id="L590" title="All 2 branches missed.">				if (((Comparable)a[cursor2]).compareTo(tmp[cursor1]) &lt; 0) {</span>
+<span class="nc" id="L591">					a[dest++] = a[cursor2++];</span>
+<span class="nc" id="L592">					count2++;</span>
+<span class="nc" id="L593">					count1 = 0;</span>
+<span class="nc bnc" id="L594" title="All 2 branches missed.">					if (--len2 == 0) break outer;</span>
+				} else {
+<span class="nc" id="L596">					a[dest++] = tmp[cursor1++];</span>
+<span class="nc" id="L597">					count1++;</span>
+<span class="nc" id="L598">					count2 = 0;</span>
+<span class="nc bnc" id="L599" title="All 2 branches missed.">					if (--len1 == 1) break outer;</span>
+				}
+<span class="nc bnc" id="L601" title="All 2 branches missed.">			} while ((count1 | count2) &lt; minGallop);</span>
+
+			/*
+			 * One run is winning so consistently that galloping may be a huge win. So try that, and continue galloping until (if
+			 * ever) neither run appears to be winning consistently anymore.
+			 */
+			do {
+				if (DEBUG) assert len1 &gt; 1 &amp;&amp; len2 &gt; 0;
+<span class="nc" id="L609">				count1 = gallopRight((Comparable)a[cursor2], tmp, cursor1, len1, 0);</span>
+<span class="nc bnc" id="L610" title="All 2 branches missed.">				if (count1 != 0) {</span>
+<span class="nc" id="L611">					System.arraycopy(tmp, cursor1, a, dest, count1);</span>
+<span class="nc" id="L612">					dest += count1;</span>
+<span class="nc" id="L613">					cursor1 += count1;</span>
+<span class="nc" id="L614">					len1 -= count1;</span>
+<span class="nc bnc" id="L615" title="All 2 branches missed.">					if (len1 &lt;= 1) // len1 == 1 || len1 == 0</span>
+<span class="nc" id="L616">						break outer;</span>
+				}
+<span class="nc" id="L618">				a[dest++] = a[cursor2++];</span>
+<span class="nc bnc" id="L619" title="All 2 branches missed.">				if (--len2 == 0) break outer;</span>
+
+<span class="nc" id="L621">				count2 = gallopLeft((Comparable)tmp[cursor1], a, cursor2, len2, 0);</span>
+<span class="nc bnc" id="L622" title="All 2 branches missed.">				if (count2 != 0) {</span>
+<span class="nc" id="L623">					System.arraycopy(a, cursor2, a, dest, count2);</span>
+<span class="nc" id="L624">					dest += count2;</span>
+<span class="nc" id="L625">					cursor2 += count2;</span>
+<span class="nc" id="L626">					len2 -= count2;</span>
+<span class="nc bnc" id="L627" title="All 2 branches missed.">					if (len2 == 0) break outer;</span>
+				}
+<span class="nc" id="L629">				a[dest++] = tmp[cursor1++];</span>
+<span class="nc bnc" id="L630" title="All 2 branches missed.">				if (--len1 == 1) break outer;</span>
+<span class="nc" id="L631">				minGallop--;</span>
+<span class="nc bnc" id="L632" title="All 6 branches missed.">			} while (count1 &gt;= MIN_GALLOP | count2 &gt;= MIN_GALLOP);</span>
+<span class="nc bnc" id="L633" title="All 2 branches missed.">			if (minGallop &lt; 0) minGallop = 0;</span>
+<span class="nc" id="L634">			minGallop += 2; // Penalize for leaving gallop mode</span>
+<span class="nc" id="L635">		} // End of &quot;outer&quot; loop</span>
+<span class="nc bnc" id="L636" title="All 2 branches missed.">		this.minGallop = minGallop &lt; 1 ? 1 : minGallop; // Write back to field</span>
+
+<span class="nc bnc" id="L638" title="All 2 branches missed.">		if (len1 == 1) {</span>
+			if (DEBUG) assert len2 &gt; 0;
+<span class="nc" id="L640">			System.arraycopy(a, cursor2, a, dest, len2);</span>
+<span class="nc" id="L641">			a[dest + len2] = tmp[cursor1]; // Last elt of run 1 to end of merge</span>
+<span class="nc bnc" id="L642" title="All 2 branches missed.">		} else if (len1 == 0) {</span>
+<span class="nc" id="L643">			throw new IllegalArgumentException(&quot;Comparison method violates its general contract!&quot;);</span>
+		} else {
+			if (DEBUG) assert len2 == 0;
+			if (DEBUG) assert len1 &gt; 1;
+<span class="nc" id="L647">			System.arraycopy(tmp, cursor1, a, dest, len1);</span>
+		}
+<span class="nc" id="L649">	}</span>
+
+	/** Like mergeLo, except that this method should be called only if len1 &gt;= len2; mergeLo should be called if len1 &lt;= len2.
+	 * (Either method may be called if len1 == len2.)
+	 * 
+	 * @param base1 index of first element in first run to be merged
+	 * @param len1 length of first run to be merged (must be &gt; 0)
+	 * @param base2 index of first element in second run to be merged (must be aBase + aLen)
+	 * @param len2 length of second run to be merged (must be &gt; 0) */
+	@SuppressWarnings(&quot;unchecked&quot;)
+	private void mergeHi (int base1, int len1, int base2, int len2) {
+		if (DEBUG) assert len1 &gt; 0 &amp;&amp; len2 &gt; 0 &amp;&amp; base1 + len1 == base2;
+
+		// Copy second run into temp array
+<span class="nc" id="L663">		Object[] a = this.a; // For performance</span>
+<span class="nc" id="L664">		Object[] tmp = ensureCapacity(len2);</span>
+<span class="nc" id="L665">		System.arraycopy(a, base2, tmp, 0, len2);</span>
+
+<span class="nc" id="L667">		int cursor1 = base1 + len1 - 1; // Indexes into a</span>
+<span class="nc" id="L668">		int cursor2 = len2 - 1; // Indexes into tmp array</span>
+<span class="nc" id="L669">		int dest = base2 + len2 - 1; // Indexes into a</span>
+
+		// Move last element of first run and deal with degenerate cases
+<span class="nc" id="L672">		a[dest--] = a[cursor1--];</span>
+<span class="nc bnc" id="L673" title="All 2 branches missed.">		if (--len1 == 0) {</span>
+<span class="nc" id="L674">			System.arraycopy(tmp, 0, a, dest - (len2 - 1), len2);</span>
+<span class="nc" id="L675">			return;</span>
+		}
+<span class="nc bnc" id="L677" title="All 2 branches missed.">		if (len2 == 1) {</span>
+<span class="nc" id="L678">			dest -= len1;</span>
+<span class="nc" id="L679">			cursor1 -= len1;</span>
+<span class="nc" id="L680">			System.arraycopy(a, cursor1 + 1, a, dest + 1, len1);</span>
+<span class="nc" id="L681">			a[dest] = tmp[cursor2];</span>
+<span class="nc" id="L682">			return;</span>
+		}
+
+<span class="nc" id="L685">		int minGallop = this.minGallop; // Use local variable for performance</span>
+		outer:
+		while (true) {
+<span class="nc" id="L688">			int count1 = 0; // Number of times in a row that first run won</span>
+<span class="nc" id="L689">			int count2 = 0; // Number of times in a row that second run won</span>
+
+			/*
+			 * Do the straightforward thing until (if ever) one run appears to win consistently.
+			 */
+			do {
+				if (DEBUG) assert len1 &gt; 0 &amp;&amp; len2 &gt; 1;
+<span class="nc bnc" id="L696" title="All 2 branches missed.">				if (((Comparable)tmp[cursor2]).compareTo(a[cursor1]) &lt; 0) {</span>
+<span class="nc" id="L697">					a[dest--] = a[cursor1--];</span>
+<span class="nc" id="L698">					count1++;</span>
+<span class="nc" id="L699">					count2 = 0;</span>
+<span class="nc bnc" id="L700" title="All 2 branches missed.">					if (--len1 == 0) break outer;</span>
+				} else {
+<span class="nc" id="L702">					a[dest--] = tmp[cursor2--];</span>
+<span class="nc" id="L703">					count2++;</span>
+<span class="nc" id="L704">					count1 = 0;</span>
+<span class="nc bnc" id="L705" title="All 2 branches missed.">					if (--len2 == 1) break outer;</span>
+				}
+<span class="nc bnc" id="L707" title="All 2 branches missed.">			} while ((count1 | count2) &lt; minGallop);</span>
+
+			/*
+			 * One run is winning so consistently that galloping may be a huge win. So try that, and continue galloping until (if
+			 * ever) neither run appears to be winning consistently anymore.
+			 */
+			do {
+				if (DEBUG) assert len1 &gt; 0 &amp;&amp; len2 &gt; 1;
+<span class="nc" id="L715">				count1 = len1 - gallopRight((Comparable)tmp[cursor2], a, base1, len1, len1 - 1);</span>
+<span class="nc bnc" id="L716" title="All 2 branches missed.">				if (count1 != 0) {</span>
+<span class="nc" id="L717">					dest -= count1;</span>
+<span class="nc" id="L718">					cursor1 -= count1;</span>
+<span class="nc" id="L719">					len1 -= count1;</span>
+<span class="nc" id="L720">					System.arraycopy(a, cursor1 + 1, a, dest + 1, count1);</span>
+<span class="nc bnc" id="L721" title="All 2 branches missed.">					if (len1 == 0) break outer;</span>
+				}
+<span class="nc" id="L723">				a[dest--] = tmp[cursor2--];</span>
+<span class="nc bnc" id="L724" title="All 2 branches missed.">				if (--len2 == 1) break outer;</span>
+
+<span class="nc" id="L726">				count2 = len2 - gallopLeft((Comparable)a[cursor1], tmp, 0, len2, len2 - 1);</span>
+<span class="nc bnc" id="L727" title="All 2 branches missed.">				if (count2 != 0) {</span>
+<span class="nc" id="L728">					dest -= count2;</span>
+<span class="nc" id="L729">					cursor2 -= count2;</span>
+<span class="nc" id="L730">					len2 -= count2;</span>
+<span class="nc" id="L731">					System.arraycopy(tmp, cursor2 + 1, a, dest + 1, count2);</span>
+<span class="nc bnc" id="L732" title="All 2 branches missed.">					if (len2 &lt;= 1) break outer; // len2 == 1 || len2 == 0</span>
+				}
+<span class="nc" id="L734">				a[dest--] = a[cursor1--];</span>
+<span class="nc bnc" id="L735" title="All 2 branches missed.">				if (--len1 == 0) break outer;</span>
+<span class="nc" id="L736">				minGallop--;</span>
+<span class="nc bnc" id="L737" title="All 6 branches missed.">			} while (count1 &gt;= MIN_GALLOP | count2 &gt;= MIN_GALLOP);</span>
+<span class="nc bnc" id="L738" title="All 2 branches missed.">			if (minGallop &lt; 0) minGallop = 0;</span>
+<span class="nc" id="L739">			minGallop += 2; // Penalize for leaving gallop mode</span>
+<span class="nc" id="L740">		} // End of &quot;outer&quot; loop</span>
+<span class="nc bnc" id="L741" title="All 2 branches missed.">		this.minGallop = minGallop &lt; 1 ? 1 : minGallop; // Write back to field</span>
+
+<span class="nc bnc" id="L743" title="All 2 branches missed.">		if (len2 == 1) {</span>
+			if (DEBUG) assert len1 &gt; 0;
+<span class="nc" id="L745">			dest -= len1;</span>
+<span class="nc" id="L746">			cursor1 -= len1;</span>
+<span class="nc" id="L747">			System.arraycopy(a, cursor1 + 1, a, dest + 1, len1);</span>
+<span class="nc" id="L748">			a[dest] = tmp[cursor2]; // Move first elt of run2 to front of merge</span>
+<span class="nc bnc" id="L749" title="All 2 branches missed.">		} else if (len2 == 0) {</span>
+<span class="nc" id="L750">			throw new IllegalArgumentException(&quot;Comparison method violates its general contract!&quot;);</span>
+		} else {
+			if (DEBUG) assert len1 == 0;
+			if (DEBUG) assert len2 &gt; 0;
+<span class="nc" id="L754">			System.arraycopy(tmp, 0, a, dest - (len2 - 1), len2);</span>
+		}
+<span class="nc" id="L756">	}</span>
+
+	/** Ensures that the external array tmp has at least the specified number of elements, increasing its size if necessary. The
+	 * size increases exponentially to ensure amortized linear time complexity.
+	 * 
+	 * @param minCapacity the minimum required capacity of the tmp array
+	 * @return tmp, whether or not it grew */
+	private Object[] ensureCapacity (int minCapacity) {
+<span class="nc bnc" id="L764" title="All 2 branches missed.">		if (tmp.length &lt; minCapacity) {</span>
+			// Compute smallest power of 2 &gt; minCapacity
+<span class="nc" id="L766">			int newSize = minCapacity;</span>
+<span class="nc" id="L767">			newSize |= newSize &gt;&gt; 1;</span>
+<span class="nc" id="L768">			newSize |= newSize &gt;&gt; 2;</span>
+<span class="nc" id="L769">			newSize |= newSize &gt;&gt; 4;</span>
+<span class="nc" id="L770">			newSize |= newSize &gt;&gt; 8;</span>
+<span class="nc" id="L771">			newSize |= newSize &gt;&gt; 16;</span>
+<span class="nc" id="L772">			newSize++;</span>
+
+<span class="nc bnc" id="L774" title="All 2 branches missed.">			if (newSize &lt; 0) // Not bloody likely!</span>
+<span class="nc" id="L775">				newSize = minCapacity;</span>
+			else
+<span class="nc" id="L777">				newSize = Math.min(newSize, a.length &gt;&gt;&gt; 1);</span>
+
+<span class="nc" id="L779">			Object[] newArray = new Object[newSize];</span>
+<span class="nc" id="L780">			tmp = newArray;</span>
+		}
+<span class="nc" id="L782">		return tmp;</span>
+	}
+
+	/** Checks that fromIndex and toIndex are in range, and throws an appropriate exception if they aren't.
+	 * 
+	 * @param arrayLen the length of the array
+	 * @param fromIndex the index of the first element of the range
+	 * @param toIndex the index after the last element of the range
+	 * @throws IllegalArgumentException if fromIndex &gt; toIndex
+	 * @throws ArrayIndexOutOfBoundsException if fromIndex &lt; 0 or toIndex &gt; arrayLen */
+	private static void rangeCheck (int arrayLen, int fromIndex, int toIndex) {
+<span class="nc bnc" id="L793" title="All 2 branches missed.">		if (fromIndex &gt; toIndex) throw new IllegalArgumentException(&quot;fromIndex(&quot; + fromIndex + &quot;) &gt; toIndex(&quot; + toIndex + &quot;)&quot;);</span>
+<span class="nc bnc" id="L794" title="All 2 branches missed.">		if (fromIndex &lt; 0) throw new ArrayIndexOutOfBoundsException(fromIndex);</span>
+<span class="nc bnc" id="L795" title="All 2 branches missed.">		if (toIndex &gt; arrayLen) throw new ArrayIndexOutOfBoundsException(toIndex);</span>
+<span class="nc" id="L796">	}</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.5.5.201112152213</span></div></body></html>

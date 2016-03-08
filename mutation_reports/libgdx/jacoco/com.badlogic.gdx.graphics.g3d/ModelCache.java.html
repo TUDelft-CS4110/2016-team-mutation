@@ -1,0 +1,390 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>ModelCache.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">libGDX Core</a> &gt; <a href="index.html" class="el_package">com.badlogic.gdx.graphics.g3d</a> &gt; <span class="el_source">ModelCache.java</span></div><h1>ModelCache.java</h1><pre class="source lang-java linenums">/*******************************************************************************
+ * Copyright 2011 See AUTHORS file.
+ * 
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ ******************************************************************************/
+
+package com.badlogic.gdx.graphics.g3d;
+
+import java.util.Comparator;
+
+import com.badlogic.gdx.Gdx;
+import com.badlogic.gdx.graphics.Camera;
+import com.badlogic.gdx.graphics.Mesh;
+import com.badlogic.gdx.graphics.VertexAttributes;
+import com.badlogic.gdx.graphics.g3d.model.MeshPart;
+import com.badlogic.gdx.graphics.g3d.utils.MeshBuilder;
+import com.badlogic.gdx.graphics.g3d.utils.RenderableSorter;
+import com.badlogic.gdx.utils.Array;
+import com.badlogic.gdx.utils.Disposable;
+import com.badlogic.gdx.utils.GdxRuntimeException;
+import com.badlogic.gdx.utils.Pool;
+
+/** ModelCache tries to combine multiple render calls into a single render call by merging them where possible. Can be used for
+ * multiple type of models (e.g. varying vertex attributes or materials), the ModelCache will combine where possible. Can be used
+ * dynamically (e.g. every frame) or statically (e.g. to combine part of scenery). Be aware that any combined vertices are
+ * directly transformed, therefore the resulting {@link Renderable#worldTransform} might not be suitable for sorting anymore (such
+ * as the default sorter of ModelBatch does).
+ * @author Xoppa */
+public class ModelCache implements Disposable, RenderableProvider {
+	/** Allows to reuse one or more meshes while avoiding creating new objects. Depending on the implementation it might add memory
+	 * optimizations as well. Call the {@link #obtain(VertexAttributes, int, int)} method to obtain a mesh which can at minimum the
+	 * specified amount of vertices and indices. Call the {@link #flush()} method to flush the pool ant release all previously
+	 * obtained meshes. */
+	public interface MeshPool extends Disposable {
+		/** Will try to reuse or, when not possible to reuse, optionally create a {@link Mesh} that meets the specified criteria.
+		 * @param vertexAttributes the vertex attributes of the mesh to obtain
+		 * @param vertexCount the minimum amount vertices the mesh should be able to store
+		 * @param indexCount the minimum amount of indices the mesh should be able to store
+		 * @return the obtained Mesh, or null when no mesh could be obtained. */
+		Mesh obtain (VertexAttributes vertexAttributes, int vertexCount, int indexCount);
+
+		/** Releases all previously obtained {@link Mesh}es using the the {@link #obtain(VertexAttributes, int, int)} method. */
+		void flush ();
+	}
+
+	/** A basic {@link MeshPool} implementation that avoids creating new meshes at the cost of memory usage. It does this by making
+	 * the mesh always the maximum (32k) size. Use this when for dynamic caching where you need to obtain meshes very frequently
+	 * (typically every frame).
+	 * @author Xoppa */
+<span class="nc" id="L60">	public static class SimpleMeshPool implements MeshPool {</span>
+		// FIXME Make a better (preferable JNI) MeshPool implementation
+<span class="nc" id="L62">		private Array&lt;Mesh&gt; freeMeshes = new Array&lt;Mesh&gt;();</span>
+<span class="nc" id="L63">		private Array&lt;Mesh&gt; usedMeshes = new Array&lt;Mesh&gt;();</span>
+
+		@Override
+		public void flush () {
+<span class="nc" id="L67">			freeMeshes.addAll(usedMeshes);</span>
+<span class="nc" id="L68">			usedMeshes.clear();</span>
+<span class="nc" id="L69">		}</span>
+
+		@Override
+		public Mesh obtain (VertexAttributes vertexAttributes, int vertexCount, int indexCount) {
+<span class="nc bnc" id="L73" title="All 2 branches missed.">			for (int i = 0, n = freeMeshes.size; i &lt; n; ++i) {</span>
+<span class="nc" id="L74">				final Mesh mesh = freeMeshes.get(i);</span>
+<span class="nc bnc" id="L75" title="All 6 branches missed.">				if (mesh.getVertexAttributes().equals(vertexAttributes) &amp;&amp; mesh.getMaxVertices() &gt;= vertexCount</span>
+					&amp;&amp; mesh.getMaxIndices() &gt;= indexCount) {
+<span class="nc" id="L77">					freeMeshes.removeIndex(i);</span>
+<span class="nc" id="L78">					usedMeshes.add(mesh);</span>
+<span class="nc" id="L79">					return mesh;</span>
+				}
+			}
+<span class="nc" id="L82">			vertexCount = 1 + (int)Short.MAX_VALUE;</span>
+<span class="nc" id="L83">			indexCount = Math.max(1 + (int)Short.MAX_VALUE, 1 &lt;&lt; (32 - Integer.numberOfLeadingZeros(indexCount - 1)));</span>
+<span class="nc" id="L84">			Mesh result = new Mesh(false, vertexCount, indexCount, vertexAttributes);</span>
+<span class="nc" id="L85">			usedMeshes.add(result);</span>
+<span class="nc" id="L86">			return result;</span>
+		}
+
+		@Override
+		public void dispose () {
+<span class="nc bnc" id="L91" title="All 2 branches missed.">			for (Mesh m : usedMeshes)</span>
+<span class="nc" id="L92">				m.dispose();</span>
+<span class="nc" id="L93">			usedMeshes.clear();</span>
+<span class="nc bnc" id="L94" title="All 2 branches missed.">			for (Mesh m : freeMeshes)</span>
+<span class="nc" id="L95">				m.dispose();</span>
+<span class="nc" id="L96">			freeMeshes.clear();</span>
+<span class="nc" id="L97">		}</span>
+	}
+
+	/** A tight {@link MeshPool} implementation, which is typically used for static meshes (create once, use many).
+	 * @author Xoppa */
+<span class="nc" id="L102">	public static class TightMeshPool implements MeshPool {</span>
+<span class="nc" id="L103">		private Array&lt;Mesh&gt; freeMeshes = new Array&lt;Mesh&gt;();</span>
+<span class="nc" id="L104">		private Array&lt;Mesh&gt; usedMeshes = new Array&lt;Mesh&gt;();</span>
+
+		@Override
+		public void flush () {
+<span class="nc" id="L108">			freeMeshes.addAll(usedMeshes);</span>
+<span class="nc" id="L109">			usedMeshes.clear();</span>
+<span class="nc" id="L110">		}</span>
+
+		@Override
+		public Mesh obtain (VertexAttributes vertexAttributes, int vertexCount, int indexCount) {
+<span class="nc bnc" id="L114" title="All 2 branches missed.">			for (int i = 0, n = freeMeshes.size; i &lt; n; ++i) {</span>
+<span class="nc" id="L115">				final Mesh mesh = freeMeshes.get(i);</span>
+<span class="nc bnc" id="L116" title="All 6 branches missed.">				if (mesh.getVertexAttributes().equals(vertexAttributes) &amp;&amp; mesh.getMaxVertices() == vertexCount</span>
+					&amp;&amp; mesh.getMaxIndices() == indexCount) {
+<span class="nc" id="L118">					freeMeshes.removeIndex(i);</span>
+<span class="nc" id="L119">					usedMeshes.add(mesh);</span>
+<span class="nc" id="L120">					return mesh;</span>
+				}
+			}
+<span class="nc" id="L123">			Mesh result = new Mesh(true, vertexCount, indexCount, vertexAttributes);</span>
+<span class="nc" id="L124">			usedMeshes.add(result);</span>
+<span class="nc" id="L125">			return result;</span>
+		}
+
+		@Override
+		public void dispose () {
+<span class="nc bnc" id="L130" title="All 2 branches missed.">			for (Mesh m : usedMeshes)</span>
+<span class="nc" id="L131">				m.dispose();</span>
+<span class="nc" id="L132">			usedMeshes.clear();</span>
+<span class="nc bnc" id="L133" title="All 2 branches missed.">			for (Mesh m : freeMeshes)</span>
+<span class="nc" id="L134">				m.dispose();</span>
+<span class="nc" id="L135">			freeMeshes.clear();</span>
+<span class="nc" id="L136">		}</span>
+	}
+
+	/** A {@link RenderableSorter} that sorts by vertex attributes, material attributes and primitive types (in that order), so that
+	 * meshes can be easily merged.
+	 * @author Xoppa */
+<span class="nc" id="L142">	public static class Sorter implements RenderableSorter, Comparator&lt;Renderable&gt; {</span>
+		@Override
+		public void sort (Camera camera, Array&lt;Renderable&gt; renderables) {
+<span class="nc" id="L145">			renderables.sort(this);</span>
+<span class="nc" id="L146">		}</span>
+
+		@Override
+		public int compare (Renderable arg0, Renderable arg1) {
+<span class="nc" id="L150">			final VertexAttributes va0 = arg0.meshPart.mesh.getVertexAttributes();</span>
+<span class="nc" id="L151">			final VertexAttributes va1 = arg1.meshPart.mesh.getVertexAttributes();</span>
+<span class="nc" id="L152">			final int vc = va0.compareTo(va1);</span>
+<span class="nc bnc" id="L153" title="All 2 branches missed.">			if (vc == 0) {</span>
+<span class="nc" id="L154">				final int mc = arg0.material.compareTo(arg1.material);</span>
+<span class="nc bnc" id="L155" title="All 2 branches missed.">				if (mc == 0) {</span>
+<span class="nc" id="L156">					return arg0.meshPart.primitiveType - arg1.meshPart.primitiveType;</span>
+				}
+<span class="nc" id="L158">				return mc;</span>
+			}
+<span class="nc" id="L160">			return vc;</span>
+		}
+	}
+
+<span class="nc" id="L164">	private Array&lt;Renderable&gt; renderables = new Array&lt;Renderable&gt;();</span>
+<span class="nc" id="L165">	private FlushablePool&lt;Renderable&gt; renderablesPool = new FlushablePool&lt;Renderable&gt;() {</span>
+		@Override
+		protected Renderable newObject () {
+<span class="nc" id="L168">			return new Renderable();</span>
+		}
+	};
+<span class="nc" id="L171">	private FlushablePool&lt;MeshPart&gt; meshPartPool = new FlushablePool&lt;MeshPart&gt;() {</span>
+		@Override
+		protected MeshPart newObject () {
+<span class="nc" id="L174">			return new MeshPart();</span>
+		}
+	};
+
+<span class="nc" id="L178">	private Array&lt;Renderable&gt; items = new Array&lt;Renderable&gt;();</span>
+<span class="nc" id="L179">	private Array&lt;Renderable&gt; tmp = new Array&lt;Renderable&gt;();</span>
+
+	private MeshBuilder meshBuilder;
+	private boolean building;
+	private RenderableSorter sorter;
+	private MeshPool meshPool;
+	private Camera camera;
+
+	/** Create a ModelCache using the default {@link Sorter} and the {@link SimpleMeshPool} implementation. This might not be the
+	 * most optimal implementation for you use-case, but should be good to start with. */
+	public ModelCache () {
+<span class="nc" id="L190">		this(new Sorter(), new SimpleMeshPool());</span>
+<span class="nc" id="L191">	}</span>
+
+	/** Create a ModelCache using the specified {@link RenderableSorter} and {@link MeshPool} implementation. The
+	 * {@link RenderableSorter} implementation will be called with the camera specified in {@link #begin(Camera)}. By default this
+	 * will be null. The sorter is important for optimizing the cache. For the best result, make sure that renderables that can be
+	 * merged are next to each other. */
+<span class="nc" id="L197">	public ModelCache (RenderableSorter sorter, MeshPool meshPool) {</span>
+<span class="nc" id="L198">		this.sorter = sorter;</span>
+<span class="nc" id="L199">		this.meshPool = meshPool;</span>
+<span class="nc" id="L200">		meshBuilder = new MeshBuilder();</span>
+<span class="nc" id="L201">	}</span>
+
+	/** Begin creating the cache, must be followed by a call to {@link #end()}, in between these calls one or more calls to one of
+	 * the add(...) methods can be made. Calling this method will clear the cache and prepare it for creating a new cache. The
+	 * cache is not valid until the call to {@link #end()} is made. Use one of the add methods (e.g. {@link #add(Renderable)} or
+	 * {@link #add(RenderableProvider)}) to add renderables to the cache. */
+	public void begin () {
+<span class="nc" id="L208">		begin(null);</span>
+<span class="nc" id="L209">	}</span>
+
+	/** Begin creating the cache, must be followed by a call to {@link #end()}, in between these calls one or more calls to one of
+	 * the add(...) methods can be made. Calling this method will clear the cache and prepare it for creating a new cache. The
+	 * cache is not valid until the call to {@link #end()} is made. Use one of the add methods (e.g. {@link #add(Renderable)} or
+	 * {@link #add(RenderableProvider)}) to add renderables to the cache.
+	 * @param camera The {@link Camera} that will passed to the {@link RenderableSorter} */
+	public void begin (Camera camera) {
+<span class="nc bnc" id="L217" title="All 2 branches missed.">		if (building) throw new GdxRuntimeException(&quot;Call end() after calling begin()&quot;);</span>
+<span class="nc" id="L218">		building = true;</span>
+
+<span class="nc" id="L220">		this.camera = camera;</span>
+<span class="nc" id="L221">		renderablesPool.flush();</span>
+<span class="nc" id="L222">		renderables.clear();</span>
+<span class="nc" id="L223">		items.clear();</span>
+<span class="nc" id="L224">		meshPartPool.flush();</span>
+<span class="nc" id="L225">		meshPool.flush();</span>
+<span class="nc" id="L226">	}</span>
+
+	private Renderable obtainRenderable (Material material, int primitiveType) {
+<span class="nc" id="L229">		Renderable result = renderablesPool.obtain();</span>
+<span class="nc" id="L230">		result.bones = null;</span>
+<span class="nc" id="L231">		result.environment = null;</span>
+<span class="nc" id="L232">		result.material = material;</span>
+<span class="nc" id="L233">		result.meshPart.mesh = null;</span>
+<span class="nc" id="L234">		result.meshPart.offset = 0;</span>
+<span class="nc" id="L235">		result.meshPart.size = 0;</span>
+<span class="nc" id="L236">		result.meshPart.primitiveType = primitiveType;</span>
+<span class="nc" id="L237">		result.meshPart.center.set(0, 0, 0);</span>
+<span class="nc" id="L238">		result.meshPart.halfExtents.set(0, 0, 0);</span>
+<span class="nc" id="L239">		result.meshPart.radius = -1f;</span>
+<span class="nc" id="L240">		result.shader = null;</span>
+<span class="nc" id="L241">		result.userData = null;</span>
+<span class="nc" id="L242">		result.worldTransform.idt();</span>
+<span class="nc" id="L243">		return result;</span>
+	}
+
+	/** Finishes creating the cache, must be called after a call to {@link #begin()}, only after this call the cache will be valid
+	 * (until the next call to {@link #begin()}). Calling this method will process all renderables added using one of the add(...)
+	 * methods and will combine them if possible. */
+	public void end () {
+<span class="nc bnc" id="L250" title="All 2 branches missed.">		if (!building) throw new GdxRuntimeException(&quot;Call begin() prior to calling end()&quot;);</span>
+<span class="nc" id="L251">		building = false;</span>
+
+<span class="nc bnc" id="L253" title="All 2 branches missed.">		if (items.size == 0) return;</span>
+<span class="nc" id="L254">		sorter.sort(camera, items);</span>
+
+<span class="nc" id="L256">		int itemCount = items.size;</span>
+<span class="nc" id="L257">		int initCount = renderables.size;</span>
+
+<span class="nc" id="L259">		final Renderable first = items.get(0);</span>
+<span class="nc" id="L260">		VertexAttributes vertexAttributes = first.meshPart.mesh.getVertexAttributes();</span>
+<span class="nc" id="L261">		Material material = first.material;</span>
+<span class="nc" id="L262">		int primitiveType = first.meshPart.primitiveType;</span>
+<span class="nc" id="L263">		int offset = renderables.size;</span>
+
+<span class="nc" id="L265">		meshBuilder.begin(vertexAttributes);</span>
+<span class="nc" id="L266">		MeshPart part = meshBuilder.part(&quot;&quot;, primitiveType, meshPartPool.obtain());</span>
+<span class="nc" id="L267">		renderables.add(obtainRenderable(material, primitiveType));</span>
+
+<span class="nc bnc" id="L269" title="All 2 branches missed.">		for (int i = 0, n = items.size; i &lt; n; ++i) {</span>
+<span class="nc" id="L270">			final Renderable renderable = items.get(i);</span>
+<span class="nc" id="L271">			final VertexAttributes va = renderable.meshPart.mesh.getVertexAttributes();</span>
+<span class="nc" id="L272">			final Material mat = renderable.material;</span>
+<span class="nc" id="L273">			final int pt = renderable.meshPart.primitiveType;</span>
+
+<span class="nc bnc" id="L275" title="All 4 branches missed.">			final boolean sameMesh = va.equals(vertexAttributes)</span>
+				&amp;&amp; renderable.meshPart.size + meshBuilder.getNumVertices() &lt; Short.MAX_VALUE; // comparing indices and vertices...
+<span class="nc bnc" id="L277" title="All 6 branches missed.">			final boolean samePart = sameMesh &amp;&amp; pt == primitiveType &amp;&amp; mat.same(material, true);</span>
+
+<span class="nc bnc" id="L279" title="All 2 branches missed.">			if (!samePart) {</span>
+<span class="nc bnc" id="L280" title="All 2 branches missed.">				if (!sameMesh) {</span>
+<span class="nc" id="L281">					final Mesh mesh = meshBuilder.end(meshPool.obtain(vertexAttributes, meshBuilder.getNumVertices(),</span>
+						meshBuilder.getNumIndices()));
+<span class="nc bnc" id="L283" title="All 2 branches missed.">					while (offset &lt; renderables.size)</span>
+<span class="nc" id="L284">						renderables.get(offset++).meshPart.mesh = mesh;</span>
+<span class="nc" id="L285">					meshBuilder.begin(vertexAttributes = va);</span>
+				}
+
+<span class="nc" id="L288">				final MeshPart newPart = meshBuilder.part(&quot;&quot;, pt, meshPartPool.obtain());</span>
+<span class="nc" id="L289">				final Renderable previous = renderables.get(renderables.size - 1);</span>
+<span class="nc" id="L290">				previous.meshPart.offset = part.offset;</span>
+<span class="nc" id="L291">				previous.meshPart.size = part.size;</span>
+<span class="nc" id="L292">				part = newPart;</span>
+
+<span class="nc" id="L294">				renderables.add(obtainRenderable(material = mat, primitiveType = pt));</span>
+			}
+
+<span class="nc" id="L297">			meshBuilder.setVertexTransform(renderable.worldTransform);</span>
+<span class="nc" id="L298">			meshBuilder.addMesh(renderable.meshPart.mesh, renderable.meshPart.offset, renderable.meshPart.size);</span>
+		}
+
+<span class="nc" id="L301">		final Mesh mesh = meshBuilder.end(meshPool.obtain(vertexAttributes, meshBuilder.getNumVertices(),</span>
+			meshBuilder.getNumIndices()));
+<span class="nc bnc" id="L303" title="All 2 branches missed.">		while (offset &lt; renderables.size)</span>
+<span class="nc" id="L304">			renderables.get(offset++).meshPart.mesh = mesh;</span>
+
+<span class="nc" id="L306">		final Renderable previous = renderables.get(renderables.size - 1);</span>
+<span class="nc" id="L307">		previous.meshPart.offset = part.offset;</span>
+<span class="nc" id="L308">		previous.meshPart.size = part.size;</span>
+<span class="nc" id="L309">	}</span>
+
+	/** Adds the specified {@link Renderable} to the cache. Must be called in between a call to {@link #begin()} and {@link #end()}.
+	 * All member objects might (depending on possibilities) be used by reference and should not change while the cache is used. If
+	 * the {@link Renderable#bones} member is not null then skinning is assumed and the renderable will be added as-is, by
+	 * reference. Otherwise the renderable will be merged with other renderables as much as possible, depending on the
+	 * {@link Mesh#getVertexAttributes()}, {@link Renderable#material} and primitiveType (in that order). The
+	 * {@link Renderable#environment}, {@link Renderable#shader} and {@link Renderable#userData} values (if any) are removed.
+	 * @param renderable The {@link Renderable} to add, should not change while the cache is needed. */
+	public void add (Renderable renderable) {
+<span class="nc bnc" id="L319" title="All 2 branches missed.">		if (!building) throw new GdxRuntimeException(&quot;Can only add items to the ModelCache in between .begin() and .end()&quot;);</span>
+<span class="nc bnc" id="L320" title="All 2 branches missed.">		if (renderable.bones == null)</span>
+<span class="nc" id="L321">			items.add(renderable);</span>
+		else
+<span class="nc" id="L323">			renderables.add(renderable);</span>
+<span class="nc" id="L324">	}</span>
+
+	/** Adds the specified {@link RenderableProvider} to the cache, see {@link #add(Renderable)}. */
+	public void add (final RenderableProvider renderableProvider) {
+<span class="nc" id="L328">		renderableProvider.getRenderables(tmp, renderablesPool);</span>
+<span class="nc bnc" id="L329" title="All 2 branches missed.">		for (int i = 0, n = tmp.size; i &lt; n; ++i)</span>
+<span class="nc" id="L330">			add(tmp.get(i));</span>
+<span class="nc" id="L331">		tmp.clear();</span>
+<span class="nc" id="L332">	}</span>
+
+	/** Adds the specified {@link RenderableProvider}s to the cache, see {@link #add(Renderable)}. */
+	public &lt;T extends RenderableProvider&gt; void add (final Iterable&lt;T&gt; renderableProviders) {
+<span class="nc bnc" id="L336" title="All 2 branches missed.">		for (final RenderableProvider renderableProvider : renderableProviders)</span>
+<span class="nc" id="L337">			add(renderableProvider);</span>
+<span class="nc" id="L338">	}</span>
+
+	@Override
+	public void getRenderables (Array&lt;Renderable&gt; renderables, Pool&lt;Renderable&gt; pool) {
+<span class="nc bnc" id="L342" title="All 2 branches missed.">		if (building) throw new GdxRuntimeException(&quot;Cannot render a ModelCache in between .begin() and .end()&quot;);</span>
+<span class="nc bnc" id="L343" title="All 2 branches missed.">		for (Renderable r : this.renderables) {</span>
+<span class="nc" id="L344">			r.shader = null;</span>
+<span class="nc" id="L345">			r.environment = null;</span>
+<span class="nc" id="L346">		}</span>
+<span class="nc" id="L347">		renderables.addAll(this.renderables);</span>
+<span class="nc" id="L348">	}</span>
+
+	@Override
+	public void dispose () {
+<span class="nc bnc" id="L352" title="All 2 branches missed.">		if (building) throw new GdxRuntimeException(&quot;Cannot dispose a ModelCache in between .begin() and .end()&quot;);</span>
+<span class="nc" id="L353">		meshPool.dispose();</span>
+<span class="nc" id="L354">	}</span>
+
+	/** Keeps track of the obtained items and frees them on the call to {@link #flush()}.
+	 * @author Xoppa */
+	private static abstract class FlushablePool&lt;T&gt; extends Pool&lt;T&gt; {
+<span class="nc" id="L359">		protected Array&lt;T&gt; obtained = new Array&lt;T&gt;();</span>
+
+<span class="nc" id="L361">		public FlushablePool () {</span>
+<span class="nc" id="L362">		}</span>
+
+		@Override
+		public T obtain () {
+<span class="nc" id="L366">			T result = super.obtain();</span>
+<span class="nc" id="L367">			obtained.add(result);</span>
+<span class="nc" id="L368">			return result;</span>
+		}
+
+		/** Frees all obtained instances. */
+		public void flush () {
+<span class="nc" id="L373">			super.freeAll(obtained);</span>
+<span class="nc" id="L374">			obtained.clear();</span>
+<span class="nc" id="L375">		}</span>
+
+		@Override
+		public void free (T object) {
+<span class="nc" id="L379">			obtained.removeValue(object, true);</span>
+<span class="nc" id="L380">			super.free(object);</span>
+<span class="nc" id="L381">		}</span>
+
+		@Override
+		public void freeAll (Array&lt;T&gt; objects) {
+<span class="nc" id="L385">			obtained.removeAll(objects, true);</span>
+<span class="nc" id="L386">			super.freeAll(objects);</span>
+<span class="nc" id="L387">		}</span>
+	}
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.5.5.201112152213</span></div></body></html>

@@ -1,0 +1,170 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>AssetLoadingTask.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">libGDX Core</a> &gt; <a href="index.html" class="el_package">com.badlogic.gdx.assets</a> &gt; <span class="el_source">AssetLoadingTask.java</span></div><h1>AssetLoadingTask.java</h1><pre class="source lang-java linenums">/*******************************************************************************
+ * Copyright 2011 See AUTHORS file.
+ * 
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ ******************************************************************************/
+
+package com.badlogic.gdx.assets;
+
+import com.badlogic.gdx.assets.loaders.AssetLoader;
+import com.badlogic.gdx.assets.loaders.AsynchronousAssetLoader;
+import com.badlogic.gdx.assets.loaders.SynchronousAssetLoader;
+import com.badlogic.gdx.files.FileHandle;
+import com.badlogic.gdx.utils.Array;
+import com.badlogic.gdx.utils.GdxRuntimeException;
+import com.badlogic.gdx.utils.Logger;
+import com.badlogic.gdx.utils.TimeUtils;
+import com.badlogic.gdx.utils.async.AsyncExecutor;
+import com.badlogic.gdx.utils.async.AsyncResult;
+import com.badlogic.gdx.utils.async.AsyncTask;
+
+/** Responsible for loading an asset through an {@link AssetLoader} based on an {@link AssetDescriptor}.
+ * 
+ * @author mzechner */
+class AssetLoadingTask implements AsyncTask&lt;Void&gt; {
+	AssetManager manager;
+	final AssetDescriptor assetDesc;
+	final AssetLoader loader;
+	final AsyncExecutor executor;
+	final long startTime;
+
+<span class="nc" id="L41">	volatile boolean asyncDone = false;</span>
+<span class="nc" id="L42">	volatile boolean dependenciesLoaded = false;</span>
+	volatile Array&lt;AssetDescriptor&gt; dependencies;
+<span class="nc" id="L44">	volatile AsyncResult&lt;Void&gt; depsFuture = null;</span>
+<span class="nc" id="L45">	volatile AsyncResult&lt;Void&gt; loadFuture = null;</span>
+<span class="nc" id="L46">	volatile Object asset = null;</span>
+
+<span class="nc" id="L48">	int ticks = 0;</span>
+<span class="nc" id="L49">	volatile boolean cancel = false;</span>
+
+<span class="nc" id="L51">	public AssetLoadingTask (AssetManager manager, AssetDescriptor assetDesc, AssetLoader loader, AsyncExecutor threadPool) {</span>
+<span class="nc" id="L52">		this.manager = manager;</span>
+<span class="nc" id="L53">		this.assetDesc = assetDesc;</span>
+<span class="nc" id="L54">		this.loader = loader;</span>
+<span class="nc" id="L55">		this.executor = threadPool;</span>
+<span class="nc bnc" id="L56" title="All 2 branches missed.">		startTime = manager.log.getLevel() == Logger.DEBUG ? TimeUtils.nanoTime() : 0;</span>
+<span class="nc" id="L57">	}</span>
+
+	/** Loads parts of the asset asynchronously if the loader is an {@link AsynchronousAssetLoader}. */
+	@Override
+	public Void call () throws Exception {
+<span class="nc" id="L62">		AsynchronousAssetLoader asyncLoader = (AsynchronousAssetLoader)loader;</span>
+<span class="nc bnc" id="L63" title="All 2 branches missed.">		if (dependenciesLoaded == false) {</span>
+<span class="nc" id="L64">			dependencies = asyncLoader.getDependencies(assetDesc.fileName, resolve(loader, assetDesc), assetDesc.params);</span>
+<span class="nc bnc" id="L65" title="All 2 branches missed.">			if (dependencies != null) {</span>
+<span class="nc" id="L66">				removeDuplicates(dependencies);</span>
+<span class="nc" id="L67">				manager.injectDependencies(assetDesc.fileName, dependencies);</span>
+			} else {
+				// if we have no dependencies, we load the async part of the task immediately.
+<span class="nc" id="L70">				asyncLoader.loadAsync(manager, assetDesc.fileName, resolve(loader, assetDesc), assetDesc.params);</span>
+<span class="nc" id="L71">				asyncDone = true;</span>
+			}
+		} else {
+<span class="nc" id="L74">			asyncLoader.loadAsync(manager, assetDesc.fileName, resolve(loader, assetDesc), assetDesc.params);</span>
+		}
+<span class="nc" id="L76">		return null;</span>
+	}
+
+	/** Updates the loading of the asset. In case the asset is loaded with an {@link AsynchronousAssetLoader}, the loaders
+	 * {@link AsynchronousAssetLoader#loadAsync(AssetManager, String, FileHandle, AssetLoaderParameters)} method is first called on
+	 * a worker thread. Once this method returns, the rest of the asset is loaded on the rendering thread via
+	 * {@link AsynchronousAssetLoader#loadSync(AssetManager, String, FileHandle, AssetLoaderParameters)}.
+	 * @return true in case the asset was fully loaded, false otherwise
+	 * @throws GdxRuntimeException */
+	public boolean update () {
+<span class="nc" id="L86">		ticks++;</span>
+<span class="nc bnc" id="L87" title="All 2 branches missed.">		if (loader instanceof SynchronousAssetLoader) {</span>
+<span class="nc" id="L88">			handleSyncLoader();</span>
+		} else {
+<span class="nc" id="L90">			handleAsyncLoader();</span>
+		}
+<span class="nc bnc" id="L92" title="All 2 branches missed.">		return asset != null;</span>
+	}
+
+	private void handleSyncLoader () {
+<span class="nc" id="L96">		SynchronousAssetLoader syncLoader = (SynchronousAssetLoader)loader;</span>
+<span class="nc bnc" id="L97" title="All 2 branches missed.">		if (!dependenciesLoaded) {</span>
+<span class="nc" id="L98">			dependenciesLoaded = true;</span>
+<span class="nc" id="L99">			dependencies = syncLoader.getDependencies(assetDesc.fileName, resolve(loader, assetDesc), assetDesc.params);</span>
+<span class="nc bnc" id="L100" title="All 2 branches missed.">			if (dependencies == null) {</span>
+<span class="nc" id="L101">				asset = syncLoader.load(manager, assetDesc.fileName, resolve(loader, assetDesc), assetDesc.params);</span>
+<span class="nc" id="L102">				return;</span>
+			}
+<span class="nc" id="L104">			removeDuplicates(dependencies);</span>
+<span class="nc" id="L105">			manager.injectDependencies(assetDesc.fileName, dependencies);</span>
+		} else {
+<span class="nc" id="L107">			asset = syncLoader.load(manager, assetDesc.fileName, resolve(loader, assetDesc), assetDesc.params);</span>
+		}
+<span class="nc" id="L109">	}</span>
+
+	private void handleAsyncLoader () {
+<span class="nc" id="L112">		AsynchronousAssetLoader asyncLoader = (AsynchronousAssetLoader)loader;</span>
+<span class="nc bnc" id="L113" title="All 2 branches missed.">		if (!dependenciesLoaded) {</span>
+<span class="nc bnc" id="L114" title="All 2 branches missed.">			if (depsFuture == null) {</span>
+<span class="nc" id="L115">				depsFuture = executor.submit(this);</span>
+			} else {
+<span class="nc bnc" id="L117" title="All 2 branches missed.">				if (depsFuture.isDone()) {</span>
+					try {
+<span class="nc" id="L119">						depsFuture.get();</span>
+<span class="nc" id="L120">					} catch (Exception e) {</span>
+<span class="nc" id="L121">						throw new GdxRuntimeException(&quot;Couldn't load dependencies of asset: &quot; + assetDesc.fileName, e);</span>
+<span class="nc" id="L122">					}</span>
+<span class="nc" id="L123">					dependenciesLoaded = true;</span>
+<span class="nc bnc" id="L124" title="All 2 branches missed.">					if (asyncDone) {</span>
+<span class="nc" id="L125">						asset = asyncLoader.loadSync(manager, assetDesc.fileName, resolve(loader, assetDesc), assetDesc.params);</span>
+					}
+				}
+			}
+		} else {
+<span class="nc bnc" id="L130" title="All 4 branches missed.">			if (loadFuture == null &amp;&amp; !asyncDone) {</span>
+<span class="nc" id="L131">				loadFuture = executor.submit(this);</span>
+			} else {
+<span class="nc bnc" id="L133" title="All 2 branches missed.">				if (asyncDone) {</span>
+<span class="nc" id="L134">					asset = asyncLoader.loadSync(manager, assetDesc.fileName, resolve(loader, assetDesc), assetDesc.params);</span>
+<span class="nc bnc" id="L135" title="All 2 branches missed.">				} else if (loadFuture.isDone()) {</span>
+					try {
+<span class="nc" id="L137">						loadFuture.get();</span>
+<span class="nc" id="L138">					} catch (Exception e) {</span>
+<span class="nc" id="L139">						throw new GdxRuntimeException(&quot;Couldn't load asset: &quot; + assetDesc.fileName, e);</span>
+<span class="nc" id="L140">					}</span>
+<span class="nc" id="L141">					asset = asyncLoader.loadSync(manager, assetDesc.fileName, resolve(loader, assetDesc), assetDesc.params);</span>
+				}
+			}
+		}
+<span class="nc" id="L145">	}</span>
+
+	private FileHandle resolve (AssetLoader loader, AssetDescriptor assetDesc) {
+<span class="nc bnc" id="L148" title="All 2 branches missed.">		if (assetDesc.file == null) assetDesc.file = loader.resolve(assetDesc.fileName);</span>
+<span class="nc" id="L149">		return assetDesc.file;</span>
+	}
+
+	public Object getAsset () {
+<span class="nc" id="L153">		return asset;</span>
+	}
+	
+	private void removeDuplicates(Array&lt;AssetDescriptor&gt; array) {
+<span class="nc" id="L157">		boolean ordered = array.ordered;</span>
+<span class="nc" id="L158">		array.ordered = true;</span>
+<span class="nc bnc" id="L159" title="All 2 branches missed.">		for (int i = 0; i &lt; array.size; ++i) {</span>
+<span class="nc" id="L160">			final String fn = array.get(i).fileName;</span>
+<span class="nc" id="L161">			final Class type = array.get(i).type;</span>
+<span class="nc bnc" id="L162" title="All 2 branches missed.">			for (int j = array.size - 1; j &gt; i; --j) {</span>
+<span class="nc bnc" id="L163" title="All 4 branches missed.">				if (type == array.get(j).type &amp;&amp; fn.equals(array.get(j).fileName))</span>
+<span class="nc" id="L164">					array.removeIndex(j);</span>
+			}
+		}
+<span class="nc" id="L167">		array.ordered = ordered;</span>
+<span class="nc" id="L168">	}</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.5.5.201112152213</span></div></body></html>

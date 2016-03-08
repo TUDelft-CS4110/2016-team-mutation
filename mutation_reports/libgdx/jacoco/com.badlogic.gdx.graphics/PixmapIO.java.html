@@ -1,0 +1,344 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>PixmapIO.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">libGDX Core</a> &gt; <a href="index.html" class="el_package">com.badlogic.gdx.graphics</a> &gt; <span class="el_source">PixmapIO.java</span></div><h1>PixmapIO.java</h1><pre class="source lang-java linenums">/*******************************************************************************
+ * Copyright 2011 See AUTHORS file.
+ * 
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ ******************************************************************************/
+
+package com.badlogic.gdx.graphics;
+
+import java.io.BufferedInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.nio.ByteBuffer;
+import java.util.zip.CRC32;
+import java.util.zip.CheckedOutputStream;
+import java.util.zip.Deflater;
+import java.util.zip.DeflaterOutputStream;
+import java.util.zip.InflaterInputStream;
+
+import com.badlogic.gdx.files.FileHandle;
+import com.badlogic.gdx.graphics.Pixmap.Format;
+import com.badlogic.gdx.utils.ByteArray;
+import com.badlogic.gdx.utils.Disposable;
+import com.badlogic.gdx.utils.GdxRuntimeException;
+import com.badlogic.gdx.utils.StreamUtils;
+
+/** Writes Pixmaps to various formats.
+ * @author mzechner
+ * @author Nathan Sweet */
+<span class="nc" id="L42">public class PixmapIO {</span>
+	/** Writes the {@link Pixmap} to the given file using a custom compression scheme. First three integers define the width, height
+	 * and format, remaining bytes are zlib compressed pixels. To be able to load the Pixmap to a Texture, use &quot;.cim&quot; as the file
+	 * suffix. Throws a GdxRuntimeException in case the Pixmap couldn't be written to the file.
+	 * @param file the file to write the Pixmap to */
+	static public void writeCIM (FileHandle file, Pixmap pixmap) {
+<span class="nc" id="L48">		CIM.write(file, pixmap);</span>
+<span class="nc" id="L49">	}</span>
+
+	/** Reads the {@link Pixmap} from the given file, assuming the Pixmap was written with the
+	 * {@link PixmapIO#writeCIM(FileHandle, Pixmap)} method. Throws a GdxRuntimeException in case the file couldn't be read.
+	 * @param file the file to read the Pixmap from */
+	static public Pixmap readCIM (FileHandle file) {
+<span class="nc" id="L55">		return CIM.read(file);</span>
+	}
+
+	/** Writes the pixmap as a PNG with compression. See {@link PNG} to configure the compression level, more efficiently flip the
+	 * pixmap vertically, and to write out multiple PNGs with minimal allocation. */
+	static public void writePNG (FileHandle file, Pixmap pixmap) {
+		try {
+<span class="nc" id="L62">			PNG writer = new PNG((int)(pixmap.getWidth() * pixmap.getHeight() * 1.5f)); // Guess at deflated size.</span>
+			try {
+<span class="nc" id="L64">				writer.setFlipY(false);</span>
+<span class="nc" id="L65">				writer.write(file, pixmap);</span>
+			} finally {
+<span class="nc" id="L67">				writer.dispose();</span>
+<span class="nc" id="L68">			}</span>
+<span class="nc" id="L69">		} catch (IOException ex) {</span>
+<span class="nc" id="L70">			throw new GdxRuntimeException(&quot;Error writing PNG: &quot; + file, ex);</span>
+<span class="nc" id="L71">		}</span>
+<span class="nc" id="L72">	}</span>
+
+	/** @author mzechner */
+<span class="nc" id="L75">	static private class CIM {</span>
+		static private final int BUFFER_SIZE = 32000;
+<span class="nc" id="L77">		static private final byte[] writeBuffer = new byte[BUFFER_SIZE];</span>
+<span class="nc" id="L78">		static private final byte[] readBuffer = new byte[BUFFER_SIZE];</span>
+
+		static public void write (FileHandle file, Pixmap pixmap) {
+<span class="nc" id="L81">			DataOutputStream out = null;</span>
+
+			try {
+				// long start = System.nanoTime();
+<span class="nc" id="L85">				DeflaterOutputStream deflaterOutputStream = new DeflaterOutputStream(file.write(false));</span>
+<span class="nc" id="L86">				out = new DataOutputStream(deflaterOutputStream);</span>
+<span class="nc" id="L87">				out.writeInt(pixmap.getWidth());</span>
+<span class="nc" id="L88">				out.writeInt(pixmap.getHeight());</span>
+<span class="nc" id="L89">				out.writeInt(Format.toGdx2DPixmapFormat(pixmap.getFormat()));</span>
+
+<span class="nc" id="L91">				ByteBuffer pixelBuf = pixmap.getPixels();</span>
+<span class="nc" id="L92">				pixelBuf.position(0);</span>
+<span class="nc" id="L93">				pixelBuf.limit(pixelBuf.capacity());</span>
+
+<span class="nc" id="L95">				int remainingBytes = pixelBuf.capacity() % BUFFER_SIZE;</span>
+<span class="nc" id="L96">				int iterations = pixelBuf.capacity() / BUFFER_SIZE;</span>
+
+<span class="nc" id="L98">				synchronized (writeBuffer) {</span>
+<span class="nc bnc" id="L99" title="All 2 branches missed.">					for (int i = 0; i &lt; iterations; i++) {</span>
+<span class="nc" id="L100">						pixelBuf.get(writeBuffer);</span>
+<span class="nc" id="L101">						out.write(writeBuffer);</span>
+					}
+
+<span class="nc" id="L104">					pixelBuf.get(writeBuffer, 0, remainingBytes);</span>
+<span class="nc" id="L105">					out.write(writeBuffer, 0, remainingBytes);</span>
+<span class="nc" id="L106">				}</span>
+
+<span class="nc" id="L108">				pixelBuf.position(0);</span>
+<span class="nc" id="L109">				pixelBuf.limit(pixelBuf.capacity());</span>
+				// Gdx.app.log(&quot;PixmapIO&quot;, &quot;write (&quot; + file.name() + &quot;):&quot; + (System.nanoTime() - start) / 1000000000.0f + &quot;, &quot; +
+				// Thread.currentThread().getName());
+<span class="nc" id="L112">			} catch (Exception e) {</span>
+<span class="nc" id="L113">				throw new GdxRuntimeException(&quot;Couldn't write Pixmap to file '&quot; + file + &quot;'&quot;, e);</span>
+			} finally {
+<span class="nc" id="L115">				StreamUtils.closeQuietly(out);</span>
+<span class="nc" id="L116">			}</span>
+<span class="nc" id="L117">		}</span>
+
+		static public Pixmap read (FileHandle file) {
+<span class="nc" id="L120">			DataInputStream in = null;</span>
+
+			try {
+				// long start = System.nanoTime();
+<span class="nc" id="L124">				in = new DataInputStream(new InflaterInputStream(new BufferedInputStream(file.read())));</span>
+<span class="nc" id="L125">				int width = in.readInt();</span>
+<span class="nc" id="L126">				int height = in.readInt();</span>
+<span class="nc" id="L127">				Format format = Format.fromGdx2DPixmapFormat(in.readInt());</span>
+<span class="nc" id="L128">				Pixmap pixmap = new Pixmap(width, height, format);</span>
+
+<span class="nc" id="L130">				ByteBuffer pixelBuf = pixmap.getPixels();</span>
+<span class="nc" id="L131">				pixelBuf.position(0);</span>
+<span class="nc" id="L132">				pixelBuf.limit(pixelBuf.capacity());</span>
+
+<span class="nc" id="L134">				synchronized (readBuffer) {</span>
+<span class="nc" id="L135">					int readBytes = 0;</span>
+<span class="nc bnc" id="L136" title="All 2 branches missed.">					while ((readBytes = in.read(readBuffer)) &gt; 0) {</span>
+<span class="nc" id="L137">						pixelBuf.put(readBuffer, 0, readBytes);</span>
+					}
+<span class="nc" id="L139">				}</span>
+
+<span class="nc" id="L141">				pixelBuf.position(0);</span>
+<span class="nc" id="L142">				pixelBuf.limit(pixelBuf.capacity());</span>
+				// Gdx.app.log(&quot;PixmapIO&quot;, &quot;read:&quot; + (System.nanoTime() - start) / 1000000000.0f);
+<span class="nc" id="L144">				return pixmap;</span>
+<span class="nc" id="L145">			} catch (Exception e) {</span>
+<span class="nc" id="L146">				throw new GdxRuntimeException(&quot;Couldn't read Pixmap from file '&quot; + file + &quot;'&quot;, e);</span>
+			} finally {
+<span class="nc" id="L148">				StreamUtils.closeQuietly(in);</span>
+			}
+		}
+	}
+
+	/** PNG encoder with compression. An instance can be reused to encode multiple PNGs with minimal allocation.
+	 * 
+	 * &lt;pre&gt;
+	 * Copyright (c) 2007 Matthias Mann - www.matthiasmann.de
+	 * Copyright (c) 2014 Nathan Sweet
+	 * 
+	 * Permission is hereby granted, free of charge, to any person obtaining a copy
+	 * of this software and associated documentation files (the &quot;Software&quot;), to deal
+	 * in the Software without restriction, including without limitation the rights
+	 * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+	 * copies of the Software, and to permit persons to whom the Software is
+	 * furnished to do so, subject to the following conditions:
+	 * 
+	 * The above copyright notice and this permission notice shall be included in
+	 * all copies or substantial portions of the Software.
+	 * 
+	 * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+	 * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+	 * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+	 * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+	 * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+	 * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+	 * THE SOFTWARE.
+	 * &lt;/pre&gt;
+	 * @author Matthias Mann
+	 * @author Nathan Sweet */
+<span class="nc" id="L179">	static public class PNG implements Disposable {</span>
+<span class="nc" id="L180">		static private final byte[] SIGNATURE = {(byte)137, 80, 78, 71, 13, 10, 26, 10};</span>
+		static private final int IHDR = 0x49484452, IDAT = 0x49444154, IEND = 0x49454E44;
+		static private final byte COLOR_ARGB = 6;
+		static private final byte COMPRESSION_DEFLATE = 0;
+		static private final byte FILTER_NONE = 0;
+		static private final byte INTERLACE_NONE = 0;
+		static private final byte PAETH = 4;
+
+		private final ChunkBuffer buffer;
+		private final Deflater deflater;
+		private ByteArray lineOutBytes, curLineBytes, prevLineBytes;
+<span class="nc" id="L191">		private boolean flipY = true;</span>
+		private int lastLineLen;
+
+		public PNG () {
+<span class="nc" id="L195">			this(128 * 128);</span>
+<span class="nc" id="L196">		}</span>
+
+<span class="nc" id="L198">		public PNG (int initialBufferSize) {</span>
+<span class="nc" id="L199">			buffer = new ChunkBuffer(initialBufferSize);</span>
+<span class="nc" id="L200">			deflater = new Deflater();</span>
+<span class="nc" id="L201">		}</span>
+
+		/** If true, the resulting PNG is flipped vertically. Default is true. */
+		public void setFlipY (boolean flipY) {
+<span class="nc" id="L205">			this.flipY = flipY;</span>
+<span class="nc" id="L206">		}</span>
+
+		/** Sets the deflate compression level. Default is {@link Deflater#DEFAULT_COMPRESSION}. */
+		public void setCompression (int level) {
+<span class="nc" id="L210">			deflater.setLevel(level);</span>
+<span class="nc" id="L211">		}</span>
+
+		public void write (FileHandle file, Pixmap pixmap) throws IOException {
+<span class="nc" id="L214">			OutputStream output = file.write(false);</span>
+			try {
+<span class="nc" id="L216">				write(output, pixmap);</span>
+			} finally {
+<span class="nc" id="L218">				StreamUtils.closeQuietly(output);</span>
+<span class="nc" id="L219">			}</span>
+<span class="nc" id="L220">		}</span>
+
+		/** Writes the pixmap to the stream without closing the stream. */
+		public void write (OutputStream output, Pixmap pixmap) throws IOException {
+<span class="nc" id="L224">			DeflaterOutputStream deflaterOutput = new DeflaterOutputStream(buffer, deflater);</span>
+<span class="nc" id="L225">			DataOutputStream dataOutput = new DataOutputStream(output);</span>
+<span class="nc" id="L226">			dataOutput.write(SIGNATURE);</span>
+
+<span class="nc" id="L228">			buffer.writeInt(IHDR);</span>
+<span class="nc" id="L229">			buffer.writeInt(pixmap.getWidth());</span>
+<span class="nc" id="L230">			buffer.writeInt(pixmap.getHeight());</span>
+<span class="nc" id="L231">			buffer.writeByte(8); // 8 bits per component.</span>
+<span class="nc" id="L232">			buffer.writeByte(COLOR_ARGB);</span>
+<span class="nc" id="L233">			buffer.writeByte(COMPRESSION_DEFLATE);</span>
+<span class="nc" id="L234">			buffer.writeByte(FILTER_NONE);</span>
+<span class="nc" id="L235">			buffer.writeByte(INTERLACE_NONE);</span>
+<span class="nc" id="L236">			buffer.endChunk(dataOutput);</span>
+
+<span class="nc" id="L238">			buffer.writeInt(IDAT);</span>
+<span class="nc" id="L239">			deflater.reset();</span>
+
+<span class="nc" id="L241">			int lineLen = pixmap.getWidth() * 4;</span>
+			byte[] lineOut, curLine, prevLine;
+<span class="nc bnc" id="L243" title="All 2 branches missed.">			if (lineOutBytes == null) {</span>
+<span class="nc" id="L244">				lineOut = (lineOutBytes = new ByteArray(lineLen)).items;</span>
+<span class="nc" id="L245">				curLine = (curLineBytes = new ByteArray(lineLen)).items;</span>
+<span class="nc" id="L246">				prevLine = (prevLineBytes = new ByteArray(lineLen)).items;</span>
+			} else {
+<span class="nc" id="L248">				lineOut = lineOutBytes.ensureCapacity(lineLen);</span>
+<span class="nc" id="L249">				curLine = curLineBytes.ensureCapacity(lineLen);</span>
+<span class="nc" id="L250">				prevLine = prevLineBytes.ensureCapacity(lineLen);</span>
+<span class="nc bnc" id="L251" title="All 2 branches missed.">				for (int i = 0, n = lastLineLen; i &lt; n; i++)</span>
+<span class="nc" id="L252">					prevLine[i] = 0;</span>
+			}
+<span class="nc" id="L254">			lastLineLen = lineLen;</span>
+
+<span class="nc" id="L256">			ByteBuffer pixels = pixmap.getPixels();</span>
+<span class="nc" id="L257">			int oldPosition = pixels.position();</span>
+<span class="nc bnc" id="L258" title="All 2 branches missed.">			boolean rgba8888 = pixmap.getFormat() == Format.RGBA8888;</span>
+<span class="nc bnc" id="L259" title="All 2 branches missed.">			for (int y = 0, h = pixmap.getHeight(); y &lt; h; y++) {</span>
+<span class="nc bnc" id="L260" title="All 2 branches missed.">				int py = flipY ? (h - y - 1) : y;</span>
+<span class="nc bnc" id="L261" title="All 2 branches missed.">				if (rgba8888) {</span>
+<span class="nc" id="L262">					pixels.position(py * lineLen);</span>
+<span class="nc" id="L263">					pixels.get(curLine, 0, lineLen);</span>
+				} else {
+<span class="nc bnc" id="L265" title="All 2 branches missed.">					for (int px = 0, x = 0; px &lt; pixmap.getWidth(); px++) {</span>
+<span class="nc" id="L266">						int pixel = pixmap.getPixel(px, py);</span>
+<span class="nc" id="L267">						curLine[x++] = (byte)((pixel &gt;&gt; 24) &amp; 0xff);</span>
+<span class="nc" id="L268">						curLine[x++] = (byte)((pixel &gt;&gt; 16) &amp; 0xff);</span>
+<span class="nc" id="L269">						curLine[x++] = (byte)((pixel &gt;&gt; 8) &amp; 0xff);</span>
+<span class="nc" id="L270">						curLine[x++] = (byte)(pixel &amp; 0xff);</span>
+					}
+				}
+
+<span class="nc" id="L274">				lineOut[0] = (byte)(curLine[0] - prevLine[0]);</span>
+<span class="nc" id="L275">				lineOut[1] = (byte)(curLine[1] - prevLine[1]);</span>
+<span class="nc" id="L276">				lineOut[2] = (byte)(curLine[2] - prevLine[2]);</span>
+<span class="nc" id="L277">				lineOut[3] = (byte)(curLine[3] - prevLine[3]);</span>
+
+<span class="nc bnc" id="L279" title="All 2 branches missed.">				for (int x = 4; x &lt; lineLen; x++) {</span>
+<span class="nc" id="L280">					int a = curLine[x - 4] &amp; 0xff;</span>
+<span class="nc" id="L281">					int b = prevLine[x] &amp; 0xff;</span>
+<span class="nc" id="L282">					int c = prevLine[x - 4] &amp; 0xff;</span>
+<span class="nc" id="L283">					int p = a + b - c;</span>
+<span class="nc" id="L284">					int pa = p - a;</span>
+<span class="nc bnc" id="L285" title="All 2 branches missed.">					if (pa &lt; 0) pa = -pa;</span>
+<span class="nc" id="L286">					int pb = p - b;</span>
+<span class="nc bnc" id="L287" title="All 2 branches missed.">					if (pb &lt; 0) pb = -pb;</span>
+<span class="nc" id="L288">					int pc = p - c;</span>
+<span class="nc bnc" id="L289" title="All 2 branches missed.">					if (pc &lt; 0) pc = -pc;</span>
+<span class="nc bnc" id="L290" title="All 4 branches missed.">					if (pa &lt;= pb &amp;&amp; pa &lt;= pc)</span>
+<span class="nc" id="L291">						c = a;</span>
+<span class="nc bnc" id="L292" title="All 2 branches missed.">					else if (pb &lt;= pc) //</span>
+<span class="nc" id="L293">						c = b;</span>
+<span class="nc" id="L294">					lineOut[x] = (byte)(curLine[x] - c);</span>
+				}
+
+<span class="nc" id="L297">				deflaterOutput.write(PAETH);</span>
+<span class="nc" id="L298">				deflaterOutput.write(lineOut, 0, lineLen);</span>
+
+<span class="nc" id="L300">				byte[] temp = curLine;</span>
+<span class="nc" id="L301">				curLine = prevLine;</span>
+<span class="nc" id="L302">				prevLine = temp;</span>
+			}
+<span class="nc" id="L304">			pixels.position(oldPosition);</span>
+<span class="nc" id="L305">			deflaterOutput.finish();</span>
+<span class="nc" id="L306">			buffer.endChunk(dataOutput);</span>
+
+<span class="nc" id="L308">			buffer.writeInt(IEND);</span>
+<span class="nc" id="L309">			buffer.endChunk(dataOutput);</span>
+
+<span class="nc" id="L311">			output.flush();</span>
+<span class="nc" id="L312">		}</span>
+
+		/** Disposal will happen automatically in {@link #finalize()} but can be done explicitly if desired. */
+		public void dispose () {
+<span class="nc" id="L316">			deflater.end();</span>
+<span class="nc" id="L317">		}</span>
+
+		static class ChunkBuffer extends DataOutputStream {
+			final ByteArrayOutputStream buffer;
+			final CRC32 crc;
+
+			ChunkBuffer (int initialSize) {
+<span class="nc" id="L324">				this(new ByteArrayOutputStream(initialSize), new CRC32());</span>
+<span class="nc" id="L325">			}</span>
+
+			private ChunkBuffer (ByteArrayOutputStream buffer, CRC32 crc) {
+<span class="nc" id="L328">				super(new CheckedOutputStream(buffer, crc));</span>
+<span class="nc" id="L329">				this.buffer = buffer;</span>
+<span class="nc" id="L330">				this.crc = crc;</span>
+<span class="nc" id="L331">			}</span>
+
+			public void endChunk (DataOutputStream target) throws IOException {
+<span class="nc" id="L334">				flush();</span>
+<span class="nc" id="L335">				target.writeInt(buffer.size() - 4);</span>
+<span class="nc" id="L336">				buffer.writeTo(target);</span>
+<span class="nc" id="L337">				target.writeInt((int)crc.getValue());</span>
+<span class="nc" id="L338">				buffer.reset();</span>
+<span class="nc" id="L339">				crc.reset();</span>
+<span class="nc" id="L340">			}</span>
+		}
+	}
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.5.5.201112152213</span></div></body></html>

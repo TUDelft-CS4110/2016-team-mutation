@@ -1,0 +1,787 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>IdentityMap.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">libGDX Core</a> &gt; <a href="index.html" class="el_package">com.badlogic.gdx.utils</a> &gt; <span class="el_source">IdentityMap.java</span></div><h1>IdentityMap.java</h1><pre class="source lang-java linenums">/*******************************************************************************
+ * Copyright 2011 See AUTHORS file.
+ * 
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ ******************************************************************************/
+
+package com.badlogic.gdx.utils;
+
+import java.util.Iterator;
+import java.util.NoSuchElementException;
+
+import com.badlogic.gdx.math.MathUtils;
+
+/** An unordered map that uses identity comparison for keys. This implementation is a cuckoo hash map using 3 hashes, random
+ * walking, and a small stash for problematic keys. Null keys are not allowed. Null values are allowed. No allocation is done
+ * except when growing the table size. &lt;br&gt;
+ * &lt;br&gt;
+ * This map performs very fast get, containsKey, and remove (typically O(1), worst case O(log(n))). Put may be a bit slower,
+ * depending on hash collisions. Load factors greater than 0.91 greatly increase the chances the map will have to rehash to the
+ * next higher POT size.
+ * @author Nathan Sweet */
+public class IdentityMap&lt;K, V&gt; implements Iterable&lt;IdentityMap.Entry&lt;K, V&gt;&gt; {
+	private static final int PRIME1 = 0xbe1f14b1;
+	private static final int PRIME2 = 0xb4b82e39;
+	private static final int PRIME3 = 0xced1c241;
+
+	public int size;
+
+	K[] keyTable;
+	V[] valueTable;
+	int capacity, stashSize;
+
+	private float loadFactor;
+	private int hashShift, mask, threshold;
+	private int stashCapacity;
+	private int pushIterations;
+
+	private Entries entries1, entries2;
+	private Values values1, values2;
+	private Keys keys1, keys2;
+
+	/** Creates a new map with an initial capacity of 51 and a load factor of 0.8. */
+	public IdentityMap () {
+<span class="nc" id="L54">		this(51, 0.8f);</span>
+<span class="nc" id="L55">	}</span>
+
+	/** Creates a new map with a load factor of 0.8.
+	 * @param initialCapacity If not a power of two, it is increased to the next nearest power of two. */
+	public IdentityMap (int initialCapacity) {
+<span class="nc" id="L60">		this(initialCapacity, 0.8f);</span>
+<span class="nc" id="L61">	}</span>
+
+	/** Creates a new map with the specified initial capacity and load factor. This map will hold initialCapacity items before
+	 * growing the backing table.
+	 * @param initialCapacity If not a power of two, it is increased to the next nearest power of two. */
+<span class="nc" id="L66">	public IdentityMap (int initialCapacity, float loadFactor) {</span>
+<span class="nc bnc" id="L67" title="All 2 branches missed.">		if (initialCapacity &lt; 0) throw new IllegalArgumentException(&quot;initialCapacity must be &gt;= 0: &quot; + initialCapacity);</span>
+<span class="nc" id="L68">		initialCapacity = MathUtils.nextPowerOfTwo((int)Math.ceil(initialCapacity / loadFactor));</span>
+<span class="nc bnc" id="L69" title="All 2 branches missed.">		if (initialCapacity &gt; 1 &lt;&lt; 30) throw new IllegalArgumentException(&quot;initialCapacity is too large: &quot; + initialCapacity);</span>
+<span class="nc" id="L70">		capacity = initialCapacity;</span>
+
+<span class="nc bnc" id="L72" title="All 2 branches missed.">		if (loadFactor &lt;= 0) throw new IllegalArgumentException(&quot;loadFactor must be &gt; 0: &quot; + loadFactor);</span>
+<span class="nc" id="L73">		this.loadFactor = loadFactor;</span>
+
+<span class="nc" id="L75">		threshold = (int)(capacity * loadFactor);</span>
+<span class="nc" id="L76">		mask = capacity - 1;</span>
+<span class="nc" id="L77">		hashShift = 31 - Integer.numberOfTrailingZeros(capacity);</span>
+<span class="nc" id="L78">		stashCapacity = Math.max(3, (int)Math.ceil(Math.log(capacity)) * 2);</span>
+<span class="nc" id="L79">		pushIterations = Math.max(Math.min(capacity, 8), (int)Math.sqrt(capacity) / 8);</span>
+
+<span class="nc" id="L81">		keyTable = (K[])new Object[capacity + stashCapacity];</span>
+<span class="nc" id="L82">		valueTable = (V[])new Object[keyTable.length];</span>
+<span class="nc" id="L83">	}</span>
+
+	/** Creates a new map identical to the specified map. */
+	public IdentityMap (IdentityMap map) {
+<span class="nc" id="L87">		this(map.capacity, map.loadFactor);</span>
+<span class="nc" id="L88">		stashSize = map.stashSize;</span>
+<span class="nc" id="L89">		System.arraycopy(map.keyTable, 0, keyTable, 0, map.keyTable.length);</span>
+<span class="nc" id="L90">		System.arraycopy(map.valueTable, 0, valueTable, 0, map.valueTable.length);</span>
+<span class="nc" id="L91">		size = map.size;</span>
+<span class="nc" id="L92">	}</span>
+
+	public V put (K key, V value) {
+<span class="nc bnc" id="L95" title="All 2 branches missed.">		if (key == null) throw new IllegalArgumentException(&quot;key cannot be null.&quot;);</span>
+<span class="nc" id="L96">		K[] keyTable = this.keyTable;</span>
+
+		// Check for existing keys.
+<span class="nc" id="L99">		int hashCode = System.identityHashCode(key);</span>
+<span class="nc" id="L100">		int index1 = hashCode &amp; mask;</span>
+<span class="nc" id="L101">		K key1 = keyTable[index1];</span>
+<span class="nc bnc" id="L102" title="All 2 branches missed.">		if (key1 == key) {</span>
+<span class="nc" id="L103">			V oldValue = valueTable[index1];</span>
+<span class="nc" id="L104">			valueTable[index1] = value;</span>
+<span class="nc" id="L105">			return oldValue;</span>
+		}
+
+<span class="nc" id="L108">		int index2 = hash2(hashCode);</span>
+<span class="nc" id="L109">		K key2 = keyTable[index2];</span>
+<span class="nc bnc" id="L110" title="All 2 branches missed.">		if (key2 == key) {</span>
+<span class="nc" id="L111">			V oldValue = valueTable[index2];</span>
+<span class="nc" id="L112">			valueTable[index2] = value;</span>
+<span class="nc" id="L113">			return oldValue;</span>
+		}
+
+<span class="nc" id="L116">		int index3 = hash3(hashCode);</span>
+<span class="nc" id="L117">		K key3 = keyTable[index3];</span>
+<span class="nc bnc" id="L118" title="All 2 branches missed.">		if (key3 == key) {</span>
+<span class="nc" id="L119">			V oldValue = valueTable[index3];</span>
+<span class="nc" id="L120">			valueTable[index3] = value;</span>
+<span class="nc" id="L121">			return oldValue;</span>
+		}
+
+		// Update key in the stash.
+<span class="nc bnc" id="L125" title="All 2 branches missed.">		for (int i = capacity, n = i + stashSize; i &lt; n; i++) {</span>
+<span class="nc bnc" id="L126" title="All 2 branches missed.">			if (keyTable[i] == key) {</span>
+<span class="nc" id="L127">				V oldValue = valueTable[i];</span>
+<span class="nc" id="L128">				valueTable[i] = value;</span>
+<span class="nc" id="L129">				return oldValue;</span>
+			}
+		}
+
+		// Check for empty buckets.
+<span class="nc bnc" id="L134" title="All 2 branches missed.">		if (key1 == null) {</span>
+<span class="nc" id="L135">			keyTable[index1] = key;</span>
+<span class="nc" id="L136">			valueTable[index1] = value;</span>
+<span class="nc bnc" id="L137" title="All 2 branches missed.">			if (size++ &gt;= threshold) resize(capacity &lt;&lt; 1);</span>
+<span class="nc" id="L138">			return null;</span>
+		}
+
+<span class="nc bnc" id="L141" title="All 2 branches missed.">		if (key2 == null) {</span>
+<span class="nc" id="L142">			keyTable[index2] = key;</span>
+<span class="nc" id="L143">			valueTable[index2] = value;</span>
+<span class="nc bnc" id="L144" title="All 2 branches missed.">			if (size++ &gt;= threshold) resize(capacity &lt;&lt; 1);</span>
+<span class="nc" id="L145">			return null;</span>
+		}
+
+<span class="nc bnc" id="L148" title="All 2 branches missed.">		if (key3 == null) {</span>
+<span class="nc" id="L149">			keyTable[index3] = key;</span>
+<span class="nc" id="L150">			valueTable[index3] = value;</span>
+<span class="nc bnc" id="L151" title="All 2 branches missed.">			if (size++ &gt;= threshold) resize(capacity &lt;&lt; 1);</span>
+<span class="nc" id="L152">			return null;</span>
+		}
+
+<span class="nc" id="L155">		push(key, value, index1, key1, index2, key2, index3, key3);</span>
+<span class="nc" id="L156">		return null;</span>
+	}
+
+	/** Skips checks for existing keys. */
+	private void putResize (K key, V value) {
+		// Check for empty buckets.
+<span class="nc" id="L162">		int hashCode = System.identityHashCode(key);</span>
+<span class="nc" id="L163">		int index1 = hashCode &amp; mask;</span>
+<span class="nc" id="L164">		K key1 = keyTable[index1];</span>
+<span class="nc bnc" id="L165" title="All 2 branches missed.">		if (key1 == null) {</span>
+<span class="nc" id="L166">			keyTable[index1] = key;</span>
+<span class="nc" id="L167">			valueTable[index1] = value;</span>
+<span class="nc bnc" id="L168" title="All 2 branches missed.">			if (size++ &gt;= threshold) resize(capacity &lt;&lt; 1);</span>
+<span class="nc" id="L169">			return;</span>
+		}
+
+<span class="nc" id="L172">		int index2 = hash2(hashCode);</span>
+<span class="nc" id="L173">		K key2 = keyTable[index2];</span>
+<span class="nc bnc" id="L174" title="All 2 branches missed.">		if (key2 == null) {</span>
+<span class="nc" id="L175">			keyTable[index2] = key;</span>
+<span class="nc" id="L176">			valueTable[index2] = value;</span>
+<span class="nc bnc" id="L177" title="All 2 branches missed.">			if (size++ &gt;= threshold) resize(capacity &lt;&lt; 1);</span>
+<span class="nc" id="L178">			return;</span>
+		}
+
+<span class="nc" id="L181">		int index3 = hash3(hashCode);</span>
+<span class="nc" id="L182">		K key3 = keyTable[index3];</span>
+<span class="nc bnc" id="L183" title="All 2 branches missed.">		if (key3 == null) {</span>
+<span class="nc" id="L184">			keyTable[index3] = key;</span>
+<span class="nc" id="L185">			valueTable[index3] = value;</span>
+<span class="nc bnc" id="L186" title="All 2 branches missed.">			if (size++ &gt;= threshold) resize(capacity &lt;&lt; 1);</span>
+<span class="nc" id="L187">			return;</span>
+		}
+
+<span class="nc" id="L190">		push(key, value, index1, key1, index2, key2, index3, key3);</span>
+<span class="nc" id="L191">	}</span>
+
+	private void push (K insertKey, V insertValue, int index1, K key1, int index2, K key2, int index3, K key3) {
+<span class="nc" id="L194">		K[] keyTable = this.keyTable;</span>
+<span class="nc" id="L195">		V[] valueTable = this.valueTable;</span>
+<span class="nc" id="L196">		int mask = this.mask;</span>
+
+		// Push keys until an empty bucket is found.
+		K evictedKey;
+		V evictedValue;
+<span class="nc" id="L201">		int i = 0, pushIterations = this.pushIterations;</span>
+		do {
+			// Replace the key and value for one of the hashes.
+<span class="nc bnc" id="L204" title="All 3 branches missed.">			switch (MathUtils.random(2)) {</span>
+			case 0:
+<span class="nc" id="L206">				evictedKey = key1;</span>
+<span class="nc" id="L207">				evictedValue = valueTable[index1];</span>
+<span class="nc" id="L208">				keyTable[index1] = insertKey;</span>
+<span class="nc" id="L209">				valueTable[index1] = insertValue;</span>
+<span class="nc" id="L210">				break;</span>
+			case 1:
+<span class="nc" id="L212">				evictedKey = key2;</span>
+<span class="nc" id="L213">				evictedValue = valueTable[index2];</span>
+<span class="nc" id="L214">				keyTable[index2] = insertKey;</span>
+<span class="nc" id="L215">				valueTable[index2] = insertValue;</span>
+<span class="nc" id="L216">				break;</span>
+			default:
+<span class="nc" id="L218">				evictedKey = key3;</span>
+<span class="nc" id="L219">				evictedValue = valueTable[index3];</span>
+<span class="nc" id="L220">				keyTable[index3] = insertKey;</span>
+<span class="nc" id="L221">				valueTable[index3] = insertValue;</span>
+				break;
+			}
+
+			// If the evicted key hashes to an empty bucket, put it there and stop.
+<span class="nc" id="L226">			int hashCode = System.identityHashCode(evictedKey);</span>
+<span class="nc" id="L227">			index1 = hashCode &amp; mask;</span>
+<span class="nc" id="L228">			key1 = keyTable[index1];</span>
+<span class="nc bnc" id="L229" title="All 2 branches missed.">			if (key1 == null) {</span>
+<span class="nc" id="L230">				keyTable[index1] = evictedKey;</span>
+<span class="nc" id="L231">				valueTable[index1] = evictedValue;</span>
+<span class="nc bnc" id="L232" title="All 2 branches missed.">				if (size++ &gt;= threshold) resize(capacity &lt;&lt; 1);</span>
+<span class="nc" id="L233">				return;</span>
+			}
+
+<span class="nc" id="L236">			index2 = hash2(hashCode);</span>
+<span class="nc" id="L237">			key2 = keyTable[index2];</span>
+<span class="nc bnc" id="L238" title="All 2 branches missed.">			if (key2 == null) {</span>
+<span class="nc" id="L239">				keyTable[index2] = evictedKey;</span>
+<span class="nc" id="L240">				valueTable[index2] = evictedValue;</span>
+<span class="nc bnc" id="L241" title="All 2 branches missed.">				if (size++ &gt;= threshold) resize(capacity &lt;&lt; 1);</span>
+<span class="nc" id="L242">				return;</span>
+			}
+
+<span class="nc" id="L245">			index3 = hash3(hashCode);</span>
+<span class="nc" id="L246">			key3 = keyTable[index3];</span>
+<span class="nc bnc" id="L247" title="All 2 branches missed.">			if (key3 == null) {</span>
+<span class="nc" id="L248">				keyTable[index3] = evictedKey;</span>
+<span class="nc" id="L249">				valueTable[index3] = evictedValue;</span>
+<span class="nc bnc" id="L250" title="All 2 branches missed.">				if (size++ &gt;= threshold) resize(capacity &lt;&lt; 1);</span>
+<span class="nc" id="L251">				return;</span>
+			}
+
+<span class="nc bnc" id="L254" title="All 2 branches missed.">			if (++i == pushIterations) break;</span>
+
+<span class="nc" id="L256">			insertKey = evictedKey;</span>
+<span class="nc" id="L257">			insertValue = evictedValue;</span>
+<span class="nc" id="L258">		} while (true);</span>
+
+<span class="nc" id="L260">		putStash(evictedKey, evictedValue);</span>
+<span class="nc" id="L261">	}</span>
+
+	private void putStash (K key, V value) {
+<span class="nc bnc" id="L264" title="All 2 branches missed.">		if (stashSize == stashCapacity) {</span>
+			// Too many pushes occurred and the stash is full, increase the table size.
+<span class="nc" id="L266">			resize(capacity &lt;&lt; 1);</span>
+<span class="nc" id="L267">			put(key, value);</span>
+<span class="nc" id="L268">			return;</span>
+		}
+		// Store key in the stash.
+<span class="nc" id="L271">		int index = capacity + stashSize;</span>
+<span class="nc" id="L272">		keyTable[index] = key;</span>
+<span class="nc" id="L273">		valueTable[index] = value;</span>
+<span class="nc" id="L274">		stashSize++;</span>
+<span class="nc" id="L275">		size++;</span>
+<span class="nc" id="L276">	}</span>
+
+	public V get (K key) {
+<span class="nc" id="L279">		int hashCode = System.identityHashCode(key);</span>
+<span class="nc" id="L280">		int index = hashCode &amp; mask;</span>
+<span class="nc bnc" id="L281" title="All 2 branches missed.">		if (key != keyTable[index]) {</span>
+<span class="nc" id="L282">			index = hash2(hashCode);</span>
+<span class="nc bnc" id="L283" title="All 2 branches missed.">			if (key != keyTable[index]) {</span>
+<span class="nc" id="L284">				index = hash3(hashCode);</span>
+<span class="nc bnc" id="L285" title="All 2 branches missed.">				if (key != keyTable[index]) return getStash(key, null);</span>
+			}
+		}
+<span class="nc" id="L288">		return valueTable[index];</span>
+	}
+
+	public V get (K key, V defaultValue) {
+<span class="nc" id="L292">		int hashCode = System.identityHashCode(key);</span>
+<span class="nc" id="L293">		int index = hashCode &amp; mask;</span>
+<span class="nc bnc" id="L294" title="All 2 branches missed.">		if (key != keyTable[index]) {</span>
+<span class="nc" id="L295">			index = hash2(hashCode);</span>
+<span class="nc bnc" id="L296" title="All 2 branches missed.">			if (key != keyTable[index]) {</span>
+<span class="nc" id="L297">				index = hash3(hashCode);</span>
+<span class="nc bnc" id="L298" title="All 2 branches missed.">				if (key != keyTable[index]) return getStash(key, defaultValue);</span>
+			}
+		}
+<span class="nc" id="L301">		return valueTable[index];</span>
+	}
+
+	private V getStash (K key, V defaultValue) {
+<span class="nc" id="L305">		K[] keyTable = this.keyTable;</span>
+<span class="nc bnc" id="L306" title="All 2 branches missed.">		for (int i = capacity, n = i + stashSize; i &lt; n; i++)</span>
+<span class="nc bnc" id="L307" title="All 2 branches missed.">			if (keyTable[i] == key) return valueTable[i];</span>
+<span class="nc" id="L308">		return defaultValue;</span>
+	}
+
+	public V remove (K key) {
+<span class="nc" id="L312">		int hashCode = System.identityHashCode(key);</span>
+<span class="nc" id="L313">		int index = hashCode &amp; mask;</span>
+<span class="nc bnc" id="L314" title="All 2 branches missed.">		if (keyTable[index] == key) {</span>
+<span class="nc" id="L315">			keyTable[index] = null;</span>
+<span class="nc" id="L316">			V oldValue = valueTable[index];</span>
+<span class="nc" id="L317">			valueTable[index] = null;</span>
+<span class="nc" id="L318">			size--;</span>
+<span class="nc" id="L319">			return oldValue;</span>
+		}
+
+<span class="nc" id="L322">		index = hash2(hashCode);</span>
+<span class="nc bnc" id="L323" title="All 2 branches missed.">		if (keyTable[index] == key) {</span>
+<span class="nc" id="L324">			keyTable[index] = null;</span>
+<span class="nc" id="L325">			V oldValue = valueTable[index];</span>
+<span class="nc" id="L326">			valueTable[index] = null;</span>
+<span class="nc" id="L327">			size--;</span>
+<span class="nc" id="L328">			return oldValue;</span>
+		}
+
+<span class="nc" id="L331">		index = hash3(hashCode);</span>
+<span class="nc bnc" id="L332" title="All 2 branches missed.">		if (keyTable[index] == key) {</span>
+<span class="nc" id="L333">			keyTable[index] = null;</span>
+<span class="nc" id="L334">			V oldValue = valueTable[index];</span>
+<span class="nc" id="L335">			valueTable[index] = null;</span>
+<span class="nc" id="L336">			size--;</span>
+<span class="nc" id="L337">			return oldValue;</span>
+		}
+
+<span class="nc" id="L340">		return removeStash(key);</span>
+	}
+
+	V removeStash (K key) {
+<span class="nc" id="L344">		K[] keyTable = this.keyTable;</span>
+<span class="nc bnc" id="L345" title="All 2 branches missed.">		for (int i = capacity, n = i + stashSize; i &lt; n; i++) {</span>
+<span class="nc bnc" id="L346" title="All 2 branches missed.">			if (keyTable[i] == key) {</span>
+<span class="nc" id="L347">				V oldValue = valueTable[i];</span>
+<span class="nc" id="L348">				removeStashIndex(i);</span>
+<span class="nc" id="L349">				size--;</span>
+<span class="nc" id="L350">				return oldValue;</span>
+			}
+		}
+<span class="nc" id="L353">		return null;</span>
+	}
+
+	void removeStashIndex (int index) {
+		// If the removed location was not last, move the last tuple to the removed location.
+<span class="nc" id="L358">		stashSize--;</span>
+<span class="nc" id="L359">		int lastIndex = capacity + stashSize;</span>
+<span class="nc bnc" id="L360" title="All 2 branches missed.">		if (index &lt; lastIndex) {</span>
+<span class="nc" id="L361">			keyTable[index] = keyTable[lastIndex];</span>
+<span class="nc" id="L362">			valueTable[index] = valueTable[lastIndex];</span>
+<span class="nc" id="L363">			valueTable[lastIndex] = null;</span>
+		} else
+<span class="nc" id="L365">			valueTable[index] = null;</span>
+<span class="nc" id="L366">	}</span>
+
+	/** Reduces the size of the backing arrays to be the specified capacity or less. If the capacity is already less, nothing is
+	 * done. If the map contains more items than the specified capacity, the next highest power of two capacity is used instead. */
+	public void shrink (int maximumCapacity) {
+<span class="nc bnc" id="L371" title="All 2 branches missed.">		if (maximumCapacity &lt; 0) throw new IllegalArgumentException(&quot;maximumCapacity must be &gt;= 0: &quot; + maximumCapacity);</span>
+<span class="nc bnc" id="L372" title="All 2 branches missed.">		if (size &gt; maximumCapacity) maximumCapacity = size;</span>
+<span class="nc bnc" id="L373" title="All 2 branches missed.">		if (capacity &lt;= maximumCapacity) return;</span>
+<span class="nc" id="L374">		maximumCapacity = MathUtils.nextPowerOfTwo(maximumCapacity);</span>
+<span class="nc" id="L375">		resize(maximumCapacity);</span>
+<span class="nc" id="L376">	}</span>
+
+	/** Clears the map and reduces the size of the backing arrays to be the specified capacity if they are larger. */
+	public void clear (int maximumCapacity) {
+<span class="nc bnc" id="L380" title="All 2 branches missed.">		if (capacity &lt;= maximumCapacity) {</span>
+<span class="nc" id="L381">			clear();</span>
+<span class="nc" id="L382">			return;</span>
+		}
+<span class="nc" id="L384">		size = 0;</span>
+<span class="nc" id="L385">		resize(maximumCapacity);</span>
+<span class="nc" id="L386">	}</span>
+
+	public void clear () {
+<span class="nc bnc" id="L389" title="All 2 branches missed.">		if (size == 0) return;</span>
+<span class="nc" id="L390">		K[] keyTable = this.keyTable;</span>
+<span class="nc" id="L391">		V[] valueTable = this.valueTable;</span>
+<span class="nc bnc" id="L392" title="All 2 branches missed.">		for (int i = capacity + stashSize; i-- &gt; 0;) {</span>
+<span class="nc" id="L393">			keyTable[i] = null;</span>
+<span class="nc" id="L394">			valueTable[i] = null;</span>
+		}
+<span class="nc" id="L396">		size = 0;</span>
+<span class="nc" id="L397">		stashSize = 0;</span>
+<span class="nc" id="L398">	}</span>
+
+	/** Returns true if the specified value is in the map. Note this traverses the entire map and compares every value, which may be
+	 * an expensive operation.
+	 * @param identity If true, uses == to compare the specified value with values in the map. If false, uses
+	 *           {@link #equals(Object)}. */
+	public boolean containsValue (Object value, boolean identity) {
+<span class="nc" id="L405">		V[] valueTable = this.valueTable;</span>
+<span class="nc bnc" id="L406" title="All 2 branches missed.">		if (value == null) {</span>
+<span class="nc" id="L407">			K[] keyTable = this.keyTable;</span>
+<span class="nc bnc" id="L408" title="All 2 branches missed.">			for (int i = capacity + stashSize; i-- &gt; 0;)</span>
+<span class="nc bnc" id="L409" title="All 4 branches missed.">				if (keyTable[i] != null &amp;&amp; valueTable[i] == null) return true;</span>
+<span class="nc bnc" id="L410" title="All 2 branches missed.">		} else if (identity) {</span>
+<span class="nc bnc" id="L411" title="All 2 branches missed.">			for (int i = capacity + stashSize; i-- &gt; 0;)</span>
+<span class="nc bnc" id="L412" title="All 2 branches missed.">				if (valueTable[i] == value) return true;</span>
+		} else {
+<span class="nc bnc" id="L414" title="All 2 branches missed.">			for (int i = capacity + stashSize; i-- &gt; 0;)</span>
+<span class="nc bnc" id="L415" title="All 2 branches missed.">				if (value.equals(valueTable[i])) return true;</span>
+		}
+<span class="nc" id="L417">		return false;</span>
+	}
+
+	public boolean containsKey (K key) {
+<span class="nc" id="L421">		int hashCode = System.identityHashCode(key);</span>
+<span class="nc" id="L422">		int index = hashCode &amp; mask;</span>
+<span class="nc bnc" id="L423" title="All 2 branches missed.">		if (key != keyTable[index]) {</span>
+<span class="nc" id="L424">			index = hash2(hashCode);</span>
+<span class="nc bnc" id="L425" title="All 2 branches missed.">			if (key != keyTable[index]) {</span>
+<span class="nc" id="L426">				index = hash3(hashCode);</span>
+<span class="nc bnc" id="L427" title="All 2 branches missed.">				if (key != keyTable[index]) return containsKeyStash(key);</span>
+			}
+		}
+<span class="nc" id="L430">		return true;</span>
+	}
+
+	private boolean containsKeyStash (K key) {
+<span class="nc" id="L434">		K[] keyTable = this.keyTable;</span>
+<span class="nc bnc" id="L435" title="All 2 branches missed.">		for (int i = capacity, n = i + stashSize; i &lt; n; i++)</span>
+<span class="nc bnc" id="L436" title="All 2 branches missed.">			if (keyTable[i] == key) return true;</span>
+<span class="nc" id="L437">		return false;</span>
+	}
+
+	/** Returns the key for the specified value, or null if it is not in the map. Note this traverses the entire map and compares
+	 * every value, which may be an expensive operation.
+	 * @param identity If true, uses == to compare the specified value with values in the map. If false, uses
+	 *           {@link #equals(Object)}. */
+	public K findKey (Object value, boolean identity) {
+<span class="nc" id="L445">		V[] valueTable = this.valueTable;</span>
+<span class="nc bnc" id="L446" title="All 2 branches missed.">		if (value == null) {</span>
+<span class="nc" id="L447">			K[] keyTable = this.keyTable;</span>
+<span class="nc bnc" id="L448" title="All 2 branches missed.">			for (int i = capacity + stashSize; i-- &gt; 0;)</span>
+<span class="nc bnc" id="L449" title="All 4 branches missed.">				if (keyTable[i] != null &amp;&amp; valueTable[i] == null) return keyTable[i];</span>
+<span class="nc bnc" id="L450" title="All 2 branches missed.">		} else if (identity) {</span>
+<span class="nc bnc" id="L451" title="All 2 branches missed.">			for (int i = capacity + stashSize; i-- &gt; 0;)</span>
+<span class="nc bnc" id="L452" title="All 2 branches missed.">				if (valueTable[i] == value) return keyTable[i];</span>
+		} else {
+<span class="nc bnc" id="L454" title="All 2 branches missed.">			for (int i = capacity + stashSize; i-- &gt; 0;)</span>
+<span class="nc bnc" id="L455" title="All 2 branches missed.">				if (value.equals(valueTable[i])) return keyTable[i];</span>
+		}
+<span class="nc" id="L457">		return null;</span>
+	}
+
+	/** Increases the size of the backing array to accommodate the specified number of additional items. Useful before adding many
+	 * items to avoid multiple backing array resizes. */
+	public void ensureCapacity (int additionalCapacity) {
+<span class="nc" id="L463">		int sizeNeeded = size + additionalCapacity;</span>
+<span class="nc bnc" id="L464" title="All 2 branches missed.">		if (sizeNeeded &gt;= threshold) resize(MathUtils.nextPowerOfTwo((int)Math.ceil(sizeNeeded / loadFactor)));</span>
+<span class="nc" id="L465">	}</span>
+
+	private void resize (int newSize) {
+<span class="nc" id="L468">		int oldEndIndex = capacity + stashSize;</span>
+
+<span class="nc" id="L470">		capacity = newSize;</span>
+<span class="nc" id="L471">		threshold = (int)(newSize * loadFactor);</span>
+<span class="nc" id="L472">		mask = newSize - 1;</span>
+<span class="nc" id="L473">		hashShift = 31 - Integer.numberOfTrailingZeros(newSize);</span>
+<span class="nc" id="L474">		stashCapacity = Math.max(3, (int)Math.ceil(Math.log(newSize)) * 2);</span>
+<span class="nc" id="L475">		pushIterations = Math.max(Math.min(newSize, 8), (int)Math.sqrt(newSize) / 8);</span>
+
+<span class="nc" id="L477">		K[] oldKeyTable = keyTable;</span>
+<span class="nc" id="L478">		V[] oldValueTable = valueTable;</span>
+
+<span class="nc" id="L480">		keyTable = (K[])new Object[newSize + stashCapacity];</span>
+<span class="nc" id="L481">		valueTable = (V[])new Object[newSize + stashCapacity];</span>
+
+<span class="nc" id="L483">		int oldSize = size;</span>
+<span class="nc" id="L484">		size = 0;</span>
+<span class="nc" id="L485">		stashSize = 0;</span>
+<span class="nc bnc" id="L486" title="All 2 branches missed.">		if (oldSize &gt; 0) {</span>
+<span class="nc bnc" id="L487" title="All 2 branches missed.">			for (int i = 0; i &lt; oldEndIndex; i++) {</span>
+<span class="nc" id="L488">				K key = oldKeyTable[i];</span>
+<span class="nc bnc" id="L489" title="All 2 branches missed.">				if (key != null) putResize(key, oldValueTable[i]);</span>
+			}
+		}
+<span class="nc" id="L492">	}</span>
+
+	private int hash2 (int h) {
+<span class="nc" id="L495">		h *= PRIME2;</span>
+<span class="nc" id="L496">		return (h ^ h &gt;&gt;&gt; hashShift) &amp; mask;</span>
+	}
+
+	private int hash3 (int h) {
+<span class="nc" id="L500">		h *= PRIME3;</span>
+<span class="nc" id="L501">		return (h ^ h &gt;&gt;&gt; hashShift) &amp; mask;</span>
+	}
+
+	public int hashCode () {
+<span class="nc" id="L505">		int h = 0;</span>
+<span class="nc" id="L506">		K[] keyTable = this.keyTable;</span>
+<span class="nc" id="L507">		V[] valueTable = this.valueTable;</span>
+<span class="nc bnc" id="L508" title="All 2 branches missed.">		for (int i = 0, n = capacity + stashSize; i &lt; n; i++) {</span>
+<span class="nc" id="L509">			K key = keyTable[i];</span>
+<span class="nc bnc" id="L510" title="All 2 branches missed.">			if (key != null) {</span>
+<span class="nc" id="L511">				h += key.hashCode() * 31;</span>
+
+<span class="nc" id="L513">				V value = valueTable[i];</span>
+<span class="nc bnc" id="L514" title="All 2 branches missed.">				if (value != null) {</span>
+<span class="nc" id="L515">					h += value.hashCode();</span>
+				}
+			}
+		}
+<span class="nc" id="L519">		return h;</span>
+	}
+
+	public boolean equals (Object obj) {
+<span class="nc bnc" id="L523" title="All 2 branches missed.">		if (obj == this) return true;</span>
+<span class="nc bnc" id="L524" title="All 2 branches missed.">		if (!(obj instanceof IdentityMap)) return false;</span>
+<span class="nc" id="L525">		IdentityMap&lt;K, V&gt; other = (IdentityMap) obj;</span>
+<span class="nc bnc" id="L526" title="All 2 branches missed.">		if (other.size != size) return false;</span>
+<span class="nc" id="L527">		K[] keyTable = this.keyTable;</span>
+<span class="nc" id="L528">		V[] valueTable = this.valueTable;</span>
+<span class="nc bnc" id="L529" title="All 2 branches missed.">		for (int i = 0, n = capacity + stashSize; i &lt; n; i++) {</span>
+<span class="nc" id="L530">			K key = keyTable[i];</span>
+<span class="nc bnc" id="L531" title="All 2 branches missed.">			if (key != null) {</span>
+<span class="nc" id="L532">				 V value = valueTable[i];</span>
+<span class="nc bnc" id="L533" title="All 2 branches missed.">				 if (value == null) {</span>
+<span class="nc bnc" id="L534" title="All 4 branches missed.">					 if (!other.containsKey(key) || other.get(key) != null) {</span>
+<span class="nc" id="L535">						 return false;</span>
+					 }
+				 } else {
+<span class="nc bnc" id="L538" title="All 2 branches missed.">					if (!value.equals(other.get(key))) {</span>
+<span class="nc" id="L539">						return false;</span>
+					}
+				}
+			}
+		}
+<span class="nc" id="L544">		return true;</span>
+	}
+
+	public String toString () {
+<span class="nc bnc" id="L548" title="All 2 branches missed.">		if (size == 0) return &quot;[]&quot;;</span>
+<span class="nc" id="L549">		StringBuilder buffer = new StringBuilder(32);</span>
+<span class="nc" id="L550">		buffer.append('[');</span>
+<span class="nc" id="L551">		K[] keyTable = this.keyTable;</span>
+<span class="nc" id="L552">		V[] valueTable = this.valueTable;</span>
+<span class="nc" id="L553">		int i = keyTable.length;</span>
+<span class="nc bnc" id="L554" title="All 2 branches missed.">		while (i-- &gt; 0) {</span>
+<span class="nc" id="L555">			K key = keyTable[i];</span>
+<span class="nc bnc" id="L556" title="All 2 branches missed.">			if (key == null) continue;</span>
+<span class="nc" id="L557">			buffer.append(key);</span>
+<span class="nc" id="L558">			buffer.append('=');</span>
+<span class="nc" id="L559">			buffer.append(valueTable[i]);</span>
+<span class="nc" id="L560">			break;</span>
+		}
+<span class="nc bnc" id="L562" title="All 2 branches missed.">		while (i-- &gt; 0) {</span>
+<span class="nc" id="L563">			K key = keyTable[i];</span>
+<span class="nc bnc" id="L564" title="All 2 branches missed.">			if (key == null) continue;</span>
+<span class="nc" id="L565">			buffer.append(&quot;, &quot;);</span>
+<span class="nc" id="L566">			buffer.append(key);</span>
+<span class="nc" id="L567">			buffer.append('=');</span>
+<span class="nc" id="L568">			buffer.append(valueTable[i]);</span>
+<span class="nc" id="L569">		}</span>
+<span class="nc" id="L570">		buffer.append(']');</span>
+<span class="nc" id="L571">		return buffer.toString();</span>
+	}
+
+	public Iterator&lt;Entry&lt;K, V&gt;&gt; iterator () {
+<span class="nc" id="L575">		return entries();</span>
+	}
+
+	/** Returns an iterator for the entries in the map. Remove is supported. Note that the same iterator instance is returned each
+	 * time this method is called. Use the {@link Entries} constructor for nested or multithreaded iteration. */
+	public Entries&lt;K, V&gt; entries () {
+<span class="nc bnc" id="L581" title="All 2 branches missed.">		if (entries1 == null) {</span>
+<span class="nc" id="L582">			entries1 = new Entries(this);</span>
+<span class="nc" id="L583">			entries2 = new Entries(this);</span>
+		}
+<span class="nc bnc" id="L585" title="All 2 branches missed.">		if (!entries1.valid) {</span>
+<span class="nc" id="L586">			entries1.reset();</span>
+<span class="nc" id="L587">			entries1.valid = true;</span>
+<span class="nc" id="L588">			entries2.valid = false;</span>
+<span class="nc" id="L589">			return entries1;</span>
+		}
+<span class="nc" id="L591">		entries2.reset();</span>
+<span class="nc" id="L592">		entries2.valid = true;</span>
+<span class="nc" id="L593">		entries1.valid = false;</span>
+<span class="nc" id="L594">		return entries2;</span>
+	}
+
+	/** Returns an iterator for the values in the map. Remove is supported. Note that the same iterator instance is returned each
+	 * time this method is called. Use the {@link Entries} constructor for nested or multithreaded iteration. */
+	public Values&lt;V&gt; values () {
+<span class="nc bnc" id="L600" title="All 2 branches missed.">		if (values1 == null) {</span>
+<span class="nc" id="L601">			values1 = new Values(this);</span>
+<span class="nc" id="L602">			values2 = new Values(this);</span>
+		}
+<span class="nc bnc" id="L604" title="All 2 branches missed.">		if (!values1.valid) {</span>
+<span class="nc" id="L605">			values1.reset();</span>
+<span class="nc" id="L606">			values1.valid = true;</span>
+<span class="nc" id="L607">			values2.valid = false;</span>
+<span class="nc" id="L608">			return values1;</span>
+		}
+<span class="nc" id="L610">		values2.reset();</span>
+<span class="nc" id="L611">		values2.valid = true;</span>
+<span class="nc" id="L612">		values1.valid = false;</span>
+<span class="nc" id="L613">		return values2;</span>
+	}
+
+	/** Returns an iterator for the keys in the map. Remove is supported. Note that the same iterator instance is returned each time
+	 * this method is called. Use the {@link Entries} constructor for nested or multithreaded iteration. */
+	public Keys&lt;K&gt; keys () {
+<span class="nc bnc" id="L619" title="All 2 branches missed.">		if (keys1 == null) {</span>
+<span class="nc" id="L620">			keys1 = new Keys(this);</span>
+<span class="nc" id="L621">			keys2 = new Keys(this);</span>
+		}
+<span class="nc bnc" id="L623" title="All 2 branches missed.">		if (!keys1.valid) {</span>
+<span class="nc" id="L624">			keys1.reset();</span>
+<span class="nc" id="L625">			keys1.valid = true;</span>
+<span class="nc" id="L626">			keys2.valid = false;</span>
+<span class="nc" id="L627">			return keys1;</span>
+		}
+<span class="nc" id="L629">		keys2.reset();</span>
+<span class="nc" id="L630">		keys2.valid = true;</span>
+<span class="nc" id="L631">		keys1.valid = false;</span>
+<span class="nc" id="L632">		return keys2;</span>
+	}
+
+<span class="nc" id="L635">	static public class Entry&lt;K, V&gt; {</span>
+		public K key;
+		public V value;
+
+		public String toString () {
+<span class="nc" id="L640">			return key + &quot;=&quot; + value;</span>
+		}
+	}
+
+	static private abstract class MapIterator&lt;K, V, I&gt; implements Iterable&lt;I&gt;, Iterator&lt;I&gt; {
+		public boolean hasNext;
+
+		final IdentityMap&lt;K, V&gt; map;
+		int nextIndex, currentIndex;
+<span class="nc" id="L649">		boolean valid = true;</span>
+
+<span class="nc" id="L651">		public MapIterator (IdentityMap&lt;K, V&gt; map) {</span>
+<span class="nc" id="L652">			this.map = map;</span>
+<span class="nc" id="L653">			reset();</span>
+<span class="nc" id="L654">		}</span>
+
+		public void reset () {
+<span class="nc" id="L657">			currentIndex = -1;</span>
+<span class="nc" id="L658">			nextIndex = -1;</span>
+<span class="nc" id="L659">			findNextIndex();</span>
+<span class="nc" id="L660">		}</span>
+
+		void findNextIndex () {
+<span class="nc" id="L663">			hasNext = false;</span>
+<span class="nc" id="L664">			K[] keyTable = map.keyTable;</span>
+<span class="nc bnc" id="L665" title="All 2 branches missed.">			for (int n = map.capacity + map.stashSize; ++nextIndex &lt; n;) {</span>
+<span class="nc bnc" id="L666" title="All 2 branches missed.">				if (keyTable[nextIndex] != null) {</span>
+<span class="nc" id="L667">					hasNext = true;</span>
+<span class="nc" id="L668">					break;</span>
+				}
+			}
+<span class="nc" id="L671">		}</span>
+
+		public void remove () {
+<span class="nc bnc" id="L674" title="All 2 branches missed.">			if (currentIndex &lt; 0) throw new IllegalStateException(&quot;next must be called before remove.&quot;);</span>
+<span class="nc bnc" id="L675" title="All 2 branches missed.">			if (currentIndex &gt;= map.capacity) {</span>
+<span class="nc" id="L676">				map.removeStashIndex(currentIndex);</span>
+<span class="nc" id="L677">				nextIndex = currentIndex - 1;</span>
+<span class="nc" id="L678">				findNextIndex();</span>
+			} else {
+<span class="nc" id="L680">				map.keyTable[currentIndex] = null;</span>
+<span class="nc" id="L681">				map.valueTable[currentIndex] = null;</span>
+			}
+<span class="nc" id="L683">			currentIndex = -1;</span>
+<span class="nc" id="L684">			map.size--;</span>
+<span class="nc" id="L685">		}</span>
+	}
+
+	static public class Entries&lt;K, V&gt; extends MapIterator&lt;K, V, Entry&lt;K, V&gt;&gt; {
+<span class="nc" id="L689">		private Entry&lt;K, V&gt; entry = new Entry();</span>
+
+		public Entries (IdentityMap&lt;K, V&gt; map) {
+<span class="nc" id="L692">			super(map);</span>
+<span class="nc" id="L693">		}</span>
+
+		/** Note the same entry instance is returned each time this method is called. */
+		public Entry&lt;K, V&gt; next () {
+<span class="nc bnc" id="L697" title="All 2 branches missed.">			if (!hasNext) throw new NoSuchElementException();</span>
+<span class="nc bnc" id="L698" title="All 2 branches missed.">			if (!valid) throw new GdxRuntimeException(&quot;#iterator() cannot be used nested.&quot;);</span>
+<span class="nc" id="L699">			K[] keyTable = map.keyTable;</span>
+<span class="nc" id="L700">			entry.key = keyTable[nextIndex];</span>
+<span class="nc" id="L701">			entry.value = map.valueTable[nextIndex];</span>
+<span class="nc" id="L702">			currentIndex = nextIndex;</span>
+<span class="nc" id="L703">			findNextIndex();</span>
+<span class="nc" id="L704">			return entry;</span>
+		}
+
+		public boolean hasNext () {
+<span class="nc bnc" id="L708" title="All 2 branches missed.">			if (!valid) throw new GdxRuntimeException(&quot;#iterator() cannot be used nested.&quot;);</span>
+<span class="nc" id="L709">			return hasNext;</span>
+		}
+
+		public Iterator&lt;Entry&lt;K, V&gt;&gt; iterator () {
+<span class="nc" id="L713">			return this;</span>
+		}
+	}
+
+	static public class Values&lt;V&gt; extends MapIterator&lt;Object, V, V&gt; {
+		public Values (IdentityMap&lt;?, V&gt; map) {
+<span class="nc" id="L719">			super((IdentityMap&lt;Object, V&gt;)map);</span>
+<span class="nc" id="L720">		}</span>
+
+		public boolean hasNext () {
+<span class="nc bnc" id="L723" title="All 2 branches missed.">			if (!valid) throw new GdxRuntimeException(&quot;#iterator() cannot be used nested.&quot;);</span>
+<span class="nc" id="L724">			return hasNext;</span>
+		}
+
+		public V next () {
+<span class="nc bnc" id="L728" title="All 2 branches missed.">			if (!hasNext) throw new NoSuchElementException();</span>
+<span class="nc bnc" id="L729" title="All 2 branches missed.">			if (!valid) throw new GdxRuntimeException(&quot;#iterator() cannot be used nested.&quot;);</span>
+<span class="nc" id="L730">			V value = map.valueTable[nextIndex];</span>
+<span class="nc" id="L731">			currentIndex = nextIndex;</span>
+<span class="nc" id="L732">			findNextIndex();</span>
+<span class="nc" id="L733">			return value;</span>
+		}
+
+		public Iterator&lt;V&gt; iterator () {
+<span class="nc" id="L737">			return this;</span>
+		}
+
+		/** Returns a new array containing the remaining values. */
+		public Array&lt;V&gt; toArray () {
+<span class="nc" id="L742">			Array array = new Array(true, map.size);</span>
+<span class="nc bnc" id="L743" title="All 2 branches missed.">			while (hasNext)</span>
+<span class="nc" id="L744">				array.add(next());</span>
+<span class="nc" id="L745">			return array;</span>
+		}
+
+		/** Adds the remaining values to the specified array. */
+		public void toArray (Array&lt;V&gt; array) {
+<span class="nc bnc" id="L750" title="All 2 branches missed.">			while (hasNext)</span>
+<span class="nc" id="L751">				array.add(next());</span>
+<span class="nc" id="L752">		}</span>
+	}
+
+	static public class Keys&lt;K&gt; extends MapIterator&lt;K, Object, K&gt; {
+		public Keys (IdentityMap&lt;K, ?&gt; map) {
+<span class="nc" id="L757">			super((IdentityMap&lt;K, Object&gt;)map);</span>
+<span class="nc" id="L758">		}</span>
+
+		public boolean hasNext () {
+<span class="nc bnc" id="L761" title="All 2 branches missed.">			if (!valid) throw new GdxRuntimeException(&quot;#iterator() cannot be used nested.&quot;);</span>
+<span class="nc" id="L762">			return hasNext;</span>
+		}
+
+		public K next () {
+<span class="nc bnc" id="L766" title="All 2 branches missed.">			if (!hasNext) throw new NoSuchElementException();</span>
+<span class="nc bnc" id="L767" title="All 2 branches missed.">			if (!valid) throw new GdxRuntimeException(&quot;#iterator() cannot be used nested.&quot;);</span>
+<span class="nc" id="L768">			K key = map.keyTable[nextIndex];</span>
+<span class="nc" id="L769">			currentIndex = nextIndex;</span>
+<span class="nc" id="L770">			findNextIndex();</span>
+<span class="nc" id="L771">			return key;</span>
+		}
+
+		public Iterator&lt;K&gt; iterator () {
+<span class="nc" id="L775">			return this;</span>
+		}
+
+		/** Returns a new array containing the remaining keys. */
+		public Array&lt;K&gt; toArray () {
+<span class="nc" id="L780">			Array array = new Array(true, map.size);</span>
+<span class="nc bnc" id="L781" title="All 2 branches missed.">			while (hasNext)</span>
+<span class="nc" id="L782">				array.add(next());</span>
+<span class="nc" id="L783">			return array;</span>
+		}
+	}
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.5.5.201112152213</span></div></body></html>

@@ -1,0 +1,218 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>CameraGroupStrategy.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">libGDX Core</a> &gt; <a href="index.html" class="el_package">com.badlogic.gdx.graphics.g3d.decals</a> &gt; <span class="el_source">CameraGroupStrategy.java</span></div><h1>CameraGroupStrategy.java</h1><pre class="source lang-java linenums">/*******************************************************************************
+ * Copyright 2011 See AUTHORS file.
+ * 
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ ******************************************************************************/
+
+package com.badlogic.gdx.graphics.g3d.decals;
+
+import java.util.Comparator;
+
+import com.badlogic.gdx.Gdx;
+import com.badlogic.gdx.graphics.Camera;
+import com.badlogic.gdx.graphics.GL20;
+import com.badlogic.gdx.graphics.glutils.ShaderProgram;
+import com.badlogic.gdx.utils.Array;
+import com.badlogic.gdx.utils.Disposable;
+import com.badlogic.gdx.utils.ObjectMap;
+import com.badlogic.gdx.utils.Pool;
+
+/** &lt;p&gt;
+ * Minimalistic grouping strategy that splits decals into opaque and transparent ones enabling and disabling blending as needed.
+ * Opaque decals are rendered first (decal color is ignored in opacity check).&lt;br/&gt;
+ * Use this strategy only if the vast majority of your decals are opaque and the few transparent ones are unlikely to overlap.
+ * &lt;/p&gt;
+ * &lt;p&gt;
+ * Can produce invisible artifacts when transparent decals overlap each other.
+ * &lt;/p&gt;
+ * &lt;p&gt;
+ * Needs to be explicitly disposed as it might allocate a ShaderProgram when GLSL 2.0 is used.
+ * &lt;/p&gt;
+ * &lt;p&gt;
+ * States (* = any, EV = entry value - same as value before flush):&lt;br/&gt;
+ * &lt;table&gt;
+ * &lt;tr&gt;
+ * &lt;td&gt;&lt;/td&gt;
+ * &lt;td&gt;expects&lt;/td&gt;
+ * &lt;td&gt;exits on&lt;/td&gt;
+ * &lt;/tr&gt;
+ * &lt;tr&gt;
+ * &lt;td&gt;glDepthMask&lt;/td&gt;
+ * &lt;td&gt;true&lt;/td&gt;
+ * &lt;td&gt;EV&lt;/td&gt;
+ * &lt;/tr&gt;
+ * &lt;tr&gt;
+ * &lt;td&gt;GL_DEPTH_TEST&lt;/td&gt;
+ * &lt;td&gt;enabled&lt;/td&gt;
+ * &lt;td&gt;EV&lt;/td&gt;
+ * &lt;/tr&gt;
+ * &lt;tr&gt;
+ * &lt;td&gt;glDepthFunc&lt;/td&gt;
+ * &lt;td&gt;GL_LESS | GL_LEQUAL&lt;/td&gt;
+ * &lt;td&gt;EV&lt;/td&gt;
+ * &lt;/tr&gt;
+ * &lt;tr&gt;
+ * &lt;td&gt;GL_BLEND&lt;/td&gt;
+ * &lt;td&gt;disabled&lt;/td&gt;
+ * &lt;td&gt;EV | disabled&lt;/td&gt;
+ * &lt;/tr&gt;
+ * &lt;tr&gt;
+ * &lt;td&gt;glBlendFunc&lt;/td&gt;
+ * &lt;td&gt;*&lt;/td&gt;
+ * &lt;td&gt;*&lt;/td&gt;
+ * &lt;/tr&gt;
+ * &lt;tr&gt;
+ * &lt;td&gt;GL_TEXTURE_2D&lt;/td&gt;
+ * &lt;td&gt;*&lt;/td&gt;
+ * &lt;td&gt;disabled&lt;/td&gt;
+ * &lt;/tr&gt;
+ * &lt;/table&gt;
+ * &lt;/p&gt; */
+public class CameraGroupStrategy implements GroupStrategy, Disposable {
+	private static final int GROUP_OPAQUE = 0;
+	private static final int GROUP_BLEND = 1;
+
+<span class="nc" id="L85">	Pool&lt;Array&lt;Decal&gt;&gt; arrayPool = new Pool&lt;Array&lt;Decal&gt;&gt;(16) {</span>
+		@Override
+		protected Array&lt;Decal&gt; newObject () {
+<span class="nc" id="L88">			return new Array();</span>
+		}
+	};
+<span class="nc" id="L91">	Array&lt;Array&lt;Decal&gt;&gt; usedArrays = new Array&lt;Array&lt;Decal&gt;&gt;();</span>
+<span class="nc" id="L92">	ObjectMap&lt;DecalMaterial, Array&lt;Decal&gt;&gt; materialGroups = new ObjectMap&lt;DecalMaterial, Array&lt;Decal&gt;&gt;();</span>
+
+	Camera camera;
+	ShaderProgram shader;
+	private final Comparator&lt;Decal&gt; cameraSorter;
+
+	public CameraGroupStrategy (final Camera camera) {
+<span class="nc" id="L99">		this(camera, new Comparator&lt;Decal&gt;() {</span>
+			@Override
+			public int compare (Decal o1, Decal o2) {
+<span class="nc" id="L102">				float dist1 = camera.position.dst(o1.position);</span>
+<span class="nc" id="L103">				float dist2 = camera.position.dst(o2.position);</span>
+<span class="nc" id="L104">				return (int)Math.signum(dist2 - dist1);</span>
+			}
+		});
+<span class="nc" id="L107">	}</span>
+
+<span class="nc" id="L109">	public CameraGroupStrategy (Camera camera, Comparator&lt;Decal&gt; sorter) {</span>
+<span class="nc" id="L110">		this.camera = camera;</span>
+<span class="nc" id="L111">		this.cameraSorter = sorter;</span>
+<span class="nc" id="L112">		createDefaultShader();</span>
+
+<span class="nc" id="L114">	}</span>
+
+	public void setCamera (Camera camera) {
+<span class="nc" id="L117">		this.camera = camera;</span>
+<span class="nc" id="L118">	}</span>
+
+	public Camera getCamera () {
+<span class="nc" id="L121">		return camera;</span>
+	}
+
+	@Override
+	public int decideGroup (Decal decal) {
+<span class="nc bnc" id="L126" title="All 2 branches missed.">		return decal.getMaterial().isOpaque() ? GROUP_OPAQUE : GROUP_BLEND;</span>
+	}
+
+	@Override
+	public void beforeGroup (int group, Array&lt;Decal&gt; contents) {
+<span class="nc bnc" id="L131" title="All 2 branches missed.">		if (group == GROUP_BLEND) {</span>
+<span class="nc" id="L132">			Gdx.gl.glEnable(GL20.GL_BLEND);</span>
+<span class="nc" id="L133">			contents.sort(cameraSorter);</span>
+		} else {
+<span class="nc bnc" id="L135" title="All 2 branches missed.">			for (int i = 0, n = contents.size; i &lt; n; i++) {</span>
+<span class="nc" id="L136">				Decal decal = contents.get(i);</span>
+<span class="nc" id="L137">				Array&lt;Decal&gt; materialGroup = materialGroups.get(decal.material);</span>
+<span class="nc bnc" id="L138" title="All 2 branches missed.">				if (materialGroup == null) {</span>
+<span class="nc" id="L139">					materialGroup = arrayPool.obtain();</span>
+<span class="nc" id="L140">					materialGroup.clear();</span>
+<span class="nc" id="L141">					usedArrays.add(materialGroup);</span>
+<span class="nc" id="L142">					materialGroups.put(decal.material, materialGroup);</span>
+				}
+<span class="nc" id="L144">				materialGroup.add(decal);</span>
+			}
+
+<span class="nc" id="L147">			contents.clear();</span>
+<span class="nc bnc" id="L148" title="All 2 branches missed.">			for (Array&lt;Decal&gt; materialGroup : materialGroups.values()) {</span>
+<span class="nc" id="L149">				contents.addAll(materialGroup);</span>
+<span class="nc" id="L150">			}</span>
+
+<span class="nc" id="L152">			materialGroups.clear();</span>
+<span class="nc" id="L153">			arrayPool.freeAll(usedArrays);</span>
+<span class="nc" id="L154">			usedArrays.clear();</span>
+		}
+<span class="nc" id="L156">	}</span>
+
+	@Override
+	public void afterGroup (int group) {
+<span class="nc bnc" id="L160" title="All 2 branches missed.">		if (group == GROUP_BLEND) {</span>
+<span class="nc" id="L161">			Gdx.gl.glDisable(GL20.GL_BLEND);</span>
+		}
+<span class="nc" id="L163">	}</span>
+
+	@Override
+	public void beforeGroups () {
+<span class="nc" id="L167">		Gdx.gl.glEnable(GL20.GL_DEPTH_TEST);</span>
+<span class="nc" id="L168">		shader.begin();</span>
+<span class="nc" id="L169">		shader.setUniformMatrix(&quot;u_projectionViewMatrix&quot;, camera.combined);</span>
+<span class="nc" id="L170">		shader.setUniformi(&quot;u_texture&quot;, 0);</span>
+<span class="nc" id="L171">	}</span>
+
+	@Override
+	public void afterGroups () {
+<span class="nc" id="L175">		shader.end();</span>
+<span class="nc" id="L176">		Gdx.gl.glDisable(GL20.GL_DEPTH_TEST);</span>
+<span class="nc" id="L177">	}</span>
+
+	private void createDefaultShader () {
+<span class="nc" id="L180">		String vertexShader = &quot;attribute vec4 &quot; + ShaderProgram.POSITION_ATTRIBUTE + &quot;;\n&quot; //</span>
+			+ &quot;attribute vec4 &quot; + ShaderProgram.COLOR_ATTRIBUTE + &quot;;\n&quot; //
+			+ &quot;attribute vec2 &quot; + ShaderProgram.TEXCOORD_ATTRIBUTE + &quot;0;\n&quot; //
+			+ &quot;uniform mat4 u_projectionViewMatrix;\n&quot; //
+			+ &quot;varying vec4 v_color;\n&quot; //
+			+ &quot;varying vec2 v_texCoords;\n&quot; //
+			+ &quot;\n&quot; //
+			+ &quot;void main()\n&quot; //
+			+ &quot;{\n&quot; //
+			+ &quot;   v_color = &quot; + ShaderProgram.COLOR_ATTRIBUTE + &quot;;\n&quot; //
+			+ &quot;   v_texCoords = &quot; + ShaderProgram.TEXCOORD_ATTRIBUTE + &quot;0;\n&quot; //
+			+ &quot;   gl_Position =  u_projectionViewMatrix * &quot; + ShaderProgram.POSITION_ATTRIBUTE + &quot;;\n&quot; //
+			+ &quot;}\n&quot;;
+<span class="nc" id="L193">		String fragmentShader = &quot;#ifdef GL_ES\n&quot; //</span>
+			+ &quot;precision mediump float;\n&quot; //
+			+ &quot;#endif\n&quot; //
+			+ &quot;varying vec4 v_color;\n&quot; //
+			+ &quot;varying vec2 v_texCoords;\n&quot; //
+			+ &quot;uniform sampler2D u_texture;\n&quot; //
+			+ &quot;void main()\n&quot;//
+			+ &quot;{\n&quot; //
+			+ &quot;  gl_FragColor = v_color * texture2D(u_texture, v_texCoords);\n&quot; //
+			+ &quot;}&quot;;
+
+<span class="nc" id="L204">		shader = new ShaderProgram(vertexShader, fragmentShader);</span>
+<span class="nc bnc" id="L205" title="All 2 branches missed.">		if (shader.isCompiled() == false) throw new IllegalArgumentException(&quot;couldn't compile shader: &quot; + shader.getLog());</span>
+<span class="nc" id="L206">	}</span>
+
+	@Override
+	public ShaderProgram getGroupShader (int group) {
+<span class="nc" id="L210">		return shader;</span>
+	}
+
+	@Override
+	public void dispose () {
+<span class="nc bnc" id="L215" title="All 2 branches missed.">		if (shader != null) shader.dispose();</span>
+<span class="nc" id="L216">	}</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.5.5.201112152213</span></div></body></html>

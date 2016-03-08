@@ -1,0 +1,1018 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>SpriteCache.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">libGDX Core</a> &gt; <a href="index.html" class="el_package">com.badlogic.gdx.graphics.g2d</a> &gt; <span class="el_source">SpriteCache.java</span></div><h1>SpriteCache.java</h1><pre class="source lang-java linenums">/*******************************************************************************
+ * Copyright 2011 See AUTHORS file.
+ * 
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ ******************************************************************************/
+
+package com.badlogic.gdx.graphics.g2d;
+
+import static com.badlogic.gdx.graphics.g2d.Sprite.SPRITE_SIZE;
+import static com.badlogic.gdx.graphics.g2d.Sprite.VERTEX_SIZE;
+
+import java.nio.FloatBuffer;
+
+import com.badlogic.gdx.ApplicationListener;
+import com.badlogic.gdx.Gdx;
+import com.badlogic.gdx.graphics.Color;
+import com.badlogic.gdx.graphics.GL20;
+import com.badlogic.gdx.graphics.Mesh;
+import com.badlogic.gdx.graphics.Texture;
+import com.badlogic.gdx.graphics.VertexAttribute;
+import com.badlogic.gdx.graphics.VertexAttributes.Usage;
+import com.badlogic.gdx.graphics.glutils.ShaderProgram;
+import com.badlogic.gdx.math.MathUtils;
+import com.badlogic.gdx.math.Matrix4;
+import com.badlogic.gdx.utils.Array;
+import com.badlogic.gdx.utils.Disposable;
+import com.badlogic.gdx.utils.GdxRuntimeException;
+import com.badlogic.gdx.utils.IntArray;
+import com.badlogic.gdx.utils.NumberUtils;
+
+/** Draws 2D images, optimized for geometry that does not change. Sprites and/or textures are cached and given an ID, which can
+ * later be used for drawing. The size, color, and texture region for each cached image cannot be modified. This information is
+ * stored in video memory and does not have to be sent to the GPU each time it is drawn.&lt;br&gt;
+ * &lt;br&gt;
+ * To cache {@link Sprite sprites} or {@link Texture textures}, first call {@link SpriteCache#beginCache()}, then call the
+ * appropriate add method to define the images. To complete the cache, call {@link SpriteCache#endCache()} and store the returned
+ * cache ID.&lt;br&gt;
+ * &lt;br&gt;
+ * To draw with SpriteCache, first call {@link #begin()}, then call {@link #draw(int)} with a cache ID. When SpriteCache drawing
+ * is complete, call {@link #end()}.&lt;br&gt;
+ * &lt;br&gt;
+ * By default, SpriteCache draws using screen coordinates and uses an x-axis pointing to the right, an y-axis pointing upwards and
+ * the origin is the bottom left corner of the screen. The default transformation and projection matrices can be changed. If the
+ * screen is {@link ApplicationListener#resize(int, int) resized}, the SpriteCache's matrices must be updated. For example:&lt;br&gt;
+ * &lt;code&gt;cache.getProjectionMatrix().setToOrtho2D(0, 0, Gdx.graphics.getWidth(), Gdx.graphics.getHeight());&lt;/code&gt;&lt;br&gt;
+ * &lt;br&gt;
+ * Note that SpriteCache does not manage blending. You will need to enable blending (&lt;i&gt;Gdx.gl.glEnable(GL10.GL_BLEND);&lt;/i&gt;) and
+ * set the blend func as needed before or between calls to {@link #draw(int)}.&lt;br&gt;
+ * &lt;br&gt;
+ * SpriteCache is managed. If the OpenGL context is lost and the restored, all OpenGL resources a SpriteCache uses internally are
+ * restored.&lt;br&gt;
+ * &lt;br&gt;
+ * SpriteCache is a reasonably heavyweight object. Typically only one instance should be used for an entire application.&lt;br&gt;
+ * &lt;br&gt;
+ * SpriteCache works with OpenGL ES 1.x and 2.0. For 2.0, it uses its own custom shader to draw.&lt;br&gt;
+ * &lt;br&gt;
+ * SpriteCache must be disposed once it is no longer needed.
+ * @author Nathan Sweet */
+public class SpriteCache implements Disposable {
+<span class="nc" id="L70">	static private final float[] tempVertices = new float[VERTEX_SIZE * 6];</span>
+
+	private final Mesh mesh;
+	private boolean drawing;
+<span class="nc" id="L74">	private final Matrix4 transformMatrix = new Matrix4();</span>
+<span class="nc" id="L75">	private final Matrix4 projectionMatrix = new Matrix4();</span>
+<span class="nc" id="L76">	private Array&lt;Cache&gt; caches = new Array();</span>
+
+<span class="nc" id="L78">	private final Matrix4 combinedMatrix = new Matrix4();</span>
+	private final ShaderProgram shader;
+
+	private Cache currentCache;
+<span class="nc" id="L82">	private final Array&lt;Texture&gt; textures = new Array(8);</span>
+<span class="nc" id="L83">	private final IntArray counts = new IntArray(8);</span>
+
+<span class="nc" id="L85">	private float color = Color.WHITE.toFloatBits();</span>
+<span class="nc" id="L86">	private Color tempColor = new Color(1, 1, 1, 1);</span>
+
+<span class="nc" id="L88">	private ShaderProgram customShader = null;</span>
+
+	/** Number of render calls since the last {@link #begin()}. **/
+<span class="nc" id="L91">	public int renderCalls = 0;</span>
+
+	/** Number of rendering calls, ever. Will not be reset unless set manually. **/
+<span class="nc" id="L94">	public int totalRenderCalls = 0;</span>
+
+	/** Creates a cache that uses indexed geometry and can contain up to 1000 images. */
+	public SpriteCache () {
+<span class="nc" id="L98">		this(1000, false);</span>
+<span class="nc" id="L99">	}</span>
+
+	/** Creates a cache with the specified size, using a default shader if OpenGL ES 2.0 is being used.
+	 * @param size The maximum number of images this cache can hold. The memory required to hold the images is allocated up front.
+	 *           Max of 5460 if indices are used.
+	 * @param useIndices If true, indexed geometry will be used. */
+	public SpriteCache (int size, boolean useIndices) {
+<span class="nc" id="L106">		this(size, createDefaultShader(), useIndices);</span>
+<span class="nc" id="L107">	}</span>
+
+	/** Creates a cache with the specified size and OpenGL ES 2.0 shader.
+	 * @param size The maximum number of images this cache can hold. The memory required to hold the images is allocated up front.
+	 *           Max of 5460 if indices are used.
+	 * @param useIndices If true, indexed geometry will be used. */
+<span class="nc" id="L113">	public SpriteCache (int size, ShaderProgram shader, boolean useIndices) {</span>
+<span class="nc" id="L114">		this.shader = shader;</span>
+
+<span class="nc bnc" id="L116" title="All 4 branches missed.">		if (useIndices &amp;&amp; size &gt; 5460) throw new IllegalArgumentException(&quot;Can't have more than 5460 sprites per batch: &quot; + size);</span>
+
+<span class="nc bnc" id="L118" title="All 4 branches missed.">		mesh = new Mesh(true, size * (useIndices ? 4 : 6), useIndices ? size * 6 : 0, new VertexAttribute(Usage.Position, 2,</span>
+			ShaderProgram.POSITION_ATTRIBUTE), new VertexAttribute(Usage.ColorPacked, 4, ShaderProgram.COLOR_ATTRIBUTE),
+			new VertexAttribute(Usage.TextureCoordinates, 2, ShaderProgram.TEXCOORD_ATTRIBUTE + &quot;0&quot;));
+<span class="nc" id="L121">		mesh.setAutoBind(false);</span>
+
+<span class="nc bnc" id="L123" title="All 2 branches missed.">		if (useIndices) {</span>
+<span class="nc" id="L124">			int length = size * 6;</span>
+<span class="nc" id="L125">			short[] indices = new short[length];</span>
+<span class="nc" id="L126">			short j = 0;</span>
+<span class="nc bnc" id="L127" title="All 2 branches missed.">			for (int i = 0; i &lt; length; i += 6, j += 4) {</span>
+<span class="nc" id="L128">				indices[i + 0] = (short)j;</span>
+<span class="nc" id="L129">				indices[i + 1] = (short)(j + 1);</span>
+<span class="nc" id="L130">				indices[i + 2] = (short)(j + 2);</span>
+<span class="nc" id="L131">				indices[i + 3] = (short)(j + 2);</span>
+<span class="nc" id="L132">				indices[i + 4] = (short)(j + 3);</span>
+<span class="nc" id="L133">				indices[i + 5] = (short)j;</span>
+			}
+<span class="nc" id="L135">			mesh.setIndices(indices);</span>
+		}
+
+<span class="nc" id="L138">		projectionMatrix.setToOrtho2D(0, 0, Gdx.graphics.getWidth(), Gdx.graphics.getHeight());</span>
+<span class="nc" id="L139">	}</span>
+
+	/** Sets the color used to tint images when they are added to the SpriteCache. Default is {@link Color#WHITE}. */
+	public void setColor (Color tint) {
+<span class="nc" id="L143">		color = tint.toFloatBits();</span>
+<span class="nc" id="L144">	}</span>
+
+	/** @see #setColor(Color) */
+	public void setColor (float r, float g, float b, float a) {
+<span class="nc" id="L148">		int intBits = (int)(255 * a) &lt;&lt; 24 | (int)(255 * b) &lt;&lt; 16 | (int)(255 * g) &lt;&lt; 8 | (int)(255 * r);</span>
+<span class="nc" id="L149">		color = NumberUtils.intToFloatColor(intBits);</span>
+<span class="nc" id="L150">	}</span>
+
+	/** @see #setColor(Color)
+	 * @see Color#toFloatBits() */
+	public void setColor (float color) {
+<span class="nc" id="L155">		this.color = color;</span>
+<span class="nc" id="L156">	}</span>
+
+	public Color getColor () {
+<span class="nc" id="L159">		int intBits = NumberUtils.floatToIntColor(color);</span>
+<span class="nc" id="L160">		Color color = this.tempColor;</span>
+<span class="nc" id="L161">		color.r = (intBits &amp; 0xff) / 255f;</span>
+<span class="nc" id="L162">		color.g = ((intBits &gt;&gt;&gt; 8) &amp; 0xff) / 255f;</span>
+<span class="nc" id="L163">		color.b = ((intBits &gt;&gt;&gt; 16) &amp; 0xff) / 255f;</span>
+<span class="nc" id="L164">		color.a = ((intBits &gt;&gt;&gt; 24) &amp; 0xff) / 255f;</span>
+<span class="nc" id="L165">		return color;</span>
+	}
+
+	/** Starts the definition of a new cache, allowing the add and {@link #endCache()} methods to be called. */
+	public void beginCache () {
+<span class="nc bnc" id="L170" title="All 2 branches missed.">		if (currentCache != null) throw new IllegalStateException(&quot;endCache must be called before begin.&quot;);</span>
+<span class="nc bnc" id="L171" title="All 2 branches missed.">		int verticesPerImage = mesh.getNumIndices() &gt; 0 ? 4 : 6;</span>
+<span class="nc" id="L172">		currentCache = new Cache(caches.size, mesh.getVerticesBuffer().limit());</span>
+<span class="nc" id="L173">		caches.add(currentCache);</span>
+<span class="nc" id="L174">		mesh.getVerticesBuffer().compact();</span>
+<span class="nc" id="L175">	}</span>
+
+	/** Starts the redefinition of an existing cache, allowing the add and {@link #endCache()} methods to be called. If this is not
+	 * the last cache created, it cannot have more entries added to it than when it was first created. To do that, use
+	 * {@link #clear()} and then {@link #begin()}. */
+	public void beginCache (int cacheID) {
+<span class="nc bnc" id="L181" title="All 2 branches missed.">		if (currentCache != null) throw new IllegalStateException(&quot;endCache must be called before begin.&quot;);</span>
+<span class="nc bnc" id="L182" title="All 2 branches missed.">		if (cacheID == caches.size - 1) {</span>
+<span class="nc" id="L183">			Cache oldCache = caches.removeIndex(cacheID);</span>
+<span class="nc" id="L184">			mesh.getVerticesBuffer().limit(oldCache.offset);</span>
+<span class="nc" id="L185">			beginCache();</span>
+<span class="nc" id="L186">			return;</span>
+		}
+<span class="nc" id="L188">		currentCache = caches.get(cacheID);</span>
+<span class="nc" id="L189">		mesh.getVerticesBuffer().position(currentCache.offset);</span>
+<span class="nc" id="L190">	}</span>
+
+	/** Ends the definition of a cache, returning the cache ID to be used with {@link #draw(int)}. */
+	public int endCache () {
+<span class="nc bnc" id="L194" title="All 2 branches missed.">		if (currentCache == null) throw new IllegalStateException(&quot;beginCache must be called before endCache.&quot;);</span>
+<span class="nc" id="L195">		Cache cache = currentCache;</span>
+<span class="nc" id="L196">		int cacheCount = mesh.getVerticesBuffer().position() - cache.offset;</span>
+<span class="nc bnc" id="L197" title="All 2 branches missed.">		if (cache.textures == null) {</span>
+			// New cache.
+<span class="nc" id="L199">			cache.maxCount = cacheCount;</span>
+<span class="nc" id="L200">			cache.textureCount = textures.size;</span>
+<span class="nc" id="L201">			cache.textures = textures.toArray(Texture.class);</span>
+<span class="nc" id="L202">			cache.counts = new int[cache.textureCount];</span>
+<span class="nc bnc" id="L203" title="All 2 branches missed.">			for (int i = 0, n = counts.size; i &lt; n; i++)</span>
+<span class="nc" id="L204">				cache.counts[i] = counts.get(i);</span>
+
+<span class="nc" id="L206">			mesh.getVerticesBuffer().flip();</span>
+		} else {
+			// Redefine existing cache.
+<span class="nc bnc" id="L209" title="All 2 branches missed.">			if (cacheCount &gt; cache.maxCount) {</span>
+<span class="nc" id="L210">				throw new GdxRuntimeException(</span>
+					&quot;If a cache is not the last created, it cannot be redefined with more entries than when it was first created: &quot;
+						+ cacheCount + &quot; (&quot; + cache.maxCount + &quot; max)&quot;);
+			}
+
+<span class="nc" id="L215">			cache.textureCount = textures.size;</span>
+
+<span class="nc bnc" id="L217" title="All 2 branches missed.">			if (cache.textures.length &lt; cache.textureCount) cache.textures = new Texture[cache.textureCount];</span>
+<span class="nc bnc" id="L218" title="All 2 branches missed.">			for (int i = 0, n = cache.textureCount; i &lt; n; i++)</span>
+<span class="nc" id="L219">				cache.textures[i] = textures.get(i);</span>
+
+<span class="nc bnc" id="L221" title="All 2 branches missed.">			if (cache.counts.length &lt; cache.textureCount) cache.counts = new int[cache.textureCount];</span>
+<span class="nc bnc" id="L222" title="All 2 branches missed.">			for (int i = 0, n = cache.textureCount; i &lt; n; i++)</span>
+<span class="nc" id="L223">				cache.counts[i] = counts.get(i);</span>
+
+<span class="nc" id="L225">			FloatBuffer vertices = mesh.getVerticesBuffer();</span>
+<span class="nc" id="L226">			vertices.position(0);</span>
+<span class="nc" id="L227">			Cache lastCache = caches.get(caches.size - 1);</span>
+<span class="nc" id="L228">			vertices.limit(lastCache.offset + lastCache.maxCount);</span>
+		}
+
+<span class="nc" id="L231">		currentCache = null;</span>
+<span class="nc" id="L232">		textures.clear();</span>
+<span class="nc" id="L233">		counts.clear();</span>
+
+<span class="nc" id="L235">		return cache.id;</span>
+	}
+
+	/** Invalidates all cache IDs and resets the SpriteCache so new caches can be added. */
+	public void clear () {
+<span class="nc" id="L240">		caches.clear();</span>
+<span class="nc" id="L241">		mesh.getVerticesBuffer().clear().flip();</span>
+<span class="nc" id="L242">	}</span>
+
+	/** Adds the specified vertices to the cache. Each vertex should have 5 elements, one for each of the attributes: x, y, color,
+	 * u, and v. If indexed geometry is used, each image should be specified as 4 vertices, otherwise each image should be
+	 * specified as 6 vertices. */
+	public void add (Texture texture, float[] vertices, int offset, int length) {
+<span class="nc bnc" id="L248" title="All 2 branches missed.">		if (currentCache == null) throw new IllegalStateException(&quot;beginCache must be called before add.&quot;);</span>
+
+<span class="nc bnc" id="L250" title="All 2 branches missed.">		int verticesPerImage = mesh.getNumIndices() &gt; 0 ? 4 : 6;</span>
+<span class="nc" id="L251">		int count = length / (verticesPerImage * VERTEX_SIZE) * 6;</span>
+<span class="nc" id="L252">		int lastIndex = textures.size - 1;</span>
+<span class="nc bnc" id="L253" title="All 4 branches missed.">		if (lastIndex &lt; 0 || textures.get(lastIndex) != texture) {</span>
+<span class="nc" id="L254">			textures.add(texture);</span>
+<span class="nc" id="L255">			counts.add(count);</span>
+		} else
+<span class="nc" id="L257">			counts.incr(lastIndex, count);</span>
+
+<span class="nc" id="L259">		mesh.getVerticesBuffer().put(vertices, offset, length);</span>
+<span class="nc" id="L260">	}</span>
+
+	/** Adds the specified texture to the cache. */
+	public void add (Texture texture, float x, float y) {
+<span class="nc" id="L264">		final float fx2 = x + texture.getWidth();</span>
+<span class="nc" id="L265">		final float fy2 = y + texture.getHeight();</span>
+
+<span class="nc" id="L267">		tempVertices[0] = x;</span>
+<span class="nc" id="L268">		tempVertices[1] = y;</span>
+<span class="nc" id="L269">		tempVertices[2] = color;</span>
+<span class="nc" id="L270">		tempVertices[3] = 0;</span>
+<span class="nc" id="L271">		tempVertices[4] = 1;</span>
+
+<span class="nc" id="L273">		tempVertices[5] = x;</span>
+<span class="nc" id="L274">		tempVertices[6] = fy2;</span>
+<span class="nc" id="L275">		tempVertices[7] = color;</span>
+<span class="nc" id="L276">		tempVertices[8] = 0;</span>
+<span class="nc" id="L277">		tempVertices[9] = 0;</span>
+
+<span class="nc" id="L279">		tempVertices[10] = fx2;</span>
+<span class="nc" id="L280">		tempVertices[11] = fy2;</span>
+<span class="nc" id="L281">		tempVertices[12] = color;</span>
+<span class="nc" id="L282">		tempVertices[13] = 1;</span>
+<span class="nc" id="L283">		tempVertices[14] = 0;</span>
+
+<span class="nc bnc" id="L285" title="All 2 branches missed.">		if (mesh.getNumIndices() &gt; 0) {</span>
+<span class="nc" id="L286">			tempVertices[15] = fx2;</span>
+<span class="nc" id="L287">			tempVertices[16] = y;</span>
+<span class="nc" id="L288">			tempVertices[17] = color;</span>
+<span class="nc" id="L289">			tempVertices[18] = 1;</span>
+<span class="nc" id="L290">			tempVertices[19] = 1;</span>
+<span class="nc" id="L291">			add(texture, tempVertices, 0, 20);</span>
+		} else {
+<span class="nc" id="L293">			tempVertices[15] = fx2;</span>
+<span class="nc" id="L294">			tempVertices[16] = fy2;</span>
+<span class="nc" id="L295">			tempVertices[17] = color;</span>
+<span class="nc" id="L296">			tempVertices[18] = 1;</span>
+<span class="nc" id="L297">			tempVertices[19] = 0;</span>
+
+<span class="nc" id="L299">			tempVertices[20] = fx2;</span>
+<span class="nc" id="L300">			tempVertices[21] = y;</span>
+<span class="nc" id="L301">			tempVertices[22] = color;</span>
+<span class="nc" id="L302">			tempVertices[23] = 1;</span>
+<span class="nc" id="L303">			tempVertices[24] = 1;</span>
+
+<span class="nc" id="L305">			tempVertices[25] = x;</span>
+<span class="nc" id="L306">			tempVertices[26] = y;</span>
+<span class="nc" id="L307">			tempVertices[27] = color;</span>
+<span class="nc" id="L308">			tempVertices[28] = 0;</span>
+<span class="nc" id="L309">			tempVertices[29] = 1;</span>
+<span class="nc" id="L310">			add(texture, tempVertices, 0, 30);</span>
+		}
+<span class="nc" id="L312">	}</span>
+
+	/** Adds the specified texture to the cache. */
+	public void add (Texture texture, float x, float y, int srcWidth, int srcHeight, float u, float v, float u2, float v2,
+		float color) {
+<span class="nc" id="L317">		final float fx2 = x + srcWidth;</span>
+<span class="nc" id="L318">		final float fy2 = y + srcHeight;</span>
+
+<span class="nc" id="L320">		tempVertices[0] = x;</span>
+<span class="nc" id="L321">		tempVertices[1] = y;</span>
+<span class="nc" id="L322">		tempVertices[2] = color;</span>
+<span class="nc" id="L323">		tempVertices[3] = u;</span>
+<span class="nc" id="L324">		tempVertices[4] = v;</span>
+
+<span class="nc" id="L326">		tempVertices[5] = x;</span>
+<span class="nc" id="L327">		tempVertices[6] = fy2;</span>
+<span class="nc" id="L328">		tempVertices[7] = color;</span>
+<span class="nc" id="L329">		tempVertices[8] = u;</span>
+<span class="nc" id="L330">		tempVertices[9] = v2;</span>
+
+<span class="nc" id="L332">		tempVertices[10] = fx2;</span>
+<span class="nc" id="L333">		tempVertices[11] = fy2;</span>
+<span class="nc" id="L334">		tempVertices[12] = color;</span>
+<span class="nc" id="L335">		tempVertices[13] = u2;</span>
+<span class="nc" id="L336">		tempVertices[14] = v2;</span>
+
+<span class="nc bnc" id="L338" title="All 2 branches missed.">		if (mesh.getNumIndices() &gt; 0) {</span>
+<span class="nc" id="L339">			tempVertices[15] = fx2;</span>
+<span class="nc" id="L340">			tempVertices[16] = y;</span>
+<span class="nc" id="L341">			tempVertices[17] = color;</span>
+<span class="nc" id="L342">			tempVertices[18] = u2;</span>
+<span class="nc" id="L343">			tempVertices[19] = v;</span>
+<span class="nc" id="L344">			add(texture, tempVertices, 0, 20);</span>
+		} else {
+<span class="nc" id="L346">			tempVertices[15] = fx2;</span>
+<span class="nc" id="L347">			tempVertices[16] = fy2;</span>
+<span class="nc" id="L348">			tempVertices[17] = color;</span>
+<span class="nc" id="L349">			tempVertices[18] = u2;</span>
+<span class="nc" id="L350">			tempVertices[19] = v2;</span>
+
+<span class="nc" id="L352">			tempVertices[20] = fx2;</span>
+<span class="nc" id="L353">			tempVertices[21] = y;</span>
+<span class="nc" id="L354">			tempVertices[22] = color;</span>
+<span class="nc" id="L355">			tempVertices[23] = u2;</span>
+<span class="nc" id="L356">			tempVertices[24] = v;</span>
+
+<span class="nc" id="L358">			tempVertices[25] = x;</span>
+<span class="nc" id="L359">			tempVertices[26] = y;</span>
+<span class="nc" id="L360">			tempVertices[27] = color;</span>
+<span class="nc" id="L361">			tempVertices[28] = u;</span>
+<span class="nc" id="L362">			tempVertices[29] = v;</span>
+<span class="nc" id="L363">			add(texture, tempVertices, 0, 30);</span>
+		}
+<span class="nc" id="L365">	}</span>
+
+	/** Adds the specified texture to the cache. */
+	public void add (Texture texture, float x, float y, int srcX, int srcY, int srcWidth, int srcHeight) {
+<span class="nc" id="L369">		float invTexWidth = 1.0f / texture.getWidth();</span>
+<span class="nc" id="L370">		float invTexHeight = 1.0f / texture.getHeight();</span>
+<span class="nc" id="L371">		final float u = srcX * invTexWidth;</span>
+<span class="nc" id="L372">		final float v = (srcY + srcHeight) * invTexHeight;</span>
+<span class="nc" id="L373">		final float u2 = (srcX + srcWidth) * invTexWidth;</span>
+<span class="nc" id="L374">		final float v2 = srcY * invTexHeight;</span>
+<span class="nc" id="L375">		final float fx2 = x + srcWidth;</span>
+<span class="nc" id="L376">		final float fy2 = y + srcHeight;</span>
+
+<span class="nc" id="L378">		tempVertices[0] = x;</span>
+<span class="nc" id="L379">		tempVertices[1] = y;</span>
+<span class="nc" id="L380">		tempVertices[2] = color;</span>
+<span class="nc" id="L381">		tempVertices[3] = u;</span>
+<span class="nc" id="L382">		tempVertices[4] = v;</span>
+
+<span class="nc" id="L384">		tempVertices[5] = x;</span>
+<span class="nc" id="L385">		tempVertices[6] = fy2;</span>
+<span class="nc" id="L386">		tempVertices[7] = color;</span>
+<span class="nc" id="L387">		tempVertices[8] = u;</span>
+<span class="nc" id="L388">		tempVertices[9] = v2;</span>
+
+<span class="nc" id="L390">		tempVertices[10] = fx2;</span>
+<span class="nc" id="L391">		tempVertices[11] = fy2;</span>
+<span class="nc" id="L392">		tempVertices[12] = color;</span>
+<span class="nc" id="L393">		tempVertices[13] = u2;</span>
+<span class="nc" id="L394">		tempVertices[14] = v2;</span>
+
+<span class="nc bnc" id="L396" title="All 2 branches missed.">		if (mesh.getNumIndices() &gt; 0) {</span>
+<span class="nc" id="L397">			tempVertices[15] = fx2;</span>
+<span class="nc" id="L398">			tempVertices[16] = y;</span>
+<span class="nc" id="L399">			tempVertices[17] = color;</span>
+<span class="nc" id="L400">			tempVertices[18] = u2;</span>
+<span class="nc" id="L401">			tempVertices[19] = v;</span>
+<span class="nc" id="L402">			add(texture, tempVertices, 0, 20);</span>
+		} else {
+<span class="nc" id="L404">			tempVertices[15] = fx2;</span>
+<span class="nc" id="L405">			tempVertices[16] = fy2;</span>
+<span class="nc" id="L406">			tempVertices[17] = color;</span>
+<span class="nc" id="L407">			tempVertices[18] = u2;</span>
+<span class="nc" id="L408">			tempVertices[19] = v2;</span>
+
+<span class="nc" id="L410">			tempVertices[20] = fx2;</span>
+<span class="nc" id="L411">			tempVertices[21] = y;</span>
+<span class="nc" id="L412">			tempVertices[22] = color;</span>
+<span class="nc" id="L413">			tempVertices[23] = u2;</span>
+<span class="nc" id="L414">			tempVertices[24] = v;</span>
+
+<span class="nc" id="L416">			tempVertices[25] = x;</span>
+<span class="nc" id="L417">			tempVertices[26] = y;</span>
+<span class="nc" id="L418">			tempVertices[27] = color;</span>
+<span class="nc" id="L419">			tempVertices[28] = u;</span>
+<span class="nc" id="L420">			tempVertices[29] = v;</span>
+<span class="nc" id="L421">			add(texture, tempVertices, 0, 30);</span>
+		}
+<span class="nc" id="L423">	}</span>
+
+	/** Adds the specified texture to the cache. */
+	public void add (Texture texture, float x, float y, float width, float height, int srcX, int srcY, int srcWidth,
+		int srcHeight, boolean flipX, boolean flipY) {
+
+<span class="nc" id="L429">		float invTexWidth = 1.0f / texture.getWidth();</span>
+<span class="nc" id="L430">		float invTexHeight = 1.0f / texture.getHeight();</span>
+<span class="nc" id="L431">		float u = srcX * invTexWidth;</span>
+<span class="nc" id="L432">		float v = (srcY + srcHeight) * invTexHeight;</span>
+<span class="nc" id="L433">		float u2 = (srcX + srcWidth) * invTexWidth;</span>
+<span class="nc" id="L434">		float v2 = srcY * invTexHeight;</span>
+<span class="nc" id="L435">		final float fx2 = x + width;</span>
+<span class="nc" id="L436">		final float fy2 = y + height;</span>
+
+<span class="nc bnc" id="L438" title="All 2 branches missed.">		if (flipX) {</span>
+<span class="nc" id="L439">			float tmp = u;</span>
+<span class="nc" id="L440">			u = u2;</span>
+<span class="nc" id="L441">			u2 = tmp;</span>
+		}
+<span class="nc bnc" id="L443" title="All 2 branches missed.">		if (flipY) {</span>
+<span class="nc" id="L444">			float tmp = v;</span>
+<span class="nc" id="L445">			v = v2;</span>
+<span class="nc" id="L446">			v2 = tmp;</span>
+		}
+
+<span class="nc" id="L449">		tempVertices[0] = x;</span>
+<span class="nc" id="L450">		tempVertices[1] = y;</span>
+<span class="nc" id="L451">		tempVertices[2] = color;</span>
+<span class="nc" id="L452">		tempVertices[3] = u;</span>
+<span class="nc" id="L453">		tempVertices[4] = v;</span>
+
+<span class="nc" id="L455">		tempVertices[5] = x;</span>
+<span class="nc" id="L456">		tempVertices[6] = fy2;</span>
+<span class="nc" id="L457">		tempVertices[7] = color;</span>
+<span class="nc" id="L458">		tempVertices[8] = u;</span>
+<span class="nc" id="L459">		tempVertices[9] = v2;</span>
+
+<span class="nc" id="L461">		tempVertices[10] = fx2;</span>
+<span class="nc" id="L462">		tempVertices[11] = fy2;</span>
+<span class="nc" id="L463">		tempVertices[12] = color;</span>
+<span class="nc" id="L464">		tempVertices[13] = u2;</span>
+<span class="nc" id="L465">		tempVertices[14] = v2;</span>
+
+<span class="nc bnc" id="L467" title="All 2 branches missed.">		if (mesh.getNumIndices() &gt; 0) {</span>
+<span class="nc" id="L468">			tempVertices[15] = fx2;</span>
+<span class="nc" id="L469">			tempVertices[16] = y;</span>
+<span class="nc" id="L470">			tempVertices[17] = color;</span>
+<span class="nc" id="L471">			tempVertices[18] = u2;</span>
+<span class="nc" id="L472">			tempVertices[19] = v;</span>
+<span class="nc" id="L473">			add(texture, tempVertices, 0, 20);</span>
+		} else {
+<span class="nc" id="L475">			tempVertices[15] = fx2;</span>
+<span class="nc" id="L476">			tempVertices[16] = fy2;</span>
+<span class="nc" id="L477">			tempVertices[17] = color;</span>
+<span class="nc" id="L478">			tempVertices[18] = u2;</span>
+<span class="nc" id="L479">			tempVertices[19] = v2;</span>
+
+<span class="nc" id="L481">			tempVertices[20] = fx2;</span>
+<span class="nc" id="L482">			tempVertices[21] = y;</span>
+<span class="nc" id="L483">			tempVertices[22] = color;</span>
+<span class="nc" id="L484">			tempVertices[23] = u2;</span>
+<span class="nc" id="L485">			tempVertices[24] = v;</span>
+
+<span class="nc" id="L487">			tempVertices[25] = x;</span>
+<span class="nc" id="L488">			tempVertices[26] = y;</span>
+<span class="nc" id="L489">			tempVertices[27] = color;</span>
+<span class="nc" id="L490">			tempVertices[28] = u;</span>
+<span class="nc" id="L491">			tempVertices[29] = v;</span>
+<span class="nc" id="L492">			add(texture, tempVertices, 0, 30);</span>
+		}
+<span class="nc" id="L494">	}</span>
+
+	/** Adds the specified texture to the cache. */
+	public void add (Texture texture, float x, float y, float originX, float originY, float width, float height, float scaleX,
+		float scaleY, float rotation, int srcX, int srcY, int srcWidth, int srcHeight, boolean flipX, boolean flipY) {
+
+		// bottom left and top right corner points relative to origin
+<span class="nc" id="L501">		final float worldOriginX = x + originX;</span>
+<span class="nc" id="L502">		final float worldOriginY = y + originY;</span>
+<span class="nc" id="L503">		float fx = -originX;</span>
+<span class="nc" id="L504">		float fy = -originY;</span>
+<span class="nc" id="L505">		float fx2 = width - originX;</span>
+<span class="nc" id="L506">		float fy2 = height - originY;</span>
+
+		// scale
+<span class="nc bnc" id="L509" title="All 4 branches missed.">		if (scaleX != 1 || scaleY != 1) {</span>
+<span class="nc" id="L510">			fx *= scaleX;</span>
+<span class="nc" id="L511">			fy *= scaleY;</span>
+<span class="nc" id="L512">			fx2 *= scaleX;</span>
+<span class="nc" id="L513">			fy2 *= scaleY;</span>
+		}
+
+		// construct corner points, start from top left and go counter clockwise
+<span class="nc" id="L517">		final float p1x = fx;</span>
+<span class="nc" id="L518">		final float p1y = fy;</span>
+<span class="nc" id="L519">		final float p2x = fx;</span>
+<span class="nc" id="L520">		final float p2y = fy2;</span>
+<span class="nc" id="L521">		final float p3x = fx2;</span>
+<span class="nc" id="L522">		final float p3y = fy2;</span>
+<span class="nc" id="L523">		final float p4x = fx2;</span>
+<span class="nc" id="L524">		final float p4y = fy;</span>
+
+		float x1;
+		float y1;
+		float x2;
+		float y2;
+		float x3;
+		float y3;
+		float x4;
+		float y4;
+
+		// rotate
+<span class="nc bnc" id="L536" title="All 2 branches missed.">		if (rotation != 0) {</span>
+<span class="nc" id="L537">			final float cos = MathUtils.cosDeg(rotation);</span>
+<span class="nc" id="L538">			final float sin = MathUtils.sinDeg(rotation);</span>
+
+<span class="nc" id="L540">			x1 = cos * p1x - sin * p1y;</span>
+<span class="nc" id="L541">			y1 = sin * p1x + cos * p1y;</span>
+
+<span class="nc" id="L543">			x2 = cos * p2x - sin * p2y;</span>
+<span class="nc" id="L544">			y2 = sin * p2x + cos * p2y;</span>
+
+<span class="nc" id="L546">			x3 = cos * p3x - sin * p3y;</span>
+<span class="nc" id="L547">			y3 = sin * p3x + cos * p3y;</span>
+
+<span class="nc" id="L549">			x4 = x1 + (x3 - x2);</span>
+<span class="nc" id="L550">			y4 = y3 - (y2 - y1);</span>
+<span class="nc" id="L551">		} else {</span>
+<span class="nc" id="L552">			x1 = p1x;</span>
+<span class="nc" id="L553">			y1 = p1y;</span>
+
+<span class="nc" id="L555">			x2 = p2x;</span>
+<span class="nc" id="L556">			y2 = p2y;</span>
+
+<span class="nc" id="L558">			x3 = p3x;</span>
+<span class="nc" id="L559">			y3 = p3y;</span>
+
+<span class="nc" id="L561">			x4 = p4x;</span>
+<span class="nc" id="L562">			y4 = p4y;</span>
+		}
+
+<span class="nc" id="L565">		x1 += worldOriginX;</span>
+<span class="nc" id="L566">		y1 += worldOriginY;</span>
+<span class="nc" id="L567">		x2 += worldOriginX;</span>
+<span class="nc" id="L568">		y2 += worldOriginY;</span>
+<span class="nc" id="L569">		x3 += worldOriginX;</span>
+<span class="nc" id="L570">		y3 += worldOriginY;</span>
+<span class="nc" id="L571">		x4 += worldOriginX;</span>
+<span class="nc" id="L572">		y4 += worldOriginY;</span>
+
+<span class="nc" id="L574">		float invTexWidth = 1.0f / texture.getWidth();</span>
+<span class="nc" id="L575">		float invTexHeight = 1.0f / texture.getHeight();</span>
+<span class="nc" id="L576">		float u = srcX * invTexWidth;</span>
+<span class="nc" id="L577">		float v = (srcY + srcHeight) * invTexHeight;</span>
+<span class="nc" id="L578">		float u2 = (srcX + srcWidth) * invTexWidth;</span>
+<span class="nc" id="L579">		float v2 = srcY * invTexHeight;</span>
+
+<span class="nc bnc" id="L581" title="All 2 branches missed.">		if (flipX) {</span>
+<span class="nc" id="L582">			float tmp = u;</span>
+<span class="nc" id="L583">			u = u2;</span>
+<span class="nc" id="L584">			u2 = tmp;</span>
+		}
+
+<span class="nc bnc" id="L587" title="All 2 branches missed.">		if (flipY) {</span>
+<span class="nc" id="L588">			float tmp = v;</span>
+<span class="nc" id="L589">			v = v2;</span>
+<span class="nc" id="L590">			v2 = tmp;</span>
+		}
+
+<span class="nc" id="L593">		tempVertices[0] = x1;</span>
+<span class="nc" id="L594">		tempVertices[1] = y1;</span>
+<span class="nc" id="L595">		tempVertices[2] = color;</span>
+<span class="nc" id="L596">		tempVertices[3] = u;</span>
+<span class="nc" id="L597">		tempVertices[4] = v;</span>
+
+<span class="nc" id="L599">		tempVertices[5] = x2;</span>
+<span class="nc" id="L600">		tempVertices[6] = y2;</span>
+<span class="nc" id="L601">		tempVertices[7] = color;</span>
+<span class="nc" id="L602">		tempVertices[8] = u;</span>
+<span class="nc" id="L603">		tempVertices[9] = v2;</span>
+
+<span class="nc" id="L605">		tempVertices[10] = x3;</span>
+<span class="nc" id="L606">		tempVertices[11] = y3;</span>
+<span class="nc" id="L607">		tempVertices[12] = color;</span>
+<span class="nc" id="L608">		tempVertices[13] = u2;</span>
+<span class="nc" id="L609">		tempVertices[14] = v2;</span>
+
+<span class="nc bnc" id="L611" title="All 2 branches missed.">		if (mesh.getNumIndices() &gt; 0) {</span>
+<span class="nc" id="L612">			tempVertices[15] = x4;</span>
+<span class="nc" id="L613">			tempVertices[16] = y4;</span>
+<span class="nc" id="L614">			tempVertices[17] = color;</span>
+<span class="nc" id="L615">			tempVertices[18] = u2;</span>
+<span class="nc" id="L616">			tempVertices[19] = v;</span>
+<span class="nc" id="L617">			add(texture, tempVertices, 0, 20);</span>
+		} else {
+<span class="nc" id="L619">			tempVertices[15] = x3;</span>
+<span class="nc" id="L620">			tempVertices[16] = y3;</span>
+<span class="nc" id="L621">			tempVertices[17] = color;</span>
+<span class="nc" id="L622">			tempVertices[18] = u2;</span>
+<span class="nc" id="L623">			tempVertices[19] = v2;</span>
+
+<span class="nc" id="L625">			tempVertices[20] = x4;</span>
+<span class="nc" id="L626">			tempVertices[21] = y4;</span>
+<span class="nc" id="L627">			tempVertices[22] = color;</span>
+<span class="nc" id="L628">			tempVertices[23] = u2;</span>
+<span class="nc" id="L629">			tempVertices[24] = v;</span>
+
+<span class="nc" id="L631">			tempVertices[25] = x1;</span>
+<span class="nc" id="L632">			tempVertices[26] = y1;</span>
+<span class="nc" id="L633">			tempVertices[27] = color;</span>
+<span class="nc" id="L634">			tempVertices[28] = u;</span>
+<span class="nc" id="L635">			tempVertices[29] = v;</span>
+<span class="nc" id="L636">			add(texture, tempVertices, 0, 30);</span>
+		}
+<span class="nc" id="L638">	}</span>
+
+	/** Adds the specified region to the cache. */
+	public void add (TextureRegion region, float x, float y) {
+<span class="nc" id="L642">		add(region, x, y, region.getRegionWidth(), region.getRegionHeight());</span>
+<span class="nc" id="L643">	}</span>
+
+	/** Adds the specified region to the cache. */
+	public void add (TextureRegion region, float x, float y, float width, float height) {
+<span class="nc" id="L647">		final float fx2 = x + width;</span>
+<span class="nc" id="L648">		final float fy2 = y + height;</span>
+<span class="nc" id="L649">		final float u = region.u;</span>
+<span class="nc" id="L650">		final float v = region.v2;</span>
+<span class="nc" id="L651">		final float u2 = region.u2;</span>
+<span class="nc" id="L652">		final float v2 = region.v;</span>
+
+<span class="nc" id="L654">		tempVertices[0] = x;</span>
+<span class="nc" id="L655">		tempVertices[1] = y;</span>
+<span class="nc" id="L656">		tempVertices[2] = color;</span>
+<span class="nc" id="L657">		tempVertices[3] = u;</span>
+<span class="nc" id="L658">		tempVertices[4] = v;</span>
+
+<span class="nc" id="L660">		tempVertices[5] = x;</span>
+<span class="nc" id="L661">		tempVertices[6] = fy2;</span>
+<span class="nc" id="L662">		tempVertices[7] = color;</span>
+<span class="nc" id="L663">		tempVertices[8] = u;</span>
+<span class="nc" id="L664">		tempVertices[9] = v2;</span>
+
+<span class="nc" id="L666">		tempVertices[10] = fx2;</span>
+<span class="nc" id="L667">		tempVertices[11] = fy2;</span>
+<span class="nc" id="L668">		tempVertices[12] = color;</span>
+<span class="nc" id="L669">		tempVertices[13] = u2;</span>
+<span class="nc" id="L670">		tempVertices[14] = v2;</span>
+
+<span class="nc bnc" id="L672" title="All 2 branches missed.">		if (mesh.getNumIndices() &gt; 0) {</span>
+<span class="nc" id="L673">			tempVertices[15] = fx2;</span>
+<span class="nc" id="L674">			tempVertices[16] = y;</span>
+<span class="nc" id="L675">			tempVertices[17] = color;</span>
+<span class="nc" id="L676">			tempVertices[18] = u2;</span>
+<span class="nc" id="L677">			tempVertices[19] = v;</span>
+<span class="nc" id="L678">			add(region.texture, tempVertices, 0, 20);</span>
+		} else {
+<span class="nc" id="L680">			tempVertices[15] = fx2;</span>
+<span class="nc" id="L681">			tempVertices[16] = fy2;</span>
+<span class="nc" id="L682">			tempVertices[17] = color;</span>
+<span class="nc" id="L683">			tempVertices[18] = u2;</span>
+<span class="nc" id="L684">			tempVertices[19] = v2;</span>
+
+<span class="nc" id="L686">			tempVertices[20] = fx2;</span>
+<span class="nc" id="L687">			tempVertices[21] = y;</span>
+<span class="nc" id="L688">			tempVertices[22] = color;</span>
+<span class="nc" id="L689">			tempVertices[23] = u2;</span>
+<span class="nc" id="L690">			tempVertices[24] = v;</span>
+
+<span class="nc" id="L692">			tempVertices[25] = x;</span>
+<span class="nc" id="L693">			tempVertices[26] = y;</span>
+<span class="nc" id="L694">			tempVertices[27] = color;</span>
+<span class="nc" id="L695">			tempVertices[28] = u;</span>
+<span class="nc" id="L696">			tempVertices[29] = v;</span>
+<span class="nc" id="L697">			add(region.texture, tempVertices, 0, 30);</span>
+		}
+<span class="nc" id="L699">	}</span>
+
+	/** Adds the specified region to the cache. */
+	public void add (TextureRegion region, float x, float y, float originX, float originY, float width, float height,
+		float scaleX, float scaleY, float rotation) {
+
+		// bottom left and top right corner points relative to origin
+<span class="nc" id="L706">		final float worldOriginX = x + originX;</span>
+<span class="nc" id="L707">		final float worldOriginY = y + originY;</span>
+<span class="nc" id="L708">		float fx = -originX;</span>
+<span class="nc" id="L709">		float fy = -originY;</span>
+<span class="nc" id="L710">		float fx2 = width - originX;</span>
+<span class="nc" id="L711">		float fy2 = height - originY;</span>
+
+		// scale
+<span class="nc bnc" id="L714" title="All 4 branches missed.">		if (scaleX != 1 || scaleY != 1) {</span>
+<span class="nc" id="L715">			fx *= scaleX;</span>
+<span class="nc" id="L716">			fy *= scaleY;</span>
+<span class="nc" id="L717">			fx2 *= scaleX;</span>
+<span class="nc" id="L718">			fy2 *= scaleY;</span>
+		}
+
+		// construct corner points, start from top left and go counter clockwise
+<span class="nc" id="L722">		final float p1x = fx;</span>
+<span class="nc" id="L723">		final float p1y = fy;</span>
+<span class="nc" id="L724">		final float p2x = fx;</span>
+<span class="nc" id="L725">		final float p2y = fy2;</span>
+<span class="nc" id="L726">		final float p3x = fx2;</span>
+<span class="nc" id="L727">		final float p3y = fy2;</span>
+<span class="nc" id="L728">		final float p4x = fx2;</span>
+<span class="nc" id="L729">		final float p4y = fy;</span>
+
+		float x1;
+		float y1;
+		float x2;
+		float y2;
+		float x3;
+		float y3;
+		float x4;
+		float y4;
+
+		// rotate
+<span class="nc bnc" id="L741" title="All 2 branches missed.">		if (rotation != 0) {</span>
+<span class="nc" id="L742">			final float cos = MathUtils.cosDeg(rotation);</span>
+<span class="nc" id="L743">			final float sin = MathUtils.sinDeg(rotation);</span>
+
+<span class="nc" id="L745">			x1 = cos * p1x - sin * p1y;</span>
+<span class="nc" id="L746">			y1 = sin * p1x + cos * p1y;</span>
+
+<span class="nc" id="L748">			x2 = cos * p2x - sin * p2y;</span>
+<span class="nc" id="L749">			y2 = sin * p2x + cos * p2y;</span>
+
+<span class="nc" id="L751">			x3 = cos * p3x - sin * p3y;</span>
+<span class="nc" id="L752">			y3 = sin * p3x + cos * p3y;</span>
+
+<span class="nc" id="L754">			x4 = x1 + (x3 - x2);</span>
+<span class="nc" id="L755">			y4 = y3 - (y2 - y1);</span>
+<span class="nc" id="L756">		} else {</span>
+<span class="nc" id="L757">			x1 = p1x;</span>
+<span class="nc" id="L758">			y1 = p1y;</span>
+
+<span class="nc" id="L760">			x2 = p2x;</span>
+<span class="nc" id="L761">			y2 = p2y;</span>
+
+<span class="nc" id="L763">			x3 = p3x;</span>
+<span class="nc" id="L764">			y3 = p3y;</span>
+
+<span class="nc" id="L766">			x4 = p4x;</span>
+<span class="nc" id="L767">			y4 = p4y;</span>
+		}
+
+<span class="nc" id="L770">		x1 += worldOriginX;</span>
+<span class="nc" id="L771">		y1 += worldOriginY;</span>
+<span class="nc" id="L772">		x2 += worldOriginX;</span>
+<span class="nc" id="L773">		y2 += worldOriginY;</span>
+<span class="nc" id="L774">		x3 += worldOriginX;</span>
+<span class="nc" id="L775">		y3 += worldOriginY;</span>
+<span class="nc" id="L776">		x4 += worldOriginX;</span>
+<span class="nc" id="L777">		y4 += worldOriginY;</span>
+
+<span class="nc" id="L779">		final float u = region.u;</span>
+<span class="nc" id="L780">		final float v = region.v2;</span>
+<span class="nc" id="L781">		final float u2 = region.u2;</span>
+<span class="nc" id="L782">		final float v2 = region.v;</span>
+
+<span class="nc" id="L784">		tempVertices[0] = x1;</span>
+<span class="nc" id="L785">		tempVertices[1] = y1;</span>
+<span class="nc" id="L786">		tempVertices[2] = color;</span>
+<span class="nc" id="L787">		tempVertices[3] = u;</span>
+<span class="nc" id="L788">		tempVertices[4] = v;</span>
+
+<span class="nc" id="L790">		tempVertices[5] = x2;</span>
+<span class="nc" id="L791">		tempVertices[6] = y2;</span>
+<span class="nc" id="L792">		tempVertices[7] = color;</span>
+<span class="nc" id="L793">		tempVertices[8] = u;</span>
+<span class="nc" id="L794">		tempVertices[9] = v2;</span>
+
+<span class="nc" id="L796">		tempVertices[10] = x3;</span>
+<span class="nc" id="L797">		tempVertices[11] = y3;</span>
+<span class="nc" id="L798">		tempVertices[12] = color;</span>
+<span class="nc" id="L799">		tempVertices[13] = u2;</span>
+<span class="nc" id="L800">		tempVertices[14] = v2;</span>
+
+<span class="nc bnc" id="L802" title="All 2 branches missed.">		if (mesh.getNumIndices() &gt; 0) {</span>
+<span class="nc" id="L803">			tempVertices[15] = x4;</span>
+<span class="nc" id="L804">			tempVertices[16] = y4;</span>
+<span class="nc" id="L805">			tempVertices[17] = color;</span>
+<span class="nc" id="L806">			tempVertices[18] = u2;</span>
+<span class="nc" id="L807">			tempVertices[19] = v;</span>
+<span class="nc" id="L808">			add(region.texture, tempVertices, 0, 20);</span>
+		} else {
+<span class="nc" id="L810">			tempVertices[15] = x3;</span>
+<span class="nc" id="L811">			tempVertices[16] = y3;</span>
+<span class="nc" id="L812">			tempVertices[17] = color;</span>
+<span class="nc" id="L813">			tempVertices[18] = u2;</span>
+<span class="nc" id="L814">			tempVertices[19] = v2;</span>
+
+<span class="nc" id="L816">			tempVertices[20] = x4;</span>
+<span class="nc" id="L817">			tempVertices[21] = y4;</span>
+<span class="nc" id="L818">			tempVertices[22] = color;</span>
+<span class="nc" id="L819">			tempVertices[23] = u2;</span>
+<span class="nc" id="L820">			tempVertices[24] = v;</span>
+
+<span class="nc" id="L822">			tempVertices[25] = x1;</span>
+<span class="nc" id="L823">			tempVertices[26] = y1;</span>
+<span class="nc" id="L824">			tempVertices[27] = color;</span>
+<span class="nc" id="L825">			tempVertices[28] = u;</span>
+<span class="nc" id="L826">			tempVertices[29] = v;</span>
+<span class="nc" id="L827">			add(region.texture, tempVertices, 0, 30);</span>
+		}
+<span class="nc" id="L829">	}</span>
+
+	/** Adds the specified sprite to the cache. */
+	public void add (Sprite sprite) {
+<span class="nc bnc" id="L833" title="All 2 branches missed.">		if (mesh.getNumIndices() &gt; 0) {</span>
+<span class="nc" id="L834">			add(sprite.getTexture(), sprite.getVertices(), 0, SPRITE_SIZE);</span>
+<span class="nc" id="L835">			return;</span>
+		}
+
+<span class="nc" id="L838">		float[] spriteVertices = sprite.getVertices();</span>
+<span class="nc" id="L839">		System.arraycopy(spriteVertices, 0, tempVertices, 0, 3 * VERTEX_SIZE); // temp0,1,2=sprite0,1,2</span>
+<span class="nc" id="L840">		System.arraycopy(spriteVertices, 2 * VERTEX_SIZE, tempVertices, 3 * VERTEX_SIZE, VERTEX_SIZE); // temp3=sprite2</span>
+<span class="nc" id="L841">		System.arraycopy(spriteVertices, 3 * VERTEX_SIZE, tempVertices, 4 * VERTEX_SIZE, VERTEX_SIZE); // temp4=sprite3</span>
+<span class="nc" id="L842">		System.arraycopy(spriteVertices, 0, tempVertices, 5 * VERTEX_SIZE, VERTEX_SIZE); // temp5=sprite0</span>
+<span class="nc" id="L843">		add(sprite.getTexture(), tempVertices, 0, 30);</span>
+<span class="nc" id="L844">	}</span>
+
+	/** Prepares the OpenGL state for SpriteCache rendering. */
+	public void begin () {
+<span class="nc bnc" id="L848" title="All 2 branches missed.">		if (drawing) throw new IllegalStateException(&quot;end must be called before begin.&quot;);</span>
+<span class="nc" id="L849">		renderCalls = 0;</span>
+<span class="nc" id="L850">		combinedMatrix.set(projectionMatrix).mul(transformMatrix);</span>
+
+<span class="nc" id="L852">		Gdx.gl20.glDepthMask(false);</span>
+
+<span class="nc bnc" id="L854" title="All 2 branches missed.">		if (customShader != null) {</span>
+<span class="nc" id="L855">			customShader.begin();</span>
+<span class="nc" id="L856">			customShader.setUniformMatrix(&quot;u_proj&quot;, projectionMatrix);</span>
+<span class="nc" id="L857">			customShader.setUniformMatrix(&quot;u_trans&quot;, transformMatrix);</span>
+<span class="nc" id="L858">			customShader.setUniformMatrix(&quot;u_projTrans&quot;, combinedMatrix);</span>
+<span class="nc" id="L859">			customShader.setUniformi(&quot;u_texture&quot;, 0);</span>
+<span class="nc" id="L860">			mesh.bind(customShader);</span>
+		} else {
+<span class="nc" id="L862">			shader.begin();</span>
+<span class="nc" id="L863">			shader.setUniformMatrix(&quot;u_projectionViewMatrix&quot;, combinedMatrix);</span>
+<span class="nc" id="L864">			shader.setUniformi(&quot;u_texture&quot;, 0);</span>
+<span class="nc" id="L865">			mesh.bind(shader);</span>
+		}
+<span class="nc" id="L867">		drawing = true;</span>
+<span class="nc" id="L868">	}</span>
+
+	/** Completes rendering for this SpriteCache. */
+	public void end () {
+<span class="nc bnc" id="L872" title="All 2 branches missed.">		if (!drawing) throw new IllegalStateException(&quot;begin must be called before end.&quot;);</span>
+<span class="nc" id="L873">		drawing = false;</span>
+
+<span class="nc" id="L875">		shader.end();</span>
+<span class="nc" id="L876">		GL20 gl = Gdx.gl20;</span>
+<span class="nc" id="L877">		gl.glDepthMask(true);</span>
+<span class="nc bnc" id="L878" title="All 2 branches missed.">		if (customShader != null)</span>
+<span class="nc" id="L879">			mesh.unbind(customShader);</span>
+		else
+<span class="nc" id="L881">			mesh.unbind(shader);</span>
+<span class="nc" id="L882">	}</span>
+
+	/** Draws all the images defined for the specified cache ID. */
+	public void draw (int cacheID) {
+<span class="nc bnc" id="L886" title="All 2 branches missed.">		if (!drawing) throw new IllegalStateException(&quot;SpriteCache.begin must be called before draw.&quot;);</span>
+
+<span class="nc" id="L888">		Cache cache = caches.get(cacheID);</span>
+<span class="nc bnc" id="L889" title="All 2 branches missed.">		int verticesPerImage = mesh.getNumIndices() &gt; 0 ? 4 : 6;</span>
+<span class="nc" id="L890">		int offset = cache.offset / (verticesPerImage * VERTEX_SIZE) * 6;</span>
+<span class="nc" id="L891">		Texture[] textures = cache.textures;</span>
+<span class="nc" id="L892">		int[] counts = cache.counts;</span>
+<span class="nc" id="L893">		int textureCount = cache.textureCount;</span>
+<span class="nc bnc" id="L894" title="All 2 branches missed.">		for (int i = 0; i &lt; textureCount; i++) {</span>
+<span class="nc" id="L895">			int count = counts[i];</span>
+<span class="nc" id="L896">			textures[i].bind();</span>
+<span class="nc bnc" id="L897" title="All 2 branches missed.">			if (customShader != null)</span>
+<span class="nc" id="L898">				mesh.render(customShader, GL20.GL_TRIANGLES, offset, count);</span>
+			else
+<span class="nc" id="L900">				mesh.render(shader, GL20.GL_TRIANGLES, offset, count);</span>
+<span class="nc" id="L901">			offset += count;</span>
+		}
+<span class="nc" id="L903">		renderCalls += textureCount;</span>
+<span class="nc" id="L904">		totalRenderCalls += textureCount;</span>
+<span class="nc" id="L905">	}</span>
+
+	/** Draws a subset of images defined for the specified cache ID.
+	 * @param offset The first image to render.
+	 * @param length The number of images from the first image (inclusive) to render. */
+	public void draw (int cacheID, int offset, int length) {
+<span class="nc bnc" id="L911" title="All 2 branches missed.">		if (!drawing) throw new IllegalStateException(&quot;SpriteCache.begin must be called before draw.&quot;);</span>
+
+<span class="nc" id="L913">		Cache cache = caches.get(cacheID);</span>
+<span class="nc" id="L914">		offset = offset * 6 + cache.offset;</span>
+<span class="nc" id="L915">		length *= 6;</span>
+<span class="nc" id="L916">		Texture[] textures = cache.textures;</span>
+<span class="nc" id="L917">		int[] counts = cache.counts;</span>
+<span class="nc" id="L918">		int textureCount = cache.textureCount;</span>
+<span class="nc bnc" id="L919" title="All 2 branches missed.">		for (int i = 0; i &lt; textureCount; i++) {</span>
+<span class="nc" id="L920">			textures[i].bind();</span>
+<span class="nc" id="L921">			int count = counts[i];</span>
+<span class="nc bnc" id="L922" title="All 2 branches missed.">			if (count &gt; length) {</span>
+<span class="nc" id="L923">				i = textureCount;</span>
+<span class="nc" id="L924">				count = length;</span>
+			} else
+<span class="nc" id="L926">				length -= count;</span>
+<span class="nc bnc" id="L927" title="All 2 branches missed.">			if (customShader != null)</span>
+<span class="nc" id="L928">				mesh.render(customShader, GL20.GL_TRIANGLES, offset, count);</span>
+			else
+<span class="nc" id="L930">				mesh.render(shader, GL20.GL_TRIANGLES, offset, count);</span>
+<span class="nc" id="L931">			offset += count;</span>
+		}
+<span class="nc" id="L933">		renderCalls += cache.textureCount;</span>
+<span class="nc" id="L934">		totalRenderCalls += textureCount;</span>
+<span class="nc" id="L935">	}</span>
+
+	/** Releases all resources held by this SpriteCache. */
+	public void dispose () {
+<span class="nc" id="L939">		mesh.dispose();</span>
+<span class="nc bnc" id="L940" title="All 2 branches missed.">		if (shader != null) shader.dispose();</span>
+<span class="nc" id="L941">	}</span>
+
+	public Matrix4 getProjectionMatrix () {
+<span class="nc" id="L944">		return projectionMatrix;</span>
+	}
+
+	public void setProjectionMatrix (Matrix4 projection) {
+<span class="nc bnc" id="L948" title="All 2 branches missed.">		if (drawing) throw new IllegalStateException(&quot;Can't set the matrix within begin/end.&quot;);</span>
+<span class="nc" id="L949">		projectionMatrix.set(projection);</span>
+<span class="nc" id="L950">	}</span>
+
+	public Matrix4 getTransformMatrix () {
+<span class="nc" id="L953">		return transformMatrix;</span>
+	}
+
+	public void setTransformMatrix (Matrix4 transform) {
+<span class="nc bnc" id="L957" title="All 2 branches missed.">		if (drawing) throw new IllegalStateException(&quot;Can't set the matrix within begin/end.&quot;);</span>
+<span class="nc" id="L958">		transformMatrix.set(transform);</span>
+<span class="nc" id="L959">	}</span>
+
+	static private class Cache {
+		final int id;
+		final int offset;
+		int maxCount;
+		int textureCount;
+		Texture[] textures;
+		int[] counts;
+
+<span class="nc" id="L969">		public Cache (int id, int offset) {</span>
+<span class="nc" id="L970">			this.id = id;</span>
+<span class="nc" id="L971">			this.offset = offset;</span>
+<span class="nc" id="L972">		}</span>
+	}
+
+	static ShaderProgram createDefaultShader () {
+<span class="nc" id="L976">		String vertexShader = &quot;attribute vec4 &quot; + ShaderProgram.POSITION_ATTRIBUTE + &quot;;\n&quot; //</span>
+			+ &quot;attribute vec4 &quot; + ShaderProgram.COLOR_ATTRIBUTE + &quot;;\n&quot; //
+			+ &quot;attribute vec2 &quot; + ShaderProgram.TEXCOORD_ATTRIBUTE + &quot;0;\n&quot; //
+			+ &quot;uniform mat4 u_projectionViewMatrix;\n&quot; //
+			+ &quot;varying vec4 v_color;\n&quot; //
+			+ &quot;varying vec2 v_texCoords;\n&quot; //
+			+ &quot;\n&quot; //
+			+ &quot;void main()\n&quot; //
+			+ &quot;{\n&quot; //
+			+ &quot;   v_color = &quot; + ShaderProgram.COLOR_ATTRIBUTE + &quot;;\n&quot; //
+			+ &quot;   v_color.a = v_color.a * (255.0/254.0);\n&quot; //
+			+ &quot;   v_texCoords = &quot; + ShaderProgram.TEXCOORD_ATTRIBUTE + &quot;0;\n&quot; //
+			+ &quot;   gl_Position =  u_projectionViewMatrix * &quot; + ShaderProgram.POSITION_ATTRIBUTE + &quot;;\n&quot; //
+			+ &quot;}\n&quot;;
+<span class="nc" id="L990">		String fragmentShader = &quot;#ifdef GL_ES\n&quot; //</span>
+			+ &quot;precision mediump float;\n&quot; //
+			+ &quot;#endif\n&quot; //
+			+ &quot;varying vec4 v_color;\n&quot; //
+			+ &quot;varying vec2 v_texCoords;\n&quot; //
+			+ &quot;uniform sampler2D u_texture;\n&quot; //
+			+ &quot;void main()\n&quot;//
+			+ &quot;{\n&quot; //
+			+ &quot;  gl_FragColor = v_color * texture2D(u_texture, v_texCoords);\n&quot; //
+			+ &quot;}&quot;;
+<span class="nc" id="L1000">		ShaderProgram shader = new ShaderProgram(vertexShader, fragmentShader);</span>
+<span class="nc bnc" id="L1001" title="All 2 branches missed.">		if (shader.isCompiled() == false) throw new IllegalArgumentException(&quot;Error compiling shader: &quot; + shader.getLog());</span>
+<span class="nc" id="L1002">		return shader;</span>
+	}
+
+	/** Sets the shader to be used in a GLES 2.0 environment. Vertex position attribute is called &quot;a_position&quot;, the texture
+	 * coordinates attribute is called called &quot;a_texCoords&quot;, the color attribute is called &quot;a_color&quot;. The projection matrix is
+	 * uploaded via a mat4 uniform called &quot;u_proj&quot;, the transform matrix is uploaded via a uniform called &quot;u_trans&quot;, the combined
+	 * transform and projection matrx is is uploaded via a mat4 uniform called &quot;u_projTrans&quot;. The texture sampler is passed via a
+	 * uniform called &quot;u_texture&quot;.
+	 * 
+	 * Call this method with a null argument to use the default shader.
+	 * 
+	 * @param shader the {@link ShaderProgram} or null to use the default shader. */
+	public void setShader (ShaderProgram shader) {
+<span class="nc" id="L1015">		customShader = shader;</span>
+<span class="nc" id="L1016">	}</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.5.5.201112152213</span></div></body></html>

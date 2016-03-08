@@ -1,0 +1,1132 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>ShapeRenderer.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">libGDX Core</a> &gt; <a href="index.html" class="el_package">com.badlogic.gdx.graphics.glutils</a> &gt; <span class="el_source">ShapeRenderer.java</span></div><h1>ShapeRenderer.java</h1><pre class="source lang-java linenums">/*******************************************************************************
+ * Copyright 2011 See AUTHORS file.
+ * 
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ ******************************************************************************/
+
+package com.badlogic.gdx.graphics.glutils;
+
+import com.badlogic.gdx.Gdx;
+import com.badlogic.gdx.graphics.Camera;
+import com.badlogic.gdx.graphics.Color;
+import com.badlogic.gdx.graphics.GL20;
+import com.badlogic.gdx.math.MathUtils;
+import com.badlogic.gdx.math.Matrix4;
+import com.badlogic.gdx.math.Vector2;
+import com.badlogic.gdx.math.Vector3;
+import com.badlogic.gdx.utils.Disposable;
+
+/** Renders points, lines, shape outlines and filled shapes.
+ * &lt;p&gt;
+ * By default a 2D orthographic projection with the origin in the lower left corner is used and units are specified in screen
+ * pixels. This can be changed by configuring the projection matrix, usually using the {@link Camera#combined} matrix. If the
+ * screen resolution changes, the projection matrix may need to be updated.
+ * &lt;p&gt;
+ * Shapes are rendered in batches to increase performance. Standard usage pattern looks as follows:
+ * 
+ * &lt;pre&gt;
+ * {@code
+ * camera.update();
+ * shapeRenderer.setProjectionMatrix(camera.combined);
+ * 
+ * shapeRenderer.begin(ShapeType.Line);
+ * shapeRenderer.setColor(1, 1, 0, 1);
+ * shapeRenderer.line(x, y, x2, y2);
+ * shapeRenderer.rect(x, y, width, height);
+ * shapeRenderer.circle(x, y, radius);
+ * shapeRenderer.end();
+ * 
+ * shapeRenderer.begin(ShapeType.Filled);
+ * shapeRenderer.setColor(0, 1, 0, 1);
+ * shapeRenderer.rect(x, y, width, height);
+ * shapeRenderer.circle(x, y, radius);
+ * shapeRenderer.end();
+ * }
+ * &lt;/pre&gt;
+ * 
+ * ShapeRenderer has a second matrix called the transformation matrix which is used to rotate, scale and translate shapes in a
+ * more flexible manner. The following example shows how to rotate a rectangle around its center using the z-axis as the rotation
+ * axis and placing it's center at (20, 12, 2):
+ * 
+ * &lt;pre&gt;
+ * shapeRenderer.begin(ShapeType.Line);
+ * shapeRenderer.identity();
+ * shapeRenderer.translate(20, 12, 2);
+ * shapeRenderer.rotate(0, 0, 1, 90);
+ * shapeRenderer.rect(-width / 2, -height / 2, width, height);
+ * shapeRenderer.end();
+ * &lt;/pre&gt;
+ * 
+ * Matrix operations all use postmultiplication and work just like glTranslate, glScale and glRotate. The last transformation
+ * specified will be the first that is applied to a shape (rotate then translate in the above example).
+ * &lt;p&gt;
+ * The projection and transformation matrices are a state of the ShapeRenderer, just like the color, and will be applied to all
+ * shapes until they are changed.
+ * @author mzechner
+ * @author stbachmann
+ * @author Nathan Sweet */
+public class ShapeRenderer implements Disposable {
+	/** Shape types to be used with {@link #begin(ShapeType)}.
+	 * @author mzechner, stbachmann */
+<span class="nc" id="L81">	public enum ShapeType {</span>
+<span class="nc" id="L82">		Point(GL20.GL_POINTS), Line(GL20.GL_LINES), Filled(GL20.GL_TRIANGLES);</span>
+
+		private final int glType;
+
+<span class="nc" id="L86">		ShapeType (int glType) {</span>
+<span class="nc" id="L87">			this.glType = glType;</span>
+<span class="nc" id="L88">		}</span>
+
+		public int getGlType () {
+<span class="nc" id="L91">			return glType;</span>
+		}
+	}
+
+	private final ImmediateModeRenderer renderer;
+<span class="nc" id="L96">	private boolean matrixDirty = false;</span>
+<span class="nc" id="L97">	private final Matrix4 projectionMatrix = new Matrix4();</span>
+<span class="nc" id="L98">	private final Matrix4 transformMatrix = new Matrix4();</span>
+<span class="nc" id="L99">	private final Matrix4 combinedMatrix = new Matrix4();</span>
+<span class="nc" id="L100">	private final Vector2 tmp = new Vector2();</span>
+<span class="nc" id="L101">	private final Color color = new Color(1, 1, 1, 1);</span>
+	private ShapeType shapeType;
+	private boolean autoShapeType;
+<span class="nc" id="L104">	private float defaultRectLineWidth = 0.75f;</span>
+
+	public ShapeRenderer () {
+<span class="nc" id="L107">		this(5000);</span>
+<span class="nc" id="L108">	}</span>
+
+	public ShapeRenderer (int maxVertices) {
+<span class="nc" id="L111">		this(maxVertices, null);</span>
+<span class="nc" id="L112">	}</span>
+
+<span class="nc" id="L114">	public ShapeRenderer (int maxVertices, ShaderProgram defaultShader) {</span>
+<span class="nc bnc" id="L115" title="All 2 branches missed.">		if (defaultShader == null) {</span>
+<span class="nc" id="L116">			renderer = new ImmediateModeRenderer20(maxVertices, false, true, 0);</span>
+		} else {
+<span class="nc" id="L118">			renderer = new ImmediateModeRenderer20(maxVertices, false, true, 0, defaultShader);</span>
+		}
+<span class="nc" id="L120">		projectionMatrix.setToOrtho2D(0, 0, Gdx.graphics.getWidth(), Gdx.graphics.getHeight());</span>
+<span class="nc" id="L121">		matrixDirty = true;</span>
+<span class="nc" id="L122">	}</span>
+
+	/** Sets the color to be used by the next shapes drawn. */
+	public void setColor (Color color) {
+<span class="nc" id="L126">		this.color.set(color);</span>
+<span class="nc" id="L127">	}</span>
+
+	/** Sets the color to be used by the next shapes drawn. */
+	public void setColor (float r, float g, float b, float a) {
+<span class="nc" id="L131">		this.color.set(r, g, b, a);</span>
+<span class="nc" id="L132">	}</span>
+
+	public Color getColor () {
+<span class="nc" id="L135">		return color;</span>
+	}
+
+	public void updateMatrices () {
+<span class="nc" id="L139">		matrixDirty = true;</span>
+<span class="nc" id="L140">	}</span>
+
+	/** Sets the projection matrix to be used for rendering. Usually this will be set to {@link Camera#combined}.
+	 * @param matrix */
+	public void setProjectionMatrix (Matrix4 matrix) {
+<span class="nc" id="L145">		projectionMatrix.set(matrix);</span>
+<span class="nc" id="L146">		matrixDirty = true;</span>
+<span class="nc" id="L147">	}</span>
+
+	/** If the matrix is modified, {@link #updateMatrices()} must be called. */
+	public Matrix4 getProjectionMatrix () {
+<span class="nc" id="L151">		return projectionMatrix;</span>
+	}
+
+	public void setTransformMatrix (Matrix4 matrix) {
+<span class="nc" id="L155">		transformMatrix.set(matrix);</span>
+<span class="nc" id="L156">		matrixDirty = true;</span>
+<span class="nc" id="L157">	}</span>
+
+	/** If the matrix is modified, {@link #updateMatrices()} must be called. */
+	public Matrix4 getTransformMatrix () {
+<span class="nc" id="L161">		return transformMatrix;</span>
+	}
+
+	/** Sets the transformation matrix to identity. */
+	public void identity () {
+<span class="nc" id="L166">		transformMatrix.idt();</span>
+<span class="nc" id="L167">		matrixDirty = true;</span>
+<span class="nc" id="L168">	}</span>
+
+	/** Multiplies the current transformation matrix by a translation matrix. */
+	public void translate (float x, float y, float z) {
+<span class="nc" id="L172">		transformMatrix.translate(x, y, z);</span>
+<span class="nc" id="L173">		matrixDirty = true;</span>
+<span class="nc" id="L174">	}</span>
+
+	/** Multiplies the current transformation matrix by a rotation matrix. */
+	public void rotate (float axisX, float axisY, float axisZ, float degrees) {
+<span class="nc" id="L178">		transformMatrix.rotate(axisX, axisY, axisZ, degrees);</span>
+<span class="nc" id="L179">		matrixDirty = true;</span>
+<span class="nc" id="L180">	}</span>
+
+	/** Multiplies the current transformation matrix by a scale matrix. */
+	public void scale (float scaleX, float scaleY, float scaleZ) {
+<span class="nc" id="L184">		transformMatrix.scale(scaleX, scaleY, scaleZ);</span>
+<span class="nc" id="L185">		matrixDirty = true;</span>
+<span class="nc" id="L186">	}</span>
+
+	/** If true, when drawing a shape cannot be performed with the current shape type, the batch is flushed and the shape type is
+	 * changed automatically. This can increase the number of batch flushes if care is not taken to draw the same type of shapes
+	 * together. Default is false. */
+	public void setAutoShapeType (boolean autoShapeType) {
+<span class="nc" id="L192">		this.autoShapeType = autoShapeType;</span>
+<span class="nc" id="L193">	}</span>
+
+	/** Begins a new batch without specifying a shape type.
+	 * @throws IllegalStateException if {@link #autoShapeType} is false. */
+	public void begin () {
+<span class="nc bnc" id="L198" title="All 2 branches missed.">		if (!autoShapeType) throw new IllegalStateException(&quot;autoShapeType must be true to use this method.&quot;);</span>
+<span class="nc" id="L199">		begin(ShapeType.Line);</span>
+<span class="nc" id="L200">	}</span>
+
+	/** Starts a new batch of shapes. Shapes drawn within the batch will attempt to use the type specified. The call to this method
+	 * must be paired with a call to {@link #end()}.
+	 * @see #setAutoShapeType(boolean) */
+	public void begin (ShapeType type) {
+<span class="nc bnc" id="L206" title="All 2 branches missed.">		if (shapeType != null) throw new IllegalStateException(&quot;Call end() before beginning a new shape batch.&quot;);</span>
+<span class="nc" id="L207">		shapeType = type;</span>
+<span class="nc bnc" id="L208" title="All 2 branches missed.">		if (matrixDirty) {</span>
+<span class="nc" id="L209">			combinedMatrix.set(projectionMatrix);</span>
+<span class="nc" id="L210">			Matrix4.mul(combinedMatrix.val, transformMatrix.val);</span>
+<span class="nc" id="L211">			matrixDirty = false;</span>
+		}
+<span class="nc" id="L213">		renderer.begin(combinedMatrix, shapeType.getGlType());</span>
+<span class="nc" id="L214">	}</span>
+
+	public void set (ShapeType type) {
+<span class="nc bnc" id="L217" title="All 2 branches missed.">		if (shapeType == type) return;</span>
+<span class="nc bnc" id="L218" title="All 2 branches missed.">		if (shapeType == null) throw new IllegalStateException(&quot;begin must be called first.&quot;);</span>
+<span class="nc bnc" id="L219" title="All 2 branches missed.">		if (!autoShapeType) throw new IllegalStateException(&quot;autoShapeType must be enabled.&quot;);</span>
+<span class="nc" id="L220">		end();</span>
+<span class="nc" id="L221">		begin(type);</span>
+<span class="nc" id="L222">	}</span>
+
+	/** Draws a point using {@link ShapeType#Point}, {@link ShapeType#Line} or {@link ShapeType#Filled}. */
+	public void point (float x, float y, float z) {
+<span class="nc bnc" id="L226" title="All 2 branches missed.">		if (shapeType == ShapeType.Line) {</span>
+<span class="nc" id="L227">			float size = defaultRectLineWidth * 0.5f;</span>
+<span class="nc" id="L228">			line(x - size, y - size, z, x + size, y + size, z);</span>
+<span class="nc" id="L229">			return;</span>
+<span class="nc bnc" id="L230" title="All 2 branches missed.">		} else if (shapeType == ShapeType.Filled) {</span>
+<span class="nc" id="L231">			float size = defaultRectLineWidth * 0.5f;</span>
+<span class="nc" id="L232">			box(x - size, y - size, z - size, defaultRectLineWidth, defaultRectLineWidth, defaultRectLineWidth);</span>
+<span class="nc" id="L233">			return;</span>
+		}
+<span class="nc" id="L235">		check(ShapeType.Point, null, 1);</span>
+<span class="nc" id="L236">		renderer.color(color);</span>
+<span class="nc" id="L237">		renderer.vertex(x, y, z);</span>
+<span class="nc" id="L238">	}</span>
+
+	/** Draws a line using {@link ShapeType#Line} or {@link ShapeType#Filled}. */
+	public final void line (float x, float y, float z, float x2, float y2, float z2) {
+<span class="nc" id="L242">		line(x, y, z, x2, y2, z2, color, color);</span>
+<span class="nc" id="L243">	}</span>
+
+	/** @see #line(float, float, float, float, float, float) */
+	public final void line (Vector3 v0, Vector3 v1) {
+<span class="nc" id="L247">		line(v0.x, v0.y, v0.z, v1.x, v1.y, v1.z, color, color);</span>
+<span class="nc" id="L248">	}</span>
+
+	/** @see #line(float, float, float, float, float, float) */
+	public final void line (float x, float y, float x2, float y2) {
+<span class="nc" id="L252">		line(x, y, 0.0f, x2, y2, 0.0f, color, color);</span>
+<span class="nc" id="L253">	}</span>
+
+	/** @see #line(float, float, float, float, float, float) */
+	public final void line (Vector2 v0, Vector2 v1) {
+<span class="nc" id="L257">		line(v0.x, v0.y, 0.0f, v1.x, v1.y, 0.0f, color, color);</span>
+<span class="nc" id="L258">	}</span>
+
+	/** @see #line(float, float, float, float, float, float, Color, Color) */
+	public final void line (float x, float y, float x2, float y2, Color c1, Color c2) {
+<span class="nc" id="L262">		line(x, y, 0.0f, x2, y2, 0.0f, c1, c2);</span>
+<span class="nc" id="L263">	}</span>
+
+	/** Draws a line using {@link ShapeType#Line} or {@link ShapeType#Filled}. The line is drawn with two colors interpolated
+	 * between the start and end points. */
+	public void line (float x, float y, float z, float x2, float y2, float z2, Color c1, Color c2) {
+<span class="nc bnc" id="L268" title="All 2 branches missed.">		if (shapeType == ShapeType.Filled) {</span>
+<span class="nc" id="L269">			rectLine(x, y, x2, y2, defaultRectLineWidth);</span>
+<span class="nc" id="L270">			return;</span>
+		}
+<span class="nc" id="L272">		check(ShapeType.Line, null, 2);</span>
+<span class="nc" id="L273">		renderer.color(c1.r, c1.g, c1.b, c1.a);</span>
+<span class="nc" id="L274">		renderer.vertex(x, y, z);</span>
+<span class="nc" id="L275">		renderer.color(c2.r, c2.g, c2.b, c2.a);</span>
+<span class="nc" id="L276">		renderer.vertex(x2, y2, z2);</span>
+<span class="nc" id="L277">	}</span>
+
+	/** Draws a curve using {@link ShapeType#Line}. */
+	public void curve (float x1, float y1, float cx1, float cy1, float cx2, float cy2, float x2, float y2, int segments) {
+<span class="nc" id="L281">		check(ShapeType.Line, null, segments * 2 + 2);</span>
+<span class="nc" id="L282">		float colorBits = color.toFloatBits();</span>
+		
+		// Algorithm from: http://www.antigrain.com/research/bezier_interpolation/index.html#PAGE_BEZIER_INTERPOLATION
+<span class="nc" id="L285">		float subdiv_step = 1f / segments;</span>
+<span class="nc" id="L286">		float subdiv_step2 = subdiv_step * subdiv_step;</span>
+<span class="nc" id="L287">		float subdiv_step3 = subdiv_step * subdiv_step * subdiv_step;</span>
+
+<span class="nc" id="L289">		float pre1 = 3 * subdiv_step;</span>
+<span class="nc" id="L290">		float pre2 = 3 * subdiv_step2;</span>
+<span class="nc" id="L291">		float pre4 = 6 * subdiv_step2;</span>
+<span class="nc" id="L292">		float pre5 = 6 * subdiv_step3;</span>
+
+<span class="nc" id="L294">		float tmp1x = x1 - cx1 * 2 + cx2;</span>
+<span class="nc" id="L295">		float tmp1y = y1 - cy1 * 2 + cy2;</span>
+
+<span class="nc" id="L297">		float tmp2x = (cx1 - cx2) * 3 - x1 + x2;</span>
+<span class="nc" id="L298">		float tmp2y = (cy1 - cy2) * 3 - y1 + y2;</span>
+
+<span class="nc" id="L300">		float fx = x1;</span>
+<span class="nc" id="L301">		float fy = y1;</span>
+
+<span class="nc" id="L303">		float dfx = (cx1 - x1) * pre1 + tmp1x * pre2 + tmp2x * subdiv_step3;</span>
+<span class="nc" id="L304">		float dfy = (cy1 - y1) * pre1 + tmp1y * pre2 + tmp2y * subdiv_step3;</span>
+
+<span class="nc" id="L306">		float ddfx = tmp1x * pre4 + tmp2x * pre5;</span>
+<span class="nc" id="L307">		float ddfy = tmp1y * pre4 + tmp2y * pre5;</span>
+
+<span class="nc" id="L309">		float dddfx = tmp2x * pre5;</span>
+<span class="nc" id="L310">		float dddfy = tmp2y * pre5;</span>
+
+<span class="nc bnc" id="L312" title="All 2 branches missed.">		while (segments-- &gt; 0) {</span>
+<span class="nc" id="L313">			renderer.color(colorBits);</span>
+<span class="nc" id="L314">			renderer.vertex(fx, fy, 0);</span>
+<span class="nc" id="L315">			fx += dfx;</span>
+<span class="nc" id="L316">			fy += dfy;</span>
+<span class="nc" id="L317">			dfx += ddfx;</span>
+<span class="nc" id="L318">			dfy += ddfy;</span>
+<span class="nc" id="L319">			ddfx += dddfx;</span>
+<span class="nc" id="L320">			ddfy += dddfy;</span>
+<span class="nc" id="L321">			renderer.color(colorBits);</span>
+<span class="nc" id="L322">			renderer.vertex(fx, fy, 0);</span>
+		}
+<span class="nc" id="L324">		renderer.color(colorBits);</span>
+<span class="nc" id="L325">		renderer.vertex(fx, fy, 0);</span>
+<span class="nc" id="L326">		renderer.color(colorBits);</span>
+<span class="nc" id="L327">		renderer.vertex(x2, y2, 0);</span>
+<span class="nc" id="L328">	}</span>
+
+	/** Draws a triangle in x/y plane using {@link ShapeType#Line} or {@link ShapeType#Filled}. */
+	public void triangle (float x1, float y1, float x2, float y2, float x3, float y3) {
+<span class="nc" id="L332">		check(ShapeType.Line, ShapeType.Filled, 6);</span>
+<span class="nc" id="L333">		float colorBits = color.toFloatBits();</span>
+<span class="nc bnc" id="L334" title="All 2 branches missed.">		if (shapeType == ShapeType.Line) {</span>
+<span class="nc" id="L335">			renderer.color(colorBits);</span>
+<span class="nc" id="L336">			renderer.vertex(x1, y1, 0);</span>
+<span class="nc" id="L337">			renderer.color(colorBits);</span>
+<span class="nc" id="L338">			renderer.vertex(x2, y2, 0);</span>
+
+<span class="nc" id="L340">			renderer.color(colorBits);</span>
+<span class="nc" id="L341">			renderer.vertex(x2, y2, 0);</span>
+<span class="nc" id="L342">			renderer.color(colorBits);</span>
+<span class="nc" id="L343">			renderer.vertex(x3, y3, 0);</span>
+
+<span class="nc" id="L345">			renderer.color(colorBits);</span>
+<span class="nc" id="L346">			renderer.vertex(x3, y3, 0);</span>
+<span class="nc" id="L347">			renderer.color(colorBits);</span>
+<span class="nc" id="L348">			renderer.vertex(x1, y1, 0);</span>
+		} else {
+<span class="nc" id="L350">			renderer.color(colorBits);</span>
+<span class="nc" id="L351">			renderer.vertex(x1, y1, 0);</span>
+<span class="nc" id="L352">			renderer.color(colorBits);</span>
+<span class="nc" id="L353">			renderer.vertex(x2, y2, 0);</span>
+<span class="nc" id="L354">			renderer.color(colorBits);</span>
+<span class="nc" id="L355">			renderer.vertex(x3, y3, 0);</span>
+		}
+<span class="nc" id="L357">	}</span>
+
+	/** Draws a triangle in x/y plane with colored corners using {@link ShapeType#Line} or {@link ShapeType#Filled}. */
+	public void triangle (float x1, float y1, float x2, float y2, float x3, float y3, Color col1, Color col2, Color col3) {
+<span class="nc" id="L361">		check(ShapeType.Line, ShapeType.Filled, 6);</span>
+<span class="nc bnc" id="L362" title="All 2 branches missed.">		if (shapeType == ShapeType.Line) {</span>
+<span class="nc" id="L363">			renderer.color(col1.r, col1.g, col1.b, col1.a);</span>
+<span class="nc" id="L364">			renderer.vertex(x1, y1, 0);</span>
+<span class="nc" id="L365">			renderer.color(col2.r, col2.g, col2.b, col2.a);</span>
+<span class="nc" id="L366">			renderer.vertex(x2, y2, 0);</span>
+
+<span class="nc" id="L368">			renderer.color(col2.r, col2.g, col2.b, col2.a);</span>
+<span class="nc" id="L369">			renderer.vertex(x2, y2, 0);</span>
+<span class="nc" id="L370">			renderer.color(col3.r, col3.g, col3.b, col3.a);</span>
+<span class="nc" id="L371">			renderer.vertex(x3, y3, 0);</span>
+
+<span class="nc" id="L373">			renderer.color(col3.r, col3.g, col3.b, col3.a);</span>
+<span class="nc" id="L374">			renderer.vertex(x3, y3, 0);</span>
+<span class="nc" id="L375">			renderer.color(col1.r, col1.g, col1.b, col1.a);</span>
+<span class="nc" id="L376">			renderer.vertex(x1, y1, 0);</span>
+		} else {
+<span class="nc" id="L378">			renderer.color(col1.r, col1.g, col1.b, col1.a);</span>
+<span class="nc" id="L379">			renderer.vertex(x1, y1, 0);</span>
+<span class="nc" id="L380">			renderer.color(col2.r, col2.g, col2.b, col2.a);</span>
+<span class="nc" id="L381">			renderer.vertex(x2, y2, 0);</span>
+<span class="nc" id="L382">			renderer.color(col3.r, col3.g, col3.b, col3.a);</span>
+<span class="nc" id="L383">			renderer.vertex(x3, y3, 0);</span>
+		}
+<span class="nc" id="L385">	}</span>
+
+	/** Draws a rectangle in the x/y plane using {@link ShapeType#Line} or {@link ShapeType#Filled}. */
+	public void rect (float x, float y, float width, float height) {
+<span class="nc" id="L389">		check(ShapeType.Line, ShapeType.Filled, 8);</span>
+<span class="nc" id="L390">		float colorBits = color.toFloatBits();</span>
+<span class="nc bnc" id="L391" title="All 2 branches missed.">		if (shapeType == ShapeType.Line) {</span>
+<span class="nc" id="L392">			renderer.color(colorBits);</span>
+<span class="nc" id="L393">			renderer.vertex(x, y, 0);</span>
+<span class="nc" id="L394">			renderer.color(colorBits);</span>
+<span class="nc" id="L395">			renderer.vertex(x + width, y, 0);</span>
+
+<span class="nc" id="L397">			renderer.color(colorBits);</span>
+<span class="nc" id="L398">			renderer.vertex(x + width, y, 0);</span>
+<span class="nc" id="L399">			renderer.color(colorBits);</span>
+<span class="nc" id="L400">			renderer.vertex(x + width, y + height, 0);</span>
+
+<span class="nc" id="L402">			renderer.color(colorBits);</span>
+<span class="nc" id="L403">			renderer.vertex(x + width, y + height, 0);</span>
+<span class="nc" id="L404">			renderer.color(colorBits);</span>
+<span class="nc" id="L405">			renderer.vertex(x, y + height, 0);</span>
+
+<span class="nc" id="L407">			renderer.color(colorBits);</span>
+<span class="nc" id="L408">			renderer.vertex(x, y + height, 0);</span>
+<span class="nc" id="L409">			renderer.color(colorBits);</span>
+<span class="nc" id="L410">			renderer.vertex(x, y, 0);</span>
+		} else {
+<span class="nc" id="L412">			renderer.color(colorBits);</span>
+<span class="nc" id="L413">			renderer.vertex(x, y, 0);</span>
+<span class="nc" id="L414">			renderer.color(colorBits);</span>
+<span class="nc" id="L415">			renderer.vertex(x + width, y, 0);</span>
+<span class="nc" id="L416">			renderer.color(colorBits);</span>
+<span class="nc" id="L417">			renderer.vertex(x + width, y + height, 0);</span>
+
+<span class="nc" id="L419">			renderer.color(colorBits);</span>
+<span class="nc" id="L420">			renderer.vertex(x + width, y + height, 0);</span>
+<span class="nc" id="L421">			renderer.color(colorBits);</span>
+<span class="nc" id="L422">			renderer.vertex(x, y + height, 0);</span>
+<span class="nc" id="L423">			renderer.color(colorBits);</span>
+<span class="nc" id="L424">			renderer.vertex(x, y, 0);</span>
+		}
+<span class="nc" id="L426">	}</span>
+
+	/** Draws a rectangle in the x/y plane using {@link ShapeType#Line} or {@link ShapeType#Filled}. The x and y specify the lower
+	 * left corner.
+	 * @param col1 The color at (x, y).
+	 * @param col2 The color at (x + width, y).
+	 * @param col3 The color at (x + width, y + height).
+	 * @param col4 The color at (x, y + height). */
+	public void rect (float x, float y, float width, float height, Color col1, Color col2, Color col3, Color col4) {
+<span class="nc" id="L435">		check(ShapeType.Line, ShapeType.Filled, 8);</span>
+
+<span class="nc bnc" id="L437" title="All 2 branches missed.">		if (shapeType == ShapeType.Line) {</span>
+<span class="nc" id="L438">			renderer.color(col1.r, col1.g, col1.b, col1.a);</span>
+<span class="nc" id="L439">			renderer.vertex(x, y, 0);</span>
+<span class="nc" id="L440">			renderer.color(col2.r, col2.g, col2.b, col2.a);</span>
+<span class="nc" id="L441">			renderer.vertex(x + width, y, 0);</span>
+
+<span class="nc" id="L443">			renderer.color(col2.r, col2.g, col2.b, col2.a);</span>
+<span class="nc" id="L444">			renderer.vertex(x + width, y, 0);</span>
+<span class="nc" id="L445">			renderer.color(col3.r, col3.g, col3.b, col3.a);</span>
+<span class="nc" id="L446">			renderer.vertex(x + width, y + height, 0);</span>
+
+<span class="nc" id="L448">			renderer.color(col3.r, col3.g, col3.b, col3.a);</span>
+<span class="nc" id="L449">			renderer.vertex(x + width, y + height, 0);</span>
+<span class="nc" id="L450">			renderer.color(col4.r, col4.g, col4.b, col4.a);</span>
+<span class="nc" id="L451">			renderer.vertex(x, y + height, 0);</span>
+
+<span class="nc" id="L453">			renderer.color(col4.r, col4.g, col4.b, col4.a);</span>
+<span class="nc" id="L454">			renderer.vertex(x, y + height, 0);</span>
+<span class="nc" id="L455">			renderer.color(col1.r, col1.g, col1.b, col1.a);</span>
+<span class="nc" id="L456">			renderer.vertex(x, y, 0);</span>
+		} else {
+<span class="nc" id="L458">			renderer.color(col1.r, col1.g, col1.b, col1.a);</span>
+<span class="nc" id="L459">			renderer.vertex(x, y, 0);</span>
+<span class="nc" id="L460">			renderer.color(col2.r, col2.g, col2.b, col2.a);</span>
+<span class="nc" id="L461">			renderer.vertex(x + width, y, 0);</span>
+<span class="nc" id="L462">			renderer.color(col3.r, col3.g, col3.b, col3.a);</span>
+<span class="nc" id="L463">			renderer.vertex(x + width, y + height, 0);</span>
+
+<span class="nc" id="L465">			renderer.color(col3.r, col3.g, col3.b, col3.a);</span>
+<span class="nc" id="L466">			renderer.vertex(x + width, y + height, 0);</span>
+<span class="nc" id="L467">			renderer.color(col4.r, col4.g, col4.b, col4.a);</span>
+<span class="nc" id="L468">			renderer.vertex(x, y + height, 0);</span>
+<span class="nc" id="L469">			renderer.color(col1.r, col1.g, col1.b, col1.a);</span>
+<span class="nc" id="L470">			renderer.vertex(x, y, 0);</span>
+		}
+<span class="nc" id="L472">	}</span>
+
+	/** Draws a rectangle in the x/y plane using {@link ShapeType#Line} or {@link ShapeType#Filled}. The x and y specify the lower
+	 * left corner. The originX and originY specify the point about which to rotate the rectangle. */
+	public void rect (float x, float y, float originX, float originY, float width, float height, float scaleX, float scaleY,
+		float degrees) {
+<span class="nc" id="L478">		rect(x, y, originX, originY, width, height, scaleX, scaleY, degrees, color, color, color, color);</span>
+<span class="nc" id="L479">	}</span>
+
+	/** Draws a rectangle in the x/y plane using {@link ShapeType#Line} or {@link ShapeType#Filled}. The x and y specify the lower
+	 * left corner. The originX and originY specify the point about which to rotate the rectangle.
+	 * @param col1 The color at (x, y)
+	 * @param col2 The color at (x + width, y)
+	 * @param col3 The color at (x + width, y + height)
+	 * @param col4 The color at (x, y + height) */
+	public void rect (float x, float y, float originX, float originY, float width, float height, float scaleX, float scaleY,
+		float degrees, Color col1, Color col2, Color col3, Color col4) {
+<span class="nc" id="L489">		check(ShapeType.Line, ShapeType.Filled, 8);</span>
+
+<span class="nc" id="L491">		float cos = MathUtils.cosDeg(degrees);</span>
+<span class="nc" id="L492">		float sin = MathUtils.sinDeg(degrees);</span>
+<span class="nc" id="L493">		float fx = -originX;</span>
+<span class="nc" id="L494">		float fy = -originY;</span>
+<span class="nc" id="L495">		float fx2 = width - originX;</span>
+<span class="nc" id="L496">		float fy2 = height - originY;</span>
+
+<span class="nc bnc" id="L498" title="All 4 branches missed.">		if (scaleX != 1 || scaleY != 1) {</span>
+<span class="nc" id="L499">			fx *= scaleX;</span>
+<span class="nc" id="L500">			fy *= scaleY;</span>
+<span class="nc" id="L501">			fx2 *= scaleX;</span>
+<span class="nc" id="L502">			fy2 *= scaleY;</span>
+		}
+
+<span class="nc" id="L505">		float worldOriginX = x + originX;</span>
+<span class="nc" id="L506">		float worldOriginY = y + originY;</span>
+
+<span class="nc" id="L508">		float x1 = cos * fx - sin * fy + worldOriginX;</span>
+<span class="nc" id="L509">		float y1 = sin * fx + cos * fy + worldOriginY;</span>
+
+<span class="nc" id="L511">		float x2 = cos * fx2 - sin * fy + worldOriginX;</span>
+<span class="nc" id="L512">		float y2 = sin * fx2 + cos * fy + worldOriginY;</span>
+
+<span class="nc" id="L514">		float x3 = cos * fx2 - sin * fy2 + worldOriginX;</span>
+<span class="nc" id="L515">		float y3 = sin * fx2 + cos * fy2 + worldOriginY;</span>
+
+<span class="nc" id="L517">		float x4 = x1 + (x3 - x2);</span>
+<span class="nc" id="L518">		float y4 = y3 - (y2 - y1);</span>
+
+<span class="nc bnc" id="L520" title="All 2 branches missed.">		if (shapeType == ShapeType.Line) {</span>
+<span class="nc" id="L521">			renderer.color(col1.r, col1.g, col1.b, col1.a);</span>
+<span class="nc" id="L522">			renderer.vertex(x1, y1, 0);</span>
+<span class="nc" id="L523">			renderer.color(col2.r, col2.g, col2.b, col2.a);</span>
+<span class="nc" id="L524">			renderer.vertex(x2, y2, 0);</span>
+
+<span class="nc" id="L526">			renderer.color(col2.r, col2.g, col2.b, col2.a);</span>
+<span class="nc" id="L527">			renderer.vertex(x2, y2, 0);</span>
+<span class="nc" id="L528">			renderer.color(col3.r, col3.g, col3.b, col3.a);</span>
+<span class="nc" id="L529">			renderer.vertex(x3, y3, 0);</span>
+
+<span class="nc" id="L531">			renderer.color(col3.r, col3.g, col3.b, col3.a);</span>
+<span class="nc" id="L532">			renderer.vertex(x3, y3, 0);</span>
+<span class="nc" id="L533">			renderer.color(col4.r, col4.g, col4.b, col4.a);</span>
+<span class="nc" id="L534">			renderer.vertex(x4, y4, 0);</span>
+
+<span class="nc" id="L536">			renderer.color(col4.r, col4.g, col4.b, col4.a);</span>
+<span class="nc" id="L537">			renderer.vertex(x4, y4, 0);</span>
+<span class="nc" id="L538">			renderer.color(col1.r, col1.g, col1.b, col1.a);</span>
+<span class="nc" id="L539">			renderer.vertex(x1, y1, 0);</span>
+		} else {
+<span class="nc" id="L541">			renderer.color(col1.r, col1.g, col1.b, col1.a);</span>
+<span class="nc" id="L542">			renderer.vertex(x1, y1, 0);</span>
+<span class="nc" id="L543">			renderer.color(col2.r, col2.g, col2.b, col2.a);</span>
+<span class="nc" id="L544">			renderer.vertex(x2, y2, 0);</span>
+<span class="nc" id="L545">			renderer.color(col3.r, col3.g, col3.b, col3.a);</span>
+<span class="nc" id="L546">			renderer.vertex(x3, y3, 0);</span>
+
+<span class="nc" id="L548">			renderer.color(col3.r, col3.g, col3.b, col3.a);</span>
+<span class="nc" id="L549">			renderer.vertex(x3, y3, 0);</span>
+<span class="nc" id="L550">			renderer.color(col4.r, col4.g, col4.b, col4.a);</span>
+<span class="nc" id="L551">			renderer.vertex(x4, y4, 0);</span>
+<span class="nc" id="L552">			renderer.color(col1.r, col1.g, col1.b, col1.a);</span>
+<span class="nc" id="L553">			renderer.vertex(x1, y1, 0);</span>
+		}
+
+<span class="nc" id="L556">	}</span>
+
+	/** Draws a line using a rotated rectangle, where with one edge is centered at x1, y1 and the opposite edge centered at x2, y2. */
+	public void rectLine (float x1, float y1, float x2, float y2, float width) {
+<span class="nc" id="L560">		check(ShapeType.Line, ShapeType.Filled, 8);</span>
+<span class="nc" id="L561">		float colorBits = color.toFloatBits();</span>
+<span class="nc" id="L562">		Vector2 t = tmp.set(y2 - y1, x1 - x2).nor();</span>
+<span class="nc" id="L563">		width *= 0.5f;</span>
+<span class="nc" id="L564">		float tx = t.x * width;</span>
+<span class="nc" id="L565">		float ty = t.y * width;</span>
+<span class="nc bnc" id="L566" title="All 2 branches missed.">		if (shapeType == ShapeType.Line) {</span>
+<span class="nc" id="L567">			renderer.color(colorBits);</span>
+<span class="nc" id="L568">			renderer.vertex(x1 + tx, y1 + ty, 0);</span>
+<span class="nc" id="L569">			renderer.color(colorBits);</span>
+<span class="nc" id="L570">			renderer.vertex(x1 - tx, y1 - ty, 0);</span>
+
+<span class="nc" id="L572">			renderer.color(colorBits);</span>
+<span class="nc" id="L573">			renderer.vertex(x2 + tx, y2 + ty, 0);</span>
+<span class="nc" id="L574">			renderer.color(colorBits);</span>
+<span class="nc" id="L575">			renderer.vertex(x2 - tx, y2 - ty, 0);</span>
+
+<span class="nc" id="L577">			renderer.color(colorBits);</span>
+<span class="nc" id="L578">			renderer.vertex(x2 + tx, y2 + ty, 0);</span>
+<span class="nc" id="L579">			renderer.color(colorBits);</span>
+<span class="nc" id="L580">			renderer.vertex(x1 + tx, y1 + ty, 0);</span>
+
+<span class="nc" id="L582">			renderer.color(colorBits);</span>
+<span class="nc" id="L583">			renderer.vertex(x2 - tx, y2 - ty, 0);</span>
+<span class="nc" id="L584">			renderer.color(colorBits);</span>
+<span class="nc" id="L585">			renderer.vertex(x1 - tx, y1 - ty, 0);</span>
+		} else {
+<span class="nc" id="L587">			renderer.color(colorBits);</span>
+<span class="nc" id="L588">			renderer.vertex(x1 + tx, y1 + ty, 0);</span>
+<span class="nc" id="L589">			renderer.color(colorBits);</span>
+<span class="nc" id="L590">			renderer.vertex(x1 - tx, y1 - ty, 0);</span>
+<span class="nc" id="L591">			renderer.color(colorBits);</span>
+<span class="nc" id="L592">			renderer.vertex(x2 + tx, y2 + ty, 0);</span>
+
+<span class="nc" id="L594">			renderer.color(colorBits);</span>
+<span class="nc" id="L595">			renderer.vertex(x2 - tx, y2 - ty, 0);</span>
+<span class="nc" id="L596">			renderer.color(colorBits);</span>
+<span class="nc" id="L597">			renderer.vertex(x2 + tx, y2 + ty, 0);</span>
+<span class="nc" id="L598">			renderer.color(colorBits);</span>
+<span class="nc" id="L599">			renderer.vertex(x1 - tx, y1 - ty, 0);</span>
+		}
+<span class="nc" id="L601">	}</span>
+
+	/** @see #rectLine(float, float, float, float, float) */
+	public void rectLine (Vector2 p1, Vector2 p2, float width) {
+<span class="nc" id="L605">		rectLine(p1.x, p1.y, p2.x, p2.y, width);</span>
+<span class="nc" id="L606">	}</span>
+
+	/** Draws a cube using {@link ShapeType#Line} or {@link ShapeType#Filled}. The x, y and z specify the bottom, left, front corner
+	 * of the rectangle. */
+	public void box (float x, float y, float z, float width, float height, float depth) {
+<span class="nc" id="L611">		depth = -depth;</span>
+<span class="nc" id="L612">		float colorBits = color.toFloatBits();</span>
+<span class="nc bnc" id="L613" title="All 2 branches missed.">		if (shapeType == ShapeType.Line) {</span>
+<span class="nc" id="L614">			check(ShapeType.Line, ShapeType.Filled, 24);</span>
+
+<span class="nc" id="L616">			renderer.color(colorBits);</span>
+<span class="nc" id="L617">			renderer.vertex(x, y, z);</span>
+<span class="nc" id="L618">			renderer.color(colorBits);</span>
+<span class="nc" id="L619">			renderer.vertex(x + width, y, z);</span>
+
+<span class="nc" id="L621">			renderer.color(colorBits);</span>
+<span class="nc" id="L622">			renderer.vertex(x + width, y, z);</span>
+<span class="nc" id="L623">			renderer.color(colorBits);</span>
+<span class="nc" id="L624">			renderer.vertex(x + width, y, z + depth);</span>
+
+<span class="nc" id="L626">			renderer.color(colorBits);</span>
+<span class="nc" id="L627">			renderer.vertex(x + width, y, z + depth);</span>
+<span class="nc" id="L628">			renderer.color(colorBits);</span>
+<span class="nc" id="L629">			renderer.vertex(x, y, z + depth);</span>
+
+<span class="nc" id="L631">			renderer.color(colorBits);</span>
+<span class="nc" id="L632">			renderer.vertex(x, y, z + depth);</span>
+<span class="nc" id="L633">			renderer.color(colorBits);</span>
+<span class="nc" id="L634">			renderer.vertex(x, y, z);</span>
+
+<span class="nc" id="L636">			renderer.color(colorBits);</span>
+<span class="nc" id="L637">			renderer.vertex(x, y, z);</span>
+<span class="nc" id="L638">			renderer.color(colorBits);</span>
+<span class="nc" id="L639">			renderer.vertex(x, y + height, z);</span>
+
+<span class="nc" id="L641">			renderer.color(colorBits);</span>
+<span class="nc" id="L642">			renderer.vertex(x, y + height, z);</span>
+<span class="nc" id="L643">			renderer.color(colorBits);</span>
+<span class="nc" id="L644">			renderer.vertex(x + width, y + height, z);</span>
+
+<span class="nc" id="L646">			renderer.color(colorBits);</span>
+<span class="nc" id="L647">			renderer.vertex(x + width, y + height, z);</span>
+<span class="nc" id="L648">			renderer.color(colorBits);</span>
+<span class="nc" id="L649">			renderer.vertex(x + width, y + height, z + depth);</span>
+
+<span class="nc" id="L651">			renderer.color(colorBits);</span>
+<span class="nc" id="L652">			renderer.vertex(x + width, y + height, z + depth);</span>
+<span class="nc" id="L653">			renderer.color(colorBits);</span>
+<span class="nc" id="L654">			renderer.vertex(x, y + height, z + depth);</span>
+
+<span class="nc" id="L656">			renderer.color(colorBits);</span>
+<span class="nc" id="L657">			renderer.vertex(x, y + height, z + depth);</span>
+<span class="nc" id="L658">			renderer.color(colorBits);</span>
+<span class="nc" id="L659">			renderer.vertex(x, y + height, z);</span>
+
+<span class="nc" id="L661">			renderer.color(colorBits);</span>
+<span class="nc" id="L662">			renderer.vertex(x + width, y, z);</span>
+<span class="nc" id="L663">			renderer.color(colorBits);</span>
+<span class="nc" id="L664">			renderer.vertex(x + width, y + height, z);</span>
+
+<span class="nc" id="L666">			renderer.color(colorBits);</span>
+<span class="nc" id="L667">			renderer.vertex(x + width, y, z + depth);</span>
+<span class="nc" id="L668">			renderer.color(colorBits);</span>
+<span class="nc" id="L669">			renderer.vertex(x + width, y + height, z + depth);</span>
+
+<span class="nc" id="L671">			renderer.color(colorBits);</span>
+<span class="nc" id="L672">			renderer.vertex(x, y, z + depth);</span>
+<span class="nc" id="L673">			renderer.color(colorBits);</span>
+<span class="nc" id="L674">			renderer.vertex(x, y + height, z + depth);</span>
+		} else {
+<span class="nc" id="L676">			check(ShapeType.Line, ShapeType.Filled, 36);</span>
+
+			// Front
+<span class="nc" id="L679">			renderer.color(colorBits);</span>
+<span class="nc" id="L680">			renderer.vertex(x, y, z);</span>
+<span class="nc" id="L681">			renderer.color(colorBits);</span>
+<span class="nc" id="L682">			renderer.vertex(x + width, y, z);</span>
+<span class="nc" id="L683">			renderer.color(colorBits);</span>
+<span class="nc" id="L684">			renderer.vertex(x + width, y + height, z);</span>
+
+<span class="nc" id="L686">			renderer.color(colorBits);</span>
+<span class="nc" id="L687">			renderer.vertex(x, y, z);</span>
+<span class="nc" id="L688">			renderer.color(colorBits);</span>
+<span class="nc" id="L689">			renderer.vertex(x + width, y + height, z);</span>
+<span class="nc" id="L690">			renderer.color(colorBits);</span>
+<span class="nc" id="L691">			renderer.vertex(x, y + height, z);</span>
+
+			// Back
+<span class="nc" id="L694">			renderer.color(colorBits);</span>
+<span class="nc" id="L695">			renderer.vertex(x + width, y, z + depth);</span>
+<span class="nc" id="L696">			renderer.color(colorBits);</span>
+<span class="nc" id="L697">			renderer.vertex(x, y, z + depth);</span>
+<span class="nc" id="L698">			renderer.color(colorBits);</span>
+<span class="nc" id="L699">			renderer.vertex(x + width, y + height, z + depth);</span>
+
+<span class="nc" id="L701">			renderer.color(colorBits);</span>
+<span class="nc" id="L702">			renderer.vertex(x, y + height, z + depth);</span>
+<span class="nc" id="L703">			renderer.color(colorBits);</span>
+<span class="nc" id="L704">			renderer.vertex(x, y, z + depth);</span>
+<span class="nc" id="L705">			renderer.color(colorBits);</span>
+<span class="nc" id="L706">			renderer.vertex(x + width, y + height, z + depth);</span>
+
+			// Left
+<span class="nc" id="L709">			renderer.color(colorBits);</span>
+<span class="nc" id="L710">			renderer.vertex(x, y, z + depth);</span>
+<span class="nc" id="L711">			renderer.color(colorBits);</span>
+<span class="nc" id="L712">			renderer.vertex(x, y, z);</span>
+<span class="nc" id="L713">			renderer.color(colorBits);</span>
+<span class="nc" id="L714">			renderer.vertex(x, y + height, z);</span>
+
+<span class="nc" id="L716">			renderer.color(colorBits);</span>
+<span class="nc" id="L717">			renderer.vertex(x, y, z + depth);</span>
+<span class="nc" id="L718">			renderer.color(colorBits);</span>
+<span class="nc" id="L719">			renderer.vertex(x, y + height, z);</span>
+<span class="nc" id="L720">			renderer.color(colorBits);</span>
+<span class="nc" id="L721">			renderer.vertex(x, y + height, z + depth);</span>
+
+			// Right
+<span class="nc" id="L724">			renderer.color(colorBits);</span>
+<span class="nc" id="L725">			renderer.vertex(x + width, y, z);</span>
+<span class="nc" id="L726">			renderer.color(colorBits);</span>
+<span class="nc" id="L727">			renderer.vertex(x + width, y, z + depth);</span>
+<span class="nc" id="L728">			renderer.color(colorBits);</span>
+<span class="nc" id="L729">			renderer.vertex(x + width, y + height, z + depth);</span>
+
+<span class="nc" id="L731">			renderer.color(colorBits);</span>
+<span class="nc" id="L732">			renderer.vertex(x + width, y, z);</span>
+<span class="nc" id="L733">			renderer.color(colorBits);</span>
+<span class="nc" id="L734">			renderer.vertex(x + width, y + height, z + depth);</span>
+<span class="nc" id="L735">			renderer.color(colorBits);</span>
+<span class="nc" id="L736">			renderer.vertex(x + width, y + height, z);</span>
+
+			// Top
+<span class="nc" id="L739">			renderer.color(colorBits);</span>
+<span class="nc" id="L740">			renderer.vertex(x, y + height, z);</span>
+<span class="nc" id="L741">			renderer.color(colorBits);</span>
+<span class="nc" id="L742">			renderer.vertex(x + width, y + height, z);</span>
+<span class="nc" id="L743">			renderer.color(colorBits);</span>
+<span class="nc" id="L744">			renderer.vertex(x + width, y + height, z + depth);</span>
+
+<span class="nc" id="L746">			renderer.color(colorBits);</span>
+<span class="nc" id="L747">			renderer.vertex(x, y + height, z);</span>
+<span class="nc" id="L748">			renderer.color(colorBits);</span>
+<span class="nc" id="L749">			renderer.vertex(x + width, y + height, z + depth);</span>
+<span class="nc" id="L750">			renderer.color(colorBits);</span>
+<span class="nc" id="L751">			renderer.vertex(x, y + height, z + depth);</span>
+
+			// Bottom
+<span class="nc" id="L754">			renderer.color(colorBits);</span>
+<span class="nc" id="L755">			renderer.vertex(x, y, z + depth);</span>
+<span class="nc" id="L756">			renderer.color(colorBits);</span>
+<span class="nc" id="L757">			renderer.vertex(x + width, y, z + depth);</span>
+<span class="nc" id="L758">			renderer.color(colorBits);</span>
+<span class="nc" id="L759">			renderer.vertex(x + width, y, z);</span>
+
+<span class="nc" id="L761">			renderer.color(colorBits);</span>
+<span class="nc" id="L762">			renderer.vertex(x, y, z + depth);</span>
+<span class="nc" id="L763">			renderer.color(colorBits);</span>
+<span class="nc" id="L764">			renderer.vertex(x + width, y, z);</span>
+<span class="nc" id="L765">			renderer.color(colorBits);</span>
+<span class="nc" id="L766">			renderer.vertex(x, y, z);</span>
+		}
+
+<span class="nc" id="L769">	}</span>
+
+	/** Draws two crossed lines using {@link ShapeType#Line} or {@link ShapeType#Filled}. */
+	public void x (float x, float y, float size) {
+<span class="nc" id="L773">		line(x - size, y - size, x + size, y + size);</span>
+<span class="nc" id="L774">		line(x - size, y + size, x + size, y - size);</span>
+<span class="nc" id="L775">	}</span>
+
+	/** @see #x(float, float, float) */
+	public void x (Vector2 p, float size) {
+<span class="nc" id="L779">		x(p.x, p.y, size);</span>
+<span class="nc" id="L780">	}</span>
+
+	/** Calls {@link #arc(float, float, float, float, float, int)} by estimating the number of segments needed for a smooth arc. */
+	public void arc (float x, float y, float radius, float start, float degrees) {
+<span class="nc" id="L784">		arc(x, y, radius, start, degrees, Math.max(1, (int)(6 * (float)Math.cbrt(radius) * (degrees / 360.0f))));</span>
+<span class="nc" id="L785">	}</span>
+
+	/** Draws an arc using {@link ShapeType#Line} or {@link ShapeType#Filled}. */
+	public void arc (float x, float y, float radius, float start, float degrees, int segments) {
+<span class="nc bnc" id="L789" title="All 2 branches missed.">		if (segments &lt;= 0) throw new IllegalArgumentException(&quot;segments must be &gt; 0.&quot;);</span>
+<span class="nc" id="L790">		float colorBits = color.toFloatBits();</span>
+<span class="nc" id="L791">		float theta = (2 * MathUtils.PI * (degrees / 360.0f)) / segments;</span>
+<span class="nc" id="L792">		float cos = MathUtils.cos(theta);</span>
+<span class="nc" id="L793">		float sin = MathUtils.sin(theta);</span>
+<span class="nc" id="L794">		float cx = radius * MathUtils.cos(start * MathUtils.degreesToRadians);</span>
+<span class="nc" id="L795">		float cy = radius * MathUtils.sin(start * MathUtils.degreesToRadians);</span>
+
+<span class="nc bnc" id="L797" title="All 2 branches missed.">		if (shapeType == ShapeType.Line) {</span>
+<span class="nc" id="L798">			check(ShapeType.Line, ShapeType.Filled, segments * 2 + 2);</span>
+
+<span class="nc" id="L800">			renderer.color(colorBits);</span>
+<span class="nc" id="L801">			renderer.vertex(x, y, 0);</span>
+<span class="nc" id="L802">			renderer.color(colorBits);</span>
+<span class="nc" id="L803">			renderer.vertex(x + cx, y + cy, 0);</span>
+<span class="nc bnc" id="L804" title="All 2 branches missed.">			for (int i = 0; i &lt; segments; i++) {</span>
+<span class="nc" id="L805">				renderer.color(colorBits);</span>
+<span class="nc" id="L806">				renderer.vertex(x + cx, y + cy, 0);</span>
+<span class="nc" id="L807">				float temp = cx;</span>
+<span class="nc" id="L808">				cx = cos * cx - sin * cy;</span>
+<span class="nc" id="L809">				cy = sin * temp + cos * cy;</span>
+<span class="nc" id="L810">				renderer.color(colorBits);</span>
+<span class="nc" id="L811">				renderer.vertex(x + cx, y + cy, 0);</span>
+			}
+<span class="nc" id="L813">			renderer.color(colorBits);</span>
+<span class="nc" id="L814">			renderer.vertex(x + cx, y + cy, 0);</span>
+		} else {
+<span class="nc" id="L816">			check(ShapeType.Line, ShapeType.Filled, segments * 3 + 3);</span>
+
+<span class="nc bnc" id="L818" title="All 2 branches missed.">			for (int i = 0; i &lt; segments; i++) {</span>
+<span class="nc" id="L819">				renderer.color(colorBits);</span>
+<span class="nc" id="L820">				renderer.vertex(x, y, 0);</span>
+<span class="nc" id="L821">				renderer.color(colorBits);</span>
+<span class="nc" id="L822">				renderer.vertex(x + cx, y + cy, 0);</span>
+<span class="nc" id="L823">				float temp = cx;</span>
+<span class="nc" id="L824">				cx = cos * cx - sin * cy;</span>
+<span class="nc" id="L825">				cy = sin * temp + cos * cy;</span>
+<span class="nc" id="L826">				renderer.color(colorBits);</span>
+<span class="nc" id="L827">				renderer.vertex(x + cx, y + cy, 0);</span>
+			}
+<span class="nc" id="L829">			renderer.color(colorBits);</span>
+<span class="nc" id="L830">			renderer.vertex(x, y, 0);</span>
+<span class="nc" id="L831">			renderer.color(colorBits);</span>
+<span class="nc" id="L832">			renderer.vertex(x + cx, y + cy, 0);</span>
+		}
+
+<span class="nc" id="L835">		float temp = cx;</span>
+<span class="nc" id="L836">		cx = 0;</span>
+<span class="nc" id="L837">		cy = 0;</span>
+<span class="nc" id="L838">		renderer.color(colorBits);</span>
+<span class="nc" id="L839">		renderer.vertex(x + cx, y + cy, 0);</span>
+<span class="nc" id="L840">	}</span>
+
+	/** Calls {@link #circle(float, float, float, int)} by estimating the number of segments needed for a smooth circle. */
+	public void circle (float x, float y, float radius) {
+<span class="nc" id="L844">		circle(x, y, radius, Math.max(1, (int)(6 * (float)Math.cbrt(radius))));</span>
+<span class="nc" id="L845">	}</span>
+
+	/** Draws a circle using {@link ShapeType#Line} or {@link ShapeType#Filled}. */
+	public void circle (float x, float y, float radius, int segments) {
+<span class="nc bnc" id="L849" title="All 2 branches missed.">		if (segments &lt;= 0) throw new IllegalArgumentException(&quot;segments must be &gt; 0.&quot;);</span>
+<span class="nc" id="L850">		float colorBits = color.toFloatBits();</span>
+<span class="nc" id="L851">		float angle = 2 * MathUtils.PI / segments;</span>
+<span class="nc" id="L852">		float cos = MathUtils.cos(angle);</span>
+<span class="nc" id="L853">		float sin = MathUtils.sin(angle);</span>
+<span class="nc" id="L854">		float cx = radius, cy = 0;</span>
+<span class="nc bnc" id="L855" title="All 2 branches missed.">		if (shapeType == ShapeType.Line) {</span>
+<span class="nc" id="L856">			check(ShapeType.Line, ShapeType.Filled, segments * 2 + 2);</span>
+<span class="nc bnc" id="L857" title="All 2 branches missed.">			for (int i = 0; i &lt; segments; i++) {</span>
+<span class="nc" id="L858">				renderer.color(colorBits);</span>
+<span class="nc" id="L859">				renderer.vertex(x + cx, y + cy, 0);</span>
+<span class="nc" id="L860">				float temp = cx;</span>
+<span class="nc" id="L861">				cx = cos * cx - sin * cy;</span>
+<span class="nc" id="L862">				cy = sin * temp + cos * cy;</span>
+<span class="nc" id="L863">				renderer.color(colorBits);</span>
+<span class="nc" id="L864">				renderer.vertex(x + cx, y + cy, 0);</span>
+			}
+			// Ensure the last segment is identical to the first.
+<span class="nc" id="L867">			renderer.color(colorBits);</span>
+<span class="nc" id="L868">			renderer.vertex(x + cx, y + cy, 0);</span>
+		} else {
+<span class="nc" id="L870">			check(ShapeType.Line, ShapeType.Filled, segments * 3 + 3);</span>
+<span class="nc" id="L871">			segments--;</span>
+<span class="nc bnc" id="L872" title="All 2 branches missed.">			for (int i = 0; i &lt; segments; i++) {</span>
+<span class="nc" id="L873">				renderer.color(colorBits);</span>
+<span class="nc" id="L874">				renderer.vertex(x, y, 0);</span>
+<span class="nc" id="L875">				renderer.color(colorBits);</span>
+<span class="nc" id="L876">				renderer.vertex(x + cx, y + cy, 0);</span>
+<span class="nc" id="L877">				float temp = cx;</span>
+<span class="nc" id="L878">				cx = cos * cx - sin * cy;</span>
+<span class="nc" id="L879">				cy = sin * temp + cos * cy;</span>
+<span class="nc" id="L880">				renderer.color(colorBits);</span>
+<span class="nc" id="L881">				renderer.vertex(x + cx, y + cy, 0);</span>
+			}
+			// Ensure the last segment is identical to the first.
+<span class="nc" id="L884">			renderer.color(colorBits);</span>
+<span class="nc" id="L885">			renderer.vertex(x, y, 0);</span>
+<span class="nc" id="L886">			renderer.color(colorBits);</span>
+<span class="nc" id="L887">			renderer.vertex(x + cx, y + cy, 0);</span>
+		}
+
+<span class="nc" id="L890">		float temp = cx;</span>
+<span class="nc" id="L891">		cx = radius;</span>
+<span class="nc" id="L892">		cy = 0;</span>
+<span class="nc" id="L893">		renderer.color(colorBits);</span>
+<span class="nc" id="L894">		renderer.vertex(x + cx, y + cy, 0);</span>
+<span class="nc" id="L895">	}</span>
+
+	/** Calls {@link #ellipse(float, float, float, float, int)} by estimating the number of segments needed for a smooth ellipse. */
+	public void ellipse (float x, float y, float width, float height) {
+<span class="nc" id="L899">		ellipse(x, y, width, height, Math.max(1, (int)(12 * (float)Math.cbrt(Math.max(width * 0.5f, height * 0.5f)))));</span>
+<span class="nc" id="L900">	}</span>
+
+	/** Draws an ellipse using {@link ShapeType#Line} or {@link ShapeType#Filled}. */
+	public void ellipse (float x, float y, float width, float height, int segments) {
+<span class="nc bnc" id="L904" title="All 2 branches missed.">		if (segments &lt;= 0) throw new IllegalArgumentException(&quot;segments must be &gt; 0.&quot;);</span>
+<span class="nc" id="L905">		check(ShapeType.Line, ShapeType.Filled, segments * 3);</span>
+<span class="nc" id="L906">		float colorBits = color.toFloatBits();</span>
+<span class="nc" id="L907">		float angle = 2 * MathUtils.PI / segments;</span>
+
+<span class="nc" id="L909">		float cx = x + width / 2, cy = y + height / 2;</span>
+<span class="nc bnc" id="L910" title="All 2 branches missed.">		if (shapeType == ShapeType.Line) {</span>
+<span class="nc bnc" id="L911" title="All 2 branches missed.">			for (int i = 0; i &lt; segments; i++) {</span>
+<span class="nc" id="L912">				renderer.color(colorBits);</span>
+<span class="nc" id="L913">				renderer.vertex(cx + (width * 0.5f * MathUtils.cos(i * angle)), cy + (height * 0.5f * MathUtils.sin(i * angle)), 0);</span>
+
+<span class="nc" id="L915">				renderer.color(colorBits);</span>
+<span class="nc" id="L916">				renderer.vertex(cx + (width * 0.5f * MathUtils.cos((i + 1) * angle)),</span>
+					cy + (height * 0.5f * MathUtils.sin((i + 1) * angle)), 0);
+			}
+		} else {
+<span class="nc bnc" id="L920" title="All 2 branches missed.">			for (int i = 0; i &lt; segments; i++) {</span>
+<span class="nc" id="L921">				renderer.color(colorBits);</span>
+<span class="nc" id="L922">				renderer.vertex(cx + (width * 0.5f * MathUtils.cos(i * angle)), cy + (height * 0.5f * MathUtils.sin(i * angle)), 0);</span>
+
+<span class="nc" id="L924">				renderer.color(colorBits);</span>
+<span class="nc" id="L925">				renderer.vertex(cx, cy, 0);</span>
+
+<span class="nc" id="L927">				renderer.color(colorBits);</span>
+<span class="nc" id="L928">				renderer.vertex(cx + (width * 0.5f * MathUtils.cos((i + 1) * angle)),</span>
+					cy + (height * 0.5f * MathUtils.sin((i + 1) * angle)), 0);
+			}
+		}
+<span class="nc" id="L932">	}</span>
+
+	/** Calls {@link #cone(float, float, float, float, float, int)} by estimating the number of segments needed for a smooth
+	 * circular base. */
+	public void cone (float x, float y, float z, float radius, float height) {
+<span class="nc" id="L937">		cone(x, y, z, radius, height, Math.max(1, (int)(4 * (float)Math.sqrt(radius))));</span>
+<span class="nc" id="L938">	}</span>
+
+	/** Draws a cone using {@link ShapeType#Line} or {@link ShapeType#Filled}. */
+	public void cone (float x, float y, float z, float radius, float height, int segments) {
+<span class="nc bnc" id="L942" title="All 2 branches missed.">		if (segments &lt;= 0) throw new IllegalArgumentException(&quot;segments must be &gt; 0.&quot;);</span>
+<span class="nc" id="L943">		check(ShapeType.Line, ShapeType.Filled, segments * 4 + 2);</span>
+<span class="nc" id="L944">		float colorBits = color.toFloatBits();</span>
+<span class="nc" id="L945">		float angle = 2 * MathUtils.PI / segments;</span>
+<span class="nc" id="L946">		float cos = MathUtils.cos(angle);</span>
+<span class="nc" id="L947">		float sin = MathUtils.sin(angle);</span>
+<span class="nc" id="L948">		float cx = radius, cy = 0;</span>
+<span class="nc bnc" id="L949" title="All 2 branches missed.">		if (shapeType == ShapeType.Line) {</span>
+<span class="nc bnc" id="L950" title="All 2 branches missed.">			for (int i = 0; i &lt; segments; i++) {</span>
+<span class="nc" id="L951">				renderer.color(colorBits);</span>
+<span class="nc" id="L952">				renderer.vertex(x + cx, y + cy, z);</span>
+<span class="nc" id="L953">				renderer.color(colorBits);</span>
+<span class="nc" id="L954">				renderer.vertex(x, y, z + height);</span>
+<span class="nc" id="L955">				renderer.color(colorBits);</span>
+<span class="nc" id="L956">				renderer.vertex(x + cx, y + cy, z);</span>
+<span class="nc" id="L957">				float temp = cx;</span>
+<span class="nc" id="L958">				cx = cos * cx - sin * cy;</span>
+<span class="nc" id="L959">				cy = sin * temp + cos * cy;</span>
+<span class="nc" id="L960">				renderer.color(colorBits);</span>
+<span class="nc" id="L961">				renderer.vertex(x + cx, y + cy, z);</span>
+			}
+			// Ensure the last segment is identical to the first.
+<span class="nc" id="L964">			renderer.color(colorBits);</span>
+<span class="nc" id="L965">			renderer.vertex(x + cx, y + cy, z);</span>
+		} else {
+<span class="nc" id="L967">			segments--;</span>
+<span class="nc bnc" id="L968" title="All 2 branches missed.">			for (int i = 0; i &lt; segments; i++) {</span>
+<span class="nc" id="L969">				renderer.color(colorBits);</span>
+<span class="nc" id="L970">				renderer.vertex(x, y, z);</span>
+<span class="nc" id="L971">				renderer.color(colorBits);</span>
+<span class="nc" id="L972">				renderer.vertex(x + cx, y + cy, z);</span>
+<span class="nc" id="L973">				float temp = cx;</span>
+<span class="nc" id="L974">				float temp2 = cy;</span>
+<span class="nc" id="L975">				cx = cos * cx - sin * cy;</span>
+<span class="nc" id="L976">				cy = sin * temp + cos * cy;</span>
+<span class="nc" id="L977">				renderer.color(colorBits);</span>
+<span class="nc" id="L978">				renderer.vertex(x + cx, y + cy, z);</span>
+
+<span class="nc" id="L980">				renderer.color(colorBits);</span>
+<span class="nc" id="L981">				renderer.vertex(x + temp, y + temp2, z);</span>
+<span class="nc" id="L982">				renderer.color(colorBits);</span>
+<span class="nc" id="L983">				renderer.vertex(x + cx, y + cy, z);</span>
+<span class="nc" id="L984">				renderer.color(colorBits);</span>
+<span class="nc" id="L985">				renderer.vertex(x, y, z + height);</span>
+			}
+			// Ensure the last segment is identical to the first.
+<span class="nc" id="L988">			renderer.color(colorBits);</span>
+<span class="nc" id="L989">			renderer.vertex(x, y, z);</span>
+<span class="nc" id="L990">			renderer.color(colorBits);</span>
+<span class="nc" id="L991">			renderer.vertex(x + cx, y + cy, z);</span>
+		}
+<span class="nc" id="L993">		float temp = cx;</span>
+<span class="nc" id="L994">		float temp2 = cy;</span>
+<span class="nc" id="L995">		cx = radius;</span>
+<span class="nc" id="L996">		cy = 0;</span>
+<span class="nc" id="L997">		renderer.color(colorBits);</span>
+<span class="nc" id="L998">		renderer.vertex(x + cx, y + cy, z);</span>
+<span class="nc bnc" id="L999" title="All 2 branches missed.">		if (shapeType != ShapeType.Line) {</span>
+<span class="nc" id="L1000">			renderer.color(colorBits);</span>
+<span class="nc" id="L1001">			renderer.vertex(x + temp, y + temp2, z);</span>
+<span class="nc" id="L1002">			renderer.color(colorBits);</span>
+<span class="nc" id="L1003">			renderer.vertex(x + cx, y + cy, z);</span>
+<span class="nc" id="L1004">			renderer.color(colorBits);</span>
+<span class="nc" id="L1005">			renderer.vertex(x, y, z + height);</span>
+		}
+<span class="nc" id="L1007">	}</span>
+
+	/** Draws a polygon in the x/y plane using {@link ShapeType#Line}. The vertices must contain at least 3 points (6 floats x,y). */
+	public void polygon (float[] vertices, int offset, int count) {
+<span class="nc bnc" id="L1011" title="All 2 branches missed.">		if (count &lt; 6) throw new IllegalArgumentException(&quot;Polygons must contain at least 3 points.&quot;);</span>
+<span class="nc bnc" id="L1012" title="All 2 branches missed.">		if (count % 2 != 0) throw new IllegalArgumentException(&quot;Polygons must have an even number of vertices.&quot;);</span>
+
+<span class="nc" id="L1014">		check(ShapeType.Line, null, count);</span>
+<span class="nc" id="L1015">		float colorBits = color.toFloatBits();</span>
+<span class="nc" id="L1016">		float firstX = vertices[0];</span>
+<span class="nc" id="L1017">		float firstY = vertices[1];</span>
+
+<span class="nc bnc" id="L1019" title="All 2 branches missed.">		for (int i = offset, n = offset + count; i &lt; n; i += 2) {</span>
+<span class="nc" id="L1020">			float x1 = vertices[i];</span>
+<span class="nc" id="L1021">			float y1 = vertices[i + 1];</span>
+
+			float x2;
+			float y2;
+
+<span class="nc bnc" id="L1026" title="All 2 branches missed.">			if (i + 2 &gt;= count) {</span>
+<span class="nc" id="L1027">				x2 = firstX;</span>
+<span class="nc" id="L1028">				y2 = firstY;</span>
+			} else {
+<span class="nc" id="L1030">				x2 = vertices[i + 2];</span>
+<span class="nc" id="L1031">				y2 = vertices[i + 3];</span>
+			}
+
+<span class="nc" id="L1034">			renderer.color(colorBits);</span>
+<span class="nc" id="L1035">			renderer.vertex(x1, y1, 0);</span>
+<span class="nc" id="L1036">			renderer.color(colorBits);</span>
+<span class="nc" id="L1037">			renderer.vertex(x2, y2, 0);</span>
+		}
+<span class="nc" id="L1039">	}</span>
+
+	/** @see #polygon(float[], int, int) */
+	public void polygon (float[] vertices) {
+<span class="nc" id="L1043">		polygon(vertices, 0, vertices.length);</span>
+<span class="nc" id="L1044">	}</span>
+
+	/** Draws a polyline in the x/y plane using {@link ShapeType#Line}. The vertices must contain at least 2 points (4 floats x,y). */
+	public void polyline (float[] vertices, int offset, int count) {
+<span class="nc bnc" id="L1048" title="All 2 branches missed.">		if (count &lt; 4) throw new IllegalArgumentException(&quot;Polylines must contain at least 2 points.&quot;);</span>
+<span class="nc bnc" id="L1049" title="All 2 branches missed.">		if (count % 2 != 0) throw new IllegalArgumentException(&quot;Polylines must have an even number of vertices.&quot;);</span>
+
+<span class="nc" id="L1051">		check(ShapeType.Line, null, count);</span>
+<span class="nc" id="L1052">		float colorBits = color.toFloatBits();</span>
+<span class="nc bnc" id="L1053" title="All 2 branches missed.">		for (int i = offset, n = offset + count - 2; i &lt; n; i += 2) {</span>
+<span class="nc" id="L1054">			float x1 = vertices[i];</span>
+<span class="nc" id="L1055">			float y1 = vertices[i + 1];</span>
+
+			float x2;
+			float y2;
+
+<span class="nc" id="L1060">			x2 = vertices[i + 2];</span>
+<span class="nc" id="L1061">			y2 = vertices[i + 3];</span>
+
+<span class="nc" id="L1063">			renderer.color(colorBits);</span>
+<span class="nc" id="L1064">			renderer.vertex(x1, y1, 0);</span>
+<span class="nc" id="L1065">			renderer.color(colorBits);</span>
+<span class="nc" id="L1066">			renderer.vertex(x2, y2, 0);</span>
+		}
+<span class="nc" id="L1068">	}</span>
+
+	/** @see #polyline(float[], int, int) */
+	public void polyline (float[] vertices) {
+<span class="nc" id="L1072">		polyline(vertices, 0, vertices.length);</span>
+<span class="nc" id="L1073">	}</span>
+
+	/** @param other May be null. */
+	private void check (ShapeType preferred, ShapeType other, int newVertices) {
+<span class="nc bnc" id="L1077" title="All 2 branches missed.">		if (shapeType == null) throw new IllegalStateException(&quot;begin must be called first.&quot;);</span>
+
+<span class="nc bnc" id="L1079" title="All 4 branches missed.">		if (shapeType != preferred &amp;&amp; shapeType != other) {</span>
+			// Shape type is not valid.
+<span class="nc bnc" id="L1081" title="All 2 branches missed.">			if (!autoShapeType) {</span>
+<span class="nc bnc" id="L1082" title="All 2 branches missed.">				if (other == null)</span>
+<span class="nc" id="L1083">					throw new IllegalStateException(&quot;Must call begin(ShapeType.&quot; + preferred + &quot;).&quot;);</span>
+				else
+<span class="nc" id="L1085">					throw new IllegalStateException(&quot;Must call begin(ShapeType.&quot; + preferred + &quot;) or begin(ShapeType.&quot; + other + &quot;).&quot;);</span>
+			}
+<span class="nc" id="L1087">			end();</span>
+<span class="nc" id="L1088">			begin(preferred);</span>
+<span class="nc bnc" id="L1089" title="All 2 branches missed.">		} else if (matrixDirty) {</span>
+			// Matrix has been changed.
+<span class="nc" id="L1091">			ShapeType type = shapeType;</span>
+<span class="nc" id="L1092">			end();</span>
+<span class="nc" id="L1093">			begin(type);</span>
+<span class="nc bnc" id="L1094" title="All 2 branches missed.">		} else if (renderer.getMaxVertices() - renderer.getNumVertices() &lt; newVertices) {</span>
+			// Not enough space.
+<span class="nc" id="L1096">			ShapeType type = shapeType;</span>
+<span class="nc" id="L1097">			end();</span>
+<span class="nc" id="L1098">			begin(type);</span>
+		}
+<span class="nc" id="L1100">	}</span>
+
+	/** Finishes the batch of shapes and ensures they get rendered. */
+	public void end () {
+<span class="nc" id="L1104">		renderer.end();</span>
+<span class="nc" id="L1105">		shapeType = null;</span>
+<span class="nc" id="L1106">	}</span>
+
+	public void flush () {
+<span class="nc" id="L1109">		ShapeType type = shapeType;</span>
+<span class="nc" id="L1110">		end();</span>
+<span class="nc" id="L1111">		begin(type);</span>
+<span class="nc" id="L1112">	}</span>
+
+	/** Returns the current shape type. */
+	public ShapeType getCurrentType () {
+<span class="nc" id="L1116">		return shapeType;</span>
+	}
+
+	public ImmediateModeRenderer getRenderer () {
+<span class="nc" id="L1120">		return renderer;</span>
+	}
+
+	/** @return true if currently between begin and end. */
+	public boolean isDrawing () {
+<span class="nc bnc" id="L1125" title="All 2 branches missed.">		return shapeType != null;</span>
+	}
+
+	public void dispose () {
+<span class="nc" id="L1129">		renderer.dispose();</span>
+<span class="nc" id="L1130">	}</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.5.5.201112152213</span></div></body></html>

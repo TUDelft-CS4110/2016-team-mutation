@@ -1,0 +1,205 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>DecalBatch.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">libGDX Core</a> &gt; <a href="index.html" class="el_package">com.badlogic.gdx.graphics.g3d.decals</a> &gt; <span class="el_source">DecalBatch.java</span></div><h1>DecalBatch.java</h1><pre class="source lang-java linenums">/*******************************************************************************
+ * Copyright 2011 See AUTHORS file.
+ * 
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ ******************************************************************************/
+
+package com.badlogic.gdx.graphics.g3d.decals;
+
+import com.badlogic.gdx.Gdx;
+import com.badlogic.gdx.graphics.GL20;
+import com.badlogic.gdx.graphics.Mesh;
+import com.badlogic.gdx.graphics.VertexAttribute;
+import com.badlogic.gdx.graphics.VertexAttributes;
+import com.badlogic.gdx.graphics.glutils.ShaderProgram;
+import com.badlogic.gdx.utils.Array;
+import com.badlogic.gdx.utils.Disposable;
+import com.badlogic.gdx.utils.Pool;
+import com.badlogic.gdx.utils.SortedIntList;
+
+/** &lt;p&gt;
+ * Renderer for {@link Decal} objects.
+ * &lt;/p&gt;
+ * &lt;p&gt;
+ * New objects are added using {@link DecalBatch#add(Decal)}, there is no limit on how many decals can be added.&lt;br/&gt;
+ * Once all the decals have been submitted a call to {@link DecalBatch#flush()} will batch them together and send big chunks of
+ * geometry to the GL.
+ * &lt;/p&gt;
+ * &lt;p&gt;
+ * The size of the batch specifies the maximum number of decals that can be batched together before they have to be submitted to
+ * the graphics pipeline. The default size is {@link DecalBatch#DEFAULT_SIZE}. If it is known before hand that not as many will be
+ * needed on average the batch can be downsized to save memory. If the game is basically 3d based and decals will only be needed
+ * for an orthogonal HUD it makes sense to tune the size down.
+ * &lt;/p&gt;
+ * &lt;p&gt;
+ * The way the batch handles things depends on the {@link GroupStrategy}. Different strategies can be used to customize shaders,
+ * states, culling etc. for more details see the {@link GroupStrategy} java doc.&lt;br/&gt;
+ * While it shouldn't be necessary to change strategies, if you have to do so, do it before calling {@link #add(Decal)}, and if
+ * you already did, call {@link #flush()} first.
+ * &lt;/p&gt; */
+public class DecalBatch implements Disposable {
+	private static final int DEFAULT_SIZE = 1000;
+	private float[] vertices;
+	private Mesh mesh;
+
+<span class="nc" id="L55">	private final SortedIntList&lt;Array&lt;Decal&gt;&gt; groupList = new SortedIntList&lt;Array&lt;Decal&gt;&gt;();</span>
+	private GroupStrategy groupStrategy;
+<span class="nc" id="L57">	private final Pool&lt;Array&lt;Decal&gt;&gt; groupPool = new Pool&lt;Array&lt;Decal&gt;&gt;(16) {</span>
+		@Override
+		protected Array&lt;Decal&gt; newObject () {
+<span class="nc" id="L60">			return new Array&lt;Decal&gt;(false, 100);</span>
+		}
+	};
+<span class="nc" id="L63">	private final Array&lt;Array&lt;Decal&gt;&gt; usedGroups = new Array&lt;Array&lt;Decal&gt;&gt;(16);</span>
+
+	/**
+	 * Creates a new DecalBatch using the given {@link GroupStrategy}. The most
+	 * commong strategy to use is a {@link CameraGroupStrategy}
+	 * @param groupStrategy
+	 */
+	public DecalBatch (GroupStrategy groupStrategy) {
+<span class="nc" id="L71">		this(DEFAULT_SIZE, groupStrategy);</span>
+<span class="nc" id="L72">	}</span>
+
+<span class="nc" id="L74">	public DecalBatch (int size, GroupStrategy groupStrategy) {</span>
+<span class="nc" id="L75">		initialize(size);</span>
+<span class="nc" id="L76">		setGroupStrategy(groupStrategy);</span>
+<span class="nc" id="L77">	}</span>
+
+	/** Sets the {@link GroupStrategy} used
+	 * @param groupStrategy Group strategy to use */
+	public void setGroupStrategy (GroupStrategy groupStrategy) {
+<span class="nc" id="L82">		this.groupStrategy = groupStrategy;</span>
+<span class="nc" id="L83">	}</span>
+
+	/** Initializes the batch with the given amount of decal objects the buffer is able to hold when full.
+	 * 
+	 * @param size Maximum size of decal objects to hold in memory */
+	public void initialize (int size) {
+<span class="nc" id="L89">		vertices = new float[size * Decal.SIZE];</span>
+
+<span class="nc" id="L91">		Mesh.VertexDataType vertexDataType = Mesh.VertexDataType.VertexArray;</span>
+<span class="nc bnc" id="L92" title="All 2 branches missed.">		if(Gdx.gl30 != null) {</span>
+<span class="nc" id="L93">			vertexDataType = Mesh.VertexDataType.VertexBufferObjectWithVAO;</span>
+		}
+<span class="nc" id="L95">		mesh = new Mesh(vertexDataType, false, size * 4, size * 6, new VertexAttribute(</span>
+				VertexAttributes.Usage.Position, 3, ShaderProgram.POSITION_ATTRIBUTE), new VertexAttribute(
+				VertexAttributes.Usage.ColorPacked, 4, ShaderProgram.COLOR_ATTRIBUTE), new VertexAttribute(
+				VertexAttributes.Usage.TextureCoordinates, 2, ShaderProgram.TEXCOORD_ATTRIBUTE + &quot;0&quot;));
+
+<span class="nc" id="L100">		short[] indices = new short[size * 6];</span>
+<span class="nc" id="L101">		int v = 0;</span>
+<span class="nc bnc" id="L102" title="All 2 branches missed.">		for (int i = 0; i &lt; indices.length; i += 6, v += 4) {</span>
+<span class="nc" id="L103">			indices[i] = (short)(v);</span>
+<span class="nc" id="L104">			indices[i + 1] = (short)(v + 2);</span>
+<span class="nc" id="L105">			indices[i + 2] = (short)(v + 1);</span>
+<span class="nc" id="L106">			indices[i + 3] = (short)(v + 1);</span>
+<span class="nc" id="L107">			indices[i + 4] = (short)(v + 2);</span>
+<span class="nc" id="L108">			indices[i + 5] = (short)(v + 3);</span>
+		}
+<span class="nc" id="L110">		mesh.setIndices(indices);</span>
+<span class="nc" id="L111">	}</span>
+
+	/** @return maximum amount of decal objects this buffer can hold in memory */
+	public int getSize () {
+<span class="nc" id="L115">		return vertices.length / Decal.SIZE;</span>
+	}
+
+	/** Add a decal to the batch, marking it for later rendering
+	 * 
+	 * @param decal Decal to add for rendering */
+	public void add (Decal decal) {
+<span class="nc" id="L122">		int groupIndex = groupStrategy.decideGroup(decal);</span>
+<span class="nc" id="L123">		Array&lt;Decal&gt; targetGroup = groupList.get(groupIndex);</span>
+<span class="nc bnc" id="L124" title="All 2 branches missed.">		if (targetGroup == null) {</span>
+<span class="nc" id="L125">			targetGroup = groupPool.obtain();</span>
+<span class="nc" id="L126">			targetGroup.clear();</span>
+<span class="nc" id="L127">			usedGroups.add(targetGroup);</span>
+<span class="nc" id="L128">			groupList.insert(groupIndex, targetGroup);</span>
+		}
+<span class="nc" id="L130">		targetGroup.add(decal);</span>
+<span class="nc" id="L131">	}</span>
+
+	/** Flush this batch sending all contained decals to GL. After flushing the batch is empty once again. */
+	public void flush () {
+<span class="nc" id="L135">		render();</span>
+<span class="nc" id="L136">		clear();</span>
+<span class="nc" id="L137">	}</span>
+
+	/** Renders all decals to the buffer and flushes the buffer to the GL when full/done */
+	protected void render () {
+<span class="nc" id="L141">		groupStrategy.beforeGroups();</span>
+<span class="nc bnc" id="L142" title="All 2 branches missed.">		for (SortedIntList.Node&lt;Array&lt;Decal&gt;&gt; group : groupList) {</span>
+<span class="nc" id="L143">			groupStrategy.beforeGroup(group.index, group.value);</span>
+<span class="nc" id="L144">			ShaderProgram shader = groupStrategy.getGroupShader(group.index);</span>
+<span class="nc" id="L145">			render(shader, group.value);</span>
+<span class="nc" id="L146">			groupStrategy.afterGroup(group.index);</span>
+<span class="nc" id="L147">		}</span>
+<span class="nc" id="L148">		groupStrategy.afterGroups();</span>
+<span class="nc" id="L149">	}</span>
+
+	/** Renders a group of vertices to the buffer, flushing them to GL when done/full
+	 * 
+	 * @param decals Decals to render */
+	private void render (ShaderProgram shader, Array&lt;Decal&gt; decals) {
+		// batch vertices
+<span class="nc" id="L156">		DecalMaterial lastMaterial = null;</span>
+<span class="nc" id="L157">		int idx = 0;</span>
+<span class="nc bnc" id="L158" title="All 2 branches missed.">		for (Decal decal : decals) {</span>
+<span class="nc bnc" id="L159" title="All 4 branches missed.">			if (lastMaterial == null || !lastMaterial.equals(decal.getMaterial())) {</span>
+<span class="nc bnc" id="L160" title="All 2 branches missed.">				if (idx &gt; 0) {</span>
+<span class="nc" id="L161">					flush(shader, idx);</span>
+<span class="nc" id="L162">					idx = 0;</span>
+				}
+<span class="nc" id="L164">				decal.material.set();</span>
+<span class="nc" id="L165">				lastMaterial = decal.material;</span>
+			}
+<span class="nc" id="L167">			decal.update();</span>
+<span class="nc" id="L168">			System.arraycopy(decal.vertices, 0, vertices, idx, decal.vertices.length);</span>
+<span class="nc" id="L169">			idx += decal.vertices.length;</span>
+			// if our batch is full we have to flush it
+<span class="nc bnc" id="L171" title="All 2 branches missed.">			if (idx == vertices.length) {</span>
+<span class="nc" id="L172">				flush(shader, idx);</span>
+<span class="nc" id="L173">				idx = 0;</span>
+			}
+<span class="nc" id="L175">		}</span>
+		// at the end if there is stuff left in the batch we render that
+<span class="nc bnc" id="L177" title="All 2 branches missed.">		if (idx &gt; 0) {</span>
+<span class="nc" id="L178">			flush(shader, idx);</span>
+		}
+<span class="nc" id="L180">	}</span>
+
+	/** Flushes vertices[0,verticesPosition[ to GL verticesPosition % Decal.SIZE must equal 0
+	 * 
+	 * @param verticesPosition Amount of elements from the vertices array to flush */
+	protected void flush (ShaderProgram shader, int verticesPosition) {
+<span class="nc" id="L186">		mesh.setVertices(vertices, 0, verticesPosition);</span>
+<span class="nc" id="L187">		mesh.render(shader, GL20.GL_TRIANGLES, 0, verticesPosition / 4);</span>
+<span class="nc" id="L188">	}</span>
+
+	/** Remove all decals from batch */
+	protected void clear () {
+<span class="nc" id="L192">		groupList.clear();</span>
+<span class="nc" id="L193">		groupPool.freeAll(usedGroups);</span>
+<span class="nc" id="L194">		usedGroups.clear();</span>
+<span class="nc" id="L195">	}</span>
+
+	/** Frees up memory by dropping the buffer and underlying resources. If the batch is needed again after disposing it can be
+	 * {@link #initialize(int) initialized} again. */
+	public void dispose () {
+<span class="nc" id="L200">		clear();</span>
+<span class="nc" id="L201">		vertices = null;</span>
+<span class="nc" id="L202">		mesh.dispose();</span>
+<span class="nc" id="L203">	}</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.5.5.201112152213</span></div></body></html>

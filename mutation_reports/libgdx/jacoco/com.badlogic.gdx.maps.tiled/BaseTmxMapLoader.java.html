@@ -1,0 +1,368 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>BaseTmxMapLoader.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">libGDX Core</a> &gt; <a href="index.html" class="el_package">com.badlogic.gdx.maps.tiled</a> &gt; <span class="el_source">BaseTmxMapLoader.java</span></div><h1>BaseTmxMapLoader.java</h1><pre class="source lang-java linenums">
+package com.badlogic.gdx.maps.tiled;
+
+import java.io.BufferedInputStream;
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.StringTokenizer;
+import java.util.zip.GZIPInputStream;
+import java.util.zip.InflaterInputStream;
+
+import com.badlogic.gdx.assets.AssetLoaderParameters;
+import com.badlogic.gdx.assets.loaders.AsynchronousAssetLoader;
+import com.badlogic.gdx.assets.loaders.FileHandleResolver;
+import com.badlogic.gdx.files.FileHandle;
+import com.badlogic.gdx.graphics.Texture.TextureFilter;
+import com.badlogic.gdx.graphics.g2d.TextureRegion;
+import com.badlogic.gdx.maps.ImageResolver;
+import com.badlogic.gdx.maps.MapLayer;
+import com.badlogic.gdx.maps.MapObject;
+import com.badlogic.gdx.maps.MapProperties;
+import com.badlogic.gdx.maps.objects.EllipseMapObject;
+import com.badlogic.gdx.maps.objects.PolygonMapObject;
+import com.badlogic.gdx.maps.objects.PolylineMapObject;
+import com.badlogic.gdx.maps.objects.RectangleMapObject;
+import com.badlogic.gdx.maps.tiled.TiledMapTileLayer.Cell;
+import com.badlogic.gdx.maps.tiled.objects.TiledMapTileMapObject;
+import com.badlogic.gdx.math.Polygon;
+import com.badlogic.gdx.math.Polyline;
+import com.badlogic.gdx.utils.Base64Coder;
+import com.badlogic.gdx.utils.GdxRuntimeException;
+import com.badlogic.gdx.utils.StreamUtils;
+import com.badlogic.gdx.utils.XmlReader;
+import com.badlogic.gdx.utils.XmlReader.Element;
+
+public abstract class BaseTmxMapLoader&lt;P extends AssetLoaderParameters&lt;TiledMap&gt;&gt; extends AsynchronousAssetLoader&lt;TiledMap, P&gt; {
+
+<span class="nc" id="L38">	public static class Parameters extends AssetLoaderParameters&lt;TiledMap&gt; {</span>
+		/** generate mipmaps? **/
+<span class="nc" id="L40">		public boolean generateMipMaps = false;</span>
+		/** The TextureFilter to use for minification **/
+<span class="nc" id="L42">		public TextureFilter textureMinFilter = TextureFilter.Nearest;</span>
+		/** The TextureFilter to use for magnification **/
+<span class="nc" id="L44">		public TextureFilter textureMagFilter = TextureFilter.Nearest;</span>
+		/** Whether to convert the objects' pixel position and size to the equivalent in tile space. **/
+<span class="nc" id="L46">		public boolean convertObjectToTileSpace = false;</span>
+		/** Whether to flip all Y coordinates so that Y positive is down. All LibGDX renderers require flipped Y coordinates, and
+		 * thus flipY set to true. This parameter is included for non-rendering related purposes of TMX files, or custom renderers. */
+<span class="nc" id="L49">		public boolean flipY = true;</span>
+	}
+
+	protected static final int FLAG_FLIP_HORIZONTALLY = 0x80000000;
+	protected static final int FLAG_FLIP_VERTICALLY = 0x40000000;
+	protected static final int FLAG_FLIP_DIAGONALLY = 0x20000000;
+	protected static final int MASK_CLEAR = 0xE0000000;
+
+<span class="nc" id="L57">	protected XmlReader xml = new XmlReader();</span>
+	protected Element root;
+	protected boolean convertObjectToTileSpace;
+<span class="nc" id="L60">	protected boolean flipY = true;</span>
+
+	protected int mapTileWidth;
+	protected int mapTileHeight;
+	protected int mapWidthInPixels;
+	protected int mapHeightInPixels;
+
+	protected TiledMap map;
+
+	public BaseTmxMapLoader (FileHandleResolver resolver) {
+<span class="nc" id="L70">		super(resolver);</span>
+<span class="nc" id="L71">	}</span>
+
+	protected void loadTileLayer (TiledMap map, Element element) {
+<span class="nc bnc" id="L74" title="All 2 branches missed.">		if (element.getName().equals(&quot;layer&quot;)) {</span>
+<span class="nc" id="L75">			int width = element.getIntAttribute(&quot;width&quot;, 0);</span>
+<span class="nc" id="L76">			int height = element.getIntAttribute(&quot;height&quot;, 0);</span>
+<span class="nc" id="L77">			int tileWidth = element.getParent().getIntAttribute(&quot;tilewidth&quot;, 0);</span>
+<span class="nc" id="L78">			int tileHeight = element.getParent().getIntAttribute(&quot;tileheight&quot;, 0);</span>
+<span class="nc" id="L79">			TiledMapTileLayer layer = new TiledMapTileLayer(width, height, tileWidth, tileHeight);</span>
+
+<span class="nc" id="L81">			loadBasicLayerInfo(layer, element);</span>
+
+<span class="nc" id="L83">			int[] ids = getTileIds(element, width, height);</span>
+<span class="nc" id="L84">			TiledMapTileSets tilesets = map.getTileSets();</span>
+<span class="nc bnc" id="L85" title="All 2 branches missed.">			for (int y = 0; y &lt; height; y++) {</span>
+<span class="nc bnc" id="L86" title="All 2 branches missed.">				for (int x = 0; x &lt; width; x++) {</span>
+<span class="nc" id="L87">					int id = ids[y * width + x];</span>
+<span class="nc bnc" id="L88" title="All 2 branches missed.">					boolean flipHorizontally = ((id &amp; FLAG_FLIP_HORIZONTALLY) != 0);</span>
+<span class="nc bnc" id="L89" title="All 2 branches missed.">					boolean flipVertically = ((id &amp; FLAG_FLIP_VERTICALLY) != 0);</span>
+<span class="nc bnc" id="L90" title="All 2 branches missed.">					boolean flipDiagonally = ((id &amp; FLAG_FLIP_DIAGONALLY) != 0);</span>
+
+<span class="nc" id="L92">					TiledMapTile tile = tilesets.getTile(id &amp; ~MASK_CLEAR);</span>
+<span class="nc bnc" id="L93" title="All 2 branches missed.">					if (tile != null) {</span>
+<span class="nc" id="L94">						Cell cell = createTileLayerCell(flipHorizontally, flipVertically, flipDiagonally);</span>
+<span class="nc" id="L95">						cell.setTile(tile);</span>
+<span class="nc bnc" id="L96" title="All 2 branches missed.">						layer.setCell(x, flipY ? height - 1 - y : y, cell);</span>
+					}
+				}
+			}
+
+<span class="nc" id="L101">			Element properties = element.getChildByName(&quot;properties&quot;);</span>
+<span class="nc bnc" id="L102" title="All 2 branches missed.">			if (properties != null) {</span>
+<span class="nc" id="L103">				loadProperties(layer.getProperties(), properties);</span>
+			}
+<span class="nc" id="L105">			map.getLayers().add(layer);</span>
+		}
+<span class="nc" id="L107">	}</span>
+
+	protected void loadObjectGroup (TiledMap map, Element element) {
+<span class="nc bnc" id="L110" title="All 2 branches missed.">		if (element.getName().equals(&quot;objectgroup&quot;)) {</span>
+<span class="nc" id="L111">			String name = element.getAttribute(&quot;name&quot;, null);</span>
+<span class="nc" id="L112">			MapLayer layer = new MapLayer();</span>
+<span class="nc" id="L113">			layer.setName(name);</span>
+<span class="nc" id="L114">			Element properties = element.getChildByName(&quot;properties&quot;);</span>
+<span class="nc bnc" id="L115" title="All 2 branches missed.">			if (properties != null) {</span>
+<span class="nc" id="L116">				loadProperties(layer.getProperties(), properties);</span>
+			}
+
+<span class="nc bnc" id="L119" title="All 2 branches missed.">			for (Element objectElement : element.getChildrenByName(&quot;object&quot;)) {</span>
+<span class="nc" id="L120">				loadObject(map, layer, objectElement);</span>
+<span class="nc" id="L121">			}</span>
+
+<span class="nc" id="L123">			map.getLayers().add(layer);</span>
+		}
+<span class="nc" id="L125">	}</span>
+
+	protected void loadImageLayer (TiledMap map, Element element, FileHandle tmxFile, ImageResolver imageResolver) {
+<span class="nc bnc" id="L128" title="All 2 branches missed.">		if (element.getName().equals(&quot;imagelayer&quot;)) {</span>
+<span class="nc" id="L129">			int x = Integer.parseInt(element.getAttribute(&quot;x&quot;, &quot;0&quot;));</span>
+<span class="nc" id="L130">			int y = Integer.parseInt(element.getAttribute(&quot;y&quot;, &quot;0&quot;));</span>
+
+<span class="nc bnc" id="L132" title="All 2 branches missed.">			if (flipY) y = mapHeightInPixels - y;</span>
+
+<span class="nc" id="L134">			TextureRegion texture = null;</span>
+
+<span class="nc" id="L136">			Element image = element.getChildByName(&quot;image&quot;);</span>
+
+<span class="nc bnc" id="L138" title="All 2 branches missed.">			if (image != null) {</span>
+<span class="nc" id="L139">				String source = image.getAttribute(&quot;source&quot;);</span>
+<span class="nc" id="L140">				FileHandle handle = getRelativeFileHandle(tmxFile, source);</span>
+<span class="nc" id="L141">				texture = imageResolver.getImage(handle.path());</span>
+<span class="nc" id="L142">				y -= texture.getRegionHeight();</span>
+			}
+
+<span class="nc" id="L145">			TiledMapImageLayer layer = new TiledMapImageLayer(texture, x, y);</span>
+
+<span class="nc" id="L147">			loadBasicLayerInfo(layer, element);</span>
+
+<span class="nc" id="L149">			Element properties = element.getChildByName(&quot;properties&quot;);</span>
+<span class="nc bnc" id="L150" title="All 2 branches missed.">			if (properties != null) {</span>
+<span class="nc" id="L151">				loadProperties(layer.getProperties(), properties);</span>
+			}
+
+<span class="nc" id="L154">			map.getLayers().add(layer);</span>
+		}
+<span class="nc" id="L156">	}</span>
+
+	protected void loadBasicLayerInfo (MapLayer layer, Element element) {
+<span class="nc" id="L159">		String name = element.getAttribute(&quot;name&quot;, null);</span>
+<span class="nc" id="L160">		float opacity = Float.parseFloat(element.getAttribute(&quot;opacity&quot;, &quot;1.0&quot;));</span>
+<span class="nc bnc" id="L161" title="All 2 branches missed.">		boolean visible = element.getIntAttribute(&quot;visible&quot;, 1) == 1;</span>
+
+<span class="nc" id="L163">		layer.setName(name);</span>
+<span class="nc" id="L164">		layer.setOpacity(opacity);</span>
+<span class="nc" id="L165">		layer.setVisible(visible);</span>
+<span class="nc" id="L166">	}</span>
+
+	protected void loadObject (TiledMap map, MapLayer layer, Element element) {
+<span class="nc bnc" id="L169" title="All 2 branches missed.">		if (element.getName().equals(&quot;object&quot;)) {</span>
+<span class="nc" id="L170">			MapObject object = null;</span>
+
+<span class="nc bnc" id="L172" title="All 2 branches missed.">			float scaleX = convertObjectToTileSpace ? 1.0f / mapTileWidth : 1.0f;</span>
+<span class="nc bnc" id="L173" title="All 2 branches missed.">			float scaleY = convertObjectToTileSpace ? 1.0f / mapTileHeight : 1.0f;</span>
+
+<span class="nc" id="L175">			float x = element.getFloatAttribute(&quot;x&quot;, 0) * scaleX;</span>
+<span class="nc bnc" id="L176" title="All 2 branches missed.">			float y = (flipY ? (mapHeightInPixels - element.getFloatAttribute(&quot;y&quot;, 0)) : element.getFloatAttribute(&quot;y&quot;, 0)) * scaleY;</span>
+
+<span class="nc" id="L178">			float width = element.getFloatAttribute(&quot;width&quot;, 0) * scaleX;</span>
+<span class="nc" id="L179">			float height = element.getFloatAttribute(&quot;height&quot;, 0) * scaleY;</span>
+
+<span class="nc bnc" id="L181" title="All 2 branches missed.">			if (element.getChildCount() &gt; 0) {</span>
+<span class="nc" id="L182">				Element child = null;</span>
+<span class="nc bnc" id="L183" title="All 2 branches missed.">				if ((child = element.getChildByName(&quot;polygon&quot;)) != null) {</span>
+<span class="nc" id="L184">					String[] points = child.getAttribute(&quot;points&quot;).split(&quot; &quot;);</span>
+<span class="nc" id="L185">					float[] vertices = new float[points.length * 2];</span>
+<span class="nc bnc" id="L186" title="All 2 branches missed.">					for (int i = 0; i &lt; points.length; i++) {</span>
+<span class="nc" id="L187">						String[] point = points[i].split(&quot;,&quot;);</span>
+<span class="nc" id="L188">						vertices[i * 2] = Float.parseFloat(point[0]) * scaleX;</span>
+<span class="nc bnc" id="L189" title="All 2 branches missed.">						vertices[i * 2 + 1] = Float.parseFloat(point[1]) * scaleY * (flipY ? -1 : 1);</span>
+					}
+<span class="nc" id="L191">					Polygon polygon = new Polygon(vertices);</span>
+<span class="nc" id="L192">					polygon.setPosition(x, y);</span>
+<span class="nc" id="L193">					object = new PolygonMapObject(polygon);</span>
+<span class="nc bnc" id="L194" title="All 2 branches missed.">				} else if ((child = element.getChildByName(&quot;polyline&quot;)) != null) {</span>
+<span class="nc" id="L195">					String[] points = child.getAttribute(&quot;points&quot;).split(&quot; &quot;);</span>
+<span class="nc" id="L196">					float[] vertices = new float[points.length * 2];</span>
+<span class="nc bnc" id="L197" title="All 2 branches missed.">					for (int i = 0; i &lt; points.length; i++) {</span>
+<span class="nc" id="L198">						String[] point = points[i].split(&quot;,&quot;);</span>
+<span class="nc" id="L199">						vertices[i * 2] = Float.parseFloat(point[0]) * scaleX;</span>
+<span class="nc bnc" id="L200" title="All 2 branches missed.">						vertices[i * 2 + 1] = Float.parseFloat(point[1]) * scaleY * (flipY ? -1 : 1);</span>
+					}
+<span class="nc" id="L202">					Polyline polyline = new Polyline(vertices);</span>
+<span class="nc" id="L203">					polyline.setPosition(x, y);</span>
+<span class="nc" id="L204">					object = new PolylineMapObject(polyline);</span>
+<span class="nc bnc" id="L205" title="All 2 branches missed.">				} else if ((child = element.getChildByName(&quot;ellipse&quot;)) != null) {</span>
+<span class="nc bnc" id="L206" title="All 2 branches missed.">					object = new EllipseMapObject(x, flipY ? y - height : y, width, height);</span>
+				}
+			}
+<span class="nc bnc" id="L209" title="All 2 branches missed.">			if (object == null) {</span>
+<span class="nc" id="L210">				String gid = null;</span>
+<span class="nc bnc" id="L211" title="All 2 branches missed.">				if ((gid = element.getAttribute(&quot;gid&quot;, null)) != null) {</span>
+<span class="nc" id="L212">					int id = (int)Long.parseLong(gid);</span>
+<span class="nc bnc" id="L213" title="All 2 branches missed.">					boolean flipHorizontally = ((id &amp; FLAG_FLIP_HORIZONTALLY) != 0);</span>
+<span class="nc bnc" id="L214" title="All 2 branches missed.">					boolean flipVertically = ((id &amp; FLAG_FLIP_VERTICALLY) != 0);</span>
+
+<span class="nc" id="L216">					TiledMapTile tile = map.getTileSets().getTile(id &amp; ~MASK_CLEAR);</span>
+<span class="nc" id="L217">					TiledMapTileMapObject tiledMapTileMapObject = new TiledMapTileMapObject(tile, flipHorizontally, flipVertically);</span>
+<span class="nc" id="L218">					TextureRegion textureRegion = tiledMapTileMapObject.getTextureRegion();</span>
+<span class="nc" id="L219">					tiledMapTileMapObject.getProperties().put(&quot;gid&quot;, id);</span>
+<span class="nc" id="L220">					tiledMapTileMapObject.setX(x);</span>
+<span class="nc bnc" id="L221" title="All 2 branches missed.">					tiledMapTileMapObject.setY(flipY ? y : y - height);</span>
+<span class="nc" id="L222">					float objectWidth = element.getFloatAttribute(&quot;width&quot;, textureRegion.getRegionWidth());</span>
+<span class="nc" id="L223">					float objectHeight = element.getFloatAttribute(&quot;height&quot;, textureRegion.getRegionHeight());</span>
+<span class="nc" id="L224">					tiledMapTileMapObject.setScaleX(scaleX * (objectWidth / textureRegion.getRegionWidth()));</span>
+<span class="nc" id="L225">					tiledMapTileMapObject.setScaleY(scaleY * (objectHeight / textureRegion.getRegionHeight()));</span>
+<span class="nc" id="L226">					tiledMapTileMapObject.setRotation(element.getFloatAttribute(&quot;rotation&quot;, 0));</span>
+<span class="nc" id="L227">					object = tiledMapTileMapObject;</span>
+<span class="nc" id="L228">				} else {</span>
+<span class="nc bnc" id="L229" title="All 2 branches missed.">					object = new RectangleMapObject(x, flipY ? y - height : y, width, height);</span>
+				}
+			}
+<span class="nc" id="L232">			object.setName(element.getAttribute(&quot;name&quot;, null));</span>
+<span class="nc" id="L233">			String rotation = element.getAttribute(&quot;rotation&quot;, null);</span>
+<span class="nc bnc" id="L234" title="All 2 branches missed.">			if (rotation != null) {</span>
+<span class="nc" id="L235">				object.getProperties().put(&quot;rotation&quot;, Float.parseFloat(rotation));</span>
+			}
+<span class="nc" id="L237">			String type = element.getAttribute(&quot;type&quot;, null);</span>
+<span class="nc bnc" id="L238" title="All 2 branches missed.">			if (type != null) {</span>
+<span class="nc" id="L239">				object.getProperties().put(&quot;type&quot;, type);</span>
+			}
+<span class="nc" id="L241">			int id = element.getIntAttribute(&quot;id&quot;, 0);</span>
+<span class="nc bnc" id="L242" title="All 2 branches missed.">			if (id != 0) {</span>
+<span class="nc" id="L243">				object.getProperties().put(&quot;id&quot;, id);</span>
+			}
+<span class="nc" id="L245">			object.getProperties().put(&quot;x&quot;, x * scaleX);</span>
+<span class="nc bnc" id="L246" title="All 2 branches missed.">			object.getProperties().put(&quot;y&quot;, (flipY ? y - height : y) * scaleY);</span>
+<span class="nc" id="L247">			object.getProperties().put(&quot;width&quot;, width);</span>
+<span class="nc" id="L248">			object.getProperties().put(&quot;height&quot;, height);</span>
+<span class="nc bnc" id="L249" title="All 2 branches missed.">			object.setVisible(element.getIntAttribute(&quot;visible&quot;, 1) == 1);</span>
+<span class="nc" id="L250">			Element properties = element.getChildByName(&quot;properties&quot;);</span>
+<span class="nc bnc" id="L251" title="All 2 branches missed.">			if (properties != null) {</span>
+<span class="nc" id="L252">				loadProperties(object.getProperties(), properties);</span>
+			}
+<span class="nc" id="L254">			layer.getObjects().add(object);</span>
+		}
+<span class="nc" id="L256">	}</span>
+
+	protected void loadProperties (MapProperties properties, Element element) {
+<span class="nc bnc" id="L259" title="All 2 branches missed.">		if (element == null) return;</span>
+<span class="nc bnc" id="L260" title="All 2 branches missed.">		if (element.getName().equals(&quot;properties&quot;)) {</span>
+<span class="nc bnc" id="L261" title="All 2 branches missed.">			for (Element property : element.getChildrenByName(&quot;property&quot;)) {</span>
+<span class="nc" id="L262">				String name = property.getAttribute(&quot;name&quot;, null);</span>
+<span class="nc" id="L263">				String value = property.getAttribute(&quot;value&quot;, null);</span>
+<span class="nc bnc" id="L264" title="All 2 branches missed.">				if (value == null) {</span>
+<span class="nc" id="L265">					value = property.getText();</span>
+				}
+<span class="nc" id="L267">				properties.put(name, value);</span>
+<span class="nc" id="L268">			}</span>
+		}
+<span class="nc" id="L270">	}</span>
+
+	protected Cell createTileLayerCell (boolean flipHorizontally, boolean flipVertically, boolean flipDiagonally) {
+<span class="nc" id="L273">		Cell cell = new Cell();</span>
+<span class="nc bnc" id="L274" title="All 2 branches missed.">		if (flipDiagonally) {</span>
+<span class="nc bnc" id="L275" title="All 4 branches missed.">			if (flipHorizontally &amp;&amp; flipVertically) {</span>
+<span class="nc" id="L276">				cell.setFlipHorizontally(true);</span>
+<span class="nc" id="L277">				cell.setRotation(Cell.ROTATE_270);</span>
+<span class="nc bnc" id="L278" title="All 2 branches missed.">			} else if (flipHorizontally) {</span>
+<span class="nc" id="L279">				cell.setRotation(Cell.ROTATE_270);</span>
+<span class="nc bnc" id="L280" title="All 2 branches missed.">			} else if (flipVertically) {</span>
+<span class="nc" id="L281">				cell.setRotation(Cell.ROTATE_90);</span>
+			} else {
+<span class="nc" id="L283">				cell.setFlipVertically(true);</span>
+<span class="nc" id="L284">				cell.setRotation(Cell.ROTATE_270);</span>
+			}
+		} else {
+<span class="nc" id="L287">			cell.setFlipHorizontally(flipHorizontally);</span>
+<span class="nc" id="L288">			cell.setFlipVertically(flipVertically);</span>
+		}
+<span class="nc" id="L290">		return cell;</span>
+	}
+
+	static public int[] getTileIds (Element element, int width, int height) {
+<span class="nc" id="L294">		Element data = element.getChildByName(&quot;data&quot;);</span>
+<span class="nc" id="L295">		String encoding = data.getAttribute(&quot;encoding&quot;, null);</span>
+<span class="nc bnc" id="L296" title="All 2 branches missed.">		if (encoding == null) { // no 'encoding' attribute means that the encoding is XML</span>
+<span class="nc" id="L297">			throw new GdxRuntimeException(&quot;Unsupported encoding (XML) for TMX Layer Data&quot;);</span>
+		}
+<span class="nc" id="L299">		int[] ids = new int[width * height];</span>
+<span class="nc bnc" id="L300" title="All 2 branches missed.">		if (encoding.equals(&quot;csv&quot;)) {</span>
+<span class="nc" id="L301">			String[] array = data.getText().split(&quot;,&quot;);</span>
+<span class="nc bnc" id="L302" title="All 2 branches missed.">			for (int i = 0; i &lt; array.length; i++)</span>
+<span class="nc" id="L303">				ids[i] = (int)Long.parseLong(array[i].trim());</span>
+<span class="nc" id="L304">		} else {</span>
+			if (true)
+<span class="nc bnc" id="L306" title="All 2 branches missed.">				if (encoding.equals(&quot;base64&quot;)) {</span>
+<span class="nc" id="L307">					InputStream is = null;</span>
+					try {
+<span class="nc" id="L309">						String compression = data.getAttribute(&quot;compression&quot;, null);</span>
+<span class="nc" id="L310">						byte[] bytes = Base64Coder.decode(data.getText());</span>
+<span class="nc bnc" id="L311" title="All 2 branches missed.">						if (compression == null)</span>
+<span class="nc" id="L312">							is = new ByteArrayInputStream(bytes);</span>
+<span class="nc bnc" id="L313" title="All 2 branches missed.">						else if (compression.equals(&quot;gzip&quot;))</span>
+<span class="nc" id="L314">							is = new BufferedInputStream(new GZIPInputStream(new ByteArrayInputStream(bytes), bytes.length));</span>
+<span class="nc bnc" id="L315" title="All 2 branches missed.">						else if (compression.equals(&quot;zlib&quot;))</span>
+<span class="nc" id="L316">							is = new BufferedInputStream(new InflaterInputStream(new ByteArrayInputStream(bytes)));</span>
+						else
+<span class="nc" id="L318">							throw new GdxRuntimeException(&quot;Unrecognised compression (&quot; + compression + &quot;) for TMX Layer Data&quot;);</span>
+
+<span class="nc" id="L320">						byte[] temp = new byte[4];</span>
+<span class="nc bnc" id="L321" title="All 2 branches missed.">						for (int y = 0; y &lt; height; y++) {</span>
+<span class="nc bnc" id="L322" title="All 2 branches missed.">							for (int x = 0; x &lt; width; x++) {</span>
+<span class="nc" id="L323">								int read = is.read(temp);</span>
+<span class="nc bnc" id="L324" title="All 2 branches missed.">								while (read &lt; temp.length) {</span>
+<span class="nc" id="L325">									int curr = is.read(temp, read, temp.length - read);</span>
+<span class="nc bnc" id="L326" title="All 2 branches missed.">									if (curr == -1) break;</span>
+<span class="nc" id="L327">									read += curr;</span>
+<span class="nc" id="L328">								}</span>
+<span class="nc bnc" id="L329" title="All 2 branches missed.">								if (read != temp.length)</span>
+<span class="nc" id="L330">									throw new GdxRuntimeException(&quot;Error Reading TMX Layer Data: Premature end of tile data&quot;);</span>
+<span class="nc" id="L331">								ids[y * width + x] = unsignedByteToInt(temp[0]) | unsignedByteToInt(temp[1]) &lt;&lt; 8</span>
+									| unsignedByteToInt(temp[2]) &lt;&lt; 16 | unsignedByteToInt(temp[3]) &lt;&lt; 24;
+							}
+						}
+<span class="nc" id="L335">					} catch (IOException e) {</span>
+<span class="nc" id="L336">						throw new GdxRuntimeException(&quot;Error Reading TMX Layer Data - IOException: &quot; + e.getMessage());</span>
+					} finally {
+<span class="nc" id="L338">						StreamUtils.closeQuietly(is);</span>
+<span class="nc" id="L339">					}</span>
+<span class="nc" id="L340">				} else {</span>
+					// any other value of 'encoding' is one we're not aware of, probably a feature of a future version of Tiled
+					// or another editor
+<span class="nc" id="L343">					throw new GdxRuntimeException(&quot;Unrecognised encoding (&quot; + encoding + &quot;) for TMX Layer Data&quot;);</span>
+				}
+		}
+<span class="nc" id="L346">		return ids;</span>
+	}
+
+	protected static int unsignedByteToInt (byte b) {
+<span class="nc" id="L350">		return b &amp; 0xFF;</span>
+	}
+
+	protected static FileHandle getRelativeFileHandle (FileHandle file, String path) {
+<span class="nc" id="L354">		StringTokenizer tokenizer = new StringTokenizer(path, &quot;\\/&quot;);</span>
+<span class="nc" id="L355">		FileHandle result = file.parent();</span>
+<span class="nc bnc" id="L356" title="All 2 branches missed.">		while (tokenizer.hasMoreElements()) {</span>
+<span class="nc" id="L357">			String token = tokenizer.nextToken();</span>
+<span class="nc bnc" id="L358" title="All 2 branches missed.">			if (token.equals(&quot;..&quot;))</span>
+<span class="nc" id="L359">				result = result.parent();</span>
+			else {
+<span class="nc" id="L361">				result = result.child(token);</span>
+			}
+<span class="nc" id="L363">		}</span>
+<span class="nc" id="L364">		return result;</span>
+	}
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.5.5.201112152213</span></div></body></html>

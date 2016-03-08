@@ -1,0 +1,652 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>CpuSpriteBatch.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="right"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">libGDX Core</a> &gt; <a href="index.html" class="el_package">com.badlogic.gdx.graphics.g2d</a> &gt; <span class="el_source">CpuSpriteBatch.java</span></div><h1>CpuSpriteBatch.java</h1><pre class="source lang-java linenums">/*******************************************************************************
+ * Copyright 2011 See AUTHORS file.
+ *
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ ******************************************************************************/
+
+package com.badlogic.gdx.graphics.g2d;
+
+import com.badlogic.gdx.graphics.Texture;
+import com.badlogic.gdx.graphics.glutils.ShaderProgram;
+import com.badlogic.gdx.math.Affine2;
+import com.badlogic.gdx.math.MathUtils;
+import com.badlogic.gdx.math.Matrix4;
+import com.badlogic.gdx.utils.GdxRuntimeException;
+
+/** CpuSpriteBatch behaves like SpriteBatch, except it doesn't flush automatically whenever the transformation matrix changes.
+ * Instead, the vertices get adjusted on subsequent draws to match the running batch. This can improve performance through longer
+ * batches, for example when drawing Groups with transform enabled.
+ *
+ * @see SpriteBatch#renderCalls
+ * @see com.badlogic.gdx.scenes.scene2d.Group#setTransform(boolean) Group.setTransform()
+ * @author Valentin Milea */
+public class CpuSpriteBatch extends SpriteBatch {
+
+<span class="nc" id="L35">	private final Matrix4 virtualMatrix = new Matrix4();</span>
+<span class="nc" id="L36">	private final Affine2 adjustAffine = new Affine2();</span>
+	private boolean adjustNeeded;
+<span class="nc" id="L38">	private boolean haveIdentityRealMatrix = true;</span>
+
+<span class="nc" id="L40">	private final Affine2 tmpAffine = new Affine2();</span>
+
+	/** Constructs a CpuSpriteBatch with a size of 1000 and the default shader.
+	 * @see SpriteBatch#SpriteBatch() */
+	public CpuSpriteBatch () {
+<span class="nc" id="L45">		this(1000);</span>
+<span class="nc" id="L46">	}</span>
+
+	/** Constructs a CpuSpriteBatch with the default shader.
+	 * @see SpriteBatch#SpriteBatch(int) */
+	public CpuSpriteBatch (int size) {
+<span class="nc" id="L51">		this(size, null);</span>
+<span class="nc" id="L52">	}</span>
+
+	/** Constructs a CpuSpriteBatch with a custom shader.
+	 * @see SpriteBatch#SpriteBatch(int, ShaderProgram) */
+	public CpuSpriteBatch (int size, ShaderProgram defaultShader) {
+<span class="nc" id="L57">		super(size, defaultShader);</span>
+<span class="nc" id="L58">	}</span>
+
+	/** &lt;p&gt;
+	 * Flushes the batch and realigns the real matrix on the GPU. Subsequent draws won't need adjustment and will be slightly
+	 * faster as long as the transform matrix is not {@link #setTransformMatrix(Matrix4) changed}.
+	 * &lt;/p&gt;
+	 * &lt;p&gt;
+	 * Note: The real transform matrix &lt;em&gt;must&lt;/em&gt; be invertible. If a singular matrix is detected, GdxRuntimeException will be
+	 * thrown.
+	 * &lt;/p&gt;
+	 * @see SpriteBatch#flush() */
+	public void flushAndSyncTransformMatrix () {
+<span class="nc" id="L70">		flush();</span>
+
+<span class="nc bnc" id="L72" title="All 2 branches missed.">		if (adjustNeeded) {</span>
+			// vertices flushed, safe now to replace matrix
+<span class="nc" id="L74">			haveIdentityRealMatrix = checkIdt(virtualMatrix);</span>
+
+<span class="nc bnc" id="L76" title="All 4 branches missed.">			if (!haveIdentityRealMatrix &amp;&amp; virtualMatrix.det() == 0)</span>
+<span class="nc" id="L77">				throw new GdxRuntimeException(&quot;Transform matrix is singular, can't sync&quot;);</span>
+
+<span class="nc" id="L79">			adjustNeeded = false;</span>
+<span class="nc" id="L80">			super.setTransformMatrix(virtualMatrix);</span>
+		}
+<span class="nc" id="L82">	}</span>
+
+	@Override
+	public Matrix4 getTransformMatrix () {
+<span class="nc bnc" id="L86" title="All 2 branches missed.">		return (adjustNeeded ? virtualMatrix : super.getTransformMatrix());</span>
+	}
+
+	/** Sets the transform matrix to be used by this Batch. Even if this is called inside a {@link #begin()}/{@link #end()} block,
+	 * the current batch is &lt;em&gt;not&lt;/em&gt; flushed to the GPU. Instead, for every subsequent draw() the vertices will be transformed
+	 * on the CPU to match the original batch matrix. This adjustment must be performed until the matrices are realigned by
+	 * restoring the original matrix, or by calling {@link #flushAndSyncTransformMatrix()}. */
+	@Override
+	public void setTransformMatrix (Matrix4 transform) {
+<span class="nc" id="L95">		Matrix4 realMatrix = super.getTransformMatrix();</span>
+
+<span class="nc bnc" id="L97" title="All 2 branches missed.">		if (checkEqual(realMatrix, transform)) {</span>
+<span class="nc" id="L98">			adjustNeeded = false;</span>
+		} else {
+<span class="nc bnc" id="L100" title="All 2 branches missed.">			if (isDrawing()) {</span>
+<span class="nc" id="L101">				virtualMatrix.setAsAffine(transform);</span>
+<span class="nc" id="L102">				adjustNeeded = true;</span>
+
+				// adjust = inverse(real) x virtual
+				// real x adjust x vertex = virtual x vertex
+
+<span class="nc bnc" id="L107" title="All 2 branches missed.">				if (haveIdentityRealMatrix) {</span>
+<span class="nc" id="L108">					adjustAffine.set(transform);</span>
+				} else {
+<span class="nc" id="L110">					tmpAffine.set(transform);</span>
+<span class="nc" id="L111">					adjustAffine.set(realMatrix).inv().mul(tmpAffine);</span>
+				}
+			} else {
+<span class="nc" id="L114">				realMatrix.setAsAffine(transform);</span>
+<span class="nc" id="L115">				haveIdentityRealMatrix = checkIdt(realMatrix);</span>
+			}
+		}
+<span class="nc" id="L118">	}</span>
+
+	/** Sets the transform matrix to be used by this Batch. Even if this is called inside a {@link #begin()}/{@link #end()} block,
+	 * the current batch is &lt;em&gt;not&lt;/em&gt; flushed to the GPU. Instead, for every subsequent draw() the vertices will be transformed
+	 * on the CPU to match the original batch matrix. This adjustment must be performed until the matrices are realigned by
+	 * restoring the original matrix, or by calling {@link #flushAndSyncTransformMatrix()} or {@link #end()}. */
+	public void setTransformMatrix (Affine2 transform) {
+<span class="nc" id="L125">		Matrix4 realMatrix = super.getTransformMatrix();</span>
+
+<span class="nc bnc" id="L127" title="All 2 branches missed.">		if (checkEqual(realMatrix, transform)) {</span>
+<span class="nc" id="L128">			adjustNeeded = false;</span>
+		} else {
+<span class="nc" id="L130">			virtualMatrix.setAsAffine(transform);</span>
+
+<span class="nc bnc" id="L132" title="All 2 branches missed.">			if (isDrawing()) {</span>
+<span class="nc" id="L133">				adjustNeeded = true;</span>
+
+				// adjust = inverse(real) x virtual
+				// real x adjust x vertex = virtual x vertex
+
+<span class="nc bnc" id="L138" title="All 2 branches missed.">				if (haveIdentityRealMatrix) {</span>
+<span class="nc" id="L139">					adjustAffine.set(transform);</span>
+				} else {
+<span class="nc" id="L141">					adjustAffine.set(realMatrix).inv().mul(transform);</span>
+				}
+			} else {
+<span class="nc" id="L144">				realMatrix.setAsAffine(transform);</span>
+<span class="nc" id="L145">				haveIdentityRealMatrix = checkIdt(realMatrix);</span>
+			}
+		}
+<span class="nc" id="L148">	}</span>
+
+	@Override
+	public void draw (Texture texture, float x, float y, float originX, float originY, float width, float height, float scaleX,
+		float scaleY, float rotation, int srcX, int srcY, int srcWidth, int srcHeight, boolean flipX, boolean flipY) {
+<span class="nc bnc" id="L153" title="All 2 branches missed.">		if (!adjustNeeded) {</span>
+<span class="nc" id="L154">			super.draw(texture, x, y, originX, originY, width, height, scaleX, scaleY, rotation, srcX, srcY, srcWidth, srcHeight,</span>
+				flipX, flipY);
+		} else {
+<span class="nc" id="L157">			drawAdjusted(texture, x, y, originX, originY, width, height, scaleX, scaleY, rotation, srcX, srcY, srcWidth, srcHeight,</span>
+				flipX, flipY);
+		}
+<span class="nc" id="L160">	}</span>
+
+	@Override
+	public void draw (Texture texture, float x, float y, float width, float height, int srcX, int srcY, int srcWidth,
+		int srcHeight, boolean flipX, boolean flipY) {
+<span class="nc bnc" id="L165" title="All 2 branches missed.">		if (!adjustNeeded) {</span>
+<span class="nc" id="L166">			super.draw(texture, x, y, width, height, srcX, srcY, srcWidth, srcHeight, flipX, flipY);</span>
+		} else {
+<span class="nc" id="L168">			drawAdjusted(texture, x, y, 0, 0, width, height, 1, 1, 0, srcX, srcY, srcWidth, srcHeight, flipX, flipY);</span>
+		}
+<span class="nc" id="L170">	}</span>
+
+	@Override
+	public void draw (Texture texture, float x, float y, int srcX, int srcY, int srcWidth, int srcHeight) {
+<span class="nc bnc" id="L174" title="All 2 branches missed.">		if (!adjustNeeded) {</span>
+<span class="nc" id="L175">			super.draw(texture, x, y, srcX, srcY, srcWidth, srcHeight);</span>
+		} else {
+<span class="nc" id="L177">			drawAdjusted(texture, x, y, 0, 0, srcWidth, srcHeight, 1, 1, 0, srcX, srcY, srcWidth, srcHeight,</span>
+				false, false);
+		}
+<span class="nc" id="L180">	}</span>
+
+	@Override
+	public void draw (Texture texture, float x, float y, float width, float height, float u, float v, float u2, float v2) {
+<span class="nc bnc" id="L184" title="All 2 branches missed.">		if (!adjustNeeded) {</span>
+<span class="nc" id="L185">			super.draw(texture, x, y, width, height, u, v, u2, v2);</span>
+		} else {
+<span class="nc" id="L187">			drawAdjustedUV(texture, x, y, 0, 0, width, height, 1, 1, 0, u, v, u2, v2, false, false);</span>
+		}
+<span class="nc" id="L189">	}</span>
+
+	@Override
+	public void draw (Texture texture, float x, float y) {
+<span class="nc bnc" id="L193" title="All 2 branches missed.">		if (!adjustNeeded) {</span>
+<span class="nc" id="L194">			super.draw(texture, x, y);</span>
+		} else {
+<span class="nc" id="L196">			drawAdjusted(texture, x, y, 0, 0, texture.getWidth(), texture.getHeight(), 1, 1, 0, 0, 1, 1, 0, false, false);</span>
+		}
+<span class="nc" id="L198">	}</span>
+
+	@Override
+	public void draw (Texture texture, float x, float y, float width, float height) {
+<span class="nc bnc" id="L202" title="All 2 branches missed.">		if (!adjustNeeded) {</span>
+<span class="nc" id="L203">			super.draw(texture, x, y, width, height);</span>
+		} else {
+<span class="nc" id="L205">			drawAdjusted(texture, x, y, 0, 0, width, height, 1, 1, 0, 0, 1, 1, 0, false, false);</span>
+		}
+<span class="nc" id="L207">	}</span>
+
+	@Override
+	public void draw (TextureRegion region, float x, float y) {
+<span class="nc bnc" id="L211" title="All 2 branches missed.">		if (!adjustNeeded) {</span>
+<span class="nc" id="L212">			super.draw(region, x, y);</span>
+		} else {
+<span class="nc" id="L214">			drawAdjusted(region, x, y, 0, 0, region.getRegionWidth(), region.getRegionHeight(), 1, 1, 0);</span>
+		}
+<span class="nc" id="L216">	}</span>
+
+	@Override
+	public void draw (TextureRegion region, float x, float y, float width, float height) {
+<span class="nc bnc" id="L220" title="All 2 branches missed.">		if (!adjustNeeded) {</span>
+<span class="nc" id="L221">			super.draw(region, x, y, width, height);</span>
+		} else {
+<span class="nc" id="L223">			drawAdjusted(region, x, y, 0, 0, width, height, 1, 1, 0);</span>
+		}
+<span class="nc" id="L225">	}</span>
+
+	@Override
+	public void draw (TextureRegion region, float x, float y, float originX, float originY, float width, float height,
+		float scaleX, float scaleY, float rotation) {
+<span class="nc bnc" id="L230" title="All 2 branches missed.">		if (!adjustNeeded) {</span>
+<span class="nc" id="L231">			super.draw(region, x, y, originX, originY, width, height, scaleX, scaleY, rotation);</span>
+		} else {
+<span class="nc" id="L233">			drawAdjusted(region, x, y, originX, originY, width, height, scaleX, scaleY, rotation);</span>
+		}
+<span class="nc" id="L235">	}</span>
+
+	@Override
+	public void draw (TextureRegion region, float x, float y, float originX, float originY, float width, float height,
+		float scaleX, float scaleY, float rotation, boolean clockwise) {
+<span class="nc bnc" id="L240" title="All 2 branches missed.">		if (!adjustNeeded) {</span>
+<span class="nc" id="L241">			super.draw(region, x, y, originX, originY, width, height, scaleX, scaleY, rotation, clockwise);</span>
+		} else {
+<span class="nc" id="L243">			drawAdjusted(region, x, y, originX, originY, width, height, scaleX, scaleY, rotation, clockwise);</span>
+		}
+<span class="nc" id="L245">	}</span>
+
+	@Override
+	public void draw (Texture texture, float[] spriteVertices, int offset, int count) {
+<span class="nc bnc" id="L249" title="All 2 branches missed.">		if (count % Sprite.SPRITE_SIZE != 0) throw new GdxRuntimeException(&quot;invalid vertex count&quot;);</span>
+
+<span class="nc bnc" id="L251" title="All 2 branches missed.">		if (!adjustNeeded) {</span>
+<span class="nc" id="L252">			super.draw(texture, spriteVertices, offset, count);</span>
+		} else {
+<span class="nc" id="L254">			drawAdjusted(texture, spriteVertices, offset, count);</span>
+		}
+<span class="nc" id="L256">	}</span>
+
+	@Override
+	public void draw (TextureRegion region, float width, float height, Affine2 transform) {
+<span class="nc bnc" id="L260" title="All 2 branches missed.">		if (!adjustNeeded) {</span>
+<span class="nc" id="L261">			super.draw(region, width, height, transform);</span>
+		} else {
+<span class="nc" id="L263">			drawAdjusted(region, width, height, transform);</span>
+		}
+<span class="nc" id="L265">	}</span>
+
+	private void drawAdjusted (TextureRegion region, float x, float y, float originX, float originY, float width, float height,
+		float scaleX, float scaleY, float rotation) {
+		// v must be flipped
+<span class="nc" id="L270">		drawAdjustedUV(region.texture, x, y, originX, originY, width, height, scaleX, scaleY, rotation, region.u, region.v2,</span>
+			region.u2, region.v, false, false);
+<span class="nc" id="L272">	}</span>
+
+	private void drawAdjusted (Texture texture, float x, float y, float originX, float originY, float width, float height,
+		float scaleX, float scaleY, float rotation, int srcX, int srcY, int srcWidth, int srcHeight, boolean flipX, boolean flipY) {
+<span class="nc" id="L276">		float invTexWidth = 1.0f / texture.getWidth();</span>
+<span class="nc" id="L277">		float invTexHeight = 1.0f / texture.getHeight();</span>
+
+<span class="nc" id="L279">		float u = srcX * invTexWidth;</span>
+<span class="nc" id="L280">		float v = (srcY + srcHeight) * invTexHeight;</span>
+<span class="nc" id="L281">		float u2 = (srcX + srcWidth) * invTexWidth;</span>
+<span class="nc" id="L282">		float v2 = srcY * invTexHeight;</span>
+
+<span class="nc" id="L284">		drawAdjustedUV(texture, x, y, originX, originY, width, height, scaleX, scaleY, rotation, u, v, u2, v2, flipX, flipY);</span>
+<span class="nc" id="L285">	}</span>
+
+	private void drawAdjustedUV (Texture texture, float x, float y, float originX, float originY, float width, float height,
+		float scaleX, float scaleY, float rotation, float u, float v, float u2, float v2, boolean flipX, boolean flipY) {
+<span class="nc bnc" id="L289" title="All 2 branches missed.">		if (!drawing) throw new IllegalStateException(&quot;CpuSpriteBatch.begin must be called before draw.&quot;);</span>
+
+<span class="nc bnc" id="L291" title="All 2 branches missed.">		if (texture != lastTexture)</span>
+<span class="nc" id="L292">			switchTexture(texture);</span>
+<span class="nc bnc" id="L293" title="All 2 branches missed.">		else if (idx == vertices.length) super.flush();</span>
+
+		// bottom left and top right corner points relative to origin
+<span class="nc" id="L296">		final float worldOriginX = x + originX;</span>
+<span class="nc" id="L297">		final float worldOriginY = y + originY;</span>
+<span class="nc" id="L298">		float fx = -originX;</span>
+<span class="nc" id="L299">		float fy = -originY;</span>
+<span class="nc" id="L300">		float fx2 = width - originX;</span>
+<span class="nc" id="L301">		float fy2 = height - originY;</span>
+
+		// scale
+<span class="nc bnc" id="L304" title="All 4 branches missed.">		if (scaleX != 1 || scaleY != 1) {</span>
+<span class="nc" id="L305">			fx *= scaleX;</span>
+<span class="nc" id="L306">			fy *= scaleY;</span>
+<span class="nc" id="L307">			fx2 *= scaleX;</span>
+<span class="nc" id="L308">			fy2 *= scaleY;</span>
+		}
+
+		// construct corner points, start from top left and go counter clockwise
+<span class="nc" id="L312">		final float p1x = fx;</span>
+<span class="nc" id="L313">		final float p1y = fy;</span>
+<span class="nc" id="L314">		final float p2x = fx;</span>
+<span class="nc" id="L315">		final float p2y = fy2;</span>
+<span class="nc" id="L316">		final float p3x = fx2;</span>
+<span class="nc" id="L317">		final float p3y = fy2;</span>
+<span class="nc" id="L318">		final float p4x = fx2;</span>
+<span class="nc" id="L319">		final float p4y = fy;</span>
+
+		float x1;
+		float y1;
+		float x2;
+		float y2;
+		float x3;
+		float y3;
+		float x4;
+		float y4;
+
+		// rotate
+<span class="nc bnc" id="L331" title="All 2 branches missed.">		if (rotation != 0) {</span>
+<span class="nc" id="L332">			final float cos = MathUtils.cosDeg(rotation);</span>
+<span class="nc" id="L333">			final float sin = MathUtils.sinDeg(rotation);</span>
+
+<span class="nc" id="L335">			x1 = cos * p1x - sin * p1y;</span>
+<span class="nc" id="L336">			y1 = sin * p1x + cos * p1y;</span>
+
+<span class="nc" id="L338">			x2 = cos * p2x - sin * p2y;</span>
+<span class="nc" id="L339">			y2 = sin * p2x + cos * p2y;</span>
+
+<span class="nc" id="L341">			x3 = cos * p3x - sin * p3y;</span>
+<span class="nc" id="L342">			y3 = sin * p3x + cos * p3y;</span>
+
+<span class="nc" id="L344">			x4 = x1 + (x3 - x2);</span>
+<span class="nc" id="L345">			y4 = y3 - (y2 - y1);</span>
+<span class="nc" id="L346">		} else {</span>
+<span class="nc" id="L347">			x1 = p1x;</span>
+<span class="nc" id="L348">			y1 = p1y;</span>
+
+<span class="nc" id="L350">			x2 = p2x;</span>
+<span class="nc" id="L351">			y2 = p2y;</span>
+
+<span class="nc" id="L353">			x3 = p3x;</span>
+<span class="nc" id="L354">			y3 = p3y;</span>
+
+<span class="nc" id="L356">			x4 = p4x;</span>
+<span class="nc" id="L357">			y4 = p4y;</span>
+		}
+
+<span class="nc" id="L360">		x1 += worldOriginX;</span>
+<span class="nc" id="L361">		y1 += worldOriginY;</span>
+<span class="nc" id="L362">		x2 += worldOriginX;</span>
+<span class="nc" id="L363">		y2 += worldOriginY;</span>
+<span class="nc" id="L364">		x3 += worldOriginX;</span>
+<span class="nc" id="L365">		y3 += worldOriginY;</span>
+<span class="nc" id="L366">		x4 += worldOriginX;</span>
+<span class="nc" id="L367">		y4 += worldOriginY;</span>
+
+<span class="nc bnc" id="L369" title="All 2 branches missed.">		if (flipX) {</span>
+<span class="nc" id="L370">			float tmp = u;</span>
+<span class="nc" id="L371">			u = u2;</span>
+<span class="nc" id="L372">			u2 = tmp;</span>
+		}
+<span class="nc bnc" id="L374" title="All 2 branches missed.">		if (flipY) {</span>
+<span class="nc" id="L375">			float tmp = v;</span>
+<span class="nc" id="L376">			v = v2;</span>
+<span class="nc" id="L377">			v2 = tmp;</span>
+		}
+
+<span class="nc" id="L380">		Affine2 t = adjustAffine;</span>
+
+<span class="nc" id="L382">		vertices[idx + 0] = t.m00 * x1 + t.m01 * y1 + t.m02;</span>
+<span class="nc" id="L383">		vertices[idx + 1] = t.m10 * x1 + t.m11 * y1 + t.m12;</span>
+<span class="nc" id="L384">		vertices[idx + 2] = color;</span>
+<span class="nc" id="L385">		vertices[idx + 3] = u;</span>
+<span class="nc" id="L386">		vertices[idx + 4] = v;</span>
+
+<span class="nc" id="L388">		vertices[idx + 5] = t.m00 * x2 + t.m01 * y2 + t.m02;</span>
+<span class="nc" id="L389">		vertices[idx + 6] = t.m10 * x2 + t.m11 * y2 + t.m12;</span>
+<span class="nc" id="L390">		vertices[idx + 7] = color;</span>
+<span class="nc" id="L391">		vertices[idx + 8] = u;</span>
+<span class="nc" id="L392">		vertices[idx + 9] = v2;</span>
+
+<span class="nc" id="L394">		vertices[idx + 10] = t.m00 * x3 + t.m01 * y3 + t.m02;</span>
+<span class="nc" id="L395">		vertices[idx + 11] = t.m10 * x3 + t.m11 * y3 + t.m12;</span>
+<span class="nc" id="L396">		vertices[idx + 12] = color;</span>
+<span class="nc" id="L397">		vertices[idx + 13] = u2;</span>
+<span class="nc" id="L398">		vertices[idx + 14] = v2;</span>
+
+<span class="nc" id="L400">		vertices[idx + 15] = t.m00 * x4 + t.m01 * y4 + t.m02;</span>
+<span class="nc" id="L401">		vertices[idx + 16] = t.m10 * x4 + t.m11 * y4 + t.m12;</span>
+<span class="nc" id="L402">		vertices[idx + 17] = color;</span>
+<span class="nc" id="L403">		vertices[idx + 18] = u2;</span>
+<span class="nc" id="L404">		vertices[idx + 19] = v;</span>
+
+<span class="nc" id="L406">		idx += Sprite.SPRITE_SIZE;</span>
+<span class="nc" id="L407">	}</span>
+
+	private void drawAdjusted (TextureRegion region, float x, float y, float originX, float originY, float width, float height,
+		float scaleX, float scaleY, float rotation, boolean clockwise) {
+<span class="nc bnc" id="L411" title="All 2 branches missed.">		if (!drawing) throw new IllegalStateException(&quot;CpuSpriteBatch.begin must be called before draw.&quot;);</span>
+
+<span class="nc bnc" id="L413" title="All 2 branches missed.">		if (region.texture != lastTexture)</span>
+<span class="nc" id="L414">			switchTexture(region.texture);</span>
+<span class="nc bnc" id="L415" title="All 2 branches missed.">		else if (idx == vertices.length) super.flush();</span>
+
+		// bottom left and top right corner points relative to origin
+<span class="nc" id="L418">		final float worldOriginX = x + originX;</span>
+<span class="nc" id="L419">		final float worldOriginY = y + originY;</span>
+<span class="nc" id="L420">		float fx = -originX;</span>
+<span class="nc" id="L421">		float fy = -originY;</span>
+<span class="nc" id="L422">		float fx2 = width - originX;</span>
+<span class="nc" id="L423">		float fy2 = height - originY;</span>
+
+		// scale
+<span class="nc bnc" id="L426" title="All 4 branches missed.">		if (scaleX != 1 || scaleY != 1) {</span>
+<span class="nc" id="L427">			fx *= scaleX;</span>
+<span class="nc" id="L428">			fy *= scaleY;</span>
+<span class="nc" id="L429">			fx2 *= scaleX;</span>
+<span class="nc" id="L430">			fy2 *= scaleY;</span>
+		}
+
+		// construct corner points, start from top left and go counter clockwise
+<span class="nc" id="L434">		final float p1x = fx;</span>
+<span class="nc" id="L435">		final float p1y = fy;</span>
+<span class="nc" id="L436">		final float p2x = fx;</span>
+<span class="nc" id="L437">		final float p2y = fy2;</span>
+<span class="nc" id="L438">		final float p3x = fx2;</span>
+<span class="nc" id="L439">		final float p3y = fy2;</span>
+<span class="nc" id="L440">		final float p4x = fx2;</span>
+<span class="nc" id="L441">		final float p4y = fy;</span>
+
+		float x1;
+		float y1;
+		float x2;
+		float y2;
+		float x3;
+		float y3;
+		float x4;
+		float y4;
+
+		// rotate
+<span class="nc bnc" id="L453" title="All 2 branches missed.">		if (rotation != 0) {</span>
+<span class="nc" id="L454">			final float cos = MathUtils.cosDeg(rotation);</span>
+<span class="nc" id="L455">			final float sin = MathUtils.sinDeg(rotation);</span>
+
+<span class="nc" id="L457">			x1 = cos * p1x - sin * p1y;</span>
+<span class="nc" id="L458">			y1 = sin * p1x + cos * p1y;</span>
+
+<span class="nc" id="L460">			x2 = cos * p2x - sin * p2y;</span>
+<span class="nc" id="L461">			y2 = sin * p2x + cos * p2y;</span>
+
+<span class="nc" id="L463">			x3 = cos * p3x - sin * p3y;</span>
+<span class="nc" id="L464">			y3 = sin * p3x + cos * p3y;</span>
+
+<span class="nc" id="L466">			x4 = x1 + (x3 - x2);</span>
+<span class="nc" id="L467">			y4 = y3 - (y2 - y1);</span>
+<span class="nc" id="L468">		} else {</span>
+<span class="nc" id="L469">			x1 = p1x;</span>
+<span class="nc" id="L470">			y1 = p1y;</span>
+
+<span class="nc" id="L472">			x2 = p2x;</span>
+<span class="nc" id="L473">			y2 = p2y;</span>
+
+<span class="nc" id="L475">			x3 = p3x;</span>
+<span class="nc" id="L476">			y3 = p3y;</span>
+
+<span class="nc" id="L478">			x4 = p4x;</span>
+<span class="nc" id="L479">			y4 = p4y;</span>
+		}
+
+<span class="nc" id="L482">		x1 += worldOriginX;</span>
+<span class="nc" id="L483">		y1 += worldOriginY;</span>
+<span class="nc" id="L484">		x2 += worldOriginX;</span>
+<span class="nc" id="L485">		y2 += worldOriginY;</span>
+<span class="nc" id="L486">		x3 += worldOriginX;</span>
+<span class="nc" id="L487">		y3 += worldOriginY;</span>
+<span class="nc" id="L488">		x4 += worldOriginX;</span>
+<span class="nc" id="L489">		y4 += worldOriginY;</span>
+
+		float u1, v1, u2, v2, u3, v3, u4, v4;
+<span class="nc bnc" id="L492" title="All 2 branches missed.">		if (clockwise) {</span>
+<span class="nc" id="L493">			u1 = region.u2;</span>
+<span class="nc" id="L494">			v1 = region.v2;</span>
+<span class="nc" id="L495">			u2 = region.u;</span>
+<span class="nc" id="L496">			v2 = region.v2;</span>
+<span class="nc" id="L497">			u3 = region.u;</span>
+<span class="nc" id="L498">			v3 = region.v;</span>
+<span class="nc" id="L499">			u4 = region.u2;</span>
+<span class="nc" id="L500">			v4 = region.v;</span>
+		} else {
+<span class="nc" id="L502">			u1 = region.u;</span>
+<span class="nc" id="L503">			v1 = region.v;</span>
+<span class="nc" id="L504">			u2 = region.u2;</span>
+<span class="nc" id="L505">			v2 = region.v;</span>
+<span class="nc" id="L506">			u3 = region.u2;</span>
+<span class="nc" id="L507">			v3 = region.v2;</span>
+<span class="nc" id="L508">			u4 = region.u;</span>
+<span class="nc" id="L509">			v4 = region.v2;</span>
+		}
+
+<span class="nc" id="L512">		Affine2 t = adjustAffine;</span>
+
+<span class="nc" id="L514">		vertices[idx + 0] = t.m00 * x1 + t.m01 * y1 + t.m02;</span>
+<span class="nc" id="L515">		vertices[idx + 1] = t.m10 * x1 + t.m11 * y1 + t.m12;</span>
+<span class="nc" id="L516">		vertices[idx + 2] = color;</span>
+<span class="nc" id="L517">		vertices[idx + 3] = u1;</span>
+<span class="nc" id="L518">		vertices[idx + 4] = v1;</span>
+
+<span class="nc" id="L520">		vertices[idx + 5] = t.m00 * x2 + t.m01 * y2 + t.m02;</span>
+<span class="nc" id="L521">		vertices[idx + 6] = t.m10 * x2 + t.m11 * y2 + t.m12;</span>
+<span class="nc" id="L522">		vertices[idx + 7] = color;</span>
+<span class="nc" id="L523">		vertices[idx + 8] = u2;</span>
+<span class="nc" id="L524">		vertices[idx + 9] = v2;</span>
+
+<span class="nc" id="L526">		vertices[idx + 10] = t.m00 * x3 + t.m01 * y3 + t.m02;</span>
+<span class="nc" id="L527">		vertices[idx + 11] = t.m10 * x3 + t.m11 * y3 + t.m12;</span>
+<span class="nc" id="L528">		vertices[idx + 12] = color;</span>
+<span class="nc" id="L529">		vertices[idx + 13] = u3;</span>
+<span class="nc" id="L530">		vertices[idx + 14] = v3;</span>
+
+<span class="nc" id="L532">		vertices[idx + 15] = t.m00 * x4 + t.m01 * y4 + t.m02;</span>
+<span class="nc" id="L533">		vertices[idx + 16] = t.m10 * x4 + t.m11 * y4 + t.m12;</span>
+<span class="nc" id="L534">		vertices[idx + 17] = color;</span>
+<span class="nc" id="L535">		vertices[idx + 18] = u4;</span>
+<span class="nc" id="L536">		vertices[idx + 19] = v4;</span>
+
+<span class="nc" id="L538">		idx += Sprite.SPRITE_SIZE;</span>
+<span class="nc" id="L539">	}</span>
+
+	private void drawAdjusted (TextureRegion region, float width, float height, Affine2 transform) {
+<span class="nc bnc" id="L542" title="All 2 branches missed.">		if (!drawing) throw new IllegalStateException(&quot;CpuSpriteBatch.begin must be called before draw.&quot;);</span>
+
+<span class="nc bnc" id="L544" title="All 2 branches missed.">		if (region.texture != lastTexture)</span>
+<span class="nc" id="L545">			switchTexture(region.texture);</span>
+<span class="nc bnc" id="L546" title="All 2 branches missed.">		else if (idx == vertices.length) super.flush();</span>
+
+<span class="nc" id="L548">		Affine2 t = transform;</span>
+
+		// construct corner points
+<span class="nc" id="L551">		float x1 = t.m02;</span>
+<span class="nc" id="L552">		float y1 = t.m12;</span>
+<span class="nc" id="L553">		float x2 = t.m01 * height + t.m02;</span>
+<span class="nc" id="L554">		float y2 = t.m11 * height + t.m12;</span>
+<span class="nc" id="L555">		float x3 = t.m00 * width + t.m01 * height + t.m02;</span>
+<span class="nc" id="L556">		float y3 = t.m10 * width + t.m11 * height + t.m12;</span>
+<span class="nc" id="L557">		float x4 = t.m00 * width + t.m02;</span>
+<span class="nc" id="L558">		float y4 = t.m10 * width + t.m12;</span>
+
+		// v must be flipped
+<span class="nc" id="L561">		float u = region.u;</span>
+<span class="nc" id="L562">		float v = region.v2;</span>
+<span class="nc" id="L563">		float u2 = region.u2;</span>
+<span class="nc" id="L564">		float v2 = region.v;</span>
+
+<span class="nc" id="L566">		t = adjustAffine;</span>
+
+<span class="nc" id="L568">		vertices[idx + 0] = t.m00 * x1 + t.m01 * y1 + t.m02;</span>
+<span class="nc" id="L569">		vertices[idx + 1] = t.m10 * x1 + t.m11 * y1 + t.m12;</span>
+<span class="nc" id="L570">		vertices[idx + 2] = color;</span>
+<span class="nc" id="L571">		vertices[idx + 3] = u;</span>
+<span class="nc" id="L572">		vertices[idx + 4] = v;</span>
+
+<span class="nc" id="L574">		vertices[idx + 5] = t.m00 * x2 + t.m01 * y2 + t.m02;</span>
+<span class="nc" id="L575">		vertices[idx + 6] = t.m10 * x2 + t.m11 * y2 + t.m12;</span>
+<span class="nc" id="L576">		vertices[idx + 7] = color;</span>
+<span class="nc" id="L577">		vertices[idx + 8] = u;</span>
+<span class="nc" id="L578">		vertices[idx + 9] = v2;</span>
+
+<span class="nc" id="L580">		vertices[idx + 10] = t.m00 * x3 + t.m01 * y3 + t.m02;</span>
+<span class="nc" id="L581">		vertices[idx + 11] = t.m10 * x3 + t.m11 * y3 + t.m12;</span>
+<span class="nc" id="L582">		vertices[idx + 12] = color;</span>
+<span class="nc" id="L583">		vertices[idx + 13] = u2;</span>
+<span class="nc" id="L584">		vertices[idx + 14] = v2;</span>
+
+<span class="nc" id="L586">		vertices[idx + 15] = t.m00 * x4 + t.m01 * y4 + t.m02;</span>
+<span class="nc" id="L587">		vertices[idx + 16] = t.m10 * x4 + t.m11 * y4 + t.m12;</span>
+<span class="nc" id="L588">		vertices[idx + 17] = color;</span>
+<span class="nc" id="L589">		vertices[idx + 18] = u2;</span>
+<span class="nc" id="L590">		vertices[idx + 19] = v;</span>
+
+<span class="nc" id="L592">		idx += Sprite.SPRITE_SIZE;</span>
+<span class="nc" id="L593">	}</span>
+
+	private void drawAdjusted (Texture texture, float[] spriteVertices, int offset, int count) {
+<span class="nc bnc" id="L596" title="All 2 branches missed.">		if (!drawing) throw new IllegalStateException(&quot;CpuSpriteBatch.begin must be called before draw.&quot;);</span>
+
+<span class="nc bnc" id="L598" title="All 2 branches missed.">		if (texture != lastTexture) switchTexture(texture);</span>
+
+<span class="nc" id="L600">		Affine2 t = adjustAffine;</span>
+
+<span class="nc" id="L602">		int copyCount = Math.min(vertices.length - idx, count);</span>
+		do {
+<span class="nc" id="L604">			count -= copyCount;</span>
+<span class="nc bnc" id="L605" title="All 2 branches missed.">			while (copyCount &gt; 0) {</span>
+<span class="nc" id="L606">				float x = spriteVertices[offset];</span>
+<span class="nc" id="L607">				float y = spriteVertices[offset + 1];</span>
+
+<span class="nc" id="L609">				vertices[idx] = t.m00 * x + t.m01 * y + t.m02; // x</span>
+<span class="nc" id="L610">				vertices[idx + 1] = t.m10 * x + t.m11 * y + t.m12; // y</span>
+<span class="nc" id="L611">				vertices[idx + 2] = spriteVertices[offset + 2]; // color</span>
+<span class="nc" id="L612">				vertices[idx + 3] = spriteVertices[offset + 3]; // u</span>
+<span class="nc" id="L613">				vertices[idx + 4] = spriteVertices[offset + 4]; // v</span>
+
+<span class="nc" id="L615">				idx += Sprite.VERTEX_SIZE;</span>
+<span class="nc" id="L616">				offset += Sprite.VERTEX_SIZE;</span>
+<span class="nc" id="L617">				copyCount -= Sprite.VERTEX_SIZE;</span>
+<span class="nc" id="L618">			}</span>
+
+<span class="nc bnc" id="L620" title="All 2 branches missed.">			if (count &gt; 0) {</span>
+<span class="nc" id="L621">				super.flush();</span>
+<span class="nc" id="L622">				copyCount = Math.min(vertices.length, count);</span>
+			}
+<span class="nc bnc" id="L624" title="All 2 branches missed.">		} while (count &gt; 0);</span>
+<span class="nc" id="L625">	}</span>
+
+	private static boolean checkEqual (Matrix4 a, Matrix4 b) {
+<span class="nc bnc" id="L628" title="All 2 branches missed.">		if (a == b) return true;</span>
+
+		// matrices are assumed to be 2D transformations
+<span class="nc bnc" id="L631" title="All 12 branches missed.">		return (a.val[Matrix4.M00] == b.val[Matrix4.M00] &amp;&amp; a.val[Matrix4.M10] == b.val[Matrix4.M10]</span>
+			&amp;&amp; a.val[Matrix4.M01] == b.val[Matrix4.M01] &amp;&amp; a.val[Matrix4.M11] == b.val[Matrix4.M11]
+			&amp;&amp; a.val[Matrix4.M03] == b.val[Matrix4.M03] &amp;&amp; a.val[Matrix4.M13] == b.val[Matrix4.M13]);
+	}
+
+	private static boolean checkEqual (Matrix4 matrix, Affine2 affine) {
+<span class="nc" id="L637">		final float[] val = matrix.getValues();</span>
+
+		// matrix is assumed to be 2D transformation
+<span class="nc bnc" id="L640" title="All 12 branches missed.">		return (val[Matrix4.M00] == affine.m00 &amp;&amp; val[Matrix4.M10] == affine.m10 &amp;&amp; val[Matrix4.M01] == affine.m01</span>
+			&amp;&amp; val[Matrix4.M11] == affine.m11 &amp;&amp; val[Matrix4.M03] == affine.m02 &amp;&amp; val[Matrix4.M13] == affine.m12);
+	}
+
+	private static boolean checkIdt (Matrix4 matrix) {
+<span class="nc" id="L645">		final float[] val = matrix.getValues();</span>
+
+		// matrix is assumed to be 2D transformation
+<span class="nc bnc" id="L648" title="All 12 branches missed.">		return (val[Matrix4.M00] == 1 &amp;&amp; val[Matrix4.M10] == 0 &amp;&amp; val[Matrix4.M01] == 0 &amp;&amp; val[Matrix4.M11] == 1</span>
+			&amp;&amp; val[Matrix4.M03] == 0 &amp;&amp; val[Matrix4.M13] == 0);
+	}
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.5.5.201112152213</span></div></body></html>
