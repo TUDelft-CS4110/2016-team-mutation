@@ -1,0 +1,202 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>Frontier.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">crawler4j</a> &gt; <a href="index.source.html" class="el_package">edu.uci.ics.crawler4j.frontier</a> &gt; <span class="el_source">Frontier.java</span></div><h1>Frontier.java</h1><pre class="source lang-java linenums">/**
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package edu.uci.ics.crawler4j.frontier;
+
+import java.util.List;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.sleepycat.je.DatabaseException;
+import com.sleepycat.je.Environment;
+
+import edu.uci.ics.crawler4j.crawler.Configurable;
+import edu.uci.ics.crawler4j.crawler.CrawlConfig;
+import edu.uci.ics.crawler4j.url.WebURL;
+
+/**
+ * @author Yasser Ganjisaffar
+ */
+
+public class Frontier extends Configurable {
+<span class="nc" id="L37">  protected static final Logger logger = LoggerFactory.getLogger(Frontier.class);</span>
+  
+  private static final String DATABASE_NAME = &quot;PendingURLsDB&quot;;
+  private static final int IN_PROCESS_RESCHEDULE_BATCH_SIZE = 100;
+  protected WorkQueues workQueues;
+
+  protected InProcessPagesDB inProcessPages;
+
+<span class="nc" id="L45">  protected final Object mutex = new Object();</span>
+<span class="nc" id="L46">  protected final Object waitingList = new Object();</span>
+
+<span class="nc" id="L48">  protected boolean isFinished = false;</span>
+
+  protected long scheduledPages;
+
+  protected Counters counters;
+
+  public Frontier(Environment env, CrawlConfig config) {
+<span class="nc" id="L55">    super(config);</span>
+<span class="nc" id="L56">    this.counters = new Counters(env, config);</span>
+    try {
+<span class="nc" id="L58">      workQueues = new WorkQueues(env, DATABASE_NAME, config.isResumableCrawling());</span>
+<span class="nc bnc" id="L59" title="All 2 branches missed.">      if (config.isResumableCrawling()) {</span>
+<span class="nc" id="L60">        scheduledPages = counters.getValue(Counters.ReservedCounterNames.SCHEDULED_PAGES);</span>
+<span class="nc" id="L61">        inProcessPages = new InProcessPagesDB(env);</span>
+<span class="nc" id="L62">        long numPreviouslyInProcessPages = inProcessPages.getLength();</span>
+<span class="nc bnc" id="L63" title="All 2 branches missed.">        if (numPreviouslyInProcessPages &gt; 0) {</span>
+<span class="nc" id="L64">          logger.info(&quot;Rescheduling {} URLs from previous crawl.&quot;, numPreviouslyInProcessPages);</span>
+<span class="nc" id="L65">          scheduledPages -= numPreviouslyInProcessPages;</span>
+
+<span class="nc" id="L67">          List&lt;WebURL&gt; urls = inProcessPages.get(IN_PROCESS_RESCHEDULE_BATCH_SIZE);</span>
+<span class="nc bnc" id="L68" title="All 2 branches missed.">          while (!urls.isEmpty()) {</span>
+<span class="nc" id="L69">            scheduleAll(urls);</span>
+<span class="nc" id="L70">            inProcessPages.delete(urls.size());</span>
+<span class="nc" id="L71">            urls = inProcessPages.get(IN_PROCESS_RESCHEDULE_BATCH_SIZE);</span>
+          }
+        }
+<span class="nc" id="L74">      } else {</span>
+<span class="nc" id="L75">        inProcessPages = null;</span>
+<span class="nc" id="L76">        scheduledPages = 0;</span>
+      }
+<span class="nc" id="L78">    } catch (DatabaseException e) {</span>
+<span class="nc" id="L79">      logger.error(&quot;Error while initializing the Frontier&quot;, e);</span>
+<span class="nc" id="L80">      workQueues = null;</span>
+<span class="nc" id="L81">    }</span>
+<span class="nc" id="L82">  }</span>
+
+  public void scheduleAll(List&lt;WebURL&gt; urls) {
+<span class="nc" id="L85">    int maxPagesToFetch = config.getMaxPagesToFetch();</span>
+<span class="nc" id="L86">    synchronized (mutex) {</span>
+<span class="nc" id="L87">      int newScheduledPage = 0;</span>
+<span class="nc bnc" id="L88" title="All 2 branches missed.">      for (WebURL url : urls) {</span>
+<span class="nc bnc" id="L89" title="All 4 branches missed.">        if ((maxPagesToFetch &gt; 0) &amp;&amp; ((scheduledPages + newScheduledPage) &gt;= maxPagesToFetch)) {</span>
+<span class="nc" id="L90">          break;</span>
+        }
+
+        try {
+<span class="nc" id="L94">          workQueues.put(url);</span>
+<span class="nc" id="L95">          newScheduledPage++;</span>
+<span class="nc" id="L96">        } catch (DatabaseException e) {</span>
+<span class="nc" id="L97">          logger.error(&quot;Error while putting the url in the work queue&quot;, e);</span>
+<span class="nc" id="L98">        }</span>
+<span class="nc" id="L99">      }</span>
+<span class="nc bnc" id="L100" title="All 2 branches missed.">      if (newScheduledPage &gt; 0) {</span>
+<span class="nc" id="L101">        scheduledPages += newScheduledPage;</span>
+<span class="nc" id="L102">        counters.increment(Counters.ReservedCounterNames.SCHEDULED_PAGES, newScheduledPage);</span>
+      }
+<span class="nc" id="L104">      synchronized (waitingList) {</span>
+<span class="nc" id="L105">        waitingList.notifyAll();</span>
+<span class="nc" id="L106">      }</span>
+<span class="nc" id="L107">    }</span>
+<span class="nc" id="L108">  }</span>
+
+  public void schedule(WebURL url) {
+<span class="nc" id="L111">    int maxPagesToFetch = config.getMaxPagesToFetch();</span>
+<span class="nc" id="L112">    synchronized (mutex) {</span>
+      try {
+<span class="nc bnc" id="L114" title="All 4 branches missed.">        if (maxPagesToFetch &lt; 0 || scheduledPages &lt; maxPagesToFetch) {</span>
+<span class="nc" id="L115">          workQueues.put(url);</span>
+<span class="nc" id="L116">          scheduledPages++;</span>
+<span class="nc" id="L117">          counters.increment(Counters.ReservedCounterNames.SCHEDULED_PAGES);</span>
+        }
+<span class="nc" id="L119">      } catch (DatabaseException e) {</span>
+<span class="nc" id="L120">        logger.error(&quot;Error while putting the url in the work queue&quot;, e);</span>
+<span class="nc" id="L121">      }</span>
+<span class="nc" id="L122">    }</span>
+<span class="nc" id="L123">  }</span>
+
+  public void getNextURLs(int max, List&lt;WebURL&gt; result) {
+    while (true) {
+<span class="nc" id="L127">      synchronized (mutex) {</span>
+<span class="nc bnc" id="L128" title="All 2 branches missed.">        if (isFinished) {</span>
+<span class="nc" id="L129">          return;</span>
+        }
+        try {
+<span class="nc" id="L132">          List&lt;WebURL&gt; curResults = workQueues.get(max);</span>
+<span class="nc" id="L133">          workQueues.delete(curResults.size());</span>
+<span class="nc bnc" id="L134" title="All 2 branches missed.">          if (inProcessPages != null) {</span>
+<span class="nc bnc" id="L135" title="All 2 branches missed.">            for (WebURL curPage : curResults) {</span>
+<span class="nc" id="L136">              inProcessPages.put(curPage);</span>
+<span class="nc" id="L137">            }</span>
+          }
+<span class="nc" id="L139">          result.addAll(curResults);</span>
+<span class="nc" id="L140">        } catch (DatabaseException e) {</span>
+<span class="nc" id="L141">          logger.error(&quot;Error while getting next urls&quot;, e);</span>
+<span class="nc" id="L142">        }</span>
+
+<span class="nc bnc" id="L144" title="All 2 branches missed.">        if (result.size() &gt; 0) {</span>
+<span class="nc" id="L145">          return;</span>
+        }
+<span class="nc" id="L147">      }</span>
+
+      try {
+<span class="nc" id="L150">        synchronized (waitingList) {</span>
+<span class="nc" id="L151">          waitingList.wait();</span>
+<span class="nc" id="L152">        }</span>
+<span class="nc" id="L153">      } catch (InterruptedException ignored) {</span>
+        // Do nothing
+<span class="nc" id="L155">      }</span>
+<span class="nc bnc" id="L156" title="All 2 branches missed.">      if (isFinished) {</span>
+<span class="nc" id="L157">        return;</span>
+      }
+    }
+  }
+
+  public void setProcessed(WebURL webURL) {
+<span class="nc" id="L163">    counters.increment(Counters.ReservedCounterNames.PROCESSED_PAGES);</span>
+<span class="nc bnc" id="L164" title="All 2 branches missed.">    if (inProcessPages != null) {</span>
+<span class="nc bnc" id="L165" title="All 2 branches missed.">      if (!inProcessPages.removeURL(webURL)) {</span>
+<span class="nc" id="L166">        logger.warn(&quot;Could not remove: {} from list of processed pages.&quot;, webURL.getURL());</span>
+      }
+    }
+<span class="nc" id="L169">  }</span>
+
+  public long getQueueLength() {
+<span class="nc" id="L172">    return workQueues.getLength();</span>
+  }
+
+  public long getNumberOfAssignedPages() {
+<span class="nc" id="L176">    return inProcessPages.getLength();</span>
+  }
+
+  public long getNumberOfProcessedPages() {
+<span class="nc" id="L180">    return counters.getValue(Counters.ReservedCounterNames.PROCESSED_PAGES);</span>
+  }
+
+  public boolean isFinished() {
+<span class="nc" id="L184">    return isFinished;</span>
+  }
+
+  public void close() {
+<span class="nc" id="L188">    workQueues.close();</span>
+<span class="nc" id="L189">    counters.close();</span>
+<span class="nc bnc" id="L190" title="All 2 branches missed.">    if (inProcessPages != null) {</span>
+<span class="nc" id="L191">      inProcessPages.close();</span>
+    }
+<span class="nc" id="L193">  }</span>
+
+  public void finish() {
+<span class="nc" id="L196">    isFinished = true;</span>
+<span class="nc" id="L197">    synchronized (waitingList) {</span>
+<span class="nc" id="L198">      waitingList.notifyAll();</span>
+<span class="nc" id="L199">    }</span>
+<span class="nc" id="L200">  }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span></div></body></html>

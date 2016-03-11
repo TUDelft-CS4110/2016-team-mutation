@@ -1,0 +1,525 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>CrawlController.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">crawler4j</a> &gt; <a href="index.source.html" class="el_package">edu.uci.ics.crawler4j.crawler</a> &gt; <span class="el_source">CrawlController.java</span></div><h1>CrawlController.java</h1><pre class="source lang-java linenums">/**
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the &quot;License&quot;); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package edu.uci.ics.crawler4j.crawler;
+
+import java.io.File;
+import java.util.ArrayList;
+import java.util.List;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.sleepycat.je.Environment;
+import com.sleepycat.je.EnvironmentConfig;
+
+import edu.uci.ics.crawler4j.fetcher.PageFetcher;
+import edu.uci.ics.crawler4j.frontier.DocIDServer;
+import edu.uci.ics.crawler4j.frontier.Frontier;
+import edu.uci.ics.crawler4j.robotstxt.RobotstxtServer;
+import edu.uci.ics.crawler4j.url.TLDList;
+import edu.uci.ics.crawler4j.url.URLCanonicalizer;
+import edu.uci.ics.crawler4j.url.WebURL;
+import edu.uci.ics.crawler4j.util.IO;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.File;
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * The controller that manages a crawling session. This class creates the
+ * crawler threads and monitors their progress.
+ *
+ * @author Yasser Ganjisaffar
+ */
+public class CrawlController extends Configurable {
+
+<span class="nc" id="L54">  static final Logger logger = LoggerFactory.getLogger(CrawlController.class);</span>
+
+  /**
+   * The 'customData' object can be used for passing custom crawl-related
+   * configurations to different components of the crawler.
+   */
+  protected Object customData;
+
+  /**
+   * Once the crawling session finishes the controller collects the local data
+   * of the crawler threads and stores them in this List.
+   */
+<span class="nc" id="L66">  protected List&lt;Object&gt; crawlersLocalData = new ArrayList&lt;&gt;();</span>
+
+  /**
+   * Is the crawling of this session finished?
+   */
+  protected boolean finished;
+
+  /**
+   * Is the crawling session set to 'shutdown'. Crawler threads monitor this
+   * flag and when it is set they will no longer process new pages.
+   */
+  protected boolean shuttingDown;
+
+  protected PageFetcher pageFetcher;
+  protected RobotstxtServer robotstxtServer;
+  protected Frontier frontier;
+  protected DocIDServer docIdServer;
+
+<span class="nc" id="L84">  protected final Object waitingLock = new Object();</span>
+  protected final Environment env;
+
+  public CrawlController(CrawlConfig config, PageFetcher pageFetcher, RobotstxtServer robotstxtServer)
+      throws Exception {
+<span class="nc" id="L89">    super(config);</span>
+
+<span class="nc" id="L91">    config.validate();</span>
+<span class="nc" id="L92">    File folder = new File(config.getCrawlStorageFolder());</span>
+<span class="nc bnc" id="L93" title="All 2 branches missed.">    if (!folder.exists()) {</span>
+<span class="nc bnc" id="L94" title="All 2 branches missed.">      if (folder.mkdirs()) {</span>
+<span class="nc" id="L95">        logger.debug(&quot;Created folder: &quot; + folder.getAbsolutePath());</span>
+      } else {
+<span class="nc" id="L97">        throw new Exception(</span>
+            &quot;couldn't create the storage folder: &quot; + folder.getAbsolutePath() + &quot; does it already exist ?&quot;);
+      }
+    }
+
+<span class="nc" id="L102">    TLDList.setUseOnline(config.isOnlineTldListUpdate());</span>
+
+<span class="nc" id="L104">    boolean resumable = config.isResumableCrawling();</span>
+
+<span class="nc" id="L106">    EnvironmentConfig envConfig = new EnvironmentConfig();</span>
+<span class="nc" id="L107">    envConfig.setAllowCreate(true);</span>
+<span class="nc" id="L108">    envConfig.setTransactional(resumable);</span>
+<span class="nc" id="L109">    envConfig.setLocking(resumable);</span>
+
+<span class="nc" id="L111">    File envHome = new File(config.getCrawlStorageFolder() + &quot;/frontier&quot;);</span>
+<span class="nc bnc" id="L112" title="All 2 branches missed.">    if (!envHome.exists()) {</span>
+<span class="nc bnc" id="L113" title="All 2 branches missed.">      if (envHome.mkdir()) {</span>
+<span class="nc" id="L114">        logger.debug(&quot;Created folder: &quot; + envHome.getAbsolutePath());</span>
+      } else {
+<span class="nc" id="L116">        throw new Exception(&quot;Failed creating the frontier folder: &quot; + envHome.getAbsolutePath());</span>
+      }
+    }
+
+<span class="nc bnc" id="L120" title="All 2 branches missed.">    if (!resumable) {</span>
+<span class="nc" id="L121">      IO.deleteFolderContents(envHome);</span>
+<span class="nc" id="L122">      logger.info(&quot;Deleted contents of: &quot; + envHome + &quot; ( as you have configured resumable crawling to false )&quot;);</span>
+    }
+
+<span class="nc" id="L125">    env = new Environment(envHome, envConfig);</span>
+<span class="nc" id="L126">    docIdServer = new DocIDServer(env, config);</span>
+<span class="nc" id="L127">    frontier = new Frontier(env, config);</span>
+
+<span class="nc" id="L129">    this.pageFetcher = pageFetcher;</span>
+<span class="nc" id="L130">    this.robotstxtServer = robotstxtServer;</span>
+
+<span class="nc" id="L132">    finished = false;</span>
+<span class="nc" id="L133">    shuttingDown = false;</span>
+<span class="nc" id="L134">  }</span>
+
+  public interface WebCrawlerFactory&lt;T extends WebCrawler&gt; {
+    T newInstance() throws Exception;
+  }
+
+  private static class DefaultWebCrawlerFactory&lt;T extends WebCrawler&gt; implements WebCrawlerFactory&lt;T&gt; {
+    final Class&lt;T&gt; _c;
+
+<span class="nc" id="L143">    DefaultWebCrawlerFactory(Class&lt;T&gt; _c) {</span>
+<span class="nc" id="L144">      this._c = _c;</span>
+<span class="nc" id="L145">    }</span>
+
+    @Override
+    public T newInstance() throws Exception {
+      try {
+<span class="nc" id="L150">        return _c.newInstance();</span>
+<span class="nc" id="L151">      } catch (ReflectiveOperationException e) {</span>
+<span class="nc" id="L152">        throw e;</span>
+      }
+    }
+  }
+
+  /**
+   * Start the crawling session and wait for it to finish.
+   * This method utilizes default crawler factory that creates new crawler using Java reflection
+   *
+   * @param _c
+   *            the class that implements the logic for crawler threads
+   * @param numberOfCrawlers
+   *            the number of concurrent threads that will be contributing in
+   *            this crawling session.
+   * @param &lt;T&gt; Your class extending WebCrawler
+   */
+  public &lt;T extends WebCrawler&gt; void start(final Class&lt;T&gt; _c, final int numberOfCrawlers) {
+<span class="nc" id="L169">    this.start(new DefaultWebCrawlerFactory&lt;&gt;(_c), numberOfCrawlers, true);</span>
+<span class="nc" id="L170">  }</span>
+
+  /**
+   * Start the crawling session and wait for it to finish.
+   *
+   * @param crawlerFactory
+   *            factory to create crawlers on demand for each thread
+   * @param numberOfCrawlers
+   *            the number of concurrent threads that will be contributing in
+   *            this crawling session.
+   * @param &lt;T&gt; Your class extending WebCrawler
+   */
+  public &lt;T extends WebCrawler&gt; void start(final WebCrawlerFactory&lt;T&gt; crawlerFactory, final int numberOfCrawlers) {
+<span class="nc" id="L183">    this.start(crawlerFactory, numberOfCrawlers, true);</span>
+<span class="nc" id="L184">  }</span>
+
+  /**
+   * Start the crawling session and return immediately.
+   *
+   * @param crawlerFactory
+   *            factory to create crawlers on demand for each thread
+   * @param numberOfCrawlers
+   *            the number of concurrent threads that will be contributing in
+   *            this crawling session.
+   * @param &lt;T&gt; Your class extending WebCrawler
+   */
+  public &lt;T extends WebCrawler&gt; void startNonBlocking(WebCrawlerFactory&lt;T&gt; crawlerFactory, final int numberOfCrawlers) {
+<span class="nc" id="L197">    this.start(crawlerFactory, numberOfCrawlers, false);</span>
+<span class="nc" id="L198">  }</span>
+
+  /**
+   * Start the crawling session and return immediately.
+   * This method utilizes default crawler factory that creates new crawler using Java reflection
+   *
+   * @param _c
+   *            the class that implements the logic for crawler threads
+   * @param numberOfCrawlers
+   *            the number of concurrent threads that will be contributing in
+   *            this crawling session.
+   * @param &lt;T&gt; Your class extending WebCrawler
+   */
+  public &lt;T extends WebCrawler&gt; void startNonBlocking(final Class&lt;T&gt; _c, final int numberOfCrawlers) {
+<span class="nc" id="L212">    this.start(new DefaultWebCrawlerFactory&lt;&gt;(_c), numberOfCrawlers, false);</span>
+<span class="nc" id="L213">  }</span>
+
+  protected &lt;T extends WebCrawler&gt; void start(final WebCrawlerFactory&lt;T&gt; crawlerFactory, final int numberOfCrawlers, boolean isBlocking) {
+    try {
+<span class="nc" id="L217">      finished = false;</span>
+<span class="nc" id="L218">      crawlersLocalData.clear();</span>
+<span class="nc" id="L219">      final List&lt;Thread&gt; threads = new ArrayList&lt;&gt;();</span>
+<span class="nc" id="L220">      final List&lt;T&gt; crawlers = new ArrayList&lt;&gt;();</span>
+
+<span class="nc bnc" id="L222" title="All 2 branches missed.">      for (int i = 1; i &lt;= numberOfCrawlers; i++) {</span>
+<span class="nc" id="L223">        T crawler = crawlerFactory.newInstance();</span>
+<span class="nc" id="L224">        Thread thread = new Thread(crawler, &quot;Crawler &quot; + i);</span>
+<span class="nc" id="L225">        crawler.setThread(thread);</span>
+<span class="nc" id="L226">        crawler.init(i, this);</span>
+<span class="nc" id="L227">        thread.start();</span>
+<span class="nc" id="L228">        crawlers.add(crawler);</span>
+<span class="nc" id="L229">        threads.add(thread);</span>
+<span class="nc" id="L230">        logger.info(&quot;Crawler {} started&quot;, i);</span>
+      }
+
+<span class="nc" id="L233">      final CrawlController controller = this;</span>
+
+<span class="nc" id="L235">      Thread monitorThread = new Thread(new Runnable() {</span>
+
+        @Override
+        public void run() {
+          try {
+<span class="nc" id="L240">            synchronized (waitingLock) {</span>
+
+              while (true) {
+<span class="nc" id="L243">                sleep(10);</span>
+<span class="nc" id="L244">                boolean someoneIsWorking = false;</span>
+<span class="nc bnc" id="L245" title="All 2 branches missed.">                for (int i = 0; i &lt; threads.size(); i++) {</span>
+<span class="nc" id="L246">                  Thread thread = threads.get(i);</span>
+<span class="nc bnc" id="L247" title="All 2 branches missed.">                  if (!thread.isAlive()) {</span>
+<span class="nc bnc" id="L248" title="All 2 branches missed.">                    if (!shuttingDown) {</span>
+<span class="nc" id="L249">                      logger.info(&quot;Thread {} was dead, I'll recreate it&quot;, i);</span>
+<span class="nc" id="L250">                      T crawler = crawlerFactory.newInstance();</span>
+<span class="nc" id="L251">                      thread = new Thread(crawler, &quot;Crawler &quot; + (i + 1));</span>
+<span class="nc" id="L252">                      threads.remove(i);</span>
+<span class="nc" id="L253">                      threads.add(i, thread);</span>
+<span class="nc" id="L254">                      crawler.setThread(thread);</span>
+<span class="nc" id="L255">                      crawler.init(i + 1, controller);</span>
+<span class="nc" id="L256">                      thread.start();</span>
+<span class="nc" id="L257">                      crawlers.remove(i);</span>
+<span class="nc" id="L258">                      crawlers.add(i, crawler);</span>
+<span class="nc" id="L259">                    }</span>
+<span class="nc bnc" id="L260" title="All 2 branches missed.">                  } else if (crawlers.get(i).isNotWaitingForNewURLs()) {</span>
+<span class="nc" id="L261">                    someoneIsWorking = true;</span>
+                  }
+                }
+<span class="nc" id="L264">                boolean shut_on_empty = config.isShutdownOnEmptyQueue();</span>
+<span class="nc bnc" id="L265" title="All 4 branches missed.">                if (!someoneIsWorking &amp;&amp; shut_on_empty) {</span>
+                  // Make sure again that none of the threads
+                  // are
+                  // alive.
+<span class="nc" id="L269">                  logger.info(&quot;It looks like no thread is working, waiting for 10 seconds to make sure...&quot;);</span>
+<span class="nc" id="L270">                  sleep(10);</span>
+
+<span class="nc" id="L272">                  someoneIsWorking = false;</span>
+<span class="nc bnc" id="L273" title="All 2 branches missed.">                  for (int i = 0; i &lt; threads.size(); i++) {</span>
+<span class="nc" id="L274">                    Thread thread = threads.get(i);</span>
+<span class="nc bnc" id="L275" title="All 4 branches missed.">                    if (thread.isAlive() &amp;&amp; crawlers.get(i).isNotWaitingForNewURLs()) {</span>
+<span class="nc" id="L276">                      someoneIsWorking = true;</span>
+                    }
+                  }
+<span class="nc bnc" id="L279" title="All 2 branches missed.">                  if (!someoneIsWorking) {</span>
+<span class="nc bnc" id="L280" title="All 2 branches missed.">                    if (!shuttingDown) {</span>
+<span class="nc" id="L281">                      long queueLength = frontier.getQueueLength();</span>
+<span class="nc bnc" id="L282" title="All 2 branches missed.">                      if (queueLength &gt; 0) {</span>
+<span class="nc" id="L283">                        continue;</span>
+                      }
+<span class="nc" id="L285">                      logger.info(</span>
+                          &quot;No thread is working and no more URLs are in queue waiting for another 10 seconds to make &quot; +
+                          &quot;sure...&quot;);
+<span class="nc" id="L288">                      sleep(10);</span>
+<span class="nc" id="L289">                      queueLength = frontier.getQueueLength();</span>
+<span class="nc bnc" id="L290" title="All 2 branches missed.">                      if (queueLength &gt; 0) {</span>
+<span class="nc" id="L291">                        continue;</span>
+                      }
+                    }
+
+<span class="nc" id="L295">                    logger.info(&quot;All of the crawlers are stopped. Finishing the process...&quot;);</span>
+                    // At this step, frontier notifies the threads that were waiting for new URLs and they should stop
+<span class="nc" id="L297">                    frontier.finish();</span>
+<span class="nc bnc" id="L298" title="All 2 branches missed.">                    for (T crawler : crawlers) {</span>
+<span class="nc" id="L299">                      crawler.onBeforeExit();</span>
+<span class="nc" id="L300">                      crawlersLocalData.add(crawler.getMyLocalData());</span>
+<span class="nc" id="L301">                    }</span>
+
+<span class="nc" id="L303">                    logger.info(&quot;Waiting for 10 seconds before final clean up...&quot;);</span>
+<span class="nc" id="L304">                    sleep(10);</span>
+
+<span class="nc" id="L306">                    frontier.close();</span>
+<span class="nc" id="L307">                    docIdServer.close();</span>
+<span class="nc" id="L308">                    pageFetcher.shutDown();</span>
+
+<span class="nc" id="L310">                    finished = true;</span>
+<span class="nc" id="L311">                    waitingLock.notifyAll();</span>
+<span class="nc" id="L312">                    env.close();</span>
+
+<span class="nc" id="L314">                    return;</span>
+                  }
+                }
+<span class="nc" id="L317">              }</span>
+<span class="nc" id="L318">            }</span>
+<span class="nc" id="L319">          } catch (Exception e) {</span>
+<span class="nc" id="L320">            logger.error(&quot;Unexpected Error&quot;, e);</span>
+          }
+<span class="nc" id="L322">        }</span>
+      });
+
+<span class="nc" id="L325">      monitorThread.start();</span>
+
+<span class="nc bnc" id="L327" title="All 2 branches missed.">      if (isBlocking) {</span>
+<span class="nc" id="L328">        waitUntilFinish();</span>
+      }
+
+<span class="nc" id="L331">    } catch (Exception e) {</span>
+<span class="nc" id="L332">      logger.error(&quot;Error happened&quot;, e);</span>
+<span class="nc" id="L333">    }</span>
+<span class="nc" id="L334">  }</span>
+
+  /**
+   * Wait until this crawling session finishes.
+   */
+  public void waitUntilFinish() {
+<span class="nc bnc" id="L340" title="All 2 branches missed.">    while (!finished) {</span>
+<span class="nc" id="L341">      synchronized (waitingLock) {</span>
+<span class="nc bnc" id="L342" title="All 2 branches missed.">        if (finished) {</span>
+<span class="nc" id="L343">          return;</span>
+        }
+        try {
+<span class="nc" id="L346">          waitingLock.wait();</span>
+<span class="nc" id="L347">        } catch (InterruptedException e) {</span>
+<span class="nc" id="L348">          logger.error(&quot;Error occurred&quot;, e);</span>
+<span class="nc" id="L349">        }</span>
+<span class="nc" id="L350">      }</span>
+    }
+<span class="nc" id="L352">  }</span>
+
+  /**
+   * Once the crawling session finishes the controller collects the local data of the crawler threads and stores them
+   * in a List.
+   * This function returns the reference to this list.
+   *
+   * @return List of Objects which are your local data
+   */
+  public List&lt;Object&gt; getCrawlersLocalData() {
+<span class="nc" id="L362">    return crawlersLocalData;</span>
+  }
+
+  protected static void sleep(int seconds) {
+    try {
+<span class="nc" id="L367">      Thread.sleep(seconds * 1000);</span>
+<span class="nc" id="L368">    } catch (InterruptedException ignored) {</span>
+      // Do nothing
+<span class="nc" id="L370">    }</span>
+<span class="nc" id="L371">  }</span>
+
+  /**
+   * Adds a new seed URL. A seed URL is a URL that is fetched by the crawler
+   * to extract new URLs in it and follow them for crawling.
+   *
+   * @param pageUrl
+   *            the URL of the seed
+   */
+  public void addSeed(String pageUrl) {
+<span class="nc" id="L381">    addSeed(pageUrl, -1);</span>
+<span class="nc" id="L382">  }</span>
+
+  /**
+   * Adds a new seed URL. A seed URL is a URL that is fetched by the crawler
+   * to extract new URLs in it and follow them for crawling. You can also
+   * specify a specific document id to be assigned to this seed URL. This
+   * document id needs to be unique. Also, note that if you add three seeds
+   * with document ids 1,2, and 7. Then the next URL that is found during the
+   * crawl will get a doc id of 8. Also you need to ensure to add seeds in
+   * increasing order of document ids.
+   *
+   * Specifying doc ids is mainly useful when you have had a previous crawl
+   * and have stored the results and want to start a new crawl with seeds
+   * which get the same document ids as the previous crawl.
+   *
+   * @param pageUrl
+   *            the URL of the seed
+   * @param docId
+   *            the document id that you want to be assigned to this seed URL.
+   *
+   */
+  public void addSeed(String pageUrl, int docId) {
+<span class="nc" id="L404">    String canonicalUrl = URLCanonicalizer.getCanonicalURL(pageUrl);</span>
+<span class="nc bnc" id="L405" title="All 2 branches missed.">    if (canonicalUrl == null) {</span>
+<span class="nc" id="L406">      logger.error(&quot;Invalid seed URL: {}&quot;, pageUrl);</span>
+    } else {
+<span class="nc bnc" id="L408" title="All 2 branches missed.">      if (docId &lt; 0) {</span>
+<span class="nc" id="L409">        docId = docIdServer.getDocId(canonicalUrl);</span>
+<span class="nc bnc" id="L410" title="All 2 branches missed.">        if (docId &gt; 0) {</span>
+<span class="nc" id="L411">          logger.trace(&quot;This URL is already seen.&quot;);</span>
+<span class="nc" id="L412">          return;</span>
+        }
+<span class="nc" id="L414">        docId = docIdServer.getNewDocID(canonicalUrl);</span>
+      } else {
+        try {
+<span class="nc" id="L417">          docIdServer.addUrlAndDocId(canonicalUrl, docId);</span>
+<span class="nc" id="L418">        } catch (Exception e) {</span>
+<span class="nc" id="L419">          logger.error(&quot;Could not add seed: {}&quot;, e.getMessage());</span>
+<span class="nc" id="L420">        }</span>
+      }
+
+<span class="nc" id="L423">      WebURL webUrl = new WebURL();</span>
+<span class="nc" id="L424">      webUrl.setURL(canonicalUrl);</span>
+<span class="nc" id="L425">      webUrl.setDocid(docId);</span>
+<span class="nc" id="L426">      webUrl.setDepth((short) 0);</span>
+<span class="nc bnc" id="L427" title="All 2 branches missed.">      if (robotstxtServer.allows(webUrl)) {</span>
+<span class="nc" id="L428">        frontier.schedule(webUrl);</span>
+      } else {
+<span class="nc" id="L430">        logger.warn(&quot;Robots.txt does not allow this seed: {}&quot;,</span>
+                    pageUrl); // using the WARN level here, as the user specifically asked to add this seed
+      }
+    }
+<span class="nc" id="L434">  }</span>
+
+  /**
+   * This function can called to assign a specific document id to a url. This
+   * feature is useful when you have had a previous crawl and have stored the
+   * Urls and their associated document ids and want to have a new crawl which
+   * is aware of the previously seen Urls and won't re-crawl them.
+   *
+   * Note that if you add three seen Urls with document ids 1,2, and 7. Then
+   * the next URL that is found during the crawl will get a doc id of 8. Also
+   * you need to ensure to add seen Urls in increasing order of document ids.
+   *
+   * @param url
+   *            the URL of the page
+   * @param docId
+   *            the document id that you want to be assigned to this URL.
+   *
+   */
+  public void addSeenUrl(String url, int docId) {
+<span class="nc" id="L453">    String canonicalUrl = URLCanonicalizer.getCanonicalURL(url);</span>
+<span class="nc bnc" id="L454" title="All 2 branches missed.">    if (canonicalUrl == null) {</span>
+<span class="nc" id="L455">      logger.error(&quot;Invalid Url: {} (can't cannonicalize it!)&quot;, url);</span>
+    } else {
+      try {
+<span class="nc" id="L458">        docIdServer.addUrlAndDocId(canonicalUrl, docId);</span>
+<span class="nc" id="L459">      } catch (Exception e) {</span>
+<span class="nc" id="L460">        logger.error(&quot;Could not add seen url: {}&quot;, e.getMessage());</span>
+<span class="nc" id="L461">      }</span>
+    }
+<span class="nc" id="L463">  }</span>
+
+  public PageFetcher getPageFetcher() {
+<span class="nc" id="L466">    return pageFetcher;</span>
+  }
+
+  public void setPageFetcher(PageFetcher pageFetcher) {
+<span class="nc" id="L470">    this.pageFetcher = pageFetcher;</span>
+<span class="nc" id="L471">  }</span>
+
+  public RobotstxtServer getRobotstxtServer() {
+<span class="nc" id="L474">    return robotstxtServer;</span>
+  }
+
+  public void setRobotstxtServer(RobotstxtServer robotstxtServer) {
+<span class="nc" id="L478">    this.robotstxtServer = robotstxtServer;</span>
+<span class="nc" id="L479">  }</span>
+
+  public Frontier getFrontier() {
+<span class="nc" id="L482">    return frontier;</span>
+  }
+
+  public void setFrontier(Frontier frontier) {
+<span class="nc" id="L486">    this.frontier = frontier;</span>
+<span class="nc" id="L487">  }</span>
+
+  public DocIDServer getDocIdServer() {
+<span class="nc" id="L490">    return docIdServer;</span>
+  }
+
+  public void setDocIdServer(DocIDServer docIdServer) {
+<span class="nc" id="L494">    this.docIdServer = docIdServer;</span>
+<span class="nc" id="L495">  }</span>
+
+  public Object getCustomData() {
+<span class="nc" id="L498">    return customData;</span>
+  }
+
+  public void setCustomData(Object customData) {
+<span class="nc" id="L502">    this.customData = customData;</span>
+<span class="nc" id="L503">  }</span>
+
+  public boolean isFinished() {
+<span class="nc" id="L506">    return this.finished;</span>
+  }
+
+  public boolean isShuttingDown() {
+<span class="nc" id="L510">    return shuttingDown;</span>
+  }
+
+  /**
+   * Set the current crawling session set to 'shutdown'. Crawler threads
+   * monitor the shutdown flag and when it is set to true, they will no longer
+   * process new pages.
+   */
+  public void shutdown() {
+<span class="nc" id="L519">    logger.info(&quot;Shutting down...&quot;);</span>
+<span class="nc" id="L520">    this.shuttingDown = true;</span>
+<span class="nc" id="L521">    pageFetcher.shutDown();</span>
+<span class="nc" id="L522">    frontier.finish();</span>
+<span class="nc" id="L523">  }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span></div></body></html>
