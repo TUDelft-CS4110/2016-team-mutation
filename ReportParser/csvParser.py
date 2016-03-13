@@ -12,14 +12,6 @@ NO_COVERAGE = "NO_COVERAGE"
 MISSED = "MISSED"
 COVERED = "COVERED"
 
-
-def plotHistogram(data):
-	hist, bins = np.histogram(data, bins=20)
-	width = 0.7 * (bins[1] - bins[0])
-	center = (bins[:-1] + bins[1:]) / 2
-	plt.bar(center, hist, align='center', width=width)
-	plt.show()
-
 def plotGraph(data):
 	branchCoverage = []
 	mutationCoverage = []
