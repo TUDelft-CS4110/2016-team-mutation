@@ -15,18 +15,34 @@ COVERED = "COVERED"
 def plotGraph(branchData, mutData):
 	branchCoverage = []
 	mutationCoverage = []
+
+	mutCovMap = {}
 	for mutOp in mutData:
+		zeroMutCov = []
+		fullMutCov = []
 		for className in mutData[mutOp]:
 			if mutData[mutOp][className][KILLED]+mutData[mutOp][className][SURVIVED] > 0 and branchData[className][COVERED]+branchData[className][MISSED] > 0:
 				mutCov = 100*mutData[mutOp][className][KILLED]/(mutData[mutOp][className][KILLED]+mutData[mutOp][className][SURVIVED])
-				mutationCoverage.append(mutCov)
 				branchCov = 100*branchData[className][COVERED]/(branchData[className][COVERED]+branchData[className][MISSED])
+
+				if not className in mutCovMap:
+					mutCovMap[className] = {}
+					mutCovMap[className][0] = 0
+					mutCovMap[className][100] = 0
+				if mutCov == 0:
+					mutCovMap[className][0] += 1
+				if mutCov == 100:
+					mutCovMap[className][100] += 1
+
+				
 				branchCoverage.append(branchCov)
+				mutationCoverage.append(mutCov)
 		plt.scatter(branchCoverage, mutationCoverage)
 		plt.xlabel('Branch Coverage')
 		plt.ylabel('Mutation Coverage')
 		plt.title(mutOp)
 		plt.show()
+	return mutCovMap
 
 def parseJacocoCSV(file, data):
 	if os.path.isfile(file):
@@ -85,7 +101,23 @@ else:
 	pitestfile = sys.argv[2]
 	parsePitestCSV(pitestfile, mutData, branchData)
 	parseJacocoCSV(jacocofile, branchData)
-	plotGraph(branchData, mutData)
+	mutCovMap = plotGraph(branchData, mutData)
+
+	print("============================================")
+	print("Zero Mutation Coverage: number of operators")
+	print("============================================")
+	for className in mutCovMap:
+		if mutCovMap[className][0] >= 2:
+			print(className + ": " + str(mutCovMap[className][0]))
+
+	print("")
+	print("============================================")
+	print("Full Mutation Coverage: number of operators")
+	print("============================================")
+	for className in mutCovMap:
+		if mutCovMap[className][100] >= 4:
+			print(className + ": " + str(mutCovMap[className][100]))
+
 	
 
 
