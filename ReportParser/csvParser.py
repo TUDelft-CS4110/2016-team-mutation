@@ -12,19 +12,21 @@ NO_COVERAGE = "NO_COVERAGE"
 MISSED = "MISSED"
 COVERED = "COVERED"
 
-def plotGraph(data):
+def plotGraph(branchData, mutData):
 	branchCoverage = []
 	mutationCoverage = []
-	for key in data:
-		if data[key][KILLED]+data[key][SURVIVED] > 0 and data[key][COVERED]+data[key][MISSED] > 0:
-			mutCov = 100*data[key][KILLED]/(data[key][KILLED]+data[key][SURVIVED])
-			mutationCoverage.append(mutCov)
-			branchCov = 100*data[key][COVERED]/(data[key][COVERED]+data[key][MISSED])
-			branchCoverage.append(branchCov)
-	plt.scatter(branchCoverage, mutationCoverage)
-	plt.xlabel('Branch Coverage')
-	plt.ylabel('Mutation Coverage')
-	plt.show()
+	for mutOp in mutData:
+		for className in mutData[mutOp]:
+			if mutData[mutOp][className][KILLED]+mutData[mutOp][className][SURVIVED] > 0 and branchData[className][COVERED]+branchData[className][MISSED] > 0:
+				mutCov = 100*mutData[mutOp][className][KILLED]/(mutData[mutOp][className][KILLED]+mutData[mutOp][className][SURVIVED])
+				mutationCoverage.append(mutCov)
+				branchCov = 100*branchData[className][COVERED]/(branchData[className][COVERED]+branchData[className][MISSED])
+				branchCoverage.append(branchCov)
+		plt.scatter(branchCoverage, mutationCoverage)
+		plt.xlabel('Branch Coverage')
+		plt.ylabel('Mutation Coverage')
+		plt.title(mutOp)
+		plt.show()
 
 def parseJacocoCSV(file, data):
 	if os.path.isfile(file):
@@ -35,55 +37,55 @@ def parseJacocoCSV(file, data):
 				missed = float(row[5])
 				covered = float(row[6])
 				if missed+covered > 0:
-					#branchCoverage = 100*covered/(missed+covered)
 					for key in data:
-						if key in row[2]:
+						if key in row[2] or key == row[2]:
 							data[key][MISSED] += missed
 							data[key][COVERED] += covered
 							break
 	else:
 		print("Jacoco file or folder does not exist.")
 
-def parsePitestCSV(file, data):
+def parsePitestCSV(file, mutData, branchData):
 	if os.path.isfile(file):
 		reader = csv.reader(open(file),delimiter=',')
 
 		for row in reader:
+			# Add mutation operator
+			if not row[2] in mutData:
+				mutData[row[2]] = {}
+				
+			# Add class
 			className = row[0].replace(".java","")
-			if className in data:
-				if row[5] == KILLED :
-					data[className][KILLED] += 1
-				elif row[5] == SURVIVED :
-					data[className][SURVIVED] += 1
-				elif row[5] == NO_COVERAGE:
-					data[className][NO_COVERAGE] +=1 
-			else:
-				#init values
-				data[className] = {}
-				data[className][KILLED] = 0
-				data[className][SURVIVED] = 0
-				data[className][NO_COVERAGE] = 0
-				data[className][MISSED] = 0
-				data[className][COVERED] = 0
-				#set first pitest value
-				if row[5] == KILLED:
-					data[className][KILLED] = 1
-				elif row[5] == SURVIVED:
-					data[className][SURVIVED] = 1
-				elif row[5] == NO_COVERAGE:
-					data[className][NO_COVERAGE] =1 
+			if not className in branchData:
+				branchData[className] = {}
+				branchData[className][MISSED] = 0
+				branchData[className][COVERED] = 0
+
+			if not className in mutData[row[2]]:
+				mutData[row[2]][className] = {}
+				mutData[row[2]][className][KILLED] = 0
+				mutData[row[2]][className][SURVIVED] = 0
+				mutData[row[2]][className][NO_COVERAGE] = 0
+
+			if row[5] == KILLED :
+				mutData[row[2]][className][KILLED] += 1
+			elif row[5] == SURVIVED :
+				mutData[row[2]][className][SURVIVED] += 1
+			elif row[5] == NO_COVERAGE:
+				mutData[row[2]][className][NO_COVERAGE] +=1 
 	else:
 		print("Pitest file or folder does not exist.")
 
 if len(sys.argv) != 3:
 	print("Please provide relative path + name of a jacoco .csv file and a pitest .csv file.")
 else:
-	data = {}
+	mutData = {}
+	branchData = {}
 	jacocofile = sys.argv[1]
 	pitestfile = sys.argv[2]
-	parsePitestCSV(pitestfile, data)
-	parseJacocoCSV(jacocofile, data)
-	plotGraph(data)
+	parsePitestCSV(pitestfile, mutData, branchData)
+	parseJacocoCSV(jacocofile, branchData)
+	plotGraph(branchData, mutData)
 	
 
 
