@@ -1,0 +1,136 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../.resources/report.gif" type="image/gif"/><title>CachingMockBytecodeGenerator.java</title><link rel="stylesheet" href="../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../.sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">mockito</a> &gt; <a href="index.source.html" class="el_package">org.mockito.internal.creation.bytebuddy</a> &gt; <span class="el_source">CachingMockBytecodeGenerator.java</span></div><h1>CachingMockBytecodeGenerator.java</h1><pre class="source lang-java linenums">package org.mockito.internal.creation.bytebuddy;
+
+import static org.mockito.internal.util.StringJoiner.join;
+import java.lang.ref.WeakReference;
+import java.lang.reflect.Modifier;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.WeakHashMap;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+import org.mockito.exceptions.base.MockitoException;
+
+<span class="fc" id="L14">class CachingMockBytecodeGenerator {</span>
+
+<span class="fc" id="L16">    private final Lock avoidingClassLeakCacheLock = new ReentrantLock();</span>
+<span class="fc" id="L17">    public final WeakHashMap&lt;ClassLoader, CachedBytecodeGenerator&gt; avoidingClassLeakageCache =</span>
+            new WeakHashMap&lt;ClassLoader, CachedBytecodeGenerator&gt;();
+
+<span class="fc" id="L20">    private final MockBytecodeGenerator mockBytecodeGenerator = new MockBytecodeGenerator();</span>
+
+    public &lt;T&gt; Class&lt;T&gt; get(MockFeatures&lt;T&gt; params) {
+        // TODO improves locking behavior with ReentrantReadWriteLock ?
+<span class="fc" id="L24">        avoidingClassLeakCacheLock.lock();</span>
+        try {
+
+<span class="fc" id="L27">            Class generatedMockClass = mockCachePerClassLoaderOf(params.mockedType).getOrGenerateMockClass(</span>
+                    params
+            );
+
+<span class="fc" id="L31">            return generatedMockClass;</span>
+        } finally {
+<span class="fc" id="L33">          avoidingClassLeakCacheLock.unlock();</span>
+        }
+    }
+
+    private &lt;T&gt; CachedBytecodeGenerator mockCachePerClassLoaderOf(Class&lt;T&gt; mockedType) {
+<span class="fc bfc" id="L38" title="All 2 branches covered.">        if (!avoidingClassLeakageCache.containsKey(mockedType.getClassLoader())) {</span>
+<span class="fc" id="L39">            avoidingClassLeakageCache.put(</span>
+                    mockedType.getClassLoader(),
+                    new CachedBytecodeGenerator(mockBytecodeGenerator)
+            );
+        }
+<span class="fc" id="L44">        return avoidingClassLeakageCache.get(mockedType.getClassLoader());</span>
+    }
+
+<span class="fc" id="L47">    private static class CachedBytecodeGenerator {</span>
+<span class="fc" id="L48">        private ConcurrentHashMap&lt;MockKey, WeakReference&lt;Class&gt;&gt; generatedClassCache =</span>
+                new ConcurrentHashMap&lt;MockKey, WeakReference&lt;Class&gt;&gt;();
+        private final MockBytecodeGenerator generator;
+
+<span class="fc" id="L52">        private CachedBytecodeGenerator(MockBytecodeGenerator generator) {</span>
+<span class="fc" id="L53">            this.generator = generator;</span>
+<span class="fc" id="L54">        }</span>
+
+        public &lt;T&gt; Class getOrGenerateMockClass(MockFeatures&lt;T&gt; features) {
+<span class="fc" id="L57">            MockKey mockKey = MockKey.of(features.mockedType, features.interfaces);</span>
+<span class="fc" id="L58">            Class generatedMockClass = null;</span>
+<span class="fc" id="L59">            WeakReference&lt;Class&gt; classWeakReference = generatedClassCache.get(mockKey);</span>
+<span class="fc bfc" id="L60" title="All 2 branches covered.">            if(classWeakReference != null) {</span>
+<span class="fc" id="L61">                generatedMockClass = classWeakReference.get();</span>
+            }
+<span class="fc bfc" id="L63" title="All 2 branches covered.">            if(generatedMockClass == null) {</span>
+<span class="fc" id="L64">                generatedMockClass = generate(features);</span>
+            }
+<span class="fc" id="L66">            generatedClassCache.put(mockKey, new WeakReference&lt;Class&gt;(generatedMockClass));</span>
+<span class="fc" id="L67">            return generatedMockClass;</span>
+        }
+
+        private &lt;T&gt; Class&lt;? extends T&gt; generate(MockFeatures&lt;T&gt; mockFeatures) {
+            try {
+<span class="fc" id="L72">                return generator.generateMockClass(mockFeatures);</span>
+<span class="fc" id="L73">            } catch (Exception bytecodeGenerationFailed) {</span>
+<span class="nc" id="L74">                throw prettifyFailure(mockFeatures, bytecodeGenerationFailed);</span>
+            }
+        }
+
+        private RuntimeException prettifyFailure(MockFeatures&lt;?&gt; mockFeatures, Exception generationFailed) {
+<span class="pc bpc" id="L79" title="1 of 2 branches missed.">            if (Modifier.isPrivate(mockFeatures.mockedType.getModifiers())) {</span>
+<span class="fc" id="L80">                throw new MockitoException(join(</span>
+                        &quot;Mockito cannot mock this class: &quot; + mockFeatures.mockedType + &quot;.&quot;,
+                        &quot;Most likely it is a private class that is not visible by Mockito&quot;,
+                        &quot;&quot;
+                ), generationFailed);
+            }
+<span class="nc" id="L86">            throw new MockitoException(join(</span>
+                    &quot;Mockito cannot mock this class: &quot; + mockFeatures.mockedType,
+                    &quot;&quot;,
+                    &quot;Mockito can only mock visible &amp; non-final classes.&quot;,
+                    &quot;If you're not sure why you're getting this error, please report to the mailing list.&quot;,
+                    &quot;&quot;,
+                    &quot;Underlying exception : &quot; + generationFailed),
+                    generationFailed
+            );
+        }
+
+        // should be stored as a weak reference
+        private static class MockKey&lt;T&gt; {
+            private final String mockedType;
+<span class="fc" id="L100">            private final Set&lt;String&gt; types = new HashSet&lt;String&gt;();</span>
+
+<span class="fc" id="L102">            private MockKey(Class&lt;T&gt; mockedType, Set&lt;Class&lt;?&gt;&gt; interfaces) {</span>
+<span class="fc" id="L103">                this.mockedType = mockedType.getName();</span>
+<span class="fc bfc" id="L104" title="All 2 branches covered.">                for (Class anInterface : interfaces) {</span>
+<span class="fc" id="L105">                    types.add(anInterface.getName());</span>
+<span class="fc" id="L106">                }</span>
+<span class="fc" id="L107">                types.add(this.mockedType);</span>
+<span class="fc" id="L108">            }</span>
+
+            @Override
+            public boolean equals(Object other) {
+<span class="pc bpc" id="L112" title="1 of 2 branches missed.">                if (this == other) return true;</span>
+<span class="pc bpc" id="L113" title="2 of 4 branches missed.">                if (other == null || getClass() != other.getClass()) return false;</span>
+
+<span class="fc" id="L115">                MockKey mockKey = (MockKey&lt;?&gt;) other;</span>
+
+<span class="pc bpc" id="L117" title="1 of 2 branches missed.">                if (!mockedType.equals(mockKey.mockedType)) return false;</span>
+<span class="pc bpc" id="L118" title="1 of 2 branches missed.">                if (!types.equals(mockKey.types)) return false;</span>
+
+<span class="fc" id="L120">                return true;</span>
+            }
+
+            @Override
+            public int hashCode() {
+<span class="fc" id="L125">                int result = mockedType.hashCode();</span>
+<span class="fc" id="L126">                result = 31 * result + types.hashCode();</span>
+<span class="fc" id="L127">                return result;</span>
+            }
+
+            public static &lt;T&gt; MockKey of(Class&lt;T&gt; mockedType, Set&lt;Class&lt;?&gt;&gt; interfaces) {
+<span class="fc" id="L131">                return new MockKey&lt;T&gt;(mockedType, interfaces);</span>
+            }
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span></div></body></html>
