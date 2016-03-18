@@ -13,11 +13,12 @@ MISSED = "MISSED"
 COVERED = "COVERED"
 
 def plotGraph(branchData, mutData):
-	branchCoverage = []
-	mutationCoverage = []
+	
 
 	mutCovMap = {}
 	for mutOp in mutData:
+		branchCoverage = []
+		mutationCoverage = []
 		zeroMutCov = []
 		fullMutCov = []
 		for className in mutData[mutOp]:
@@ -42,6 +43,9 @@ def plotGraph(branchData, mutData):
 		plt.ylabel('Mutation Coverage')
 		plt.title(mutOp)
 		plt.show()
+		plt.cla()
+		plt.clf()
+		plt.close()
 	return mutCovMap
 
 def parseJacocoCSV(file, data):
