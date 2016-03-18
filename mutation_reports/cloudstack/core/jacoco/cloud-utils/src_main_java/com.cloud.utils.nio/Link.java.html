@@ -1,0 +1,568 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>Link.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">cloud-core (18-mrt-2016 13:14:54)</a> &gt; <a href="../../index.html" class="el_group">cloud-utils</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">com.cloud.utils.nio</a> &gt; <span class="el_source">Link.java</span></div><h1>Link.java</h1><pre class="source lang-java linenums">//
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// &quot;License&quot;); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+//
+
+package com.cloud.utils.nio;
+
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.InetSocketAddress;
+import java.net.SocketTimeoutException;
+import java.nio.ByteBuffer;
+import java.nio.channels.Channels;
+import java.nio.channels.ClosedChannelException;
+import java.nio.channels.ReadableByteChannel;
+import java.nio.channels.SelectionKey;
+import java.nio.channels.SocketChannel;
+import java.security.GeneralSecurityException;
+import java.security.KeyStore;
+import java.util.concurrent.ConcurrentLinkedQueue;
+
+import javax.net.ssl.KeyManagerFactory;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLEngine;
+import javax.net.ssl.SSLEngineResult;
+import javax.net.ssl.SSLEngineResult.HandshakeStatus;
+import javax.net.ssl.SSLSession;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.TrustManagerFactory;
+
+import org.apache.cloudstack.utils.security.SSLUtils;
+import org.apache.log4j.Logger;
+
+import com.cloud.utils.PropertiesUtil;
+import com.cloud.utils.db.DbProperties;
+
+/**
+ */
+public class Link {
+<span class="nc" id="L56">    private static final Logger s_logger = Logger.getLogger(Link.class);</span>
+
+    private final InetSocketAddress _addr;
+    private final NioConnection _connection;
+    private SelectionKey _key;
+    private final ConcurrentLinkedQueue&lt;ByteBuffer[]&gt; _writeQueue;
+    private ByteBuffer _readBuffer;
+    private ByteBuffer _plaintextBuffer;
+    private Object _attach;
+    private boolean _readHeader;
+    private boolean _gotFollowingPacket;
+
+    private SSLEngine _sslEngine;
+    public static final String keystoreFile = &quot;/cloudmanagementserver.keystore&quot;;
+
+<span class="nc" id="L71">    public Link(InetSocketAddress addr, NioConnection connection) {</span>
+<span class="nc" id="L72">        _addr = addr;</span>
+<span class="nc" id="L73">        _connection = connection;</span>
+<span class="nc" id="L74">        _readBuffer = ByteBuffer.allocate(2048);</span>
+<span class="nc" id="L75">        _attach = null;</span>
+<span class="nc" id="L76">        _key = null;</span>
+<span class="nc" id="L77">        _writeQueue = new ConcurrentLinkedQueue&lt;ByteBuffer[]&gt;();</span>
+<span class="nc" id="L78">        _readHeader = true;</span>
+<span class="nc" id="L79">        _gotFollowingPacket = false;</span>
+<span class="nc" id="L80">    }</span>
+
+    public Link(Link link) {
+<span class="nc" id="L83">        this(link._addr, link._connection);</span>
+<span class="nc" id="L84">    }</span>
+
+    public Object attachment() {
+<span class="nc" id="L87">        return _attach;</span>
+    }
+
+    public void attach(Object attach) {
+<span class="nc" id="L91">        _attach = attach;</span>
+<span class="nc" id="L92">    }</span>
+
+    public void setKey(SelectionKey key) {
+<span class="nc" id="L95">        synchronized (this) {</span>
+<span class="nc" id="L96">            _key = key;</span>
+        }
+<span class="nc" id="L98">    }</span>
+
+    public void setSSLEngine(SSLEngine sslEngine) {
+<span class="nc" id="L101">        _sslEngine = sslEngine;</span>
+<span class="nc" id="L102">    }</span>
+
+    /**
+     * No user, so comment it out.
+     *
+     * Static methods for reading from a channel in case
+     * you need to add a client that doesn't require nio.
+     * @param ch channel to read from.
+     * @param bytebuffer to use.
+     * @return bytes read
+     * @throws IOException if not read to completion.
+    public static byte[] read(SocketChannel ch, ByteBuffer buff) throws IOException {
+        synchronized(buff) {
+            buff.clear();
+            buff.limit(4);
+
+            while (buff.hasRemaining()) {
+                if (ch.read(buff) == -1) {
+                    throw new IOException(&quot;Connection closed with -1 on reading size.&quot;);
+                }
+            }
+
+            buff.flip();
+
+            int length = buff.getInt();
+            ByteArrayOutputStream output = new ByteArrayOutputStream(length);
+            WritableByteChannel outCh = Channels.newChannel(output);
+
+            int count = 0;
+            while (count &lt; length) {
+                buff.clear();
+                int read = ch.read(buff);
+                if (read &lt; 0) {
+                    throw new IOException(&quot;Connection closed with -1 on reading data.&quot;);
+                }
+                count += read;
+                buff.flip();
+                outCh.write(buff);
+            }
+
+            return output.toByteArray();
+        }
+    }
+     */
+
+    private static void doWrite(SocketChannel ch, ByteBuffer[] buffers, SSLEngine sslEngine) throws IOException {
+<span class="nc" id="L148">        SSLSession sslSession = sslEngine.getSession();</span>
+<span class="nc" id="L149">        ByteBuffer pkgBuf = ByteBuffer.allocate(sslSession.getPacketBufferSize() + 40);</span>
+        SSLEngineResult engResult;
+
+<span class="nc" id="L152">        ByteBuffer headBuf = ByteBuffer.allocate(4);</span>
+
+<span class="nc" id="L154">        int totalLen = 0;</span>
+<span class="nc bnc" id="L155" title="All 2 branches missed.">        for (ByteBuffer buffer : buffers) {</span>
+<span class="nc" id="L156">            totalLen += buffer.limit();</span>
+        }
+
+<span class="nc" id="L159">        int processedLen = 0;</span>
+<span class="nc bnc" id="L160" title="All 2 branches missed.">        while (processedLen &lt; totalLen) {</span>
+<span class="nc" id="L161">            headBuf.clear();</span>
+<span class="nc" id="L162">            pkgBuf.clear();</span>
+<span class="nc" id="L163">            engResult = sslEngine.wrap(buffers, pkgBuf);</span>
+<span class="nc bnc" id="L164" title="All 4 branches missed.">            if (engResult.getHandshakeStatus() != HandshakeStatus.FINISHED &amp;&amp; engResult.getHandshakeStatus() != HandshakeStatus.NOT_HANDSHAKING &amp;&amp;</span>
+<span class="nc bnc" id="L165" title="All 2 branches missed.">                    engResult.getStatus() != SSLEngineResult.Status.OK) {</span>
+<span class="nc" id="L166">                throw new IOException(&quot;SSL: SSLEngine return bad result! &quot; + engResult);</span>
+            }
+
+<span class="nc" id="L169">            processedLen = 0;</span>
+<span class="nc bnc" id="L170" title="All 2 branches missed.">            for (ByteBuffer buffer : buffers) {</span>
+<span class="nc" id="L171">                processedLen += buffer.position();</span>
+            }
+
+<span class="nc" id="L174">            int dataRemaining = pkgBuf.position();</span>
+<span class="nc" id="L175">            int header = dataRemaining;</span>
+<span class="nc" id="L176">            int headRemaining = 4;</span>
+<span class="nc" id="L177">            pkgBuf.flip();</span>
+<span class="nc bnc" id="L178" title="All 2 branches missed.">            if (processedLen &lt; totalLen) {</span>
+<span class="nc" id="L179">                header = header | HEADER_FLAG_FOLLOWING;</span>
+            }
+<span class="nc" id="L181">            headBuf.putInt(header);</span>
+<span class="nc" id="L182">            headBuf.flip();</span>
+
+<span class="nc bnc" id="L184" title="All 2 branches missed.">            while (headRemaining &gt; 0) {</span>
+<span class="nc bnc" id="L185" title="All 2 branches missed.">                if (s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L186">                    s_logger.trace(&quot;Writing Header &quot; + headRemaining);</span>
+                }
+<span class="nc" id="L188">                long count = ch.write(headBuf);</span>
+<span class="nc" id="L189">                headRemaining -= count;</span>
+            }
+<span class="nc bnc" id="L191" title="All 2 branches missed.">            while (dataRemaining &gt; 0) {</span>
+<span class="nc bnc" id="L192" title="All 2 branches missed.">                if (s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L193">                    s_logger.trace(&quot;Writing Data &quot; + dataRemaining);</span>
+                }
+<span class="nc" id="L195">                long count = ch.write(pkgBuf);</span>
+<span class="nc" id="L196">                dataRemaining -= count;</span>
+            }
+        }
+<span class="nc" id="L199">    }</span>
+
+    /**
+     * write method to write to a socket.  This method writes to completion so
+     * it doesn't follow the nio standard.  We use this to make sure we write
+     * our own protocol.
+     *
+     * @param ch channel to write to.
+     * @param buffers buffers to write.
+     * @throws IOException if unable to write to completion.
+     */
+    public static void write(SocketChannel ch, ByteBuffer[] buffers, SSLEngine sslEngine) throws IOException {
+<span class="nc" id="L211">        synchronized (ch) {</span>
+<span class="nc" id="L212">            doWrite(ch, buffers, sslEngine);</span>
+        }
+<span class="nc" id="L214">    }</span>
+
+    /* SSL has limitation of 16k, we may need to split packets. 18000 is 16k + some extra SSL informations */
+    protected static final int MAX_SIZE_PER_PACKET = 18000;
+<span class="nc" id="L218">    protected static final int HEADER_FLAG_FOLLOWING = 0x10000;</span>
+
+    public byte[] read(SocketChannel ch) throws IOException {
+<span class="nc bnc" id="L221" title="All 2 branches missed.">        if (_readHeader) {   // Start of a packet</span>
+<span class="nc bnc" id="L222" title="All 2 branches missed.">            if (_readBuffer.position() == 0) {</span>
+<span class="nc" id="L223">                _readBuffer.limit(4);</span>
+            }
+
+<span class="nc bnc" id="L226" title="All 2 branches missed.">            if (ch.read(_readBuffer) == -1) {</span>
+<span class="nc" id="L227">                throw new IOException(&quot;Connection closed with -1 on reading size.&quot;);</span>
+            }
+
+<span class="nc bnc" id="L230" title="All 2 branches missed.">            if (_readBuffer.hasRemaining()) {</span>
+<span class="nc" id="L231">                s_logger.trace(&quot;Need to read the rest of the packet length&quot;);</span>
+<span class="nc" id="L232">                return null;</span>
+            }
+<span class="nc" id="L234">            _readBuffer.flip();</span>
+<span class="nc" id="L235">            int header = _readBuffer.getInt();</span>
+<span class="nc" id="L236">            int readSize = (short)header;</span>
+<span class="nc bnc" id="L237" title="All 2 branches missed.">            if (s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L238">                s_logger.trace(&quot;Packet length is &quot; + readSize);</span>
+            }
+
+<span class="nc bnc" id="L241" title="All 2 branches missed.">            if (readSize &gt; MAX_SIZE_PER_PACKET) {</span>
+<span class="nc" id="L242">                throw new IOException(&quot;Wrong packet size: &quot; + readSize);</span>
+            }
+
+<span class="nc bnc" id="L245" title="All 2 branches missed.">            if (!_gotFollowingPacket) {</span>
+<span class="nc" id="L246">                _plaintextBuffer = ByteBuffer.allocate(2000);</span>
+            }
+
+<span class="nc bnc" id="L249" title="All 2 branches missed.">            if ((header &amp; HEADER_FLAG_FOLLOWING) != 0) {</span>
+<span class="nc" id="L250">                _gotFollowingPacket = true;</span>
+<span class="nc" id="L251">            } else {</span>
+<span class="nc" id="L252">                _gotFollowingPacket = false;</span>
+            }
+
+<span class="nc" id="L255">            _readBuffer.clear();</span>
+<span class="nc" id="L256">            _readHeader = false;</span>
+
+<span class="nc bnc" id="L258" title="All 2 branches missed.">            if (_readBuffer.capacity() &lt; readSize) {</span>
+<span class="nc bnc" id="L259" title="All 2 branches missed.">                if (s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L260">                    s_logger.trace(&quot;Resizing the byte buffer from &quot; + _readBuffer.capacity());</span>
+                }
+<span class="nc" id="L262">                _readBuffer = ByteBuffer.allocate(readSize);</span>
+            }
+<span class="nc" id="L264">            _readBuffer.limit(readSize);</span>
+        }
+
+<span class="nc bnc" id="L267" title="All 2 branches missed.">        if (ch.read(_readBuffer) == -1) {</span>
+<span class="nc" id="L268">            throw new IOException(&quot;Connection closed with -1 on read.&quot;);</span>
+        }
+
+<span class="nc bnc" id="L271" title="All 2 branches missed.">        if (_readBuffer.hasRemaining()) {   // We're not done yet.</span>
+<span class="nc bnc" id="L272" title="All 2 branches missed.">            if (s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L273">                s_logger.trace(&quot;Still has &quot; + _readBuffer.remaining());</span>
+            }
+<span class="nc" id="L275">            return null;</span>
+        }
+
+<span class="nc" id="L278">        _readBuffer.flip();</span>
+
+        ByteBuffer appBuf;
+
+<span class="nc" id="L282">        SSLSession sslSession = _sslEngine.getSession();</span>
+        SSLEngineResult engResult;
+<span class="nc" id="L284">        int remaining = 0;</span>
+
+<span class="nc bnc" id="L286" title="All 2 branches missed.">        while (_readBuffer.hasRemaining()) {</span>
+<span class="nc" id="L287">            remaining = _readBuffer.remaining();</span>
+<span class="nc" id="L288">            appBuf = ByteBuffer.allocate(sslSession.getApplicationBufferSize() + 40);</span>
+<span class="nc" id="L289">            engResult = _sslEngine.unwrap(_readBuffer, appBuf);</span>
+<span class="nc bnc" id="L290" title="All 4 branches missed.">            if (engResult.getHandshakeStatus() != HandshakeStatus.FINISHED &amp;&amp; engResult.getHandshakeStatus() != HandshakeStatus.NOT_HANDSHAKING &amp;&amp;</span>
+<span class="nc bnc" id="L291" title="All 2 branches missed.">                    engResult.getStatus() != SSLEngineResult.Status.OK) {</span>
+<span class="nc" id="L292">                throw new IOException(&quot;SSL: SSLEngine return bad result! &quot; + engResult);</span>
+            }
+<span class="nc bnc" id="L294" title="All 2 branches missed.">            if (remaining == _readBuffer.remaining()) {</span>
+<span class="nc" id="L295">                throw new IOException(&quot;SSL: Unable to unwrap received data! still remaining &quot; + remaining + &quot;bytes!&quot;);</span>
+            }
+
+<span class="nc" id="L298">            appBuf.flip();</span>
+<span class="nc bnc" id="L299" title="All 2 branches missed.">            if (_plaintextBuffer.remaining() &lt; appBuf.limit()) {</span>
+                // We need to expand _plaintextBuffer for more data
+<span class="nc" id="L301">                ByteBuffer newBuffer = ByteBuffer.allocate(_plaintextBuffer.capacity() + appBuf.limit() * 5);</span>
+<span class="nc" id="L302">                _plaintextBuffer.flip();</span>
+<span class="nc" id="L303">                newBuffer.put(_plaintextBuffer);</span>
+<span class="nc" id="L304">                _plaintextBuffer = newBuffer;</span>
+            }
+<span class="nc" id="L306">            _plaintextBuffer.put(appBuf);</span>
+<span class="nc bnc" id="L307" title="All 2 branches missed.">            if (s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L308">                s_logger.trace(&quot;Done with packet: &quot; + appBuf.limit());</span>
+            }
+        }
+
+<span class="nc" id="L312">        _readBuffer.clear();</span>
+<span class="nc" id="L313">        _readHeader = true;</span>
+
+<span class="nc bnc" id="L315" title="All 2 branches missed.">        if (!_gotFollowingPacket) {</span>
+<span class="nc" id="L316">            _plaintextBuffer.flip();</span>
+<span class="nc" id="L317">            byte[] result = new byte[_plaintextBuffer.limit()];</span>
+<span class="nc" id="L318">            _plaintextBuffer.get(result);</span>
+<span class="nc" id="L319">            return result;</span>
+        } else {
+<span class="nc bnc" id="L321" title="All 2 branches missed.">            if (s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L322">                s_logger.trace(&quot;Waiting for more packets&quot;);</span>
+            }
+<span class="nc" id="L324">            return null;</span>
+        }
+    }
+
+    public void send(byte[] data) throws ClosedChannelException {
+<span class="nc" id="L329">        send(data, false);</span>
+<span class="nc" id="L330">    }</span>
+
+    public void send(byte[] data, boolean close) throws ClosedChannelException {
+<span class="nc" id="L333">        send(new ByteBuffer[] {ByteBuffer.wrap(data)}, close);</span>
+<span class="nc" id="L334">    }</span>
+
+    public void send(ByteBuffer[] data, boolean close) throws ClosedChannelException {
+<span class="nc" id="L337">        ByteBuffer[] item = new ByteBuffer[data.length + 1];</span>
+<span class="nc" id="L338">        int remaining = 0;</span>
+<span class="nc bnc" id="L339" title="All 2 branches missed.">        for (int i = 0; i &lt; data.length; i++) {</span>
+<span class="nc" id="L340">            remaining += data[i].remaining();</span>
+<span class="nc" id="L341">            item[i + 1] = data[i];</span>
+        }
+
+<span class="nc" id="L344">        item[0] = ByteBuffer.allocate(4);</span>
+<span class="nc" id="L345">        item[0].putInt(remaining);</span>
+<span class="nc" id="L346">        item[0].flip();</span>
+
+<span class="nc bnc" id="L348" title="All 2 branches missed.">        if (s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L349">            s_logger.trace(&quot;Sending packet of length &quot; + remaining);</span>
+        }
+
+<span class="nc" id="L352">        _writeQueue.add(item);</span>
+<span class="nc bnc" id="L353" title="All 2 branches missed.">        if (close) {</span>
+<span class="nc" id="L354">            _writeQueue.add(new ByteBuffer[0]);</span>
+        }
+<span class="nc" id="L356">        synchronized (this) {</span>
+<span class="nc bnc" id="L357" title="All 2 branches missed.">            if (_key == null) {</span>
+<span class="nc" id="L358">                throw new ClosedChannelException();</span>
+            }
+<span class="nc" id="L360">            _connection.change(SelectionKey.OP_WRITE, _key, null);</span>
+        }
+<span class="nc" id="L362">    }</span>
+
+    public void send(ByteBuffer[] data) throws ClosedChannelException {
+<span class="nc" id="L365">        send(data, false);</span>
+<span class="nc" id="L366">    }</span>
+
+    public synchronized void close() {
+<span class="nc bnc" id="L369" title="All 2 branches missed.">        if (_key != null) {</span>
+<span class="nc" id="L370">            _connection.close(_key);</span>
+        }
+<span class="nc" id="L372">    }</span>
+
+    public boolean write(SocketChannel ch) throws IOException {
+<span class="nc" id="L375">        ByteBuffer[] data = null;</span>
+<span class="nc bnc" id="L376" title="All 2 branches missed.">        while ((data = _writeQueue.poll()) != null) {</span>
+<span class="nc bnc" id="L377" title="All 2 branches missed.">            if (data.length == 0) {</span>
+<span class="nc bnc" id="L378" title="All 2 branches missed.">                if (s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L379">                    s_logger.trace(&quot;Closing connection requested&quot;);</span>
+                }
+<span class="nc" id="L381">                return true;</span>
+            }
+
+<span class="nc" id="L384">            ByteBuffer[] raw_data = new ByteBuffer[data.length - 1];</span>
+<span class="nc" id="L385">            System.arraycopy(data, 1, raw_data, 0, data.length - 1);</span>
+
+<span class="nc" id="L387">            doWrite(ch, raw_data, _sslEngine);</span>
+        }
+<span class="nc" id="L389">        return false;</span>
+    }
+
+    public InetSocketAddress getSocketAddress() {
+<span class="nc" id="L393">        return _addr;</span>
+    }
+
+    public String getIpAddress() {
+<span class="nc" id="L397">        return _addr.getAddress().toString();</span>
+    }
+
+    public synchronized void terminated() {
+<span class="nc" id="L401">        _key = null;</span>
+<span class="nc" id="L402">    }</span>
+
+    public synchronized void schedule(Task task) throws ClosedChannelException {
+<span class="nc bnc" id="L405" title="All 2 branches missed.">        if (_key == null) {</span>
+<span class="nc" id="L406">            throw new ClosedChannelException();</span>
+        }
+<span class="nc" id="L408">        _connection.scheduleTask(task);</span>
+<span class="nc" id="L409">    }</span>
+
+    public static SSLContext initSSLContext(boolean isClient) throws GeneralSecurityException, IOException {
+        InputStream stream;
+<span class="nc" id="L413">        SSLContext sslContext = null;</span>
+<span class="nc" id="L414">        KeyManagerFactory kmf = KeyManagerFactory.getInstance(&quot;SunX509&quot;);</span>
+<span class="nc" id="L415">        TrustManagerFactory tmf = TrustManagerFactory.getInstance(&quot;SunX509&quot;);</span>
+<span class="nc" id="L416">        KeyStore ks = KeyStore.getInstance(&quot;JKS&quot;);</span>
+        TrustManager[] tms;
+
+<span class="nc" id="L419">        File confFile = PropertiesUtil.findConfigFile(&quot;db.properties&quot;);</span>
+<span class="nc bnc" id="L420" title="All 4 branches missed.">        if (null != confFile &amp;&amp; !isClient) {</span>
+<span class="nc" id="L421">            final String pass = DbProperties.getDbProperties().getProperty(&quot;db.cloud.keyStorePassphrase&quot;);</span>
+<span class="nc" id="L422">            char[] passphrase = &quot;vmops.com&quot;.toCharArray();</span>
+<span class="nc bnc" id="L423" title="All 2 branches missed.">            if (pass != null) {</span>
+<span class="nc" id="L424">                passphrase = pass.toCharArray();</span>
+            }
+<span class="nc" id="L426">            String confPath = confFile.getParent();</span>
+<span class="nc" id="L427">            String keystorePath = confPath + keystoreFile;</span>
+<span class="nc bnc" id="L428" title="All 2 branches missed.">            if (new File(keystorePath).exists()) {</span>
+<span class="nc" id="L429">                stream = new FileInputStream(keystorePath);</span>
+<span class="nc" id="L430">            } else {</span>
+<span class="nc" id="L431">                s_logger.warn(&quot;SSL: Fail to find the generated keystore. Loading fail-safe one to continue.&quot;);</span>
+<span class="nc" id="L432">                stream = NioConnection.class.getResourceAsStream(&quot;/cloud.keystore&quot;);</span>
+<span class="nc" id="L433">                passphrase = &quot;vmops.com&quot;.toCharArray();</span>
+            }
+<span class="nc" id="L435">            ks.load(stream, passphrase);</span>
+<span class="nc" id="L436">            stream.close();</span>
+<span class="nc" id="L437">            kmf.init(ks, passphrase);</span>
+<span class="nc" id="L438">            tmf.init(ks);</span>
+<span class="nc" id="L439">            tms = tmf.getTrustManagers();</span>
+<span class="nc" id="L440">        } else {</span>
+<span class="nc" id="L441">            ks.load(null, null);</span>
+<span class="nc" id="L442">            kmf.init(ks, null);</span>
+<span class="nc" id="L443">            tms = new TrustManager[1];</span>
+<span class="nc" id="L444">            tms[0] = new TrustAllManager();</span>
+        }
+
+<span class="nc" id="L447">        sslContext = SSLUtils.getSSLContext();</span>
+<span class="nc" id="L448">        sslContext.init(kmf.getKeyManagers(), tms, null);</span>
+<span class="nc bnc" id="L449" title="All 2 branches missed.">        if (s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L450">            s_logger.trace(&quot;SSL: SSLcontext has been initialized&quot;);</span>
+        }
+
+<span class="nc" id="L453">        return sslContext;</span>
+    }
+
+    public static void doHandshake(SocketChannel ch, SSLEngine sslEngine, boolean isClient) throws IOException {
+<span class="nc bnc" id="L457" title="All 2 branches missed.">        if (s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L458">            s_logger.trace(&quot;SSL: begin Handshake, isClient: &quot; + isClient);</span>
+        }
+
+        SSLEngineResult engResult;
+<span class="nc" id="L462">        SSLSession sslSession = sslEngine.getSession();</span>
+        HandshakeStatus hsStatus;
+<span class="nc" id="L464">        ByteBuffer in_pkgBuf = ByteBuffer.allocate(sslSession.getPacketBufferSize() + 40);</span>
+<span class="nc" id="L465">        ByteBuffer in_appBuf = ByteBuffer.allocate(sslSession.getApplicationBufferSize() + 40);</span>
+<span class="nc" id="L466">        ByteBuffer out_pkgBuf = ByteBuffer.allocate(sslSession.getPacketBufferSize() + 40);</span>
+<span class="nc" id="L467">        ByteBuffer out_appBuf = ByteBuffer.allocate(sslSession.getApplicationBufferSize() + 40);</span>
+        int count;
+<span class="nc" id="L469">        ch.socket().setSoTimeout(60 * 1000);</span>
+<span class="nc" id="L470">        InputStream inStream = ch.socket().getInputStream();</span>
+        // Use readCh to make sure the timeout on reading is working
+<span class="nc" id="L472">        ReadableByteChannel readCh = Channels.newChannel(inStream);</span>
+
+<span class="nc bnc" id="L474" title="All 2 branches missed.">        if (isClient) {</span>
+<span class="nc" id="L475">            hsStatus = SSLEngineResult.HandshakeStatus.NEED_WRAP;</span>
+<span class="nc" id="L476">        } else {</span>
+<span class="nc" id="L477">            hsStatus = SSLEngineResult.HandshakeStatus.NEED_UNWRAP;</span>
+        }
+
+<span class="nc bnc" id="L480" title="All 2 branches missed.">        while (hsStatus != SSLEngineResult.HandshakeStatus.FINISHED) {</span>
+<span class="nc bnc" id="L481" title="All 2 branches missed.">            if (s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L482">                s_logger.trace(&quot;SSL: Handshake status &quot; + hsStatus);</span>
+            }
+<span class="nc" id="L484">            engResult = null;</span>
+<span class="nc bnc" id="L485" title="All 2 branches missed.">            if (hsStatus == SSLEngineResult.HandshakeStatus.NEED_WRAP) {</span>
+<span class="nc" id="L486">                out_pkgBuf.clear();</span>
+<span class="nc" id="L487">                out_appBuf.clear();</span>
+<span class="nc" id="L488">                out_appBuf.put(&quot;Hello&quot;.getBytes());</span>
+<span class="nc" id="L489">                engResult = sslEngine.wrap(out_appBuf, out_pkgBuf);</span>
+<span class="nc" id="L490">                out_pkgBuf.flip();</span>
+<span class="nc" id="L491">                int remain = out_pkgBuf.limit();</span>
+<span class="nc bnc" id="L492" title="All 2 branches missed.">                while (remain != 0) {</span>
+<span class="nc" id="L493">                    remain -= ch.write(out_pkgBuf);</span>
+<span class="nc bnc" id="L494" title="All 2 branches missed.">                    if (remain &lt; 0) {</span>
+<span class="nc" id="L495">                        throw new IOException(&quot;Too much bytes sent?&quot;);</span>
+                    }
+                }
+<span class="nc bnc" id="L498" title="All 2 branches missed.">            } else if (hsStatus == SSLEngineResult.HandshakeStatus.NEED_UNWRAP) {</span>
+<span class="nc" id="L499">                in_appBuf.clear();</span>
+                // One packet may contained multiply operation
+<span class="nc bnc" id="L501" title="All 4 branches missed.">                if (in_pkgBuf.position() == 0 || !in_pkgBuf.hasRemaining()) {</span>
+<span class="nc" id="L502">                    in_pkgBuf.clear();</span>
+<span class="nc" id="L503">                    count = 0;</span>
+                    try {
+<span class="nc" id="L505">                        count = readCh.read(in_pkgBuf);</span>
+<span class="nc" id="L506">                    } catch (SocketTimeoutException ex) {</span>
+<span class="nc bnc" id="L507" title="All 2 branches missed.">                        if (s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L508">                            s_logger.trace(&quot;Handshake reading time out! Cut the connection&quot;);</span>
+                        }
+<span class="nc" id="L510">                        count = -1;</span>
+                    }
+<span class="nc bnc" id="L512" title="All 2 branches missed.">                    if (count == -1) {</span>
+<span class="nc" id="L513">                        throw new IOException(&quot;Connection closed with -1 on reading size.&quot;);</span>
+                    }
+<span class="nc" id="L515">                    in_pkgBuf.flip();</span>
+                }
+<span class="nc" id="L517">                engResult = sslEngine.unwrap(in_pkgBuf, in_appBuf);</span>
+<span class="nc" id="L518">                ByteBuffer tmp_pkgBuf = ByteBuffer.allocate(sslSession.getPacketBufferSize() + 40);</span>
+<span class="nc" id="L519">                int loop_count = 0;</span>
+<span class="nc bnc" id="L520" title="All 2 branches missed.">                while (engResult.getStatus() == SSLEngineResult.Status.BUFFER_UNDERFLOW) {</span>
+                    // The client is too slow? Cut it and let it reconnect
+<span class="nc bnc" id="L522" title="All 2 branches missed.">                    if (loop_count &gt; 10) {</span>
+<span class="nc" id="L523">                        throw new IOException(&quot;Too many times in SSL BUFFER_UNDERFLOW, disconnect guest.&quot;);</span>
+                    }
+                    // We need more packets to complete this operation
+<span class="nc bnc" id="L526" title="All 2 branches missed.">                    if (s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L527">                        s_logger.trace(&quot;SSL: Buffer underflowed, getting more packets&quot;);</span>
+                    }
+<span class="nc" id="L529">                    tmp_pkgBuf.clear();</span>
+<span class="nc" id="L530">                    count = ch.read(tmp_pkgBuf);</span>
+<span class="nc bnc" id="L531" title="All 2 branches missed.">                    if (count == -1) {</span>
+<span class="nc" id="L532">                        throw new IOException(&quot;Connection closed with -1 on reading size.&quot;);</span>
+                    }
+<span class="nc" id="L534">                    tmp_pkgBuf.flip();</span>
+
+<span class="nc" id="L536">                    in_pkgBuf.mark();</span>
+<span class="nc" id="L537">                    in_pkgBuf.position(in_pkgBuf.limit());</span>
+<span class="nc" id="L538">                    in_pkgBuf.limit(in_pkgBuf.limit() + tmp_pkgBuf.limit());</span>
+<span class="nc" id="L539">                    in_pkgBuf.put(tmp_pkgBuf);</span>
+<span class="nc" id="L540">                    in_pkgBuf.reset();</span>
+
+<span class="nc" id="L542">                    in_appBuf.clear();</span>
+<span class="nc" id="L543">                    engResult = sslEngine.unwrap(in_pkgBuf, in_appBuf);</span>
+<span class="nc" id="L544">                    loop_count++;</span>
+                }
+<span class="nc bnc" id="L546" title="All 2 branches missed.">            } else if (hsStatus == SSLEngineResult.HandshakeStatus.NEED_TASK) {</span>
+                Runnable run;
+<span class="nc bnc" id="L548" title="All 2 branches missed.">                while ((run = sslEngine.getDelegatedTask()) != null) {</span>
+<span class="nc bnc" id="L549" title="All 2 branches missed.">                    if (s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L550">                        s_logger.trace(&quot;SSL: Running delegated task!&quot;);</span>
+                    }
+<span class="nc" id="L552">                    run.run();</span>
+                }
+<span class="nc bnc" id="L554" title="All 2 branches missed.">            } else if (hsStatus == SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING) {</span>
+<span class="nc" id="L555">                throw new IOException(&quot;NOT a handshaking!&quot;);</span>
+            }
+<span class="nc bnc" id="L557" title="All 4 branches missed.">            if (engResult != null &amp;&amp; engResult.getStatus() != SSLEngineResult.Status.OK) {</span>
+<span class="nc" id="L558">                throw new IOException(&quot;Fail to handshake! &quot; + engResult.getStatus());</span>
+            }
+<span class="nc bnc" id="L560" title="All 2 branches missed.">            if (engResult != null)</span>
+<span class="nc" id="L561">                hsStatus = engResult.getHandshakeStatus();</span>
+            else
+<span class="nc" id="L563">                hsStatus = sslEngine.getHandshakeStatus();</span>
+        }
+<span class="nc" id="L565">    }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>cloud-core (18-mrt-2016 13:14:54)</div></body></html>

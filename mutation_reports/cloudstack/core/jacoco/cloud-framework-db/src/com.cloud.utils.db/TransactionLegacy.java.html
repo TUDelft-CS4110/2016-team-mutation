@@ -1,0 +1,1199 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>TransactionLegacy.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">cloud-core (18-mrt-2016 13:14:54)</a> &gt; <a href="../../index.html" class="el_group">cloud-framework-db</a> &gt; <a href="../index.html" class="el_bundle">src</a> &gt; <a href="index.source.html" class="el_package">com.cloud.utils.db</a> &gt; <span class="el_source">TransactionLegacy.java</span></div><h1>TransactionLegacy.java</h1><pre class="source lang-java linenums">// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// &quot;License&quot;); you may not use this file except in compliance
+// the License.  You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+package com.cloud.utils.db;
+
+import java.io.Closeable;
+import java.io.File;
+import java.io.IOException;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Savepoint;
+import java.sql.Statement;
+import java.util.Iterator;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Properties;
+import java.util.concurrent.atomic.AtomicLong;
+
+import javax.sql.DataSource;
+
+import org.apache.commons.dbcp.ConnectionFactory;
+import org.apache.commons.dbcp.DriverManagerConnectionFactory;
+import org.apache.commons.dbcp.PoolableConnectionFactory;
+import org.apache.commons.dbcp.PoolingDataSource;
+import org.apache.commons.pool.KeyedObjectPoolFactory;
+import org.apache.commons.pool.impl.GenericObjectPool;
+import org.apache.commons.pool.impl.StackKeyedObjectPoolFactory;
+import org.apache.log4j.Logger;
+
+import com.cloud.utils.Pair;
+import com.cloud.utils.PropertiesUtil;
+import com.cloud.utils.exception.CloudRuntimeException;
+import com.cloud.utils.mgmt.JmxUtil;
+
+/**
+ * Transaction abstracts away the Connection object in JDBC.  It allows the
+ * following things that the Connection object does not.
+ *
+ *   1. Transaction can be started at an entry point and whether the DB
+ *      actions should be auto-commit or not determined at that point.
+ *   2. DB Connection is allocated only when it is needed.
+ *   3. Code does not need to know if a transaction has been started or not.
+ *      It just starts/ends a transaction and we resolve it correctly with
+ *      the previous actions.
+ *
+ * Note that this class is not synchronous but it doesn't need to be because
+ * it is stored with TLS and is one per thread.  Use appropriately.
+ */
+<span class="nc bnc" id="L64" title="All 2 branches missed.">public class TransactionLegacy implements Closeable {</span>
+<span class="nc" id="L65">    private static final Logger s_logger = Logger.getLogger(Transaction.class.getName() + &quot;.&quot; + &quot;Transaction&quot;);</span>
+<span class="nc" id="L66">    private static final Logger s_stmtLogger = Logger.getLogger(Transaction.class.getName() + &quot;.&quot; + &quot;Statement&quot;);</span>
+<span class="nc" id="L67">    private static final Logger s_lockLogger = Logger.getLogger(Transaction.class.getName() + &quot;.&quot; + &quot;Lock&quot;);</span>
+<span class="nc" id="L68">    private static final Logger s_connLogger = Logger.getLogger(Transaction.class.getName() + &quot;.&quot; + &quot;Connection&quot;);</span>
+
+<span class="nc" id="L70">    private static final ThreadLocal&lt;TransactionLegacy&gt; tls = new ThreadLocal&lt;TransactionLegacy&gt;();</span>
+    private static final String START_TXN = &quot;start_txn&quot;;
+    private static final String CURRENT_TXN = &quot;current_txn&quot;;
+    private static final String CREATE_TXN = &quot;create_txn&quot;;
+    private static final String CREATE_CONN = &quot;create_conn&quot;;
+    private static final String STATEMENT = &quot;statement&quot;;
+    private static final String ATTACHMENT = &quot;attachment&quot;;
+
+    public static final short CLOUD_DB = 0;
+    public static final short USAGE_DB = 1;
+    public static final short SIMULATOR_DB = 3;
+
+    public static final short CONNECTED_DB = -1;
+
+<span class="nc" id="L84">    private static AtomicLong s_id = new AtomicLong();</span>
+<span class="nc" id="L85">    private static final TransactionMBeanImpl s_mbean = new TransactionMBeanImpl();</span>
+    static {
+        try {
+<span class="nc" id="L88">            JmxUtil.registerMBean(&quot;Transaction&quot;, &quot;Transaction&quot;, s_mbean);</span>
+<span class="nc" id="L89">        } catch (Exception e) {</span>
+<span class="nc" id="L90">            s_logger.error(&quot;Unable to register mbean for transaction&quot;, e);</span>
+        }
+    }
+
+    private final LinkedList&lt;StackElement&gt; _stack;
+    private long _id;
+
+<span class="nc" id="L97">    private final LinkedList&lt;Pair&lt;String, Long&gt;&gt; _lockTimes = new LinkedList&lt;Pair&lt;String, Long&gt;&gt;();</span>
+
+    private String _name;
+    private Connection _conn;
+    private boolean _txn;
+    private short _dbId;
+    private long _txnTime;
+    private Statement _stmt;
+    private String _creator;
+
+    public static TransactionLegacy currentTxn() {
+<span class="nc" id="L108">        return currentTxn(true);</span>
+    }
+
+    protected static TransactionLegacy currentTxn(boolean check) {
+<span class="nc" id="L112">        TransactionLegacy txn = tls.get();</span>
+<span class="nc bnc" id="L113" title="All 2 branches missed.">        if (check) {</span>
+<span class="nc bnc" id="L114" title="All 4 branches missed.">            assert txn != null : &quot;No Transaction on stack.  Did you mark the method with @DB?&quot;;</span>
+        }
+<span class="nc" id="L116">        return txn;</span>
+    }
+
+    public static TransactionLegacy open(final short databaseId) {
+<span class="nc" id="L120">        String name = buildName();</span>
+<span class="nc bnc" id="L121" title="All 2 branches missed.">        if (name == null) {</span>
+<span class="nc" id="L122">            name = CURRENT_TXN;</span>
+        }
+<span class="nc" id="L124">        return open(name, databaseId, true);</span>
+    }
+
+    //
+    // Usage of this transaction setup should be limited, it will always open a new transaction context regardless of whether or not there is other
+    // transaction context in the stack. It is used in special use cases that we want to control DB connection explicitly and in the mean time utilize
+    // the existing DAO features
+    //
+    public void transitToUserManagedConnection(Connection conn) {
+<span class="nc bnc" id="L133" title="All 2 branches missed.">        if (_conn != null)</span>
+<span class="nc" id="L134">            throw new IllegalStateException(&quot;Can't change to a user managed connection unless the db connection is null&quot;);</span>
+
+<span class="nc" id="L136">        _conn = conn;</span>
+<span class="nc" id="L137">        _dbId = CONNECTED_DB;</span>
+<span class="nc" id="L138">    }</span>
+
+    public void transitToAutoManagedConnection(short dbId) {
+        // assert(_stack.size() &lt;= 1) : &quot;Can't change to auto managed connection unless your stack is empty&quot;;
+<span class="nc" id="L142">        _dbId = dbId;</span>
+<span class="nc" id="L143">        _conn = null;</span>
+<span class="nc" id="L144">    }</span>
+
+    public static TransactionLegacy open(final String name) {
+<span class="nc" id="L147">        return open(name, TransactionLegacy.CLOUD_DB, false);</span>
+    }
+
+    public static TransactionLegacy open(final String name, final short databaseId, final boolean forceDbChange) {
+<span class="nc" id="L151">        TransactionLegacy txn = tls.get();</span>
+<span class="nc" id="L152">        boolean isNew = false;</span>
+<span class="nc bnc" id="L153" title="All 2 branches missed.">        if (txn == null) {</span>
+<span class="nc bnc" id="L154" title="All 2 branches missed.">            if (s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L155">                s_logger.trace(&quot;Creating the transaction: &quot; + name);</span>
+            }
+<span class="nc" id="L157">            txn = new TransactionLegacy(name, false, databaseId);</span>
+<span class="nc" id="L158">            tls.set(txn);</span>
+<span class="nc" id="L159">            isNew = true;</span>
+<span class="nc bnc" id="L160" title="All 2 branches missed.">        } else if (forceDbChange) {</span>
+<span class="nc" id="L161">            final short currentDbId = txn.getDatabaseId();</span>
+<span class="nc bnc" id="L162" title="All 2 branches missed.">            if (currentDbId != databaseId) {</span>
+                // we need to end the current transaction and switch databases
+<span class="nc" id="L164">                txn.close(txn.getName());</span>
+
+<span class="nc" id="L166">                txn = new TransactionLegacy(name, false, databaseId);</span>
+<span class="nc" id="L167">                tls.set(txn);</span>
+<span class="nc" id="L168">                isNew = true;</span>
+            }
+        }
+
+<span class="nc" id="L172">        txn.takeOver(name, false);</span>
+<span class="nc bnc" id="L173" title="All 2 branches missed.">        if (isNew) {</span>
+<span class="nc" id="L174">            s_mbean.addTransaction(txn);</span>
+        }
+<span class="nc" id="L176">        return txn;</span>
+    }
+
+    protected StackElement peekInStack(Object obj) {
+<span class="nc" id="L180">        final Iterator&lt;StackElement&gt; it = _stack.iterator();</span>
+<span class="nc bnc" id="L181" title="All 2 branches missed.">        while (it.hasNext()) {</span>
+<span class="nc" id="L182">            StackElement next = it.next();</span>
+<span class="nc bnc" id="L183" title="All 2 branches missed.">            if (next.type == obj) {</span>
+<span class="nc" id="L184">                return next;</span>
+            }
+        }
+<span class="nc" id="L187">        return null;</span>
+    }
+
+    public void registerLock(String sql) {
+<span class="nc bnc" id="L191" title="All 4 branches missed.">        if (_txn &amp;&amp; s_lockLogger.isDebugEnabled()) {</span>
+<span class="nc" id="L192">            Pair&lt;String, Long&gt; time = new Pair&lt;String, Long&gt;(sql, System.currentTimeMillis());</span>
+<span class="nc" id="L193">            _lockTimes.add(time);</span>
+        }
+<span class="nc" id="L195">    }</span>
+
+    public boolean dbTxnStarted() {
+<span class="nc" id="L198">        return _txn;</span>
+    }
+
+    public static Connection getStandaloneConnectionWithException() throws SQLException {
+<span class="nc" id="L202">        Connection conn = s_ds.getConnection();</span>
+<span class="nc bnc" id="L203" title="All 2 branches missed.">        if (s_connLogger.isTraceEnabled()) {</span>
+<span class="nc" id="L204">            s_connLogger.trace(&quot;Retrieving a standalone connection: dbconn&quot; + System.identityHashCode(conn));</span>
+        }
+<span class="nc" id="L206">        return conn;</span>
+    }
+
+    public static Connection getStandaloneConnection() {
+        try {
+<span class="nc" id="L211">            return getStandaloneConnectionWithException();</span>
+<span class="nc" id="L212">        } catch (SQLException e) {</span>
+<span class="nc" id="L213">            s_logger.error(&quot;Unexpected exception: &quot;, e);</span>
+<span class="nc" id="L214">            return null;</span>
+        }
+    }
+
+    public static Connection getStandaloneUsageConnection() {
+        try {
+<span class="nc" id="L220">            Connection conn = s_usageDS.getConnection();</span>
+<span class="nc bnc" id="L221" title="All 2 branches missed.">            if (s_connLogger.isTraceEnabled()) {</span>
+<span class="nc" id="L222">                s_connLogger.trace(&quot;Retrieving a standalone connection for usage: dbconn&quot; + System.identityHashCode(conn));</span>
+            }
+<span class="nc" id="L224">            return conn;</span>
+<span class="nc" id="L225">        } catch (SQLException e) {</span>
+<span class="nc" id="L226">            s_logger.warn(&quot;Unexpected exception: &quot;, e);</span>
+<span class="nc" id="L227">            return null;</span>
+        }
+    }
+
+    public static Connection getStandaloneSimulatorConnection() {
+        try {
+<span class="nc" id="L233">            Connection conn = s_simulatorDS.getConnection();</span>
+<span class="nc bnc" id="L234" title="All 2 branches missed.">            if (s_connLogger.isTraceEnabled()) {</span>
+<span class="nc" id="L235">                s_connLogger.trace(&quot;Retrieving a standalone connection for simulator: dbconn&quot; + System.identityHashCode(conn));</span>
+            }
+<span class="nc" id="L237">            return conn;</span>
+<span class="nc" id="L238">        } catch (SQLException e) {</span>
+<span class="nc" id="L239">            s_logger.warn(&quot;Unexpected exception: &quot;, e);</span>
+<span class="nc" id="L240">            return null;</span>
+        }
+    }
+
+    protected void attach(TransactionAttachment value) {
+<span class="nc" id="L245">        _stack.push(new StackElement(ATTACHMENT, value));</span>
+<span class="nc" id="L246">    }</span>
+
+    protected TransactionAttachment detach(String name) {
+<span class="nc" id="L249">        Iterator&lt;StackElement&gt; it = _stack.descendingIterator();</span>
+<span class="nc bnc" id="L250" title="All 2 branches missed.">        while (it.hasNext()) {</span>
+<span class="nc" id="L251">            StackElement element = it.next();</span>
+<span class="nc bnc" id="L252" title="All 2 branches missed.">            if (element.type == ATTACHMENT) {</span>
+<span class="nc" id="L253">                TransactionAttachment att = (TransactionAttachment)element.ref;</span>
+<span class="nc bnc" id="L254" title="All 2 branches missed.">                if (name.equals(att.getName())) {</span>
+<span class="nc" id="L255">                    it.remove();</span>
+<span class="nc" id="L256">                    return att;</span>
+                }
+            }
+        }
+<span class="nc bnc" id="L260" title="All 2 branches missed.">        assert false : &quot;Are you sure you attached this: &quot; + name;</span>
+<span class="nc" id="L261">        return null;</span>
+    }
+
+    public static void attachToTxn(TransactionAttachment value) {
+<span class="nc" id="L265">        TransactionLegacy txn = tls.get();</span>
+<span class="nc bnc" id="L266" title="All 6 branches missed.">        assert txn != null &amp;&amp; txn.peekInStack(CURRENT_TXN) != null : &quot;Come on....how can we attach something to the transaction if you haven't started it?&quot;;</span>
+
+<span class="nc" id="L268">        txn.attach(value);</span>
+<span class="nc" id="L269">    }</span>
+
+    public static TransactionAttachment detachFromTxn(String name) {
+<span class="nc" id="L272">        TransactionLegacy txn = tls.get();</span>
+<span class="nc bnc" id="L273" title="All 4 branches missed.">        assert txn != null : &quot;No Transaction in TLS&quot;;</span>
+<span class="nc" id="L274">        return txn.detach(name);</span>
+    }
+
+    protected static boolean checkAnnotation(int stack, TransactionLegacy txn) {
+<span class="nc" id="L278">        final StackTraceElement[] stacks = Thread.currentThread().getStackTrace();</span>
+<span class="nc" id="L279">        StackElement se = txn.peekInStack(CURRENT_TXN);</span>
+<span class="nc bnc" id="L280" title="All 2 branches missed.">        if (se == null) {</span>
+<span class="nc" id="L281">            return false;</span>
+        }
+
+<span class="nc" id="L284">        StringBuffer sb = new StringBuffer();</span>
+<span class="nc bnc" id="L285" title="All 2 branches missed.">        for (; stack &lt; stacks.length; stack++) {</span>
+<span class="nc" id="L286">            String methodName = stacks[stack].getMethodName();</span>
+<span class="nc" id="L287">            sb.append(&quot; &quot;).append(methodName);</span>
+<span class="nc bnc" id="L288" title="All 2 branches missed.">            if (methodName.equals(se.ref)) {</span>
+<span class="nc" id="L289">                return true;</span>
+            }
+        }
+
+        // relax stack structure for several places that @DB required injection is not in place
+<span class="nc" id="L294">        s_logger.warn(&quot;Non-standard stack context that Transaction context is manaully placed into the calling chain. Stack chain: &quot; + sb);</span>
+<span class="nc" id="L295">        return true;</span>
+    }
+
+    protected static String buildName() {
+<span class="nc bnc" id="L299" title="All 2 branches missed.">        if (s_logger.isDebugEnabled()) {</span>
+<span class="nc" id="L300">            final StackTraceElement[] stacks = Thread.currentThread().getStackTrace();</span>
+<span class="nc" id="L301">            final StringBuilder str = new StringBuilder();</span>
+<span class="nc" id="L302">            int i = 3, j = 3;</span>
+<span class="nc bnc" id="L303" title="All 4 branches missed.">            while (j &lt; 15 &amp;&amp; i &lt; stacks.length) {</span>
+<span class="nc" id="L304">                StackTraceElement element = stacks[i];</span>
+<span class="nc" id="L305">                String filename = element.getFileName();</span>
+<span class="nc" id="L306">                String method = element.getMethodName();</span>
+<span class="nc bnc" id="L307" title="All 8 branches missed.">                if ((filename != null &amp;&amp; filename.equals(&quot;&lt;generated&gt;&quot;)) || (method != null &amp;&amp; method.equals(&quot;invokeSuper&quot;))) {</span>
+<span class="nc" id="L308">                    i++;</span>
+<span class="nc" id="L309">                    continue;</span>
+                }
+
+<span class="nc" id="L312">                str.append(&quot;-&quot;)</span>
+<span class="nc" id="L313">                .append(stacks[i].getClassName().substring(stacks[i].getClassName().lastIndexOf(&quot;.&quot;) + 1))</span>
+<span class="nc" id="L314">                .append(&quot;.&quot;)</span>
+<span class="nc" id="L315">                .append(stacks[i].getMethodName())</span>
+<span class="nc" id="L316">                .append(&quot;:&quot;)</span>
+<span class="nc" id="L317">                .append(stacks[i].getLineNumber());</span>
+<span class="nc" id="L318">                j++;</span>
+<span class="nc" id="L319">                i++;</span>
+            }
+<span class="nc" id="L321">            return str.toString();</span>
+        }
+
+<span class="nc" id="L324">        return &quot;&quot;;</span>
+    }
+
+<span class="nc" id="L327">    private TransactionLegacy(final String name, final boolean forLocking, final short databaseId) {</span>
+<span class="nc" id="L328">        _name = name;</span>
+<span class="nc" id="L329">        _conn = null;</span>
+<span class="nc" id="L330">        _stack = new LinkedList&lt;StackElement&gt;();</span>
+<span class="nc" id="L331">        _txn = false;</span>
+<span class="nc" id="L332">        _dbId = databaseId;</span>
+<span class="nc" id="L333">        _id = s_id.incrementAndGet();</span>
+<span class="nc" id="L334">        _creator = Thread.currentThread().getName();</span>
+<span class="nc" id="L335">    }</span>
+
+    public String getCreator() {
+<span class="nc" id="L338">        return _creator;</span>
+    }
+
+    public long getId() {
+<span class="nc" id="L342">        return _id;</span>
+    }
+
+    public String getName() {
+<span class="nc" id="L346">        return _name;</span>
+    }
+
+    public Short getDatabaseId() {
+<span class="nc" id="L350">        return _dbId;</span>
+    }
+
+    @Override
+    public String toString() {
+<span class="nc bnc" id="L355" title="All 2 branches missed.">        final StringBuilder str = new StringBuilder((_name != null ? _name : &quot;&quot;));</span>
+<span class="nc" id="L356">        str.append(&quot; : &quot;);</span>
+<span class="nc bnc" id="L357" title="All 2 branches missed.">        for (final StackElement se : _stack) {</span>
+<span class="nc bnc" id="L358" title="All 2 branches missed.">            if (se.type == CURRENT_TXN) {</span>
+<span class="nc" id="L359">                str.append(se.ref).append(&quot;, &quot;);</span>
+            }
+        }
+
+<span class="nc" id="L363">        return str.toString();</span>
+    }
+
+    protected void mark(final String name) {
+<span class="nc" id="L367">        _stack.push(new StackElement(CURRENT_TXN, name));</span>
+<span class="nc" id="L368">    }</span>
+
+    public boolean lock(final String name, final int timeoutSeconds) {
+<span class="nc" id="L371">        Merovingian2 lockMaster = Merovingian2.getLockMaster();</span>
+<span class="nc bnc" id="L372" title="All 2 branches missed.">        if (lockMaster == null) {</span>
+<span class="nc" id="L373">            throw new CloudRuntimeException(&quot;There's no support for locking yet&quot;);</span>
+        }
+<span class="nc" id="L375">        return lockMaster.acquire(name, timeoutSeconds);</span>
+    }
+
+    public boolean release(final String name) {
+<span class="nc" id="L379">        Merovingian2 lockMaster = Merovingian2.getLockMaster();</span>
+<span class="nc bnc" id="L380" title="All 2 branches missed.">        if (lockMaster == null) {</span>
+<span class="nc" id="L381">            throw new CloudRuntimeException(&quot;There's no support for locking yet&quot;);</span>
+        }
+<span class="nc" id="L383">        return lockMaster.release(name);</span>
+    }
+
+    /**
+     * @deprecated Use {@link Transaction} for new code
+     */
+    @Deprecated
+    public void start() {
+<span class="nc bnc" id="L391" title="All 2 branches missed.">        if (s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L392">            s_logger.trace(&quot;txn: start requested by: &quot; + buildName());</span>
+        }
+
+<span class="nc" id="L395">        _stack.push(new StackElement(START_TXN, null));</span>
+
+<span class="nc bnc" id="L397" title="All 2 branches missed.">        if (_txn) {</span>
+<span class="nc" id="L398">            s_logger.trace(&quot;txn: has already been started.&quot;);</span>
+<span class="nc" id="L399">            return;</span>
+        }
+
+<span class="nc" id="L402">        _txn = true;</span>
+
+<span class="nc" id="L404">        _txnTime = System.currentTimeMillis();</span>
+<span class="nc bnc" id="L405" title="All 2 branches missed.">        if (_conn != null) {</span>
+            try {
+<span class="nc" id="L407">                s_logger.trace(&quot;txn: set auto commit to false&quot;);</span>
+<span class="nc" id="L408">                _conn.setAutoCommit(false);</span>
+<span class="nc" id="L409">            } catch (final SQLException e) {</span>
+<span class="nc" id="L410">                s_logger.warn(&quot;Unable to set auto commit: &quot;, e);</span>
+<span class="nc" id="L411">                throw new CloudRuntimeException(&quot;Unable to set auto commit: &quot;, e);</span>
+            }
+        }
+<span class="nc" id="L414">    }</span>
+
+    protected void closePreviousStatement() {
+<span class="nc bnc" id="L417" title="All 2 branches missed.">        if (_stmt != null) {</span>
+            try {
+<span class="nc bnc" id="L419" title="All 2 branches missed.">                if (s_stmtLogger.isTraceEnabled()) {</span>
+<span class="nc" id="L420">                    s_stmtLogger.trace(&quot;Closing: &quot; + _stmt.toString());</span>
+                }
+                try {
+<span class="nc" id="L423">                    ResultSet rs = _stmt.getResultSet();</span>
+<span class="nc bnc" id="L424" title="All 4 branches missed.">                    if (rs != null &amp;&amp; _stmt.getResultSetHoldability() != ResultSet.HOLD_CURSORS_OVER_COMMIT) {</span>
+<span class="nc" id="L425">                        rs.close();</span>
+                    }
+<span class="nc" id="L427">                } catch (SQLException e) {</span>
+<span class="nc" id="L428">                    s_stmtLogger.trace(&quot;Unable to close resultset&quot;);</span>
+                }
+<span class="nc" id="L430">                _stmt.close();</span>
+<span class="nc" id="L431">            } catch (final SQLException e) {</span>
+<span class="nc" id="L432">                s_stmtLogger.trace(&quot;Unable to close statement: &quot; + _stmt.toString());</span>
+<span class="nc" id="L433">            } finally {</span>
+<span class="nc" id="L434">                _stmt = null;</span>
+<span class="nc" id="L435">            }</span>
+        }
+<span class="nc" id="L437">    }</span>
+
+    /**
+     * Prepares an auto close statement.  The statement is closed automatically if it is
+     * retrieved with this method.
+     *
+     * @param sql sql String
+     * @return PreparedStatement
+     * @throws SQLException if problem with JDBC layer.
+     *
+     * @see java.sql.Connection
+     */
+    public PreparedStatement prepareAutoCloseStatement(final String sql) throws SQLException {
+<span class="nc" id="L450">        PreparedStatement stmt = prepareStatement(sql);</span>
+<span class="nc" id="L451">        closePreviousStatement();</span>
+<span class="nc" id="L452">        _stmt = stmt;</span>
+<span class="nc" id="L453">        return stmt;</span>
+    }
+
+    public PreparedStatement prepareStatement(final String sql) throws SQLException {
+<span class="nc" id="L457">        final Connection conn = getConnection();</span>
+<span class="nc" id="L458">        final PreparedStatement pstmt = conn.prepareStatement(sql);</span>
+<span class="nc bnc" id="L459" title="All 2 branches missed.">        if (s_stmtLogger.isTraceEnabled()) {</span>
+<span class="nc" id="L460">            s_stmtLogger.trace(&quot;Preparing: &quot; + sql);</span>
+        }
+<span class="nc" id="L462">        return pstmt;</span>
+    }
+
+    /**
+     * Prepares an auto close statement.  The statement is closed automatically if it is
+     * retrieved with this method.
+     *
+     * @param sql sql String
+     * @param autoGeneratedKeys keys that are generated
+     * @return PreparedStatement
+     * @throws SQLException if problem with JDBC layer.
+     *
+     * @see java.sql.Connection
+     */
+    public PreparedStatement prepareAutoCloseStatement(final String sql, final int autoGeneratedKeys) throws SQLException {
+<span class="nc" id="L477">        final Connection conn = getConnection();</span>
+<span class="nc" id="L478">        final PreparedStatement pstmt = conn.prepareStatement(sql, autoGeneratedKeys);</span>
+<span class="nc bnc" id="L479" title="All 2 branches missed.">        if (s_stmtLogger.isTraceEnabled()) {</span>
+<span class="nc" id="L480">            s_stmtLogger.trace(&quot;Preparing: &quot; + sql);</span>
+        }
+<span class="nc" id="L482">        closePreviousStatement();</span>
+<span class="nc" id="L483">        _stmt = pstmt;</span>
+<span class="nc" id="L484">        return pstmt;</span>
+    }
+
+    /**
+     * Prepares an auto close statement.  The statement is closed automatically if it is
+     * retrieved with this method.
+     *
+     * @param sql sql String
+     * @param columnNames names of the columns
+     * @return PreparedStatement
+     * @throws SQLException if problem with JDBC layer.
+     *
+     * @see java.sql.Connection
+     */
+    public PreparedStatement prepareAutoCloseStatement(final String sql, final String[] columnNames) throws SQLException {
+<span class="nc" id="L499">        final Connection conn = getConnection();</span>
+<span class="nc" id="L500">        final PreparedStatement pstmt = conn.prepareStatement(sql, columnNames);</span>
+<span class="nc bnc" id="L501" title="All 2 branches missed.">        if (s_stmtLogger.isTraceEnabled()) {</span>
+<span class="nc" id="L502">            s_stmtLogger.trace(&quot;Preparing: &quot; + sql);</span>
+        }
+<span class="nc" id="L504">        closePreviousStatement();</span>
+<span class="nc" id="L505">        _stmt = pstmt;</span>
+<span class="nc" id="L506">        return pstmt;</span>
+    }
+
+    /**
+     * Prepares an auto close statement.  The statement is closed automatically if it is
+     * retrieved with this method.
+     *
+     * @param sql sql String
+     * @return PreparedStatement
+     * @throws SQLException if problem with JDBC layer.
+     *
+     * @see java.sql.Connection
+     */
+    public PreparedStatement prepareAutoCloseStatement(String sql, int resultSetType, int resultSetConcurrency, int resultSetHoldability) throws SQLException {
+<span class="nc" id="L520">        final Connection conn = getConnection();</span>
+<span class="nc" id="L521">        final PreparedStatement pstmt = conn.prepareStatement(sql, resultSetType, resultSetConcurrency, resultSetHoldability);</span>
+<span class="nc bnc" id="L522" title="All 2 branches missed.">        if (s_stmtLogger.isTraceEnabled()) {</span>
+<span class="nc" id="L523">            s_stmtLogger.trace(&quot;Preparing: &quot; + sql);</span>
+        }
+<span class="nc" id="L525">        closePreviousStatement();</span>
+<span class="nc" id="L526">        _stmt = pstmt;</span>
+<span class="nc" id="L527">        return pstmt;</span>
+    }
+
+    /**
+     * Returns the db connection.
+     *
+     * Note: that you can call getConnection() but beaware that
+     * all prepare statements from the Connection are not garbage
+     * collected!
+     *
+     * @return DB Connection but make sure you understand that
+     *         you are responsible for closing the PreparedStatement.
+     * @throws SQLException
+     */
+    public Connection getConnection() throws SQLException {
+<span class="nc bnc" id="L542" title="All 2 branches missed.">        if (_conn == null) {</span>
+<span class="nc bnc" id="L543" title="All 4 branches missed.">            switch (_dbId) {</span>
+            case CLOUD_DB:
+<span class="nc bnc" id="L545" title="All 2 branches missed.">                if (s_ds != null) {</span>
+<span class="nc" id="L546">                    _conn = s_ds.getConnection();</span>
+<span class="nc" id="L547">                } else {</span>
+<span class="nc" id="L548">                    s_logger.warn(&quot;A static-initialized variable becomes null, process is dying?&quot;);</span>
+<span class="nc" id="L549">                    throw new CloudRuntimeException(&quot;Database is not initialized, process is dying?&quot;);</span>
+                }
+                break;
+            case USAGE_DB:
+<span class="nc bnc" id="L553" title="All 2 branches missed.">                if (s_usageDS != null) {</span>
+<span class="nc" id="L554">                    _conn = s_usageDS.getConnection();</span>
+<span class="nc" id="L555">                } else {</span>
+<span class="nc" id="L556">                    s_logger.warn(&quot;A static-initialized variable becomes null, process is dying?&quot;);</span>
+<span class="nc" id="L557">                    throw new CloudRuntimeException(&quot;Database is not initialized, process is dying?&quot;);</span>
+                }
+                break;
+            case SIMULATOR_DB:
+<span class="nc bnc" id="L561" title="All 2 branches missed.">                if (s_simulatorDS != null) {</span>
+<span class="nc" id="L562">                    _conn = s_simulatorDS.getConnection();</span>
+<span class="nc" id="L563">                } else {</span>
+<span class="nc" id="L564">                    s_logger.warn(&quot;A static-initialized variable becomes null, process is dying?&quot;);</span>
+<span class="nc" id="L565">                    throw new CloudRuntimeException(&quot;Database is not initialized, process is dying?&quot;);</span>
+                }
+                break;
+            default:
+
+<span class="nc" id="L570">                throw new CloudRuntimeException(&quot;No database selected for the transaction&quot;);</span>
+            }
+<span class="nc bnc" id="L572" title="All 2 branches missed.">            _conn.setAutoCommit(!_txn);</span>
+
+            //
+            // MySQL default transaction isolation level is REPEATABLE READ,
+            // to reduce chances of DB deadlock, we will use READ COMMITED isolation level instead
+            // see http://dev.mysql.com/doc/refman/5.0/en/innodb-deadlocks.html
+            //
+<span class="nc" id="L579">            _stack.push(new StackElement(CREATE_CONN, null));</span>
+<span class="nc bnc" id="L580" title="All 2 branches missed.">            if (s_connLogger.isTraceEnabled()) {</span>
+<span class="nc bnc" id="L581" title="All 2 branches missed.">                s_connLogger.trace(&quot;Creating a DB connection with &quot; + (_txn ? &quot; txn: &quot; : &quot; no txn: &quot;) + &quot; for &quot; + _dbId + &quot;: dbconn&quot; + System.identityHashCode(_conn) +</span>
+<span class="nc" id="L582">                        &quot;. Stack: &quot; + buildName());</span>
+            }
+<span class="nc" id="L584">        } else {</span>
+<span class="nc" id="L585">            s_logger.trace(&quot;conn: Using existing DB connection&quot;);</span>
+        }
+
+<span class="nc" id="L588">        return _conn;</span>
+    }
+
+    protected boolean takeOver(final String name, final boolean create) {
+<span class="nc bnc" id="L592" title="All 2 branches missed.">        if (_stack.size() != 0) {</span>
+<span class="nc bnc" id="L593" title="All 2 branches missed.">            if (!create) {</span>
+                // If it is not a create transaction, then let's just use the current one.
+<span class="nc bnc" id="L595" title="All 2 branches missed.">                if (s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L596">                    s_logger.trace(&quot;Using current transaction: &quot; + toString());</span>
+                }
+<span class="nc" id="L598">                mark(name);</span>
+<span class="nc" id="L599">                return false;</span>
+            }
+
+<span class="nc" id="L602">            final StackElement se = _stack.getFirst();</span>
+<span class="nc bnc" id="L603" title="All 2 branches missed.">            if (se.type == CREATE_TXN) {</span>
+                // This create is called inside of another create.  Which is ok?
+                // We will let that create be responsible for cleaning up.
+<span class="nc bnc" id="L606" title="All 2 branches missed.">                if (s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L607">                    s_logger.trace(&quot;Create using current transaction: &quot; + toString());</span>
+                }
+<span class="nc" id="L609">                mark(name);</span>
+<span class="nc" id="L610">                return false;</span>
+            }
+
+<span class="nc" id="L613">            s_logger.warn(&quot;Encountered a transaction that has leaked.  Cleaning up. &quot; + toString());</span>
+<span class="nc" id="L614">            cleanup();</span>
+        }
+
+<span class="nc bnc" id="L617" title="All 2 branches missed.">        if (s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L618">            s_logger.trace(&quot;Took over the transaction: &quot; + name);</span>
+        }
+<span class="nc bnc" id="L620" title="All 2 branches missed.">        _stack.push(new StackElement(create ? CREATE_TXN : CURRENT_TXN, name));</span>
+<span class="nc" id="L621">        _name = name;</span>
+<span class="nc" id="L622">        return true;</span>
+    }
+
+    public void cleanup() {
+<span class="nc" id="L626">        closePreviousStatement();</span>
+
+<span class="nc" id="L628">        removeUpTo(null, null);</span>
+<span class="nc bnc" id="L629" title="All 2 branches missed.">        if (_txn) {</span>
+<span class="nc" id="L630">            rollbackTransaction();</span>
+        }
+<span class="nc" id="L632">        _txn = false;</span>
+<span class="nc" id="L633">        _name = null;</span>
+
+<span class="nc" id="L635">        closeConnection();</span>
+
+<span class="nc" id="L637">        _stack.clear();</span>
+<span class="nc" id="L638">        Merovingian2 lockMaster = Merovingian2.getLockMaster();</span>
+<span class="nc bnc" id="L639" title="All 2 branches missed.">        if (lockMaster != null) {</span>
+<span class="nc" id="L640">            lockMaster.cleanupThread();</span>
+        }
+<span class="nc" id="L642">    }</span>
+
+    @Override
+    public void close() {
+<span class="nc" id="L646">        removeUpTo(CURRENT_TXN, null);</span>
+
+<span class="nc bnc" id="L648" title="All 2 branches missed.">        if (_stack.size() == 0) {</span>
+<span class="nc" id="L649">            s_logger.trace(&quot;Transaction is done&quot;);</span>
+<span class="nc" id="L650">            cleanup();</span>
+        }
+<span class="nc" id="L652">    }</span>
+
+    /**
+     * close() is used by endTxn to close the connection.  This method only
+     * closes the connection if the name is the same as what's stored.
+     *
+     * @param name
+     * @return true if this close actually closes the connection.  false if not.
+     */
+    public boolean close(final String name) {
+<span class="nc bnc" id="L662" title="All 2 branches missed.">        if (_name == null) {    // Already cleaned up.</span>
+<span class="nc bnc" id="L663" title="All 2 branches missed.">            if (s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L664">                s_logger.trace(&quot;Already cleaned up.&quot; + buildName());</span>
+            }
+<span class="nc" id="L666">            return true;</span>
+        }
+
+<span class="nc bnc" id="L669" title="All 2 branches missed.">        if (!_name.equals(name)) {</span>
+<span class="nc" id="L670">            close();</span>
+<span class="nc" id="L671">            return false;</span>
+        }
+
+<span class="nc bnc" id="L674" title="All 4 branches missed.">        if (s_logger.isDebugEnabled() &amp;&amp; _stack.size() &gt; 2) {</span>
+<span class="nc" id="L675">            s_logger.debug(&quot;Transaction is not closed properly: &quot; + toString() + &quot;.  Called by &quot; + buildName());</span>
+        }
+
+<span class="nc" id="L678">        cleanup();</span>
+
+<span class="nc" id="L680">        s_logger.trace(&quot;All done&quot;);</span>
+<span class="nc" id="L681">        return true;</span>
+    }
+
+    protected boolean hasTxnInStack() {
+<span class="nc bnc" id="L685" title="All 2 branches missed.">        return peekInStack(START_TXN) != null;</span>
+    }
+
+    protected void clearLockTimes() {
+<span class="nc bnc" id="L689" title="All 2 branches missed.">        if (s_lockLogger.isDebugEnabled()) {</span>
+<span class="nc bnc" id="L690" title="All 2 branches missed.">            for (Pair&lt;String, Long&gt; time : _lockTimes) {</span>
+<span class="nc" id="L691">                s_lockLogger.trace(&quot;SQL &quot; + time.first() + &quot; took &quot; + (System.currentTimeMillis() - time.second()));</span>
+            }
+<span class="nc" id="L693">            _lockTimes.clear();</span>
+        }
+<span class="nc" id="L695">    }</span>
+
+    public boolean commit() {
+<span class="nc bnc" id="L698" title="All 2 branches missed.">        if (!_txn) {</span>
+<span class="nc" id="L699">            s_logger.warn(&quot;txn: Commit called when it is not a transaction: &quot; + buildName());</span>
+<span class="nc" id="L700">            return false;</span>
+        }
+
+<span class="nc" id="L703">        Iterator&lt;StackElement&gt; it = _stack.iterator();</span>
+<span class="nc bnc" id="L704" title="All 2 branches missed.">        while (it.hasNext()) {</span>
+<span class="nc" id="L705">            StackElement st = it.next();</span>
+<span class="nc bnc" id="L706" title="All 2 branches missed.">            if (st.type == START_TXN) {</span>
+<span class="nc" id="L707">                it.remove();</span>
+<span class="nc" id="L708">                break;</span>
+            }
+        }
+
+<span class="nc bnc" id="L712" title="All 2 branches missed.">        if (hasTxnInStack()) {</span>
+<span class="nc bnc" id="L713" title="All 2 branches missed.">            if (s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L714">                s_logger.trace(&quot;txn: Not committing because transaction started elsewhere: &quot; + buildName() + &quot; / &quot; + toString());</span>
+            }
+<span class="nc" id="L716">            return false;</span>
+        }
+
+<span class="nc" id="L719">        _txn = false;</span>
+        try {
+<span class="nc bnc" id="L721" title="All 2 branches missed.">            if (_conn != null) {</span>
+<span class="nc" id="L722">                _conn.commit();</span>
+<span class="nc" id="L723">                s_logger.trace(&quot;txn: DB Changes committed. Time = &quot; + (System.currentTimeMillis() - _txnTime));</span>
+<span class="nc" id="L724">                clearLockTimes();</span>
+<span class="nc" id="L725">                closeConnection();</span>
+            }
+<span class="nc" id="L727">            return true;</span>
+<span class="nc" id="L728">        } catch (final SQLException e) {</span>
+<span class="nc" id="L729">            rollbackTransaction();</span>
+<span class="nc" id="L730">            throw new CloudRuntimeException(&quot;Unable to commit or close the connection. &quot;, e);</span>
+        }
+    }
+
+    protected void closeConnection() {
+<span class="nc" id="L735">        closePreviousStatement();</span>
+
+<span class="nc bnc" id="L737" title="All 2 branches missed.">        if (_conn == null) {</span>
+<span class="nc" id="L738">            return;</span>
+        }
+
+<span class="nc bnc" id="L741" title="All 2 branches missed.">        if (_txn) {</span>
+<span class="nc" id="L742">            s_connLogger.trace(&quot;txn: Not closing DB connection because we're still in a transaction.&quot;);</span>
+<span class="nc" id="L743">            return;</span>
+        }
+
+        try {
+            // we should only close db connection when it is not user managed
+<span class="nc bnc" id="L748" title="All 2 branches missed.">            if (_dbId != CONNECTED_DB) {</span>
+<span class="nc bnc" id="L749" title="All 2 branches missed.">                if (s_connLogger.isTraceEnabled()) {</span>
+<span class="nc" id="L750">                    s_connLogger.trace(&quot;Closing DB connection: dbconn&quot; + System.identityHashCode(_conn));</span>
+                }
+<span class="nc" id="L752">                _conn.close();</span>
+<span class="nc" id="L753">                _conn = null;</span>
+            }
+
+<span class="nc" id="L756">        } catch (final SQLException e) {</span>
+<span class="nc" id="L757">            s_logger.warn(&quot;Unable to close connection&quot;, e);</span>
+        }
+<span class="nc" id="L759">    }</span>
+
+    protected void removeUpTo(String type, Object ref) {
+<span class="nc" id="L762">        boolean rollback = false;</span>
+<span class="nc" id="L763">        Iterator&lt;StackElement&gt; it = _stack.iterator();</span>
+<span class="nc bnc" id="L764" title="All 2 branches missed.">        while (it.hasNext()) {</span>
+<span class="nc" id="L765">            StackElement item = it.next();</span>
+
+<span class="nc" id="L767">            it.remove();</span>
+
+            try {
+<span class="nc bnc" id="L770" title="All 8 branches missed.">                if ( (type == null || type.equals(item.type)) &amp;&amp; (ref == null || ref.equals(item.ref))) {</span>
+<span class="nc" id="L771">                    break;</span>
+                }
+
+<span class="nc bnc" id="L774" title="All 2 branches missed.">                if (item.type == CURRENT_TXN) {</span>
+<span class="nc bnc" id="L775" title="All 2 branches missed.">                    if (s_logger.isTraceEnabled()) {</span>
+<span class="nc bnc" id="L776" title="All 2 branches missed.">                        s_logger.trace(&quot;Releasing the current txn: &quot; + (item.ref != null ? item.ref : &quot;&quot;));</span>
+                    }
+<span class="nc bnc" id="L778" title="All 2 branches missed.">                } else if (item.type == CREATE_CONN) {</span>
+<span class="nc" id="L779">                    closeConnection();</span>
+<span class="nc bnc" id="L780" title="All 2 branches missed.">                } else if (item.type == START_TXN) {</span>
+<span class="nc bnc" id="L781" title="All 2 branches missed.">                    if (item.ref == null) {</span>
+<span class="nc" id="L782">                        rollback = true;</span>
+<span class="nc" id="L783">                    } else {</span>
+                        try {
+<span class="nc" id="L785">                            _conn.rollback((Savepoint)ref);</span>
+<span class="nc" id="L786">                            rollback = false;</span>
+<span class="nc" id="L787">                        } catch (final SQLException e) {</span>
+<span class="nc" id="L788">                            s_logger.warn(&quot;Unable to rollback Txn.&quot;, e);</span>
+                        }
+                    }
+<span class="nc bnc" id="L791" title="All 2 branches missed.">                } else if (item.type == STATEMENT) {</span>
+                    try {
+<span class="nc bnc" id="L793" title="All 2 branches missed.">                        if (s_stmtLogger.isTraceEnabled()) {</span>
+<span class="nc" id="L794">                            s_stmtLogger.trace(&quot;Closing: &quot; + ref.toString());</span>
+                        }
+<span class="nc" id="L796">                        Statement stmt = (Statement)ref;</span>
+                        try {
+<span class="nc" id="L798">                            ResultSet rs = stmt.getResultSet();</span>
+<span class="nc bnc" id="L799" title="All 2 branches missed.">                            if (rs != null) {</span>
+<span class="nc" id="L800">                                rs.close();</span>
+                            }
+<span class="nc" id="L802">                        } catch (SQLException e) {</span>
+<span class="nc" id="L803">                            s_stmtLogger.trace(&quot;Unable to close resultset&quot;);</span>
+                        }
+<span class="nc" id="L805">                        stmt.close();</span>
+<span class="nc" id="L806">                    } catch (final SQLException e) {</span>
+<span class="nc" id="L807">                        s_stmtLogger.trace(&quot;Unable to close statement: &quot; + item);</span>
+                    }
+<span class="nc bnc" id="L809" title="All 2 branches missed.">                } else if (item.type == ATTACHMENT) {</span>
+<span class="nc" id="L810">                    TransactionAttachment att = (TransactionAttachment)item.ref;</span>
+<span class="nc bnc" id="L811" title="All 2 branches missed.">                    if (s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L812">                        s_logger.trace(&quot;Cleaning up &quot; + att.getName());</span>
+                    }
+<span class="nc" id="L814">                    att.cleanup();</span>
+                }
+<span class="nc" id="L816">            } catch (Exception e) {</span>
+<span class="nc" id="L817">                s_logger.error(&quot;Unable to clean up &quot; + item, e);</span>
+            }
+        }
+
+<span class="nc bnc" id="L821" title="All 2 branches missed.">        if (rollback) {</span>
+<span class="nc" id="L822">            rollback();</span>
+        }
+<span class="nc" id="L824">    }</span>
+
+    protected void rollbackTransaction() {
+<span class="nc" id="L827">        closePreviousStatement();</span>
+<span class="nc bnc" id="L828" title="All 2 branches missed.">        if (!_txn) {</span>
+<span class="nc bnc" id="L829" title="All 2 branches missed.">            if (s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L830">                s_logger.trace(&quot;Rollback called for &quot; + _name + &quot; when there's no transaction: &quot; + buildName());</span>
+            }
+<span class="nc" id="L832">            return;</span>
+        }
+<span class="nc bnc" id="L834" title="All 4 branches missed.">        assert (!hasTxnInStack()) : &quot;Who's rolling back transaction when there's still txn in stack?&quot;;</span>
+<span class="nc" id="L835">        _txn = false;</span>
+        try {
+<span class="nc bnc" id="L837" title="All 2 branches missed.">            if (_conn != null) {</span>
+<span class="nc bnc" id="L838" title="All 2 branches missed.">                if (s_logger.isDebugEnabled()) {</span>
+<span class="nc" id="L839">                    s_logger.debug(&quot;Rolling back the transaction: Time = &quot; + (System.currentTimeMillis() - _txnTime) + &quot; Name =  &quot; + _name + &quot;; called by &quot; + buildName());</span>
+                }
+<span class="nc" id="L841">                _conn.rollback();</span>
+            }
+<span class="nc" id="L843">            clearLockTimes();</span>
+<span class="nc" id="L844">            closeConnection();</span>
+<span class="nc" id="L845">        } catch (final SQLException e) {</span>
+<span class="nc" id="L846">            s_logger.warn(&quot;Unable to rollback&quot;, e);</span>
+        }
+<span class="nc" id="L848">    }</span>
+
+    protected void rollbackSavepoint(Savepoint sp) {
+        try {
+<span class="nc bnc" id="L852" title="All 2 branches missed.">            if (_conn != null) {</span>
+<span class="nc" id="L853">                _conn.rollback(sp);</span>
+            }
+<span class="nc" id="L855">        } catch (SQLException e) {</span>
+<span class="nc" id="L856">            s_logger.warn(&quot;Unable to rollback to savepoint &quot; + sp);</span>
+        }
+
+<span class="nc bnc" id="L859" title="All 2 branches missed.">        if (!hasTxnInStack()) {</span>
+<span class="nc" id="L860">            _txn = false;</span>
+<span class="nc" id="L861">            closeConnection();</span>
+        }
+<span class="nc" id="L863">    }</span>
+
+    public void rollback() {
+<span class="nc" id="L866">        Iterator&lt;StackElement&gt; it = _stack.iterator();</span>
+<span class="nc bnc" id="L867" title="All 2 branches missed.">        while (it.hasNext()) {</span>
+<span class="nc" id="L868">            StackElement st = it.next();</span>
+<span class="nc bnc" id="L869" title="All 2 branches missed.">            if (st.type == START_TXN) {</span>
+<span class="nc bnc" id="L870" title="All 2 branches missed.">                if (st.ref == null) {</span>
+<span class="nc" id="L871">                    it.remove();</span>
+<span class="nc" id="L872">                } else {</span>
+<span class="nc" id="L873">                    rollback((Savepoint)st.ref);</span>
+<span class="nc" id="L874">                    return;</span>
+                }
+            }
+        }
+
+<span class="nc" id="L879">        rollbackTransaction();</span>
+<span class="nc" id="L880">    }</span>
+
+    public Savepoint setSavepoint() throws SQLException {
+<span class="nc" id="L883">        _txn = true;</span>
+<span class="nc" id="L884">        StackElement st = new StackElement(START_TXN, null);</span>
+<span class="nc" id="L885">        _stack.push(st);</span>
+<span class="nc" id="L886">        final Connection conn = getConnection();</span>
+<span class="nc" id="L887">        final Savepoint sp = conn.setSavepoint();</span>
+<span class="nc" id="L888">        st.ref = sp;</span>
+
+<span class="nc" id="L890">        return sp;</span>
+    }
+
+    public Savepoint setSavepoint(final String name) throws SQLException {
+<span class="nc" id="L894">        _txn = true;</span>
+<span class="nc" id="L895">        StackElement st = new StackElement(START_TXN, null);</span>
+<span class="nc" id="L896">        _stack.push(st);</span>
+<span class="nc" id="L897">        final Connection conn = getConnection();</span>
+<span class="nc" id="L898">        final Savepoint sp = conn.setSavepoint(name);</span>
+<span class="nc" id="L899">        st.ref = sp;</span>
+
+<span class="nc" id="L901">        return sp;</span>
+    }
+
+    public void releaseSavepoint(final Savepoint sp) throws SQLException {
+<span class="nc" id="L905">        removeTxn(sp);</span>
+<span class="nc bnc" id="L906" title="All 2 branches missed.">        if (_conn != null) {</span>
+<span class="nc" id="L907">            _conn.releaseSavepoint(sp);</span>
+        }
+
+<span class="nc bnc" id="L910" title="All 2 branches missed.">        if (!hasTxnInStack()) {</span>
+<span class="nc" id="L911">            _txn = false;</span>
+<span class="nc" id="L912">            closeConnection();</span>
+        }
+<span class="nc" id="L914">    }</span>
+
+    protected boolean hasSavepointInStack(Savepoint sp) {
+<span class="nc" id="L917">        Iterator&lt;StackElement&gt; it = _stack.iterator();</span>
+<span class="nc bnc" id="L918" title="All 2 branches missed.">        while (it.hasNext()) {</span>
+<span class="nc" id="L919">            StackElement se = it.next();</span>
+<span class="nc bnc" id="L920" title="All 4 branches missed.">            if (se.type == START_TXN &amp;&amp; se.ref == sp) {</span>
+<span class="nc" id="L921">                return true;</span>
+            }
+        }
+<span class="nc" id="L924">        return false;</span>
+    }
+
+    protected void removeTxn(Savepoint sp) {
+<span class="nc bnc" id="L928" title="All 4 branches missed.">        assert hasSavepointInStack(sp) : &quot;Removing a save point that's not in the stack&quot;;</span>
+
+<span class="nc bnc" id="L930" title="All 2 branches missed.">        if (!hasSavepointInStack(sp)) {</span>
+<span class="nc" id="L931">            return;</span>
+        }
+
+<span class="nc" id="L934">        Iterator&lt;StackElement&gt; it = _stack.iterator();</span>
+<span class="nc bnc" id="L935" title="All 2 branches missed.">        while (it.hasNext()) {</span>
+<span class="nc" id="L936">            StackElement se = it.next();</span>
+<span class="nc bnc" id="L937" title="All 2 branches missed.">            if (se.type == START_TXN) {</span>
+<span class="nc" id="L938">                it.remove();</span>
+<span class="nc bnc" id="L939" title="All 2 branches missed.">                if (se.ref == sp) {</span>
+<span class="nc" id="L940">                    return;</span>
+                }
+            }
+        }
+<span class="nc" id="L944">    }</span>
+
+    public void rollback(final Savepoint sp) {
+<span class="nc" id="L947">        removeTxn(sp);</span>
+
+<span class="nc" id="L949">        rollbackSavepoint(sp);</span>
+<span class="nc" id="L950">    }</span>
+
+    public Connection getCurrentConnection() {
+<span class="nc" id="L953">        return _conn;</span>
+    }
+
+    public List&lt;StackElement&gt; getStack() {
+<span class="nc" id="L957">        return _stack;</span>
+    }
+
+<span class="nc" id="L960">    private TransactionLegacy() {</span>
+<span class="nc" id="L961">        _name = null;</span>
+<span class="nc" id="L962">        _conn = null;</span>
+<span class="nc" id="L963">        _stack = null;</span>
+<span class="nc" id="L964">        _txn = false;</span>
+<span class="nc" id="L965">        _dbId = -1;</span>
+<span class="nc" id="L966">    }</span>
+
+    @Override
+    protected void finalize() throws Throwable {
+<span class="nc bnc" id="L970" title="All 6 branches missed.">        if (!(_conn == null &amp;&amp; (_stack == null || _stack.size() == 0))) {</span>
+<span class="nc bnc" id="L971" title="All 2 branches missed.">            assert (false) : &quot;Oh Alex oh alex...something is wrong with how we're doing this&quot;;</span>
+<span class="nc" id="L972">            s_logger.error(&quot;Something went wrong that a transaction is orphaned before db connection is closed&quot;);</span>
+<span class="nc" id="L973">            cleanup();</span>
+        }
+<span class="nc" id="L975">    }</span>
+
+    protected class StackElement {
+        public String type;
+        public Object ref;
+
+<span class="nc" id="L981">        public StackElement(String type, Object ref) {</span>
+<span class="nc" id="L982">            this.type = type;</span>
+<span class="nc" id="L983">            this.ref = ref;</span>
+<span class="nc" id="L984">        }</span>
+
+        @Override
+        public String toString() {
+<span class="nc" id="L988">            return type + &quot;-&quot; + ref;</span>
+        }
+    }
+
+    private static DataSource s_ds;
+    private static DataSource s_usageDS;
+    private static DataSource s_simulatorDS;
+    private static boolean s_dbHAEnabled;
+
+    static {
+        // Initialize with assumed db.properties file
+<span class="nc" id="L999">        initDataSource(DbProperties.getDbProperties());</span>
+<span class="nc" id="L1000">    }</span>
+
+    public static void initDataSource(String propsFileName) throws IOException {
+<span class="nc" id="L1003">        Properties dbProps = new Properties();</span>
+<span class="nc" id="L1004">        File dbPropsFile = PropertiesUtil.findConfigFile(propsFileName);</span>
+<span class="nc bnc" id="L1005" title="All 4 branches missed.">        if (dbPropsFile != null &amp;&amp; dbPropsFile.exists()) {</span>
+<span class="nc" id="L1006">            PropertiesUtil.loadFromFile(dbProps, dbPropsFile);</span>
+<span class="nc" id="L1007">            initDataSource(dbProps);</span>
+        }
+<span class="nc" id="L1009">    }</span>
+
+    @SuppressWarnings({&quot;rawtypes&quot;, &quot;unchecked&quot;})
+    public static void initDataSource(Properties dbProps) {
+        try {
+<span class="nc bnc" id="L1014" title="All 2 branches missed.">            if (dbProps.size() == 0)</span>
+<span class="nc" id="L1015">                return;</span>
+
+<span class="nc" id="L1017">            s_dbHAEnabled = Boolean.valueOf(dbProps.getProperty(&quot;db.ha.enabled&quot;));</span>
+<span class="nc" id="L1018">            s_logger.info(&quot;Is Data Base High Availiability enabled? Ans : &quot; + s_dbHAEnabled);</span>
+<span class="nc" id="L1019">            String loadBalanceStrategy = dbProps.getProperty(&quot;db.ha.loadBalanceStrategy&quot;);</span>
+            // FIXME:  If params are missing...default them????
+<span class="nc" id="L1021">            final int cloudMaxActive = Integer.parseInt(dbProps.getProperty(&quot;db.cloud.maxActive&quot;));</span>
+<span class="nc" id="L1022">            final int cloudMaxIdle = Integer.parseInt(dbProps.getProperty(&quot;db.cloud.maxIdle&quot;));</span>
+<span class="nc" id="L1023">            final long cloudMaxWait = Long.parseLong(dbProps.getProperty(&quot;db.cloud.maxWait&quot;));</span>
+<span class="nc" id="L1024">            final String cloudUsername = dbProps.getProperty(&quot;db.cloud.username&quot;);</span>
+<span class="nc" id="L1025">            final String cloudPassword = dbProps.getProperty(&quot;db.cloud.password&quot;);</span>
+<span class="nc" id="L1026">            final String cloudHost = dbProps.getProperty(&quot;db.cloud.host&quot;);</span>
+<span class="nc" id="L1027">            final int cloudPort = Integer.parseInt(dbProps.getProperty(&quot;db.cloud.port&quot;));</span>
+<span class="nc" id="L1028">            final String cloudDbName = dbProps.getProperty(&quot;db.cloud.name&quot;);</span>
+<span class="nc" id="L1029">            final boolean cloudAutoReconnect = Boolean.parseBoolean(dbProps.getProperty(&quot;db.cloud.autoReconnect&quot;));</span>
+<span class="nc" id="L1030">            final String cloudValidationQuery = dbProps.getProperty(&quot;db.cloud.validationQuery&quot;);</span>
+<span class="nc" id="L1031">            final String cloudIsolationLevel = dbProps.getProperty(&quot;db.cloud.isolation.level&quot;);</span>
+
+<span class="nc" id="L1033">            int isolationLevel = Connection.TRANSACTION_READ_COMMITTED;</span>
+<span class="nc bnc" id="L1034" title="All 2 branches missed.">            if (cloudIsolationLevel == null) {</span>
+<span class="nc" id="L1035">                isolationLevel = Connection.TRANSACTION_READ_COMMITTED;</span>
+<span class="nc bnc" id="L1036" title="All 2 branches missed.">            } else if (cloudIsolationLevel.equalsIgnoreCase(&quot;readcommitted&quot;)) {</span>
+<span class="nc" id="L1037">                isolationLevel = Connection.TRANSACTION_READ_COMMITTED;</span>
+<span class="nc bnc" id="L1038" title="All 2 branches missed.">            } else if (cloudIsolationLevel.equalsIgnoreCase(&quot;repeatableread&quot;)) {</span>
+<span class="nc" id="L1039">                isolationLevel = Connection.TRANSACTION_REPEATABLE_READ;</span>
+<span class="nc bnc" id="L1040" title="All 2 branches missed.">            } else if (cloudIsolationLevel.equalsIgnoreCase(&quot;serializable&quot;)) {</span>
+<span class="nc" id="L1041">                isolationLevel = Connection.TRANSACTION_SERIALIZABLE;</span>
+<span class="nc bnc" id="L1042" title="All 2 branches missed.">            } else if (cloudIsolationLevel.equalsIgnoreCase(&quot;readuncommitted&quot;)) {</span>
+<span class="nc" id="L1043">                isolationLevel = Connection.TRANSACTION_READ_UNCOMMITTED;</span>
+<span class="nc" id="L1044">            } else {</span>
+<span class="nc" id="L1045">                s_logger.warn(&quot;Unknown isolation level &quot; + cloudIsolationLevel + &quot;.  Using read uncommitted&quot;);</span>
+            }
+
+<span class="nc" id="L1048">            final boolean cloudTestOnBorrow = Boolean.parseBoolean(dbProps.getProperty(&quot;db.cloud.testOnBorrow&quot;));</span>
+<span class="nc" id="L1049">            final boolean cloudTestWhileIdle = Boolean.parseBoolean(dbProps.getProperty(&quot;db.cloud.testWhileIdle&quot;));</span>
+<span class="nc" id="L1050">            final long cloudTimeBtwEvictionRunsMillis = Long.parseLong(dbProps.getProperty(&quot;db.cloud.timeBetweenEvictionRunsMillis&quot;));</span>
+<span class="nc" id="L1051">            final long cloudMinEvcitableIdleTimeMillis = Long.parseLong(dbProps.getProperty(&quot;db.cloud.minEvictableIdleTimeMillis&quot;));</span>
+<span class="nc" id="L1052">            final boolean cloudPoolPreparedStatements = Boolean.parseBoolean(dbProps.getProperty(&quot;db.cloud.poolPreparedStatements&quot;));</span>
+<span class="nc" id="L1053">            final String url = dbProps.getProperty(&quot;db.cloud.url.params&quot;);</span>
+
+<span class="nc" id="L1055">            String cloudDbHAParams = null;</span>
+<span class="nc" id="L1056">            String cloudSlaves = null;</span>
+<span class="nc bnc" id="L1057" title="All 2 branches missed.">            if (s_dbHAEnabled) {</span>
+<span class="nc" id="L1058">                cloudDbHAParams = getDBHAParams(&quot;cloud&quot;, dbProps);</span>
+<span class="nc" id="L1059">                cloudSlaves = dbProps.getProperty(&quot;db.cloud.slaves&quot;);</span>
+<span class="nc" id="L1060">                s_logger.info(&quot;The slaves configured for Cloud Data base is/are : &quot; + cloudSlaves);</span>
+            }
+
+<span class="nc" id="L1063">            final boolean useSSL = Boolean.parseBoolean(dbProps.getProperty(&quot;db.cloud.useSSL&quot;));</span>
+<span class="nc bnc" id="L1064" title="All 2 branches missed.">            if (useSSL) {</span>
+<span class="nc" id="L1065">                System.setProperty(&quot;javax.net.ssl.keyStore&quot;, dbProps.getProperty(&quot;db.cloud.keyStore&quot;));</span>
+<span class="nc" id="L1066">                System.setProperty(&quot;javax.net.ssl.keyStorePassword&quot;, dbProps.getProperty(&quot;db.cloud.keyStorePassword&quot;));</span>
+<span class="nc" id="L1067">                System.setProperty(&quot;javax.net.ssl.trustStore&quot;, dbProps.getProperty(&quot;db.cloud.trustStore&quot;));</span>
+<span class="nc" id="L1068">                System.setProperty(&quot;javax.net.ssl.trustStorePassword&quot;, dbProps.getProperty(&quot;db.cloud.trustStorePassword&quot;));</span>
+            }
+
+<span class="nc" id="L1071">            final GenericObjectPool cloudConnectionPool =</span>
+<span class="nc" id="L1072">                    new GenericObjectPool(null, cloudMaxActive, GenericObjectPool.DEFAULT_WHEN_EXHAUSTED_ACTION, cloudMaxWait, cloudMaxIdle, cloudTestOnBorrow, false,</span>
+<span class="nc" id="L1073">                            cloudTimeBtwEvictionRunsMillis, 1, cloudMinEvcitableIdleTimeMillis, cloudTestWhileIdle);</span>
+
+<span class="nc" id="L1075">            final ConnectionFactory cloudConnectionFactory =</span>
+<span class="nc bnc" id="L1076" title="All 2 branches missed.">                    new DriverManagerConnectionFactory(&quot;jdbc:mysql://&quot; + cloudHost + (s_dbHAEnabled ? &quot;,&quot; + cloudSlaves : &quot;&quot;) + &quot;:&quot; + cloudPort + &quot;/&quot; + cloudDbName +</span>
+<span class="nc bnc" id="L1077" title="All 4 branches missed.">                            &quot;?autoReconnect=&quot; + cloudAutoReconnect + (url != null ? &quot;&amp;&quot; + url : &quot;&quot;) + (useSSL ? &quot;&amp;useSSL=true&quot; : &quot;&quot;) +</span>
+<span class="nc bnc" id="L1078" title="All 4 branches missed.">                            (s_dbHAEnabled ? &quot;&amp;&quot; + cloudDbHAParams : &quot;&quot;) + (s_dbHAEnabled ? &quot;&amp;loadBalanceStrategy=&quot; + loadBalanceStrategy : &quot;&quot;), cloudUsername, cloudPassword);</span>
+
+<span class="nc bnc" id="L1080" title="All 2 branches missed.">            final KeyedObjectPoolFactory poolableObjFactory = (cloudPoolPreparedStatements ? new StackKeyedObjectPoolFactory() : null);</span>
+
+<span class="nc" id="L1082">            final PoolableConnectionFactory cloudPoolableConnectionFactory =</span>
+<span class="nc" id="L1083">                    new PoolableConnectionFactory(cloudConnectionFactory, cloudConnectionPool, poolableObjFactory, cloudValidationQuery, false, false, isolationLevel);</span>
+
+            // Default Data Source for CloudStack
+<span class="nc" id="L1086">            s_ds = new PoolingDataSource(cloudPoolableConnectionFactory.getPool());</span>
+
+            // Configure the usage db
+<span class="nc" id="L1089">            final int usageMaxActive = Integer.parseInt(dbProps.getProperty(&quot;db.usage.maxActive&quot;));</span>
+<span class="nc" id="L1090">            final int usageMaxIdle = Integer.parseInt(dbProps.getProperty(&quot;db.usage.maxIdle&quot;));</span>
+<span class="nc" id="L1091">            final long usageMaxWait = Long.parseLong(dbProps.getProperty(&quot;db.usage.maxWait&quot;));</span>
+<span class="nc" id="L1092">            final String usageUsername = dbProps.getProperty(&quot;db.usage.username&quot;);</span>
+<span class="nc" id="L1093">            final String usagePassword = dbProps.getProperty(&quot;db.usage.password&quot;);</span>
+<span class="nc" id="L1094">            final String usageHost = dbProps.getProperty(&quot;db.usage.host&quot;);</span>
+<span class="nc" id="L1095">            final int usagePort = Integer.parseInt(dbProps.getProperty(&quot;db.usage.port&quot;));</span>
+<span class="nc" id="L1096">            final String usageDbName = dbProps.getProperty(&quot;db.usage.name&quot;);</span>
+<span class="nc" id="L1097">            final boolean usageAutoReconnect = Boolean.parseBoolean(dbProps.getProperty(&quot;db.usage.autoReconnect&quot;));</span>
+<span class="nc" id="L1098">            final String usageUrl = dbProps.getProperty(&quot;db.usage.url.params&quot;);</span>
+
+<span class="nc" id="L1100">            final GenericObjectPool usageConnectionPool =</span>
+<span class="nc" id="L1101">                    new GenericObjectPool(null, usageMaxActive, GenericObjectPool.DEFAULT_WHEN_EXHAUSTED_ACTION, usageMaxWait, usageMaxIdle);</span>
+
+<span class="nc" id="L1103">            final ConnectionFactory usageConnectionFactory =</span>
+<span class="nc bnc" id="L1104" title="All 2 branches missed.">                    new DriverManagerConnectionFactory(&quot;jdbc:mysql://&quot; + usageHost + (s_dbHAEnabled ? &quot;,&quot; + dbProps.getProperty(&quot;db.cloud.slaves&quot;) : &quot;&quot;) + &quot;:&quot; + usagePort +</span>
+<span class="nc bnc" id="L1105" title="All 2 branches missed.">                            &quot;/&quot; + usageDbName + &quot;?autoReconnect=&quot; + usageAutoReconnect + (usageUrl != null ? &quot;&amp;&quot; + usageUrl : &quot;&quot;) +</span>
+<span class="nc bnc" id="L1106" title="All 4 branches missed.">                            (s_dbHAEnabled ? &quot;&amp;&quot; + getDBHAParams(&quot;usage&quot;, dbProps) : &quot;&quot;) + (s_dbHAEnabled ? &quot;&amp;loadBalanceStrategy=&quot; + loadBalanceStrategy : &quot;&quot;), usageUsername,</span>
+<span class="nc" id="L1107">                            usagePassword);</span>
+
+<span class="nc" id="L1109">            final PoolableConnectionFactory usagePoolableConnectionFactory =</span>
+<span class="nc" id="L1110">                    new PoolableConnectionFactory(usageConnectionFactory, usageConnectionPool, new StackKeyedObjectPoolFactory(), null, false, false);</span>
+
+            // Data Source for usage server
+<span class="nc" id="L1113">            s_usageDS = new PoolingDataSource(usagePoolableConnectionFactory.getPool());</span>
+
+            try {
+                // Configure the simulator db
+<span class="nc" id="L1117">                final int simulatorMaxActive = Integer.parseInt(dbProps.getProperty(&quot;db.simulator.maxActive&quot;));</span>
+<span class="nc" id="L1118">                final int simulatorMaxIdle = Integer.parseInt(dbProps.getProperty(&quot;db.simulator.maxIdle&quot;));</span>
+<span class="nc" id="L1119">                final long simulatorMaxWait = Long.parseLong(dbProps.getProperty(&quot;db.simulator.maxWait&quot;));</span>
+<span class="nc" id="L1120">                final String simulatorUsername = dbProps.getProperty(&quot;db.simulator.username&quot;);</span>
+<span class="nc" id="L1121">                final String simulatorPassword = dbProps.getProperty(&quot;db.simulator.password&quot;);</span>
+<span class="nc" id="L1122">                final String simulatorHost = dbProps.getProperty(&quot;db.simulator.host&quot;);</span>
+<span class="nc" id="L1123">                final int simulatorPort = Integer.parseInt(dbProps.getProperty(&quot;db.simulator.port&quot;));</span>
+<span class="nc" id="L1124">                final String simulatorDbName = dbProps.getProperty(&quot;db.simulator.name&quot;);</span>
+<span class="nc" id="L1125">                final boolean simulatorAutoReconnect = Boolean.parseBoolean(dbProps.getProperty(&quot;db.simulator.autoReconnect&quot;));</span>
+
+<span class="nc" id="L1127">                final GenericObjectPool simulatorConnectionPool =</span>
+<span class="nc" id="L1128">                        new GenericObjectPool(null, simulatorMaxActive, GenericObjectPool.DEFAULT_WHEN_EXHAUSTED_ACTION, simulatorMaxWait, simulatorMaxIdle);</span>
+
+<span class="nc" id="L1130">                final ConnectionFactory simulatorConnectionFactory =</span>
+<span class="nc" id="L1131">                        new DriverManagerConnectionFactory(&quot;jdbc:mysql://&quot; + simulatorHost + &quot;:&quot; + simulatorPort + &quot;/&quot; + simulatorDbName + &quot;?autoReconnect=&quot; +</span>
+<span class="nc" id="L1132">                                simulatorAutoReconnect, simulatorUsername, simulatorPassword);</span>
+
+<span class="nc" id="L1134">                final PoolableConnectionFactory simulatorPoolableConnectionFactory =</span>
+<span class="nc" id="L1135">                        new PoolableConnectionFactory(simulatorConnectionFactory, simulatorConnectionPool, new StackKeyedObjectPoolFactory(), null, false, false);</span>
+<span class="nc" id="L1136">                s_simulatorDS = new PoolingDataSource(simulatorPoolableConnectionFactory.getPool());</span>
+<span class="nc" id="L1137">            } catch (Exception e) {</span>
+<span class="nc" id="L1138">                s_logger.debug(&quot;Simulator DB properties are not available. Not initializing simulator DS&quot;);</span>
+            }
+<span class="nc" id="L1140">        } catch (final Exception e) {</span>
+<span class="nc" id="L1141">            s_ds = getDefaultDataSource(&quot;cloud&quot;);</span>
+<span class="nc" id="L1142">            s_usageDS = getDefaultDataSource(&quot;cloud_usage&quot;);</span>
+<span class="nc" id="L1143">            s_simulatorDS = getDefaultDataSource(&quot;cloud_simulator&quot;);</span>
+<span class="nc" id="L1144">            s_logger.warn(</span>
+<span class="nc" id="L1145">                    &quot;Unable to load db configuration, using defaults with 5 connections. Falling back on assumed datasource on localhost:3306 using username:password=cloud:cloud. Please check your configuration&quot;,</span>
+<span class="nc" id="L1146">                    e);</span>
+        }
+<span class="nc" id="L1148">    }</span>
+
+    private static String getDBHAParams(String dbName, Properties dbProps) {
+<span class="nc" id="L1151">        StringBuilder sb = new StringBuilder();</span>
+<span class="nc" id="L1152">        sb.append(&quot;failOverReadOnly=&quot; + dbProps.getProperty(&quot;db.&quot; + dbName + &quot;.failOverReadOnly&quot;));</span>
+<span class="nc" id="L1153">        sb.append(&quot;&amp;&quot;).append(&quot;reconnectAtTxEnd=&quot; + dbProps.getProperty(&quot;db.&quot; + dbName + &quot;.reconnectAtTxEnd&quot;));</span>
+<span class="nc" id="L1154">        sb.append(&quot;&amp;&quot;).append(&quot;autoReconnectForPools=&quot; + dbProps.getProperty(&quot;db.&quot; + dbName + &quot;.autoReconnectForPools&quot;));</span>
+<span class="nc" id="L1155">        sb.append(&quot;&amp;&quot;).append(&quot;secondsBeforeRetryMaster=&quot; + dbProps.getProperty(&quot;db.&quot; + dbName + &quot;.secondsBeforeRetryMaster&quot;));</span>
+<span class="nc" id="L1156">        sb.append(&quot;&amp;&quot;).append(&quot;queriesBeforeRetryMaster=&quot; + dbProps.getProperty(&quot;db.&quot; + dbName + &quot;.queriesBeforeRetryMaster&quot;));</span>
+<span class="nc" id="L1157">        sb.append(&quot;&amp;&quot;).append(&quot;initialTimeout=&quot; + dbProps.getProperty(&quot;db.&quot; + dbName + &quot;.initialTimeout&quot;));</span>
+<span class="nc" id="L1158">        return sb.toString();</span>
+    }
+
+    @SuppressWarnings({&quot;unchecked&quot;, &quot;rawtypes&quot;})
+    private static DataSource getDefaultDataSource(final String database) {
+<span class="nc" id="L1163">        final GenericObjectPool connectionPool = new GenericObjectPool(null, 5);</span>
+<span class="nc" id="L1164">        final ConnectionFactory connectionFactory = new DriverManagerConnectionFactory(&quot;jdbc:mysql://localhost:3306/&quot; + database, &quot;cloud&quot;, &quot;cloud&quot;);</span>
+<span class="nc" id="L1165">        final PoolableConnectionFactory poolableConnectionFactory = new PoolableConnectionFactory(connectionFactory, connectionPool, null, null, false, true);</span>
+<span class="nc" id="L1166">        return new PoolingDataSource(</span>
+<span class="nc" id="L1167">                /* connectionPool */poolableConnectionFactory.getPool());</span>
+    }
+
+    /**
+     * Used for unit testing primarily
+     *
+     * @param conn
+     */
+    protected void setConnection(Connection conn) {
+<span class="nc" id="L1176">        _conn = conn;</span>
+<span class="nc" id="L1177">    }</span>
+
+    /**
+     * Receives a list of {@link PreparedStatement} and quietly closes all of them, which
+     * triggers also closing their dependent objects, like a {@link ResultSet}
+     *
+     * @param pstmt2Close
+     */
+    public static void closePstmts(List&lt;PreparedStatement&gt; pstmt2Close) {
+<span class="nc bnc" id="L1186" title="All 2 branches missed.">        for (PreparedStatement pstmt : pstmt2Close) {</span>
+            try {
+<span class="nc bnc" id="L1188" title="All 4 branches missed.">                if (pstmt != null &amp;&amp; !pstmt.isClosed()) {</span>
+<span class="nc" id="L1189">                    pstmt.close();</span>
+                }
+<span class="nc" id="L1191">            } catch (SQLException e) {</span>
+                // It's not possible to recover from this and we need to continue closing
+<span class="nc" id="L1193">                e.printStackTrace();</span>
+            }
+        }
+<span class="nc" id="L1196">    }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>cloud-core (18-mrt-2016 13:14:54)</div></body></html>

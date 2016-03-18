@@ -1,0 +1,447 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>CreatePortForwardingRuleCmd.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">cloud-core (18-mrt-2016 13:14:54)</a> &gt; <a href="../../index.html" class="el_group">cloud-api</a> &gt; <a href="../index.html" class="el_bundle">src</a> &gt; <a href="index.source.html" class="el_package">org.apache.cloudstack.api.command.user.firewall</a> &gt; <span class="el_source">CreatePortForwardingRuleCmd.java</span></div><h1>CreatePortForwardingRuleCmd.java</h1><pre class="source lang-java linenums">// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// &quot;License&quot;); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+package org.apache.cloudstack.api.command.user.firewall;
+
+import java.util.List;
+
+import org.apache.log4j.Logger;
+
+import org.apache.cloudstack.acl.RoleType;
+import org.apache.cloudstack.acl.SecurityChecker.AccessType;
+import org.apache.cloudstack.api.ACL;
+import org.apache.cloudstack.api.APICommand;
+import org.apache.cloudstack.api.ApiCommandJobType;
+import org.apache.cloudstack.api.ApiConstants;
+import org.apache.cloudstack.api.ApiErrorCode;
+import org.apache.cloudstack.api.BaseAsyncCmd;
+import org.apache.cloudstack.api.BaseAsyncCreateCmd;
+import org.apache.cloudstack.api.Parameter;
+import org.apache.cloudstack.api.ServerApiException;
+import org.apache.cloudstack.api.response.FirewallRuleResponse;
+import org.apache.cloudstack.api.response.IPAddressResponse;
+import org.apache.cloudstack.api.response.NetworkResponse;
+import org.apache.cloudstack.api.response.UserVmResponse;
+import org.apache.cloudstack.context.CallContext;
+
+import com.cloud.event.EventTypes;
+import com.cloud.exception.InvalidParameterValueException;
+import com.cloud.exception.NetworkRuleConflictException;
+import com.cloud.exception.ResourceUnavailableException;
+import com.cloud.network.IpAddress;
+import com.cloud.network.rules.FirewallRule;
+import com.cloud.network.rules.PortForwardingRule;
+import com.cloud.user.Account;
+import com.cloud.utils.net.Ip;
+import com.cloud.utils.net.NetUtils;
+import com.cloud.vm.VirtualMachine;
+
+
+@APICommand(name = &quot;createPortForwardingRule&quot;, description = &quot;Creates a port forwarding rule&quot;, responseObject = FirewallRuleResponse.class, entityType = {FirewallRule.class,
+        VirtualMachine.class, IpAddress.class},
+        requestHasSensitiveInfo = false, responseHasSensitiveInfo = false)
+<span class="nc" id="L56">public class CreatePortForwardingRuleCmd extends BaseAsyncCreateCmd implements PortForwardingRule {</span>
+<span class="nc" id="L57">    public static final Logger s_logger = Logger.getLogger(CreatePortForwardingRuleCmd.class.getName());</span>
+
+<span class="nc" id="L59">    private static final String s_name = &quot;createportforwardingruleresponse&quot;;</span>
+
+    // ///////////////////////////////////////////////////
+    // ////////////// API parameters /////////////////////
+    // ///////////////////////////////////////////////////
+
+    @ACL(accessType = AccessType.OperateEntry)
+    @Parameter(name = ApiConstants.IP_ADDRESS_ID,
+               type = CommandType.UUID,
+               entityType = IPAddressResponse.class,
+            required = true,
+    description = &quot;the IP address id of the port forwarding rule&quot;)
+    private Long ipAddressId;
+
+    @Parameter(name = ApiConstants.PRIVATE_START_PORT,
+               type = CommandType.INTEGER,
+               required = true,
+            description = &quot;the starting port of port forwarding rule's private port range&quot;)
+    private Integer privateStartPort;
+
+    @Parameter(name = ApiConstants.PROTOCOL,
+               type = CommandType.STRING,
+               required = true,
+            description = &quot;the protocol for the port forwarding rule. Valid values are TCP or UDP.&quot;)
+    private String protocol;
+
+    @Parameter(name = ApiConstants.PRIVATE_END_PORT,
+               type = CommandType.INTEGER,
+               required = false,
+               description = &quot;the ending port of port forwarding rule's private port range&quot;)
+    private Integer privateEndPort;
+
+    @Parameter(name = ApiConstants.PUBLIC_START_PORT,
+               type = CommandType.INTEGER,
+               required = true,
+            description = &quot;the starting port of port forwarding rule's public port range&quot;)
+    private Integer publicStartPort;
+
+    @Parameter(name = ApiConstants.PUBLIC_END_PORT,
+               type = CommandType.INTEGER,
+               required = false,
+               description = &quot;the ending port of port forwarding rule's private port range&quot;)
+    private Integer publicEndPort;
+
+    @ACL(accessType = AccessType.OperateEntry)
+    @Parameter(name = ApiConstants.VIRTUAL_MACHINE_ID,
+               type = CommandType.UUID,
+               entityType = UserVmResponse.class,
+            required = true,
+                description = &quot;the ID of the virtual machine for the port forwarding rule&quot;)
+    private Long virtualMachineId;
+
+    @Parameter(name = ApiConstants.CIDR_LIST, type = CommandType.LIST, collectionType = CommandType.STRING, description = &quot;the cidr list to forward traffic from&quot;)
+    private List&lt;String&gt; cidrlist;
+
+    @Parameter(name = ApiConstants.OPEN_FIREWALL, type = CommandType.BOOLEAN, description = &quot;if true, firewall rule for source/end public port is automatically created; &quot;
+        + &quot;if false - firewall rule has to be created explicitly. If not specified 1) defaulted to false when PF&quot;
+        + &quot; rule is being created for VPC guest network 2) in all other cases defaulted to true&quot;)
+    private Boolean openFirewall;
+
+    @Parameter(name = ApiConstants.NETWORK_ID,
+               type = CommandType.UUID,
+               entityType = NetworkResponse.class,
+               description = &quot;the network of the virtual machine the port forwarding rule will be created for. &quot;
+                   + &quot;Required when public IP address is not associated with any guest network yet (VPC case).&quot;)
+    private Long networkId;
+    @Parameter(name = ApiConstants.VM_GUEST_IP,
+               type = CommandType.STRING,
+               required = false,
+    description = &quot;VM guest nic secondary IP address for the port forwarding rule&quot;)
+    private String vmSecondaryIp;
+
+    @Parameter(name = ApiConstants.FOR_DISPLAY, type = CommandType.BOOLEAN, description = &quot;an optional field, whether to the display the rule to the end user or not&quot;, since = &quot;4.4&quot;, authorized = {RoleType.Admin})
+    private Boolean display;
+
+    // ///////////////////////////////////////////////////
+    // ///////////////// Accessors ///////////////////////
+    // ///////////////////////////////////////////////////
+
+    public Long getIpAddressId() {
+<span class="nc" id="L139">        return ipAddressId;</span>
+    }
+
+    public Ip getVmSecondaryIp() {
+<span class="nc bnc" id="L143" title="All 2 branches missed.">        if (vmSecondaryIp == null) {</span>
+<span class="nc" id="L144">            return null;</span>
+        }
+<span class="nc" id="L146">        return new Ip(vmSecondaryIp);</span>
+    }
+
+    @Override
+    public String getProtocol() {
+<span class="nc" id="L151">        return protocol.trim();</span>
+    }
+
+    @Override
+    public long getVirtualMachineId() {
+<span class="nc" id="L156">        return virtualMachineId;</span>
+    }
+
+    @Override
+    public List&lt;String&gt; getSourceCidrList() {
+<span class="nc bnc" id="L161" title="All 2 branches missed.">        if (cidrlist != null) {</span>
+<span class="nc" id="L162">            throw new InvalidParameterValueException(&quot;Parameter cidrList is deprecated; if you need to open firewall &quot;</span>
+                + &quot;rule for the specific cidr, please refer to createFirewallRule command&quot;);
+        }
+<span class="nc" id="L165">        return null;</span>
+    }
+
+    public Boolean getOpenFirewall() {
+<span class="nc bnc" id="L169" title="All 2 branches missed.">        boolean isVpc = getVpcId() == null ? false : true;</span>
+<span class="nc bnc" id="L170" title="All 2 branches missed.">        if (openFirewall != null) {</span>
+<span class="nc bnc" id="L171" title="All 4 branches missed.">            if (isVpc &amp;&amp; openFirewall) {</span>
+<span class="nc" id="L172">                throw new InvalidParameterValueException(&quot;Can't have openFirewall=true when IP address belongs to VPC&quot;);</span>
+            }
+<span class="nc" id="L174">            return openFirewall;</span>
+        } else {
+<span class="nc bnc" id="L176" title="All 2 branches missed.">            if (isVpc) {</span>
+<span class="nc" id="L177">                return false;</span>
+            }
+<span class="nc" id="L179">            return true;</span>
+        }
+    }
+
+    private Long getVpcId() {
+<span class="nc bnc" id="L184" title="All 2 branches missed.">        if (ipAddressId != null) {</span>
+<span class="nc" id="L185">            IpAddress ipAddr = _networkService.getIp(ipAddressId);</span>
+<span class="nc bnc" id="L186" title="All 4 branches missed.">            if (ipAddr == null || !ipAddr.readyToUse()) {</span>
+<span class="nc" id="L187">                throw new InvalidParameterValueException(&quot;Unable to create PF rule, invalid IP address id &quot; + ipAddressId);</span>
+            } else {
+<span class="nc" id="L189">                return ipAddr.getVpcId();</span>
+            }
+        }
+<span class="nc" id="L192">        return null;</span>
+    }
+
+    // ///////////////////////////////////////////////////
+    // ///////////// API Implementation///////////////////
+    // ///////////////////////////////////////////////////
+
+    @Override
+    public String getCommandName() {
+<span class="nc" id="L201">        return s_name;</span>
+    }
+
+    @Override
+    public void execute() throws ResourceUnavailableException {
+<span class="nc" id="L206">        CallContext callerContext = CallContext.current();</span>
+<span class="nc" id="L207">        boolean success = true;</span>
+<span class="nc" id="L208">        PortForwardingRule rule = null;</span>
+        try {
+<span class="nc" id="L210">            CallContext.current().setEventDetails(&quot;Rule Id: &quot; + getEntityId());</span>
+
+<span class="nc bnc" id="L212" title="All 2 branches missed.">            if (getOpenFirewall()) {</span>
+<span class="nc bnc" id="L213" title="All 4 branches missed.">                success = success &amp;&amp; _firewallService.applyIngressFirewallRules(ipAddressId, callerContext.getCallingAccount());</span>
+            }
+
+<span class="nc bnc" id="L216" title="All 4 branches missed.">            success = success &amp;&amp; _rulesService.applyPortForwardingRules(ipAddressId, callerContext.getCallingAccount());</span>
+
+            // State is different after the rule is applied, so get new object here
+<span class="nc" id="L219">            rule = _entityMgr.findById(PortForwardingRule.class, getEntityId());</span>
+<span class="nc" id="L220">            FirewallRuleResponse fwResponse = new FirewallRuleResponse();</span>
+<span class="nc bnc" id="L221" title="All 2 branches missed.">            if (rule != null) {</span>
+<span class="nc" id="L222">                fwResponse = _responseGenerator.createPortForwardingRuleResponse(rule);</span>
+<span class="nc" id="L223">                setResponseObject(fwResponse);</span>
+            }
+<span class="nc" id="L225">            fwResponse.setResponseName(getCommandName());</span>
+<span class="nc" id="L226">        } finally {</span>
+<span class="nc bnc" id="L227" title="All 8 branches missed.">            if (!success || rule == null) {</span>
+
+<span class="nc bnc" id="L229" title="All 4 branches missed.">                if (getOpenFirewall()) {</span>
+<span class="nc" id="L230">                    _firewallService.revokeRelatedFirewallRule(getEntityId(), true);</span>
+                }
+
+                try {
+<span class="nc" id="L234">                    _rulesService.revokePortForwardingRule(getEntityId(), true);</span>
+<span class="nc" id="L235">                } catch (Exception ex) {</span>
+                    //Ignore e.g. failed to apply rules to device error
+                }
+
+<span class="nc" id="L239">                throw new ServerApiException(ApiErrorCode.INTERNAL_ERROR, &quot;Failed to apply port forwarding rule&quot;);</span>
+            }
+<span class="nc" id="L241">        }</span>
+<span class="nc" id="L242">    }</span>
+
+    @Override
+    public long getId() {
+<span class="nc" id="L246">        throw new UnsupportedOperationException(&quot;database id can only provided by VO objects&quot;);</span>
+    }
+
+    @Override
+    public String getXid() {
+        // FIXME: We should allow for end user to specify Xid.
+<span class="nc" id="L252">        return null;</span>
+    }
+
+    @Override
+    public String getUuid() {
+        // TODO Auto-generated method stub
+<span class="nc" id="L258">        return null;</span>
+    }
+
+    @Override
+    public Long getSourceIpAddressId() {
+<span class="nc" id="L263">        return ipAddressId;</span>
+    }
+
+    @Override
+    public Integer getSourcePortStart() {
+<span class="nc" id="L268">        return publicStartPort.intValue();</span>
+    }
+
+    @Override
+    public Integer getSourcePortEnd() {
+<span class="nc bnc" id="L273" title="All 2 branches missed.">        return (publicEndPort == null) ? publicStartPort.intValue() : publicEndPort.intValue();</span>
+    }
+
+    @Override
+    public Purpose getPurpose() {
+<span class="nc" id="L278">        return Purpose.PortForwarding;</span>
+    }
+
+    @Override
+    public State getState() {
+<span class="nc" id="L283">        throw new UnsupportedOperationException(&quot;Should never call me to find the state&quot;);</span>
+    }
+
+    @Override
+    public long getNetworkId() {
+<span class="nc" id="L288">        IpAddress ip = _entityMgr.findById(IpAddress.class, getIpAddressId());</span>
+<span class="nc" id="L289">        Long ntwkId = null;</span>
+
+<span class="nc bnc" id="L291" title="All 2 branches missed.">        if (ip.getAssociatedWithNetworkId() != null) {</span>
+<span class="nc" id="L292">            ntwkId = ip.getAssociatedWithNetworkId();</span>
+<span class="nc" id="L293">        } else {</span>
+<span class="nc" id="L294">            ntwkId = networkId;</span>
+        }
+<span class="nc bnc" id="L296" title="All 2 branches missed.">        if (ntwkId == null) {</span>
+<span class="nc" id="L297">            throw new InvalidParameterValueException(&quot;Unable to create port forwarding rule for the ipAddress id=&quot; + ipAddressId +</span>
+<span class="nc" id="L298">                    &quot; as ip is not associated with any network and no networkId is passed in&quot;);</span>
+        }
+<span class="nc" id="L300">        return ntwkId;</span>
+    }
+
+    @Override
+    public long getEntityOwnerId() {
+<span class="nc" id="L305">        Account account = CallContext.current().getCallingAccount();</span>
+
+<span class="nc bnc" id="L307" title="All 2 branches missed.">        if (account != null) {</span>
+<span class="nc" id="L308">            return account.getId();</span>
+        }
+
+<span class="nc" id="L311">        return Account.ACCOUNT_ID_SYSTEM; // no account info given, parent this command to SYSTEM so ERROR events are</span>
+        // tracked
+    }
+
+    @Override
+    public long getDomainId() {
+<span class="nc" id="L317">        IpAddress ip = _networkService.getIp(ipAddressId);</span>
+<span class="nc" id="L318">        return ip.getDomainId();</span>
+    }
+
+    @Override
+    public Ip getDestinationIpAddress() {
+<span class="nc" id="L323">        return null;</span>
+    }
+
+    @Override
+    public void setDestinationIpAddress(Ip destinationIpAddress) {
+<span class="nc" id="L328">        return;</span>
+    }
+
+    @Override
+    public int getDestinationPortStart() {
+<span class="nc" id="L333">        return privateStartPort.intValue();</span>
+    }
+
+    @Override
+    public int getDestinationPortEnd() {
+<span class="nc bnc" id="L338" title="All 2 branches missed.">        return (privateEndPort == null) ? privateStartPort.intValue() : privateEndPort.intValue();</span>
+    }
+
+    @Override
+    public void create() {
+        // cidr list parameter is deprecated
+<span class="nc bnc" id="L344" title="All 2 branches missed.">        if (cidrlist != null) {</span>
+<span class="nc" id="L345">            throw new InvalidParameterValueException(</span>
+<span class="nc" id="L346">                &quot;Parameter cidrList is deprecated; if you need to open firewall rule for the specific cidr, please refer to createFirewallRule command&quot;);</span>
+        }
+
+<span class="nc" id="L349">        Ip privateIp = getVmSecondaryIp();</span>
+<span class="nc bnc" id="L350" title="All 2 branches missed.">        if (privateIp != null) {</span>
+<span class="nc bnc" id="L351" title="All 2 branches missed.">            if (!NetUtils.isValidIp(privateIp.toString())) {</span>
+<span class="nc" id="L352">                throw new InvalidParameterValueException(&quot;Invalid vm ip address&quot;);</span>
+            }
+        }
+
+        try {
+<span class="nc" id="L357">            PortForwardingRule result = _rulesService.createPortForwardingRule(this, virtualMachineId, privateIp, getOpenFirewall(), isDisplay());</span>
+<span class="nc" id="L358">            setEntityId(result.getId());</span>
+<span class="nc" id="L359">            setEntityUuid(result.getUuid());</span>
+<span class="nc" id="L360">        } catch (NetworkRuleConflictException ex) {</span>
+<span class="nc" id="L361">            s_logger.info(&quot;Network rule conflict: &quot;, ex);</span>
+<span class="nc" id="L362">            s_logger.trace(&quot;Network Rule Conflict: &quot;, ex);</span>
+<span class="nc" id="L363">            throw new ServerApiException(ApiErrorCode.NETWORK_RULE_CONFLICT_ERROR, ex.getMessage());</span>
+        }
+<span class="nc" id="L365">    }</span>
+
+    @Override
+    public String getEventType() {
+<span class="nc" id="L369">        return EventTypes.EVENT_NET_RULE_ADD;</span>
+    }
+
+    @Override
+    public String getEventDescription() {
+<span class="nc" id="L374">        IpAddress ip = _networkService.getIp(ipAddressId);</span>
+<span class="nc" id="L375">        return (&quot;Applying port forwarding  rule for Ip: &quot; + ip.getAddress() + &quot; with virtual machine:&quot; + virtualMachineId);</span>
+    }
+
+    @Override
+    public long getAccountId() {
+<span class="nc" id="L380">        IpAddress ip = _networkService.getIp(ipAddressId);</span>
+<span class="nc" id="L381">        return ip.getAccountId();</span>
+    }
+
+    @Override
+    public String getSyncObjType() {
+<span class="nc" id="L386">        return BaseAsyncCmd.networkSyncObject;</span>
+    }
+
+    @Override
+    public Long getSyncObjId() {
+<span class="nc" id="L391">        return getIp().getAssociatedWithNetworkId();</span>
+    }
+
+    private IpAddress getIp() {
+<span class="nc" id="L395">        IpAddress ip = _networkService.getIp(ipAddressId);</span>
+<span class="nc bnc" id="L396" title="All 2 branches missed.">        if (ip == null) {</span>
+<span class="nc" id="L397">            throw new InvalidParameterValueException(&quot;Unable to find ip address by id &quot; + ipAddressId);</span>
+        }
+<span class="nc" id="L399">        return ip;</span>
+    }
+
+    @Override
+    public Integer getIcmpCode() {
+<span class="nc" id="L404">        return null;</span>
+    }
+
+    @Override
+    public Integer getIcmpType() {
+<span class="nc" id="L409">        return null;</span>
+    }
+
+    @Override
+    public Long getRelated() {
+<span class="nc" id="L414">        return null;</span>
+    }
+
+    @Override
+    public FirewallRuleType getType() {
+<span class="nc" id="L419">        return FirewallRuleType.User;</span>
+    }
+
+    @Override
+    public ApiCommandJobType getInstanceType() {
+<span class="nc" id="L424">        return ApiCommandJobType.FirewallRule;</span>
+    }
+
+    @Override
+    public TrafficType getTrafficType() {
+<span class="nc" id="L429">        return null;</span>
+    }
+
+    @Override
+    public boolean isDisplay() {
+<span class="nc bnc" id="L434" title="All 2 branches missed.">        if (display != null) {</span>
+<span class="nc" id="L435">            return display;</span>
+        } else {
+<span class="nc" id="L437">            return true;</span>
+        }
+    }
+
+    @Override
+    public Class&lt;?&gt; getEntityType() {
+<span class="nc" id="L443">        return FirewallRule.class;</span>
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>cloud-core (18-mrt-2016 13:14:54)</div></body></html>

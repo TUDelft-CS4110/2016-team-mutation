@@ -1,0 +1,1999 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>GenericDaoBase.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">cloud-core (18-mrt-2016 13:14:54)</a> &gt; <a href="../../index.html" class="el_group">cloud-framework-db</a> &gt; <a href="../index.html" class="el_bundle">src</a> &gt; <a href="index.source.html" class="el_package">com.cloud.utils.db</a> &gt; <span class="el_source">GenericDaoBase.java</span></div><h1>GenericDaoBase.java</h1><pre class="source lang-java linenums">// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// &quot;License&quot;); you may not use this file except in compliance
+// the License.  You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+package com.cloud.utils.db;
+
+import java.io.Serializable;
+import java.io.UnsupportedEncodingException;
+import java.lang.reflect.Array;
+import java.lang.reflect.Field;
+import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.Type;
+import java.net.MalformedURLException;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.net.URL;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Calendar;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Date;
+import java.util.Enumeration;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.TimeZone;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+
+import javax.naming.ConfigurationException;
+import javax.persistence.AttributeOverride;
+import javax.persistence.Column;
+import javax.persistence.EmbeddedId;
+import javax.persistence.EntityExistsException;
+import javax.persistence.EnumType;
+import javax.persistence.Enumerated;
+import javax.persistence.Table;
+import javax.persistence.TableGenerator;
+
+import net.sf.cglib.proxy.Callback;
+import net.sf.cglib.proxy.CallbackFilter;
+import net.sf.cglib.proxy.Enhancer;
+import net.sf.cglib.proxy.Factory;
+import net.sf.cglib.proxy.MethodInterceptor;
+import net.sf.cglib.proxy.NoOp;
+import net.sf.ehcache.Cache;
+import net.sf.ehcache.CacheManager;
+import net.sf.ehcache.Element;
+
+import org.apache.log4j.Logger;
+
+import com.cloud.utils.DateUtil;
+import com.cloud.utils.NumbersUtil;
+import com.cloud.utils.Pair;
+import com.cloud.utils.Ternary;
+import com.cloud.utils.component.ComponentLifecycle;
+import com.cloud.utils.component.ComponentLifecycleBase;
+import com.cloud.utils.component.ComponentMethodInterceptable;
+import com.cloud.utils.crypt.DBEncryptionUtil;
+import com.cloud.utils.db.SearchCriteria.SelectType;
+import com.cloud.utils.exception.CloudRuntimeException;
+import com.cloud.utils.net.Ip;
+import com.cloud.utils.net.NetUtils;
+
+/**
+ *  GenericDaoBase is a simple way to implement DAOs.  It DOES NOT
+ *  support the full EJB3 spec.  It borrows some of the annotations from
+ *  the EJB3 spec to produce a set of SQLs so developers don't have to
+ *  copy and paste the same code over and over again.  Of course,
+ *  GenericDaoBase is completely at the mercy of the annotations you add
+ *  to your entity bean.  If GenericDaoBase does not fit your needs, then
+ *  don't extend from it.
+ *
+ *  GenericDaoBase attempts to achieve the following:
+ *    1. If you use _allFieldsStr in your SQL statement and use to() to convert
+ *       the result to the entity bean, you don't ever have to worry about
+ *       missing fields because its automatically taken from the entity bean's
+ *       annotations.
+ *    2. You don't have to rewrite the same insert and select query strings
+ *       in all of your DAOs.
+ *    3. You don't have to match the '?' (you know what I'm talking about) to
+ *       the fields in the insert statement as that's taken care of for you.
+ *
+ *  GenericDaoBase looks at the following annotations:
+ *    1. Table - just name
+ *    2. Column - just name
+ *    3. GeneratedValue - any field with this annotation is not inserted.
+ *    4. SequenceGenerator - sequence generator
+ *    5. Id
+ *    6. SecondaryTable
+ *
+ *  Sometime later, I might look into injecting the SQLs as needed but right
+ *  now we have to construct them at construction time.  The good thing is that
+ *  the DAOs are suppose to be one per jvm so the time is all during the
+ *  initial load.
+ *
+ **/
+@DB
+<span class="nc bnc" id="L117" title="All 2 branches missed.">public abstract class GenericDaoBase&lt;T, ID extends Serializable&gt; extends ComponentLifecycleBase implements GenericDao&lt;T, ID&gt;, ComponentMethodInterceptable {</span>
+<span class="nc" id="L118">    private final static Logger s_logger = Logger.getLogger(GenericDaoBase.class);</span>
+
+<span class="nc" id="L120">    protected final static TimeZone s_gmtTimeZone = TimeZone.getTimeZone(&quot;GMT&quot;);</span>
+
+<span class="nc" id="L122">    protected final static Map&lt;Class&lt;?&gt;, GenericDao&lt;?, ? extends Serializable&gt;&gt; s_daoMaps = new ConcurrentHashMap&lt;Class&lt;?&gt;, GenericDao&lt;?, ? extends Serializable&gt;&gt;(71);</span>
+
+    protected Class&lt;T&gt; _entityBeanType;
+    protected String _table;
+
+    protected String _tables;
+
+    protected Field[] _embeddedFields;
+
+    // This is private on purpose.  Everyone should use createPartialSelectSql()
+    private final Pair&lt;StringBuilder, Attribute[]&gt; _partialSelectSql;
+    private final Pair&lt;StringBuilder, Attribute[]&gt; _partialQueryCacheSelectSql;
+    protected StringBuilder _discriminatorClause;
+    protected Map&lt;String, Object&gt; _discriminatorValues;
+    protected String _selectByIdSql;
+    protected String _count;
+    protected String _distinctIdSql;
+
+    protected Field _idField;
+
+    protected List&lt;Pair&lt;String, Attribute[]&gt;&gt; _insertSqls;
+    protected Pair&lt;String, Attribute&gt; _removed;
+    protected Pair&lt;String, Attribute[]&gt; _removeSql;
+    protected List&lt;Pair&lt;String, Attribute[]&gt;&gt; _deleteSqls;
+    protected Map&lt;String, Attribute[]&gt; _idAttributes;
+    protected Map&lt;String, TableGenerator&gt; _tgs;
+    protected Map&lt;String, Attribute&gt; _allAttributes;
+    protected List&lt;Attribute&gt; _ecAttributes;
+    protected Map&lt;Pair&lt;String, String&gt;, Attribute&gt; _allColumns;
+    protected Enhancer _enhancer;
+    protected Factory _factory;
+    protected Enhancer _searchEnhancer;
+    protected int _timeoutSeconds;
+
+<span class="nc" id="L156">    protected final static CallbackFilter s_callbackFilter = new UpdateFilter();</span>
+
+    protected static final String FOR_UPDATE_CLAUSE = &quot; FOR UPDATE &quot;;
+    protected static final String SHARE_MODE_CLAUSE = &quot; LOCK IN SHARE MODE&quot;;
+    protected static final String SELECT_LAST_INSERT_ID_SQL = &quot;SELECT LAST_INSERT_ID()&quot;;
+
+<span class="nc" id="L162">    protected static final SequenceFetcher s_seqFetcher = SequenceFetcher.getInstance();</span>
+
+    public static &lt;J&gt; GenericDao&lt;? extends J, ? extends Serializable&gt; getDao(Class&lt;J&gt; entityType) {
+        @SuppressWarnings(&quot;unchecked&quot;)
+<span class="nc" id="L166">        GenericDao&lt;? extends J, ? extends Serializable&gt; dao = (GenericDao&lt;? extends J, ? extends Serializable&gt;)s_daoMaps.get(entityType);</span>
+<span class="nc bnc" id="L167" title="All 4 branches missed.">        assert dao != null : &quot;Unable to find DAO for &quot; + entityType + &quot;.  Are you sure you waited for the DAO to be initialized before asking for it?&quot;;</span>
+<span class="nc" id="L168">        return dao;</span>
+    }
+
+    @Override
+    @SuppressWarnings(&quot;unchecked&quot;)
+    @DB()
+    public &lt;J&gt; GenericSearchBuilder&lt;T, J&gt; createSearchBuilder(Class&lt;J&gt; resultType) {
+<span class="nc" id="L175">        return new GenericSearchBuilder&lt;T, J&gt;(_entityBeanType, resultType);</span>
+    }
+
+    @Override
+    public Map&lt;String, Attribute&gt; getAllAttributes() {
+<span class="nc" id="L180">        return _allAttributes;</span>
+    }
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    public T createSearchEntity(MethodInterceptor interceptor) {
+<span class="nc" id="L185">        T entity = (T)_searchEnhancer.create();</span>
+<span class="nc" id="L186">        final Factory factory = (Factory)entity;</span>
+<span class="nc" id="L187">        factory.setCallback(0, interceptor);</span>
+<span class="nc" id="L188">        return entity;</span>
+    }
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    protected GenericDaoBase() {
+<span class="nc" id="L193">        super();</span>
+<span class="nc" id="L194">        Type t = getClass().getGenericSuperclass();</span>
+<span class="nc bnc" id="L195" title="All 2 branches missed.">        if (t instanceof ParameterizedType) {</span>
+<span class="nc" id="L196">            _entityBeanType = (Class&lt;T&gt;)((ParameterizedType)t).getActualTypeArguments()[0];</span>
+<span class="nc bnc" id="L197" title="All 2 branches missed.">        } else if (((Class&lt;?&gt;)t).getGenericSuperclass() instanceof ParameterizedType) {</span>
+<span class="nc" id="L198">            _entityBeanType = (Class&lt;T&gt;)((ParameterizedType)((Class&lt;?&gt;)t).getGenericSuperclass()).getActualTypeArguments()[0];</span>
+<span class="nc" id="L199">        } else {</span>
+<span class="nc" id="L200">            _entityBeanType = (Class&lt;T&gt;)((ParameterizedType)((Class&lt;?&gt;)((Class&lt;?&gt;)t).getGenericSuperclass()).getGenericSuperclass()).getActualTypeArguments()[0];</span>
+        }
+
+<span class="nc" id="L203">        s_daoMaps.put(_entityBeanType, this);</span>
+<span class="nc" id="L204">        Class&lt;?&gt;[] interphaces = _entityBeanType.getInterfaces();</span>
+<span class="nc bnc" id="L205" title="All 2 branches missed.">        if (interphaces != null) {</span>
+<span class="nc bnc" id="L206" title="All 2 branches missed.">            for (Class&lt;?&gt; interphace : interphaces) {</span>
+<span class="nc" id="L207">                s_daoMaps.put(interphace, this);</span>
+            }
+        }
+
+<span class="nc" id="L211">        _table = DbUtil.getTableName(_entityBeanType);</span>
+
+<span class="nc" id="L213">        final SqlGenerator generator = new SqlGenerator(_entityBeanType);</span>
+<span class="nc" id="L214">        _partialSelectSql = generator.buildSelectSql(false);</span>
+<span class="nc" id="L215">        _count = generator.buildCountSql();</span>
+<span class="nc" id="L216">        _distinctIdSql= generator.buildDistinctIdSql();</span>
+<span class="nc" id="L217">        _partialQueryCacheSelectSql = generator.buildSelectSql(true);</span>
+<span class="nc" id="L218">        _embeddedFields = generator.getEmbeddedFields();</span>
+<span class="nc" id="L219">        _insertSqls = generator.buildInsertSqls();</span>
+<span class="nc" id="L220">        final Pair&lt;StringBuilder, Map&lt;String, Object&gt;&gt; dc = generator.buildDiscriminatorClause();</span>
+<span class="nc bnc" id="L221" title="All 2 branches missed.">        _discriminatorClause = dc.first().length() == 0 ? null : dc.first();</span>
+<span class="nc" id="L222">        _discriminatorValues = dc.second();</span>
+
+<span class="nc" id="L224">        _idAttributes = generator.getIdAttributes();</span>
+<span class="nc bnc" id="L225" title="All 2 branches missed.">        _idField = _idAttributes.get(_table).length &gt; 0 ? _idAttributes.get(_table)[0].field : null;</span>
+
+<span class="nc" id="L227">        _tables = generator.buildTableReferences();</span>
+
+<span class="nc" id="L229">        _allAttributes = generator.getAllAttributes();</span>
+<span class="nc" id="L230">        _allColumns = generator.getAllColumns();</span>
+
+<span class="nc" id="L232">        _selectByIdSql = buildSelectByIdSql(createPartialSelectSql(null, true));</span>
+<span class="nc" id="L233">        _removeSql = generator.buildRemoveSql();</span>
+<span class="nc" id="L234">        _deleteSqls = generator.buildDeleteSqls();</span>
+<span class="nc" id="L235">        _removed = generator.getRemovedAttribute();</span>
+<span class="nc" id="L236">        _tgs = generator.getTableGenerators();</span>
+<span class="nc" id="L237">        _ecAttributes = generator.getElementCollectionAttributes();</span>
+
+<span class="nc" id="L239">        TableGenerator tg = this.getClass().getAnnotation(TableGenerator.class);</span>
+<span class="nc bnc" id="L240" title="All 2 branches missed.">        if (tg != null) {</span>
+<span class="nc" id="L241">            _tgs.put(tg.name(), tg);</span>
+        }
+<span class="nc" id="L243">        tg = this.getClass().getSuperclass().getAnnotation(TableGenerator.class);</span>
+<span class="nc bnc" id="L244" title="All 2 branches missed.">        if (tg != null) {</span>
+<span class="nc" id="L245">            _tgs.put(tg.name(), tg);</span>
+        }
+
+<span class="nc" id="L248">        Callback[] callbacks = new Callback[] {NoOp.INSTANCE, new UpdateBuilder(this)};</span>
+
+<span class="nc" id="L250">        _enhancer = new Enhancer();</span>
+<span class="nc" id="L251">        _enhancer.setSuperclass(_entityBeanType);</span>
+<span class="nc" id="L252">        _enhancer.setCallbackFilter(s_callbackFilter);</span>
+<span class="nc" id="L253">        _enhancer.setCallbacks(callbacks);</span>
+<span class="nc" id="L254">        _factory = (Factory)_enhancer.create();</span>
+
+<span class="nc" id="L256">        _searchEnhancer = new Enhancer();</span>
+<span class="nc" id="L257">        _searchEnhancer.setSuperclass(_entityBeanType);</span>
+<span class="nc" id="L258">        _searchEnhancer.setCallback(new UpdateBuilder(this));</span>
+
+<span class="nc bnc" id="L260" title="All 2 branches missed.">        if (s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L261">            s_logger.trace(&quot;Select SQL: &quot; + _partialSelectSql.first().toString());</span>
+<span class="nc bnc" id="L262" title="All 2 branches missed.">            s_logger.trace(&quot;Remove SQL: &quot; + (_removeSql != null ? _removeSql.first() : &quot;No remove sql&quot;));</span>
+<span class="nc" id="L263">            s_logger.trace(&quot;Select by Id SQL: &quot; + _selectByIdSql);</span>
+<span class="nc" id="L264">            s_logger.trace(&quot;Table References: &quot; + _tables);</span>
+<span class="nc" id="L265">            s_logger.trace(&quot;Insert SQLs:&quot;);</span>
+<span class="nc bnc" id="L266" title="All 2 branches missed.">            for (final Pair&lt;String, Attribute[]&gt; insertSql : _insertSqls) {</span>
+<span class="nc" id="L267">                s_logger.trace(insertSql.first());</span>
+            }
+
+<span class="nc" id="L270">            s_logger.trace(&quot;Delete SQLs&quot;);</span>
+<span class="nc bnc" id="L271" title="All 2 branches missed.">            for (final Pair&lt;String, Attribute[]&gt; deletSql : _deleteSqls) {</span>
+<span class="nc" id="L272">                s_logger.trace(deletSql.first());</span>
+            }
+
+<span class="nc" id="L275">            s_logger.trace(&quot;Collection SQLs&quot;);</span>
+<span class="nc bnc" id="L276" title="All 2 branches missed.">            for (Attribute attr : _ecAttributes) {</span>
+<span class="nc" id="L277">                EcInfo info = (EcInfo)attr.attache;</span>
+<span class="nc" id="L278">                s_logger.trace(info.insertSql);</span>
+<span class="nc" id="L279">                s_logger.trace(info.selectSql);</span>
+            }
+        }
+
+<span class="nc" id="L283">        setRunLevel(ComponentLifecycle.RUN_LEVEL_SYSTEM);</span>
+<span class="nc" id="L284">    }</span>
+
+    @Override
+    @DB()
+    @SuppressWarnings(&quot;unchecked&quot;)
+    public T createForUpdate(final ID id) {
+<span class="nc" id="L290">        final T entity = (T)_factory.newInstance(new Callback[] {NoOp.INSTANCE, new UpdateBuilder(this)});</span>
+<span class="nc bnc" id="L291" title="All 2 branches missed.">        if (id != null) {</span>
+            try {
+<span class="nc" id="L293">                _idField.set(entity, id);</span>
+<span class="nc" id="L294">            } catch (final IllegalArgumentException e) {</span>
+<span class="nc" id="L295">            } catch (final IllegalAccessException e) {</span>
+            }
+        }
+<span class="nc" id="L298">        return entity;</span>
+    }
+
+    @Override
+    @DB()
+    public T createForUpdate() {
+<span class="nc" id="L304">        return createForUpdate(null);</span>
+    }
+
+    @Override
+    @DB()
+    public &lt;K&gt; K getNextInSequence(final Class&lt;K&gt; clazz, final String name) {
+<span class="nc" id="L310">        final TableGenerator tg = _tgs.get(name);</span>
+<span class="nc bnc" id="L311" title="All 4 branches missed.">        assert (tg != null) : &quot;Couldn't find Table generator using &quot; + name;</span>
+
+<span class="nc" id="L313">        return s_seqFetcher.getNextSequence(clazz, tg);</span>
+    }
+
+    @Override
+    @DB()
+    public &lt;K&gt; K getRandomlyIncreasingNextInSequence(final Class&lt;K&gt; clazz, final String name) {
+<span class="nc" id="L319">        final TableGenerator tg = _tgs.get(name);</span>
+<span class="nc bnc" id="L320" title="All 4 branches missed.">        assert (tg != null) : &quot;Couldn't find Table generator using &quot; + name;</span>
+
+<span class="nc" id="L322">        return s_seqFetcher.getRandomNextSequence(clazz, tg);</span>
+    }
+
+    @Override
+    @DB()
+    public List&lt;T&gt; lockRows(final SearchCriteria&lt;T&gt; sc, final Filter filter, final boolean exclusive) {
+<span class="nc" id="L328">        return search(sc, filter, exclusive, false);</span>
+    }
+
+    @Override
+    @DB()
+    public T lockOneRandomRow(final SearchCriteria&lt;T&gt; sc, final boolean exclusive) {
+<span class="nc" id="L334">        final Filter filter = new Filter(1);</span>
+<span class="nc" id="L335">        final List&lt;T&gt; beans = search(sc, filter, exclusive, true);</span>
+<span class="nc bnc" id="L336" title="All 2 branches missed.">        return beans.isEmpty() ? null : beans.get(0);</span>
+    }
+
+    @DB()
+    protected List&lt;T&gt; search(SearchCriteria&lt;T&gt; sc, final Filter filter, final Boolean lock, final boolean cache) {
+<span class="nc bnc" id="L341" title="All 2 branches missed.">        if (_removed != null) {</span>
+<span class="nc bnc" id="L342" title="All 2 branches missed.">            if (sc == null) {</span>
+<span class="nc" id="L343">                sc = createSearchCriteria();</span>
+            }
+<span class="nc" id="L345">            sc.addAnd(_removed.second().field.getName(), SearchCriteria.Op.NULL);</span>
+        }
+<span class="nc" id="L347">        return searchIncludingRemoved(sc, filter, lock, cache);</span>
+    }
+
+    @DB()
+    protected List&lt;T&gt; search(SearchCriteria&lt;T&gt; sc, final Filter filter, final Boolean lock, final boolean cache, final boolean enableQueryCache) {
+<span class="nc bnc" id="L352" title="All 2 branches missed.">        if (_removed != null) {</span>
+<span class="nc bnc" id="L353" title="All 2 branches missed.">            if (sc == null) {</span>
+<span class="nc" id="L354">                sc = createSearchCriteria();</span>
+            }
+<span class="nc" id="L356">            sc.addAnd(_removed.second().field.getName(), SearchCriteria.Op.NULL);</span>
+        }
+<span class="nc" id="L358">        return searchIncludingRemoved(sc, filter, lock, cache, enableQueryCache);</span>
+    }
+
+    @Override
+    public List&lt;T&gt; searchIncludingRemoved(SearchCriteria&lt;T&gt; sc, final Filter filter, final Boolean lock, final boolean cache) {
+<span class="nc" id="L363">        return searchIncludingRemoved(sc, filter, lock, cache, false);</span>
+    }
+
+    @Override
+    public List&lt;T&gt; searchIncludingRemoved(SearchCriteria&lt;T&gt; sc, final Filter filter, final Boolean lock, final boolean cache, final boolean enableQueryCache) {
+<span class="nc bnc" id="L368" title="All 2 branches missed.">        String clause = sc != null ? sc.getWhereClause() : null;</span>
+<span class="nc bnc" id="L369" title="All 4 branches missed.">        if (clause != null &amp;&amp; clause.length() == 0) {</span>
+<span class="nc" id="L370">            clause = null;</span>
+        }
+
+<span class="nc bnc" id="L373" title="All 2 branches missed.">        final StringBuilder str = createPartialSelectSql(sc, clause != null, enableQueryCache);</span>
+<span class="nc bnc" id="L374" title="All 2 branches missed.">        if (clause != null) {</span>
+<span class="nc" id="L375">            str.append(clause);</span>
+        }
+
+<span class="nc" id="L378">        Collection&lt;JoinBuilder&lt;SearchCriteria&lt;?&gt;&gt;&gt; joins = null;</span>
+<span class="nc bnc" id="L379" title="All 2 branches missed.">        if (sc != null) {</span>
+<span class="nc" id="L380">            joins = sc.getJoins();</span>
+<span class="nc bnc" id="L381" title="All 2 branches missed.">            if (joins != null) {</span>
+<span class="nc" id="L382">                addJoins(str, joins);</span>
+            }
+        }
+
+<span class="nc" id="L386">        List&lt;Object&gt; groupByValues = addGroupBy(str, sc);</span>
+<span class="nc" id="L387">        addFilter(str, filter);</span>
+
+<span class="nc" id="L389">        final TransactionLegacy txn = TransactionLegacy.currentTxn();</span>
+<span class="nc bnc" id="L390" title="All 2 branches missed.">        if (lock != null) {</span>
+<span class="nc bnc" id="L391" title="All 4 branches missed.">            assert (txn.dbTxnStarted() == true) : &quot;As nice as I can here now....how do you lock when there's no DB transaction?  Review your db 101 course from college.&quot;;</span>
+<span class="nc bnc" id="L392" title="All 2 branches missed.">            str.append(lock ? FOR_UPDATE_CLAUSE : SHARE_MODE_CLAUSE);</span>
+        }
+
+<span class="nc" id="L395">        final String sql = str.toString();</span>
+
+<span class="nc" id="L397">        PreparedStatement pstmt = null;</span>
+<span class="nc" id="L398">        final List&lt;T&gt; result = new ArrayList&lt;T&gt;();</span>
+        try {
+<span class="nc" id="L400">            pstmt = txn.prepareAutoCloseStatement(sql);</span>
+<span class="nc" id="L401">            int i = 1;</span>
+<span class="nc bnc" id="L402" title="All 2 branches missed.">            if (clause != null) {</span>
+<span class="nc bnc" id="L403" title="All 2 branches missed.">                for (final Pair&lt;Attribute, Object&gt; value : sc.getValues()) {</span>
+<span class="nc" id="L404">                    prepareAttribute(i++, pstmt, value.first(), value.second());</span>
+                }
+            }
+
+<span class="nc bnc" id="L408" title="All 2 branches missed.">            if (joins != null) {</span>
+<span class="nc" id="L409">                i = addJoinAttributes(i, pstmt, joins);</span>
+            }
+
+<span class="nc bnc" id="L412" title="All 2 branches missed.">            if (groupByValues != null) {</span>
+<span class="nc bnc" id="L413" title="All 2 branches missed.">                for (Object value : groupByValues) {</span>
+<span class="nc" id="L414">                    pstmt.setObject(i++, value);</span>
+                }
+            }
+
+<span class="nc bnc" id="L418" title="All 4 branches missed.">            if (s_logger.isDebugEnabled() &amp;&amp; lock != null) {</span>
+<span class="nc" id="L419">                txn.registerLock(pstmt.toString());</span>
+            }
+<span class="nc" id="L421">            final ResultSet rs = pstmt.executeQuery();</span>
+<span class="nc bnc" id="L422" title="All 2 branches missed.">            while (rs.next()) {</span>
+<span class="nc" id="L423">                result.add(toEntityBean(rs, cache));</span>
+            }
+<span class="nc" id="L425">            return result;</span>
+<span class="nc" id="L426">        } catch (final SQLException e) {</span>
+<span class="nc" id="L427">            throw new CloudRuntimeException(&quot;DB Exception on: &quot; + pstmt, e);</span>
+<span class="nc" id="L428">        } catch (final Throwable e) {</span>
+<span class="nc" id="L429">            throw new CloudRuntimeException(&quot;Caught: &quot; + pstmt, e);</span>
+        }
+    }
+
+    @Override
+    @SuppressWarnings(&quot;unchecked&quot;)
+    public &lt;M&gt; List&lt;M&gt; customSearchIncludingRemoved(SearchCriteria&lt;M&gt; sc, final Filter filter) {
+<span class="nc bnc" id="L436" title="All 2 branches missed.">        if (sc == null) {</span>
+<span class="nc" id="L437">            throw new CloudRuntimeException(&quot;Call to customSearchIncludingRemoved with null search Criteria&quot;);</span>
+        }
+<span class="nc bnc" id="L439" title="All 2 branches missed.">        if (sc.isSelectAll()) {</span>
+<span class="nc" id="L440">            return (List&lt;M&gt;)searchIncludingRemoved((SearchCriteria&lt;T&gt;)sc, filter, null, false);</span>
+        }
+<span class="nc" id="L442">        String clause = sc.getWhereClause();</span>
+<span class="nc bnc" id="L443" title="All 4 branches missed.">        if (clause != null &amp;&amp; clause.length() == 0) {</span>
+<span class="nc" id="L444">            clause = null;</span>
+        }
+
+<span class="nc bnc" id="L447" title="All 2 branches missed.">        final StringBuilder str = createPartialSelectSql(sc, clause != null);</span>
+<span class="nc bnc" id="L448" title="All 2 branches missed.">        if (clause != null) {</span>
+<span class="nc" id="L449">            str.append(clause);</span>
+        }
+
+<span class="nc" id="L452">        Collection&lt;JoinBuilder&lt;SearchCriteria&lt;?&gt;&gt;&gt; joins = null;</span>
+<span class="nc" id="L453">        joins = sc.getJoins();</span>
+<span class="nc bnc" id="L454" title="All 2 branches missed.">        if (joins != null) {</span>
+<span class="nc" id="L455">            addJoins(str, joins);</span>
+        }
+
+<span class="nc" id="L458">        List&lt;Object&gt; groupByValues = addGroupBy(str, sc);</span>
+<span class="nc" id="L459">        addFilter(str, filter);</span>
+
+<span class="nc" id="L461">        final String sql = str.toString();</span>
+
+<span class="nc" id="L463">        final TransactionLegacy txn = TransactionLegacy.currentTxn();</span>
+<span class="nc" id="L464">        PreparedStatement pstmt = null;</span>
+        try {
+<span class="nc" id="L466">            pstmt = txn.prepareAutoCloseStatement(sql);</span>
+<span class="nc" id="L467">            int i = 1;</span>
+<span class="nc bnc" id="L468" title="All 2 branches missed.">            if (clause != null) {</span>
+<span class="nc bnc" id="L469" title="All 2 branches missed.">                for (final Pair&lt;Attribute, Object&gt; value : sc.getValues()) {</span>
+<span class="nc" id="L470">                    prepareAttribute(i++, pstmt, value.first(), value.second());</span>
+                }
+            }
+
+<span class="nc bnc" id="L474" title="All 2 branches missed.">            if (joins != null) {</span>
+<span class="nc" id="L475">                i = addJoinAttributes(i, pstmt, joins);</span>
+            }
+
+<span class="nc bnc" id="L478" title="All 2 branches missed.">            if (groupByValues != null) {</span>
+<span class="nc bnc" id="L479" title="All 2 branches missed.">                for (Object value : groupByValues) {</span>
+<span class="nc" id="L480">                    pstmt.setObject(i++, value);</span>
+                }
+            }
+
+<span class="nc" id="L484">            ResultSet rs = pstmt.executeQuery();</span>
+<span class="nc" id="L485">            SelectType st = sc.getSelectType();</span>
+<span class="nc" id="L486">            ArrayList&lt;M&gt; results = new ArrayList&lt;M&gt;();</span>
+<span class="nc" id="L487">            List&lt;Field&gt; fields = sc.getSelectFields();</span>
+<span class="nc bnc" id="L488" title="All 2 branches missed.">            while (rs.next()) {</span>
+<span class="nc bnc" id="L489" title="All 2 branches missed.">                if (st == SelectType.Entity) {</span>
+<span class="nc" id="L490">                    results.add((M)toEntityBean(rs, false));</span>
+<span class="nc bnc" id="L491" title="All 4 branches missed.">                } else if (st == SelectType.Fields || st == SelectType.Result) {</span>
+<span class="nc" id="L492">                    M m = sc.getResultType().newInstance();</span>
+<span class="nc bnc" id="L493" title="All 2 branches missed.">                    for (int j = 1; j &lt;= fields.size(); j++) {</span>
+<span class="nc" id="L494">                        setField(m, fields.get(j - 1), rs, j);</span>
+                    }
+<span class="nc" id="L496">                    results.add(m);</span>
+<span class="nc bnc" id="L497" title="All 2 branches missed.">                } else if (st == SelectType.Single) {</span>
+<span class="nc" id="L498">                    results.add(getObject(sc.getResultType(), rs, 1));</span>
+                }
+            }
+
+<span class="nc" id="L502">            return results;</span>
+<span class="nc" id="L503">        } catch (final SQLException e) {</span>
+<span class="nc" id="L504">            throw new CloudRuntimeException(&quot;DB Exception on: &quot; + pstmt, e);</span>
+<span class="nc" id="L505">        } catch (final Throwable e) {</span>
+<span class="nc" id="L506">            throw new CloudRuntimeException(&quot;Caught: &quot; + pstmt, e);</span>
+        }
+    }
+
+    @Override
+    @DB()
+    public &lt;M&gt; List&lt;M&gt; customSearch(SearchCriteria&lt;M&gt; sc, final Filter filter) {
+<span class="nc bnc" id="L513" title="All 2 branches missed.">        if (_removed != null) {</span>
+<span class="nc" id="L514">            sc.addAnd(_removed.second().field.getName(), SearchCriteria.Op.NULL);</span>
+        }
+
+<span class="nc" id="L517">        return customSearchIncludingRemoved(sc, filter);</span>
+    }
+
+    @DB()
+    protected void setField(Object entity, Field field, ResultSet rs, int index) throws SQLException {
+        try {
+<span class="nc" id="L523">            final Class&lt;?&gt; type = field.getType();</span>
+<span class="nc bnc" id="L524" title="All 2 branches missed.">            if (type == String.class) {</span>
+<span class="nc" id="L525">                byte[] bytes = rs.getBytes(index);</span>
+<span class="nc bnc" id="L526" title="All 2 branches missed.">                if (bytes != null) {</span>
+                    try {
+<span class="nc" id="L528">                        Encrypt encrypt = field.getAnnotation(Encrypt.class);</span>
+<span class="nc bnc" id="L529" title="All 4 branches missed.">                        if (encrypt != null &amp;&amp; encrypt.encrypt()) {</span>
+<span class="nc" id="L530">                            field.set(entity, DBEncryptionUtil.decrypt(new String(bytes, &quot;UTF-8&quot;)));</span>
+<span class="nc" id="L531">                        } else {</span>
+<span class="nc" id="L532">                            field.set(entity, new String(bytes, &quot;UTF-8&quot;));</span>
+                        }
+<span class="nc" id="L534">                    } catch (IllegalArgumentException e) {</span>
+<span class="nc bnc" id="L535" title="All 2 branches missed.">                        assert (false);</span>
+<span class="nc" id="L536">                        throw new CloudRuntimeException(&quot;IllegalArgumentException when converting UTF-8 data&quot;);</span>
+<span class="nc" id="L537">                    } catch (UnsupportedEncodingException e) {</span>
+<span class="nc bnc" id="L538" title="All 2 branches missed.">                        assert (false);</span>
+<span class="nc" id="L539">                        throw new CloudRuntimeException(&quot;UnsupportedEncodingException when converting UTF-8 data&quot;);</span>
+                    }
+                } else {
+<span class="nc" id="L542">                    field.set(entity, null);</span>
+                }
+<span class="nc bnc" id="L544" title="All 2 branches missed.">            } else if (type == long.class) {</span>
+<span class="nc" id="L545">                field.setLong(entity, rs.getLong(index));</span>
+<span class="nc bnc" id="L546" title="All 2 branches missed.">            } else if (type == Long.class) {</span>
+<span class="nc bnc" id="L547" title="All 2 branches missed.">                if (rs.getObject(index) == null) {</span>
+<span class="nc" id="L548">                    field.set(entity, null);</span>
+<span class="nc" id="L549">                } else {</span>
+<span class="nc" id="L550">                    field.set(entity, rs.getLong(index));</span>
+                }
+<span class="nc bnc" id="L552" title="All 2 branches missed.">            } else if (type.isEnum()) {</span>
+<span class="nc" id="L553">                final Enumerated enumerated = field.getAnnotation(Enumerated.class);</span>
+<span class="nc bnc" id="L554" title="All 2 branches missed.">                final EnumType enumType = (enumerated == null) ? EnumType.STRING : enumerated.value();</span>
+
+<span class="nc" id="L556">                final Enum&lt;?&gt;[] enums = (Enum&lt;?&gt;[])field.getType().getEnumConstants();</span>
+<span class="nc bnc" id="L557" title="All 2 branches missed.">                for (final Enum&lt;?&gt; e : enums) {</span>
+<span class="nc bnc" id="L558" title="All 4 branches missed.">                    if ((enumType == EnumType.STRING &amp;&amp; e.name().equalsIgnoreCase(rs.getString(index))) ||</span>
+<span class="nc bnc" id="L559" title="All 4 branches missed.">                            (enumType == EnumType.ORDINAL &amp;&amp; e.ordinal() == rs.getInt(index))) {</span>
+<span class="nc" id="L560">                        field.set(entity, e);</span>
+<span class="nc" id="L561">                        return;</span>
+                    }
+                }
+<span class="nc bnc" id="L564" title="All 2 branches missed.">            } else if (type == int.class) {</span>
+<span class="nc" id="L565">                field.set(entity, rs.getInt(index));</span>
+<span class="nc bnc" id="L566" title="All 2 branches missed.">            } else if (type == Integer.class) {</span>
+<span class="nc bnc" id="L567" title="All 2 branches missed.">                if (rs.getObject(index) == null) {</span>
+<span class="nc" id="L568">                    field.set(entity, null);</span>
+<span class="nc" id="L569">                } else {</span>
+<span class="nc" id="L570">                    field.set(entity, rs.getInt(index));</span>
+                }
+<span class="nc bnc" id="L572" title="All 2 branches missed.">            } else if (type == Date.class) {</span>
+<span class="nc" id="L573">                final Object data = rs.getDate(index);</span>
+<span class="nc bnc" id="L574" title="All 2 branches missed.">                if (data == null) {</span>
+<span class="nc" id="L575">                    field.set(entity, null);</span>
+<span class="nc" id="L576">                    return;</span>
+                }
+<span class="nc" id="L578">                field.set(entity, DateUtil.parseDateString(s_gmtTimeZone, rs.getString(index)));</span>
+<span class="nc bnc" id="L579" title="All 2 branches missed.">            } else if (type == Calendar.class) {</span>
+<span class="nc" id="L580">                final Object data = rs.getDate(index);</span>
+<span class="nc bnc" id="L581" title="All 2 branches missed.">                if (data == null) {</span>
+<span class="nc" id="L582">                    field.set(entity, null);</span>
+<span class="nc" id="L583">                    return;</span>
+                }
+<span class="nc" id="L585">                final Calendar cal = Calendar.getInstance();</span>
+<span class="nc" id="L586">                cal.setTime(DateUtil.parseDateString(s_gmtTimeZone, rs.getString(index)));</span>
+<span class="nc" id="L587">                field.set(entity, cal);</span>
+<span class="nc bnc" id="L588" title="All 2 branches missed.">            } else if (type == boolean.class) {</span>
+<span class="nc" id="L589">                field.setBoolean(entity, rs.getBoolean(index));</span>
+<span class="nc bnc" id="L590" title="All 2 branches missed.">            } else if (type == Boolean.class) {</span>
+<span class="nc bnc" id="L591" title="All 2 branches missed.">                if (rs.getObject(index) == null) {</span>
+<span class="nc" id="L592">                    field.set(entity, null);</span>
+<span class="nc" id="L593">                } else {</span>
+<span class="nc" id="L594">                    field.set(entity, rs.getBoolean(index));</span>
+                }
+<span class="nc bnc" id="L596" title="All 2 branches missed.">            } else if (type == URI.class) {</span>
+                try {
+<span class="nc" id="L598">                    String str = rs.getString(index);</span>
+<span class="nc bnc" id="L599" title="All 2 branches missed.">                    field.set(entity, str == null ? null : new URI(str));</span>
+<span class="nc" id="L600">                } catch (URISyntaxException e) {</span>
+<span class="nc" id="L601">                    throw new CloudRuntimeException(&quot;Invalid URI: &quot; + rs.getString(index), e);</span>
+                }
+<span class="nc bnc" id="L603" title="All 2 branches missed.">            } else if (type == URL.class) {</span>
+                try {
+<span class="nc" id="L605">                    String str = rs.getString(index);</span>
+<span class="nc bnc" id="L606" title="All 2 branches missed.">                    field.set(entity, str != null ? new URL(str) : null);</span>
+<span class="nc" id="L607">                } catch (MalformedURLException e) {</span>
+<span class="nc" id="L608">                    throw new CloudRuntimeException(&quot;Invalid URL: &quot; + rs.getString(index), e);</span>
+                }
+<span class="nc bnc" id="L610" title="All 2 branches missed.">            } else if (type == Ip.class) {</span>
+<span class="nc" id="L611">                final Enumerated enumerated = field.getAnnotation(Enumerated.class);</span>
+<span class="nc bnc" id="L612" title="All 2 branches missed.">                final EnumType enumType = (enumerated == null) ? EnumType.STRING : enumerated.value();</span>
+
+<span class="nc" id="L614">                Ip ip = null;</span>
+<span class="nc bnc" id="L615" title="All 2 branches missed.">                if (enumType == EnumType.STRING) {</span>
+<span class="nc" id="L616">                    String s = rs.getString(index);</span>
+<span class="nc bnc" id="L617" title="All 2 branches missed.">                    ip = s == null ? null : new Ip(NetUtils.ip2Long(s));</span>
+<span class="nc" id="L618">                } else {</span>
+<span class="nc" id="L619">                    ip = new Ip(rs.getLong(index));</span>
+                }
+<span class="nc" id="L621">                field.set(entity, ip);</span>
+<span class="nc bnc" id="L622" title="All 2 branches missed.">            } else if (type == short.class) {</span>
+<span class="nc" id="L623">                field.setShort(entity, rs.getShort(index));</span>
+<span class="nc bnc" id="L624" title="All 2 branches missed.">            } else if (type == Short.class) {</span>
+<span class="nc bnc" id="L625" title="All 2 branches missed.">                if (rs.getObject(index) == null) {</span>
+<span class="nc" id="L626">                    field.set(entity, null);</span>
+<span class="nc" id="L627">                } else {</span>
+<span class="nc" id="L628">                    field.set(entity, rs.getShort(index));</span>
+                }
+<span class="nc bnc" id="L630" title="All 2 branches missed.">            } else if (type == float.class) {</span>
+<span class="nc" id="L631">                field.setFloat(entity, rs.getFloat(index));</span>
+<span class="nc bnc" id="L632" title="All 2 branches missed.">            } else if (type == Float.class) {</span>
+<span class="nc bnc" id="L633" title="All 2 branches missed.">                if (rs.getObject(index) == null) {</span>
+<span class="nc" id="L634">                    field.set(entity, null);</span>
+<span class="nc" id="L635">                } else {</span>
+<span class="nc" id="L636">                    field.set(entity, rs.getFloat(index));</span>
+                }
+<span class="nc bnc" id="L638" title="All 2 branches missed.">            } else if (type == double.class) {</span>
+<span class="nc" id="L639">                field.setDouble(entity, rs.getDouble(index));</span>
+<span class="nc bnc" id="L640" title="All 2 branches missed.">            } else if (type == Double.class) {</span>
+<span class="nc bnc" id="L641" title="All 2 branches missed.">                if (rs.getObject(index) == null) {</span>
+<span class="nc" id="L642">                    field.set(entity, null);</span>
+<span class="nc" id="L643">                } else {</span>
+<span class="nc" id="L644">                    field.set(entity, rs.getDouble(index));</span>
+                }
+<span class="nc bnc" id="L646" title="All 2 branches missed.">            } else if (type == byte.class) {</span>
+<span class="nc" id="L647">                field.setByte(entity, rs.getByte(index));</span>
+<span class="nc bnc" id="L648" title="All 2 branches missed.">            } else if (type == Byte.class) {</span>
+<span class="nc bnc" id="L649" title="All 2 branches missed.">                if (rs.getObject(index) == null) {</span>
+<span class="nc" id="L650">                    field.set(entity, null);</span>
+<span class="nc" id="L651">                } else {</span>
+<span class="nc" id="L652">                    field.set(entity, rs.getByte(index));</span>
+                }
+<span class="nc bnc" id="L654" title="All 2 branches missed.">            } else if (type == byte[].class) {</span>
+<span class="nc" id="L655">                field.set(entity, rs.getBytes(index));</span>
+<span class="nc" id="L656">            } else {</span>
+<span class="nc" id="L657">                field.set(entity, rs.getObject(index));</span>
+            }
+<span class="nc" id="L659">        } catch (final IllegalAccessException e) {</span>
+<span class="nc" id="L660">            throw new CloudRuntimeException(&quot;Yikes! &quot;, e);</span>
+        }
+<span class="nc" id="L662">    }</span>
+
+    /**
+     * Get a value from a result set.
+     *
+     * @param type
+     *            the expected type of the result
+     * @param rs
+     *            the result set
+     * @param index
+     *            the index of the column
+     * @return the result in the requested type
+     * @throws SQLException
+     */
+    @DB()
+    @SuppressWarnings(&quot;unchecked&quot;)
+    protected static &lt;M&gt; M getObject(Class&lt;M&gt; type, ResultSet rs, int index) throws SQLException {
+<span class="nc bnc" id="L679" title="All 2 branches missed.">        if (type == String.class) {</span>
+<span class="nc" id="L680">            byte[] bytes = rs.getBytes(index);</span>
+<span class="nc bnc" id="L681" title="All 2 branches missed.">            if (bytes != null) {</span>
+                try {
+<span class="nc" id="L683">                    return (M)new String(bytes, &quot;UTF-8&quot;);</span>
+<span class="nc" id="L684">                } catch (UnsupportedEncodingException e) {</span>
+<span class="nc" id="L685">                    throw new CloudRuntimeException(&quot;UnsupportedEncodingException exception while converting UTF-8 data&quot;);</span>
+                }
+            } else {
+<span class="nc" id="L688">                return null;</span>
+            }
+<span class="nc bnc" id="L690" title="All 2 branches missed.">        } else if (type == int.class) {</span>
+<span class="nc" id="L691">            return (M) (Integer) rs.getInt(index);</span>
+<span class="nc bnc" id="L692" title="All 2 branches missed.">        } else if (type == Integer.class) {</span>
+<span class="nc bnc" id="L693" title="All 2 branches missed.">            if (rs.getObject(index) == null) {</span>
+<span class="nc" id="L694">                return null;</span>
+            } else {
+<span class="nc" id="L696">                return (M) (Integer) rs.getInt(index);</span>
+            }
+<span class="nc bnc" id="L698" title="All 2 branches missed.">        } else if (type == long.class) {</span>
+<span class="nc" id="L699">            return (M) (Long) rs.getLong(index);</span>
+<span class="nc bnc" id="L700" title="All 2 branches missed.">        } else if (type == Long.class) {</span>
+<span class="nc bnc" id="L701" title="All 2 branches missed.">            if (rs.getObject(index) == null) {</span>
+<span class="nc" id="L702">                return null;</span>
+            } else {
+<span class="nc" id="L704">                return (M) (Long) rs.getLong(index);</span>
+            }
+<span class="nc bnc" id="L706" title="All 2 branches missed.">        } else if (type == Date.class) {</span>
+<span class="nc" id="L707">            final Object data = rs.getDate(index);</span>
+<span class="nc bnc" id="L708" title="All 2 branches missed.">            if (data == null) {</span>
+<span class="nc" id="L709">                return null;</span>
+            } else {
+<span class="nc" id="L711">                return (M)DateUtil.parseDateString(s_gmtTimeZone, rs.getString(index));</span>
+            }
+<span class="nc bnc" id="L713" title="All 2 branches missed.">        } else if (type == short.class) {</span>
+<span class="nc" id="L714">            return (M) (Short) rs.getShort(index);</span>
+<span class="nc bnc" id="L715" title="All 2 branches missed.">        } else if (type == Short.class) {</span>
+<span class="nc bnc" id="L716" title="All 2 branches missed.">            if (rs.getObject(index) == null) {</span>
+<span class="nc" id="L717">                return null;</span>
+            } else {
+<span class="nc" id="L719">                return (M) (Short) rs.getShort(index);</span>
+            }
+<span class="nc bnc" id="L721" title="All 2 branches missed.">        } else if (type == boolean.class) {</span>
+<span class="nc" id="L722">            return (M) (Boolean) rs.getBoolean(index);</span>
+<span class="nc bnc" id="L723" title="All 2 branches missed.">        } else if (type == Boolean.class) {</span>
+<span class="nc bnc" id="L724" title="All 2 branches missed.">            if (rs.getObject(index) == null) {</span>
+<span class="nc" id="L725">                return null;</span>
+            } else {
+<span class="nc" id="L727">                return (M) (Boolean) rs.getBoolean(index);</span>
+            }
+<span class="nc bnc" id="L729" title="All 2 branches missed.">        } else if (type == float.class) {</span>
+<span class="nc" id="L730">            return (M) (Float) rs.getFloat(index);</span>
+<span class="nc bnc" id="L731" title="All 2 branches missed.">        } else if (type == Float.class) {</span>
+<span class="nc bnc" id="L732" title="All 2 branches missed.">            if (rs.getObject(index) == null) {</span>
+<span class="nc" id="L733">                return null;</span>
+            } else {
+<span class="nc" id="L735">                return (M) (Float) rs.getFloat(index);</span>
+            }
+<span class="nc bnc" id="L737" title="All 2 branches missed.">        } else if (type == double.class) {</span>
+<span class="nc" id="L738">            return (M) (Double) rs.getDouble(index);</span>
+<span class="nc bnc" id="L739" title="All 2 branches missed.">        } else if (type == Double.class) {</span>
+<span class="nc bnc" id="L740" title="All 2 branches missed.">            if (rs.getObject(index) == null) {</span>
+<span class="nc" id="L741">                return null;</span>
+            } else {
+<span class="nc" id="L743">                return (M) (Double) rs.getDouble(index);</span>
+            }
+<span class="nc bnc" id="L745" title="All 2 branches missed.">        } else if (type == byte.class) {</span>
+<span class="nc" id="L746">            return (M) (Byte) rs.getByte(index);</span>
+<span class="nc bnc" id="L747" title="All 2 branches missed.">        } else if (type == Byte.class) {</span>
+<span class="nc bnc" id="L748" title="All 2 branches missed.">            if (rs.getObject(index) == null) {</span>
+<span class="nc" id="L749">                return null;</span>
+            } else {
+<span class="nc" id="L751">                return (M) (Byte) rs.getByte(index);</span>
+            }
+<span class="nc bnc" id="L753" title="All 2 branches missed.">        } else if (type == Calendar.class) {</span>
+<span class="nc" id="L754">            final Object data = rs.getDate(index);</span>
+<span class="nc bnc" id="L755" title="All 2 branches missed.">            if (data == null) {</span>
+<span class="nc" id="L756">                return null;</span>
+            } else {
+<span class="nc" id="L758">                final Calendar cal = Calendar.getInstance();</span>
+<span class="nc" id="L759">                cal.setTime(DateUtil.parseDateString(s_gmtTimeZone, rs.getString(index)));</span>
+<span class="nc" id="L760">                return (M)cal;</span>
+            }
+<span class="nc bnc" id="L762" title="All 2 branches missed.">        } else if (type == byte[].class) {</span>
+<span class="nc" id="L763">            return (M)rs.getBytes(index);</span>
+        } else {
+<span class="nc" id="L765">            return (M)rs.getObject(index);</span>
+        }
+    }
+
+    @DB()
+    protected int addJoinAttributes(int count, PreparedStatement pstmt, Collection&lt;JoinBuilder&lt;SearchCriteria&lt;?&gt;&gt;&gt; joins) throws SQLException {
+<span class="nc bnc" id="L771" title="All 2 branches missed.">        for (JoinBuilder&lt;SearchCriteria&lt;?&gt;&gt; join : joins) {</span>
+<span class="nc bnc" id="L772" title="All 2 branches missed.">            for (final Pair&lt;Attribute, Object&gt; value : join.getT().getValues()) {</span>
+<span class="nc" id="L773">                prepareAttribute(count++, pstmt, value.first(), value.second());</span>
+            }
+        }
+
+<span class="nc bnc" id="L777" title="All 2 branches missed.">        for (JoinBuilder&lt;SearchCriteria&lt;?&gt;&gt; join : joins) {</span>
+<span class="nc bnc" id="L778" title="All 2 branches missed.">            if (join.getT().getJoins() != null) {</span>
+<span class="nc" id="L779">                count = addJoinAttributes(count, pstmt, join.getT().getJoins());</span>
+            }
+        }
+
+<span class="nc bnc" id="L783" title="All 2 branches missed.">        if (s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L784">            s_logger.trace(&quot;join search statement is &quot; + pstmt);</span>
+        }
+<span class="nc" id="L786">        return count;</span>
+    }
+
+    protected int update(ID id, UpdateBuilder ub, T entity) {
+<span class="nc bnc" id="L790" title="All 2 branches missed.">        if (_cache != null) {</span>
+<span class="nc" id="L791">            _cache.remove(id);</span>
+        }
+<span class="nc" id="L793">        SearchCriteria&lt;T&gt; sc = createSearchCriteria();</span>
+<span class="nc" id="L794">        sc.addAnd(_idAttributes.get(_table)[0], SearchCriteria.Op.EQ, id);</span>
+<span class="nc" id="L795">        TransactionLegacy txn = TransactionLegacy.currentTxn();</span>
+<span class="nc" id="L796">        txn.start();</span>
+
+        try {
+<span class="nc bnc" id="L799" title="All 2 branches missed.">            if (ub.getCollectionChanges() != null) {</span>
+<span class="nc" id="L800">                insertElementCollection(entity, _idAttributes.get(_table)[0], id, ub.getCollectionChanges());</span>
+            }
+<span class="nc" id="L802">        } catch (SQLException e) {</span>
+<span class="nc" id="L803">            throw new CloudRuntimeException(&quot;Unable to persist element collection&quot;, e);</span>
+        }
+
+<span class="nc" id="L806">        int rowsUpdated = update(ub, sc, null);</span>
+
+<span class="nc" id="L808">        txn.commit();</span>
+
+<span class="nc" id="L810">        return rowsUpdated;</span>
+    }
+
+    public int update(UpdateBuilder ub, final SearchCriteria&lt;?&gt; sc, Integer rows) {
+<span class="nc" id="L814">        StringBuilder sql = null;</span>
+<span class="nc" id="L815">        PreparedStatement pstmt = null;</span>
+<span class="nc" id="L816">        final TransactionLegacy txn = TransactionLegacy.currentTxn();</span>
+        try {
+<span class="nc" id="L818">            final String searchClause = sc.getWhereClause();</span>
+
+<span class="nc" id="L820">            sql = ub.toSql(_tables);</span>
+<span class="nc bnc" id="L821" title="All 2 branches missed.">            if (sql == null) {</span>
+<span class="nc" id="L822">                return 0;</span>
+            }
+
+<span class="nc" id="L825">            sql.append(searchClause);</span>
+
+<span class="nc bnc" id="L827" title="All 2 branches missed.">            if (rows != null) {</span>
+<span class="nc" id="L828">                sql.append(&quot; LIMIT &quot;).append(rows);</span>
+            }
+
+<span class="nc" id="L831">            txn.start();</span>
+<span class="nc" id="L832">            pstmt = txn.prepareAutoCloseStatement(sql.toString());</span>
+
+<span class="nc" id="L834">            Collection&lt;Ternary&lt;Attribute, Boolean, Object&gt;&gt; changes = ub.getChanges();</span>
+
+<span class="nc" id="L836">            int i = 1;</span>
+<span class="nc bnc" id="L837" title="All 2 branches missed.">            for (final Ternary&lt;Attribute, Boolean, Object&gt; value : changes) {</span>
+<span class="nc" id="L838">                prepareAttribute(i++, pstmt, value.first(), value.third());</span>
+            }
+
+<span class="nc bnc" id="L841" title="All 2 branches missed.">            for (Pair&lt;Attribute, Object&gt; value : sc.getValues()) {</span>
+<span class="nc" id="L842">                prepareAttribute(i++, pstmt, value.first(), value.second());</span>
+            }
+
+<span class="nc" id="L845">            int result = pstmt.executeUpdate();</span>
+<span class="nc" id="L846">            txn.commit();</span>
+<span class="nc" id="L847">            ub.clear();</span>
+<span class="nc" id="L848">            return result;</span>
+<span class="nc" id="L849">        } catch (final SQLException e) {</span>
+<span class="nc bnc" id="L850" title="All 4 branches missed.">            if (e.getSQLState().equals(&quot;23000&quot;) &amp;&amp; e.getErrorCode() == 1062) {</span>
+<span class="nc" id="L851">                throw new EntityExistsException(&quot;Entity already exists &quot;, e);</span>
+            }
+<span class="nc" id="L853">            throw new CloudRuntimeException(&quot;DB Exception on: &quot; + pstmt, e);</span>
+        }
+    }
+
+    @DB()
+    protected Attribute findAttributeByFieldName(String name) {
+<span class="nc" id="L859">        return _allAttributes.get(name);</span>
+    }
+
+    @DB()
+    protected String buildSelectByIdSql(final StringBuilder sql) {
+<span class="nc bnc" id="L864" title="All 2 branches missed.">        if (_idField == null) {</span>
+<span class="nc" id="L865">            return null;</span>
+        }
+
+<span class="nc bnc" id="L868" title="All 2 branches missed.">        if (_idField.getAnnotation(EmbeddedId.class) == null) {</span>
+<span class="nc" id="L869">            sql.append(_table).append(&quot;.&quot;).append(DbUtil.getColumnName(_idField, null)).append(&quot; = ? &quot;);</span>
+<span class="nc" id="L870">        } else {</span>
+<span class="nc" id="L871">            final Class&lt;?&gt; clazz = _idField.getClass();</span>
+<span class="nc" id="L872">            final AttributeOverride[] overrides = DbUtil.getAttributeOverrides(_idField);</span>
+<span class="nc bnc" id="L873" title="All 2 branches missed.">            for (final Field field : clazz.getDeclaredFields()) {</span>
+<span class="nc" id="L874">                sql.append(_table).append(&quot;.&quot;).append(DbUtil.getColumnName(field, overrides)).append(&quot; = ? AND &quot;);</span>
+            }
+<span class="nc" id="L876">            sql.delete(sql.length() - 4, sql.length());</span>
+        }
+
+<span class="nc" id="L879">        return sql.toString();</span>
+    }
+
+    @DB()
+    @Override
+    public Class&lt;T&gt; getEntityBeanType() {
+<span class="nc" id="L885">        return _entityBeanType;</span>
+    }
+
+    @DB()
+    protected T findOneIncludingRemovedBy(final SearchCriteria&lt;T&gt; sc) {
+<span class="nc" id="L890">        Filter filter = new Filter(1);</span>
+<span class="nc" id="L891">        List&lt;T&gt; results = searchIncludingRemoved(sc, filter, null, false);</span>
+<span class="nc bnc" id="L892" title="All 4 branches missed.">        assert results.size() &lt;= 1 : &quot;Didn't the limiting worked?&quot;;</span>
+<span class="nc bnc" id="L893" title="All 2 branches missed.">        return results.size() == 0 ? null : results.get(0);</span>
+    }
+
+    @Override
+    @DB()
+    public T findOneBy(final SearchCriteria&lt;T&gt; sc) {
+<span class="nc bnc" id="L899" title="All 2 branches missed.">        if (_removed != null) {</span>
+<span class="nc" id="L900">            sc.addAnd(_removed.second().field.getName(), SearchCriteria.Op.NULL);</span>
+        }
+<span class="nc" id="L902">        return findOneIncludingRemovedBy(sc);</span>
+    }
+
+    @DB()
+    protected List&lt;T&gt; listBy(final SearchCriteria&lt;T&gt; sc, final Filter filter) {
+<span class="nc bnc" id="L907" title="All 2 branches missed.">        if (_removed != null) {</span>
+<span class="nc" id="L908">            sc.addAnd(_removed.second().field.getName(), SearchCriteria.Op.NULL);</span>
+        }
+<span class="nc" id="L910">        return listIncludingRemovedBy(sc, filter);</span>
+    }
+
+    @DB()
+    protected List&lt;T&gt; listBy(final SearchCriteria&lt;T&gt; sc, final Filter filter, final boolean enableQueryCache) {
+<span class="nc bnc" id="L915" title="All 2 branches missed.">        if (_removed != null) {</span>
+<span class="nc" id="L916">            sc.addAnd(_removed.second().field.getName(), SearchCriteria.Op.NULL);</span>
+        }
+<span class="nc" id="L918">        return listIncludingRemovedBy(sc, filter, enableQueryCache);</span>
+    }
+
+    @DB()
+    protected List&lt;T&gt; listBy(final SearchCriteria&lt;T&gt; sc) {
+<span class="nc" id="L923">        return listBy(sc, null);</span>
+    }
+
+    @DB()
+    protected List&lt;T&gt; listIncludingRemovedBy(final SearchCriteria&lt;T&gt; sc, final Filter filter, final boolean enableQueryCache) {
+<span class="nc" id="L928">        return searchIncludingRemoved(sc, filter, null, false, enableQueryCache);</span>
+    }
+
+    @DB()
+    protected List&lt;T&gt; listIncludingRemovedBy(final SearchCriteria&lt;T&gt; sc, final Filter filter) {
+<span class="nc" id="L933">        return searchIncludingRemoved(sc, filter, null, false);</span>
+    }
+
+    @DB()
+    protected List&lt;T&gt; listIncludingRemovedBy(final SearchCriteria&lt;T&gt; sc) {
+<span class="nc" id="L938">        return listIncludingRemovedBy(sc, null);</span>
+    }
+
+    @Override
+    @DB()
+    @SuppressWarnings(&quot;unchecked&quot;)
+    public T findById(final ID id) {
+<span class="nc bnc" id="L945" title="All 2 branches missed.">        if (_cache != null) {</span>
+<span class="nc" id="L946">            final Element element = _cache.get(id);</span>
+<span class="nc bnc" id="L947" title="All 2 branches missed.">            return element == null ? lockRow(id, null) : (T)element.getObjectValue();</span>
+        } else {
+<span class="nc" id="L949">            return lockRow(id, null);</span>
+        }
+    }
+
+    @Override
+    @DB()
+    public T findByUuid(final String uuid) {
+<span class="nc" id="L956">        SearchCriteria&lt;T&gt; sc = createSearchCriteria();</span>
+<span class="nc" id="L957">        sc.addAnd(&quot;uuid&quot;, SearchCriteria.Op.EQ, uuid);</span>
+<span class="nc" id="L958">        return findOneBy(sc);</span>
+    }
+
+    @Override
+    @DB()
+    public T findByUuidIncludingRemoved(final String uuid) {
+<span class="nc" id="L964">        SearchCriteria&lt;T&gt; sc = createSearchCriteria();</span>
+<span class="nc" id="L965">        sc.addAnd(&quot;uuid&quot;, SearchCriteria.Op.EQ, uuid);</span>
+<span class="nc" id="L966">        return findOneIncludingRemovedBy(sc);</span>
+    }
+
+    @Override
+    @DB()
+    public T findByIdIncludingRemoved(ID id) {
+<span class="nc" id="L972">        return findById(id, true, null);</span>
+    }
+
+    @Override
+    @DB()
+    public T findById(final ID id, boolean fresh) {
+<span class="nc bnc" id="L978" title="All 2 branches missed.">        if (!fresh) {</span>
+<span class="nc" id="L979">            return findById(id);</span>
+        }
+
+<span class="nc bnc" id="L982" title="All 2 branches missed.">        if (_cache != null) {</span>
+<span class="nc" id="L983">            _cache.remove(id);</span>
+        }
+<span class="nc" id="L985">        return lockRow(id, null);</span>
+    }
+
+    @Override
+    @DB()
+    public T lockRow(ID id, Boolean lock) {
+<span class="nc" id="L991">        return findById(id, false, lock);</span>
+    }
+
+    protected T findById(ID id, boolean removed, Boolean lock) {
+<span class="nc" id="L995">        StringBuilder sql = new StringBuilder(_selectByIdSql);</span>
+<span class="nc bnc" id="L996" title="All 4 branches missed.">        if (!removed &amp;&amp; _removed != null) {</span>
+<span class="nc" id="L997">            sql.append(&quot; AND &quot;).append(_removed.first());</span>
+        }
+<span class="nc bnc" id="L999" title="All 2 branches missed.">        if (lock != null) {</span>
+<span class="nc bnc" id="L1000" title="All 2 branches missed.">            sql.append(lock ? FOR_UPDATE_CLAUSE : SHARE_MODE_CLAUSE);</span>
+        }
+<span class="nc" id="L1002">        TransactionLegacy txn = TransactionLegacy.currentTxn();</span>
+<span class="nc" id="L1003">        PreparedStatement pstmt = null;</span>
+        try {
+<span class="nc" id="L1005">            pstmt = txn.prepareAutoCloseStatement(sql.toString());</span>
+
+<span class="nc bnc" id="L1007" title="All 2 branches missed.">            if (_idField.getAnnotation(EmbeddedId.class) == null) {</span>
+<span class="nc" id="L1008">                prepareAttribute(1, pstmt, _idAttributes.get(_table)[0], id);</span>
+            }
+
+<span class="nc" id="L1011">            ResultSet rs = pstmt.executeQuery();</span>
+<span class="nc bnc" id="L1012" title="All 2 branches missed.">            return rs.next() ? toEntityBean(rs, true) : null;</span>
+<span class="nc" id="L1013">        } catch (SQLException e) {</span>
+<span class="nc" id="L1014">            throw new CloudRuntimeException(&quot;DB Exception on: &quot; + pstmt, e);</span>
+        }
+    }
+
+    @Override
+    @DB()
+    public T acquireInLockTable(ID id) {
+<span class="nc" id="L1021">        return acquireInLockTable(id, _timeoutSeconds);</span>
+    }
+
+    @Override
+    public T acquireInLockTable(final ID id, int seconds) {
+<span class="nc" id="L1026">        TransactionLegacy txn = TransactionLegacy.currentTxn();</span>
+<span class="nc" id="L1027">        T t = null;</span>
+<span class="nc" id="L1028">        boolean locked = false;</span>
+        try {
+<span class="nc bnc" id="L1030" title="All 2 branches missed.">            if (!txn.lock(_table + id.toString(), seconds)) {</span>
+<span class="nc" id="L1031">                return null;</span>
+            }
+
+<span class="nc" id="L1034">            locked = true;</span>
+<span class="nc" id="L1035">            t = findById(id);</span>
+<span class="nc" id="L1036">            return t;</span>
+<span class="nc" id="L1037">        } finally {</span>
+<span class="nc bnc" id="L1038" title="All 12 branches missed.">            if (t == null &amp;&amp; locked) {</span>
+<span class="nc" id="L1039">                txn.release(_table + id.toString());</span>
+            }
+<span class="nc" id="L1041">        }</span>
+    }
+
+    @Override
+    public boolean releaseFromLockTable(final ID id) {
+<span class="nc" id="L1046">        final TransactionLegacy txn = TransactionLegacy.currentTxn();</span>
+<span class="nc" id="L1047">        return txn.release(_table + id);</span>
+    }
+
+    @Override
+    @DB()
+    public boolean lockInLockTable(final String id) {
+<span class="nc" id="L1053">        return lockInLockTable(id, _timeoutSeconds);</span>
+    }
+
+    @Override
+    public boolean lockInLockTable(final String id, int seconds) {
+<span class="nc" id="L1058">        TransactionLegacy txn = TransactionLegacy.currentTxn();</span>
+<span class="nc" id="L1059">        return txn.lock(_table + id, seconds);</span>
+    }
+
+    @Override
+    public boolean unlockFromLockTable(final String id) {
+<span class="nc" id="L1064">        final TransactionLegacy txn = TransactionLegacy.currentTxn();</span>
+<span class="nc" id="L1065">        return txn.release(_table + id);</span>
+    }
+
+    @Override
+    @DB()
+    public List&lt;T&gt; listAllIncludingRemoved() {
+<span class="nc" id="L1071">        return listAllIncludingRemoved(null);</span>
+    }
+
+    @DB()
+    protected List&lt;Object&gt; addGroupBy(final StringBuilder sql, SearchCriteria&lt;?&gt; sc) {
+<span class="nc bnc" id="L1076" title="All 2 branches missed.">        if (sc == null)</span>
+<span class="nc" id="L1077">            return null;</span>
+<span class="nc" id="L1078">        Pair&lt;GroupBy&lt;?, ?, ?&gt;, List&lt;Object&gt;&gt; groupBys = sc.getGroupBy();</span>
+<span class="nc bnc" id="L1079" title="All 2 branches missed.">        if (groupBys != null) {</span>
+<span class="nc" id="L1080">            groupBys.first().toSql(sql);</span>
+<span class="nc" id="L1081">            return groupBys.second();</span>
+        } else {
+<span class="nc" id="L1083">            return null;</span>
+        }
+    }
+
+    @DB()
+    protected void addFilter(final StringBuilder sql, final Filter filter) {
+<span class="nc bnc" id="L1089" title="All 2 branches missed.">        if (filter != null) {</span>
+<span class="nc bnc" id="L1090" title="All 2 branches missed.">            if (filter.getOrderBy() != null) {</span>
+<span class="nc" id="L1091">                sql.append(filter.getOrderBy());</span>
+            }
+<span class="nc bnc" id="L1093" title="All 2 branches missed.">            if (filter.getOffset() != null) {</span>
+<span class="nc" id="L1094">                sql.append(&quot; LIMIT &quot;);</span>
+<span class="nc" id="L1095">                sql.append(filter.getOffset());</span>
+<span class="nc bnc" id="L1096" title="All 2 branches missed.">                if (filter.getLimit() != null) {</span>
+<span class="nc" id="L1097">                    sql.append(&quot;, &quot;).append(filter.getLimit());</span>
+                }
+            }
+        }
+<span class="nc" id="L1101">    }</span>
+
+    @Override
+    @DB()
+    public List&lt;T&gt; listAllIncludingRemoved(final Filter filter) {
+<span class="nc" id="L1106">        final StringBuilder sql = createPartialSelectSql(null, false);</span>
+<span class="nc" id="L1107">        addFilter(sql, filter);</span>
+
+<span class="nc" id="L1109">        return executeList(sql.toString());</span>
+    }
+
+    protected List&lt;T&gt; executeList(final String sql, final Object... params) {
+<span class="nc" id="L1113">        final TransactionLegacy txn = TransactionLegacy.currentTxn();</span>
+<span class="nc" id="L1114">        PreparedStatement pstmt = null;</span>
+<span class="nc" id="L1115">        final List&lt;T&gt; result = new ArrayList&lt;T&gt;();</span>
+        try {
+<span class="nc" id="L1117">            pstmt = txn.prepareAutoCloseStatement(sql);</span>
+<span class="nc" id="L1118">            int i = 0;</span>
+<span class="nc bnc" id="L1119" title="All 2 branches missed.">            for (final Object param : params) {</span>
+<span class="nc" id="L1120">                pstmt.setObject(++i, param);</span>
+            }
+
+<span class="nc" id="L1123">            final ResultSet rs = pstmt.executeQuery();</span>
+<span class="nc bnc" id="L1124" title="All 2 branches missed.">            while (rs.next()) {</span>
+<span class="nc" id="L1125">                result.add(toEntityBean(rs, true));</span>
+            }
+<span class="nc" id="L1127">            return result;</span>
+<span class="nc" id="L1128">        } catch (final SQLException e) {</span>
+<span class="nc" id="L1129">            throw new CloudRuntimeException(&quot;DB Exception on: &quot; + pstmt, e);</span>
+<span class="nc" id="L1130">        } catch (final Throwable e) {</span>
+<span class="nc" id="L1131">            throw new CloudRuntimeException(&quot;Caught: &quot; + pstmt, e);</span>
+        }
+    }
+
+    @Override
+    @DB()
+    public List&lt;T&gt; listAll() {
+<span class="nc" id="L1138">        return listAll(null);</span>
+    }
+
+    @Override
+    @DB()
+    public List&lt;T&gt; listAll(final Filter filter) {
+<span class="nc bnc" id="L1144" title="All 2 branches missed.">        if (_removed == null) {</span>
+<span class="nc" id="L1145">            return listAllIncludingRemoved(filter);</span>
+        }
+
+<span class="nc" id="L1148">        final StringBuilder sql = createPartialSelectSql(null, true);</span>
+<span class="nc" id="L1149">        sql.append(_removed.first());</span>
+<span class="nc" id="L1150">        addFilter(sql, filter);</span>
+
+<span class="nc" id="L1152">        return executeList(sql.toString());</span>
+    }
+
+    @Override
+    public boolean expunge(final ID id) {
+<span class="nc" id="L1157">        final TransactionLegacy txn = TransactionLegacy.currentTxn();</span>
+<span class="nc" id="L1158">        PreparedStatement pstmt = null;</span>
+<span class="nc" id="L1159">        String sql = null;</span>
+        try {
+<span class="nc" id="L1161">            txn.start();</span>
+<span class="nc bnc" id="L1162" title="All 2 branches missed.">            for (final Pair&lt;String, Attribute[]&gt; deletSql : _deleteSqls) {</span>
+<span class="nc" id="L1163">                sql = deletSql.first();</span>
+<span class="nc" id="L1164">                final Attribute[] attrs = deletSql.second();</span>
+
+<span class="nc" id="L1166">                pstmt = txn.prepareAutoCloseStatement(sql);</span>
+
+<span class="nc bnc" id="L1168" title="All 2 branches missed.">                for (int i = 0; i &lt; attrs.length; i++) {</span>
+<span class="nc" id="L1169">                    prepareAttribute(i + 1, pstmt, attrs[i], id);</span>
+                }
+<span class="nc" id="L1171">                pstmt.executeUpdate();</span>
+            }
+
+<span class="nc" id="L1174">            txn.commit();</span>
+<span class="nc bnc" id="L1175" title="All 2 branches missed.">            if (_cache != null) {</span>
+<span class="nc" id="L1176">                _cache.remove(id);</span>
+            }
+<span class="nc" id="L1178">            return true;</span>
+<span class="nc" id="L1179">        } catch (final SQLException e) {</span>
+<span class="nc" id="L1180">            throw new CloudRuntimeException(&quot;DB Exception on: &quot; + pstmt, e);</span>
+        }
+    }
+
+    // FIXME: Does not work for joins.
+    @Override
+    public int expunge(final SearchCriteria&lt;T&gt; sc) {
+<span class="nc bnc" id="L1187" title="All 2 branches missed.">        if (sc == null) {</span>
+<span class="nc" id="L1188">            throw new CloudRuntimeException(&quot;Call to throw new expunge with null search Criteria&quot;);</span>
+        }
+
+<span class="nc" id="L1191">        final StringBuilder str = new StringBuilder(&quot;DELETE FROM &quot;);</span>
+<span class="nc" id="L1192">        str.append(_table);</span>
+<span class="nc" id="L1193">        str.append(&quot; WHERE &quot;);</span>
+
+<span class="nc bnc" id="L1195" title="All 4 branches missed.">        if (sc != null &amp;&amp; sc.getWhereClause().length() &gt; 0) {</span>
+<span class="nc" id="L1196">            str.append(sc.getWhereClause());</span>
+        }
+
+<span class="nc" id="L1199">        final String sql = str.toString();</span>
+
+<span class="nc" id="L1201">        final TransactionLegacy txn = TransactionLegacy.currentTxn();</span>
+<span class="nc" id="L1202">        PreparedStatement pstmt = null;</span>
+        try {
+<span class="nc" id="L1204">            pstmt = txn.prepareAutoCloseStatement(sql);</span>
+<span class="nc" id="L1205">            int i = 0;</span>
+<span class="nc bnc" id="L1206" title="All 2 branches missed.">            for (final Pair&lt;Attribute, Object&gt; value : sc.getValues()) {</span>
+<span class="nc" id="L1207">                prepareAttribute(++i, pstmt, value.first(), value.second());</span>
+            }
+<span class="nc" id="L1209">            return pstmt.executeUpdate();</span>
+<span class="nc" id="L1210">        } catch (final SQLException e) {</span>
+<span class="nc" id="L1211">            throw new CloudRuntimeException(&quot;DB Exception on: &quot; + pstmt, e);</span>
+<span class="nc" id="L1212">        } catch (final Throwable e) {</span>
+<span class="nc" id="L1213">            throw new CloudRuntimeException(&quot;Caught: &quot; + pstmt, e);</span>
+        }
+    }
+
+    @DB()
+    protected StringBuilder createPartialSelectSql(SearchCriteria&lt;?&gt; sc, final boolean whereClause, final boolean enableQueryCache) {
+<span class="nc bnc" id="L1219" title="All 2 branches missed.">        StringBuilder sql = new StringBuilder(enableQueryCache ? _partialQueryCacheSelectSql.first() : _partialSelectSql.first());</span>
+<span class="nc bnc" id="L1220" title="All 4 branches missed.">        if (sc != null &amp;&amp; !sc.isSelectAll()) {</span>
+<span class="nc" id="L1221">            sql.delete(7, sql.indexOf(&quot; FROM&quot;));</span>
+<span class="nc" id="L1222">            sc.getSelect(sql, 7);</span>
+        }
+
+<span class="nc bnc" id="L1225" title="All 2 branches missed.">        if (!whereClause) {</span>
+<span class="nc bnc" id="L1226" title="All 2 branches missed.">            sql.delete(sql.length() - (_discriminatorClause == null ? 6 : 4), sql.length());</span>
+        }
+
+<span class="nc" id="L1229">        return sql;</span>
+    }
+
+    @DB()
+    protected StringBuilder createPartialSelectSql(SearchCriteria&lt;?&gt; sc, final boolean whereClause) {
+<span class="nc" id="L1234">        StringBuilder sql = new StringBuilder(_partialSelectSql.first());</span>
+<span class="nc bnc" id="L1235" title="All 4 branches missed.">        if (sc != null &amp;&amp; !sc.isSelectAll()) {</span>
+<span class="nc" id="L1236">            sql.delete(7, sql.indexOf(&quot; FROM&quot;));</span>
+<span class="nc" id="L1237">            sc.getSelect(sql, 7);</span>
+        }
+
+<span class="nc bnc" id="L1240" title="All 2 branches missed.">        if (!whereClause) {</span>
+<span class="nc bnc" id="L1241" title="All 2 branches missed.">            sql.delete(sql.length() - (_discriminatorClause == null ? 6 : 4), sql.length());</span>
+        }
+
+<span class="nc" id="L1244">        return sql;</span>
+    }
+
+    @DB()
+    protected void addJoins(StringBuilder str, Collection&lt;JoinBuilder&lt;SearchCriteria&lt;?&gt;&gt;&gt; joins) {
+<span class="nc" id="L1249">        int fromIndex = str.lastIndexOf(&quot;WHERE&quot;);</span>
+<span class="nc bnc" id="L1250" title="All 2 branches missed.">        if (fromIndex == -1) {</span>
+<span class="nc" id="L1251">            fromIndex = str.length();</span>
+<span class="nc" id="L1252">            str.append(&quot; WHERE &quot;);</span>
+<span class="nc" id="L1253">        } else {</span>
+<span class="nc" id="L1254">            str.append(&quot; AND &quot;);</span>
+        }
+
+<span class="nc bnc" id="L1257" title="All 2 branches missed.">        for (JoinBuilder&lt;SearchCriteria&lt;?&gt;&gt; join : joins) {</span>
+<span class="nc" id="L1258">            StringBuilder onClause = new StringBuilder();</span>
+<span class="nc" id="L1259">            onClause.append(&quot; &quot;)</span>
+<span class="nc" id="L1260">            .append(join.getType().getName())</span>
+<span class="nc" id="L1261">            .append(&quot; &quot;)</span>
+<span class="nc" id="L1262">            .append(join.getSecondAttribute().table)</span>
+<span class="nc" id="L1263">            .append(&quot; ON &quot;)</span>
+<span class="nc" id="L1264">            .append(join.getFirstAttribute().table)</span>
+<span class="nc" id="L1265">            .append(&quot;.&quot;)</span>
+<span class="nc" id="L1266">            .append(join.getFirstAttribute().columnName)</span>
+<span class="nc" id="L1267">            .append(&quot;=&quot;)</span>
+<span class="nc" id="L1268">            .append(join.getSecondAttribute().table)</span>
+<span class="nc" id="L1269">            .append(&quot;.&quot;)</span>
+<span class="nc" id="L1270">            .append(join.getSecondAttribute().columnName)</span>
+<span class="nc" id="L1271">            .append(&quot; &quot;);</span>
+<span class="nc" id="L1272">            str.insert(fromIndex, onClause);</span>
+<span class="nc" id="L1273">            String whereClause = join.getT().getWhereClause();</span>
+<span class="nc bnc" id="L1274" title="All 4 branches missed.">            if ((whereClause != null) &amp;&amp; !&quot;&quot;.equals(whereClause)) {</span>
+<span class="nc" id="L1275">                str.append(&quot; (&quot;).append(whereClause).append(&quot;) AND&quot;);</span>
+            }
+<span class="nc" id="L1277">            fromIndex += onClause.length();</span>
+        }
+
+<span class="nc" id="L1280">        str.delete(str.length() - 4, str.length());</span>
+
+<span class="nc bnc" id="L1282" title="All 2 branches missed.">        for (JoinBuilder&lt;SearchCriteria&lt;?&gt;&gt; join : joins) {</span>
+<span class="nc bnc" id="L1283" title="All 2 branches missed.">            if (join.getT().getJoins() != null) {</span>
+<span class="nc" id="L1284">                addJoins(str, join.getT().getJoins());</span>
+            }
+        }
+<span class="nc" id="L1287">    }</span>
+
+    @Override
+    @DB()
+    public List&lt;T&gt; search(final SearchCriteria&lt;T&gt; sc, final Filter filter) {
+<span class="nc" id="L1292">        return search(sc, filter, null, false);</span>
+    }
+
+    @Override
+    @DB()
+    public Pair&lt;List&lt;T&gt;, Integer&gt; searchAndCount(final SearchCriteria&lt;T&gt; sc, final Filter filter) {
+<span class="nc" id="L1298">        List&lt;T&gt; objects = search(sc, filter, null, false);</span>
+<span class="nc" id="L1299">        Integer count = getCount(sc);</span>
+<span class="nc" id="L1300">        return new Pair&lt;List&lt;T&gt;, Integer&gt;(objects, count);</span>
+    }
+
+    @Override
+    @DB()
+    public Pair&lt;List&lt;T&gt;, Integer&gt; searchAndDistinctCount(final SearchCriteria&lt;T&gt; sc, final Filter filter) {
+<span class="nc" id="L1306">        List&lt;T&gt; objects = search(sc, filter, null, false);</span>
+<span class="nc" id="L1307">        Integer count = getDistinctCount(sc);</span>
+<span class="nc" id="L1308">        return new Pair&lt;List&lt;T&gt;, Integer&gt;(objects, count);</span>
+    }
+
+    @Override
+    @DB()
+    public List&lt;T&gt; search(final SearchCriteria&lt;T&gt; sc, final Filter filter, final boolean enableQueryCache) {
+<span class="nc" id="L1314">        return search(sc, filter, null, false, enableQueryCache);</span>
+    }
+
+    @Override
+    @DB()
+    public boolean update(ID id, T entity) {
+<span class="nc bnc" id="L1320" title="All 4 branches missed.">        assert Enhancer.isEnhanced(entity.getClass()) : &quot;Entity is not generated by this dao&quot;;</span>
+
+<span class="nc" id="L1322">        UpdateBuilder ub = getUpdateBuilder(entity);</span>
+<span class="nc bnc" id="L1323" title="All 2 branches missed.">        boolean result = update(id, ub, entity) != 0;</span>
+<span class="nc" id="L1324">        return result;</span>
+    }
+
+    @DB()
+    public int update(final T entity, final SearchCriteria&lt;T&gt; sc, Integer rows) {
+<span class="nc" id="L1329">        final UpdateBuilder ub = getUpdateBuilder(entity);</span>
+<span class="nc" id="L1330">        return update(ub, sc, rows);</span>
+    }
+
+    @Override
+    @DB()
+    public int update(final T entity, final SearchCriteria&lt;T&gt; sc) {
+<span class="nc" id="L1336">        final UpdateBuilder ub = getUpdateBuilder(entity);</span>
+<span class="nc" id="L1337">        return update(ub, sc, null);</span>
+    }
+
+    @Override
+    @SuppressWarnings(&quot;unchecked&quot;)
+    public T persist(final T entity) {
+<span class="nc bnc" id="L1343" title="All 2 branches missed.">        if (Enhancer.isEnhanced(entity.getClass())) {</span>
+<span class="nc bnc" id="L1344" title="All 2 branches missed.">            if (_idField != null) {</span>
+                ID id;
+                try {
+<span class="nc" id="L1347">                    id = (ID)_idField.get(entity);</span>
+<span class="nc" id="L1348">                } catch (IllegalAccessException e) {</span>
+<span class="nc" id="L1349">                    throw new CloudRuntimeException(&quot;How can it be illegal access...come on&quot;, e);</span>
+                }
+<span class="nc" id="L1351">                update(id, entity);</span>
+<span class="nc" id="L1352">                return entity;</span>
+            }
+
+<span class="nc bnc" id="L1355" title="All 2 branches missed.">            assert false : &quot;Can't call persit if you don't have primary key&quot;;</span>
+        }
+
+<span class="nc" id="L1358">        ID id = null;</span>
+<span class="nc" id="L1359">        final TransactionLegacy txn = TransactionLegacy.currentTxn();</span>
+<span class="nc" id="L1360">        PreparedStatement pstmt = null;</span>
+<span class="nc" id="L1361">        String sql = null;</span>
+        try {
+<span class="nc" id="L1363">            txn.start();</span>
+<span class="nc bnc" id="L1364" title="All 2 branches missed.">            for (final Pair&lt;String, Attribute[]&gt; pair : _insertSqls) {</span>
+<span class="nc" id="L1365">                sql = pair.first();</span>
+<span class="nc" id="L1366">                final Attribute[] attrs = pair.second();</span>
+
+<span class="nc" id="L1368">                pstmt = txn.prepareAutoCloseStatement(sql, Statement.RETURN_GENERATED_KEYS);</span>
+
+<span class="nc" id="L1370">                int index = 1;</span>
+<span class="nc" id="L1371">                index = prepareAttributes(pstmt, entity, attrs, index);</span>
+
+<span class="nc" id="L1373">                pstmt.executeUpdate();</span>
+
+<span class="nc" id="L1375">                final ResultSet rs = pstmt.getGeneratedKeys();</span>
+<span class="nc bnc" id="L1376" title="All 2 branches missed.">                if (id == null) {</span>
+<span class="nc bnc" id="L1377" title="All 4 branches missed.">                    if (rs != null &amp;&amp; rs.next()) {</span>
+<span class="nc" id="L1378">                        id = (ID)rs.getObject(1);</span>
+                    }
+                    try {
+<span class="nc bnc" id="L1381" title="All 2 branches missed.">                        if (_idField != null) {</span>
+<span class="nc bnc" id="L1382" title="All 2 branches missed.">                            if (id != null) {</span>
+<span class="nc" id="L1383">                                _idField.set(entity, id);</span>
+<span class="nc" id="L1384">                            } else {</span>
+<span class="nc" id="L1385">                                id = (ID)_idField.get(entity);</span>
+                            }
+                        }
+<span class="nc" id="L1388">                    } catch (final IllegalAccessException e) {</span>
+<span class="nc" id="L1389">                        throw new CloudRuntimeException(&quot;Yikes! &quot;, e);</span>
+                    }
+                }
+            }
+
+<span class="nc bnc" id="L1394" title="All 4 branches missed.">            if (_ecAttributes != null &amp;&amp; _ecAttributes.size() &gt; 0) {</span>
+<span class="nc" id="L1395">                HashMap&lt;Attribute, Object&gt; ecAttributes = new HashMap&lt;Attribute, Object&gt;();</span>
+<span class="nc bnc" id="L1396" title="All 2 branches missed.">                for (Attribute attr : _ecAttributes) {</span>
+<span class="nc" id="L1397">                    Object ec = attr.field.get(entity);</span>
+<span class="nc bnc" id="L1398" title="All 2 branches missed.">                    if (ec != null) {</span>
+<span class="nc" id="L1399">                        ecAttributes.put(attr, ec);</span>
+                    }
+                }
+
+<span class="nc" id="L1403">                insertElementCollection(entity, _idAttributes.get(_table)[0], id, ecAttributes);</span>
+            }
+<span class="nc" id="L1405">            txn.commit();</span>
+<span class="nc" id="L1406">        } catch (final SQLException e) {</span>
+<span class="nc bnc" id="L1407" title="All 4 branches missed.">            if (e.getSQLState().equals(&quot;23000&quot;) &amp;&amp; e.getErrorCode() == 1062) {</span>
+<span class="nc" id="L1408">                throw new EntityExistsException(&quot;Entity already exists: &quot;, e);</span>
+            } else {
+<span class="nc" id="L1410">                throw new CloudRuntimeException(&quot;DB Exception on: &quot; + pstmt, e);</span>
+            }
+<span class="nc" id="L1412">        } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L1413">            throw new CloudRuntimeException(&quot;Problem with getting the ec attribute &quot;, e);</span>
+<span class="nc" id="L1414">        } catch (IllegalAccessException e) {</span>
+<span class="nc" id="L1415">            throw new CloudRuntimeException(&quot;Problem with getting the ec attribute &quot;, e);</span>
+        }
+
+<span class="nc bnc" id="L1418" title="All 2 branches missed.">        return _idField != null ? findByIdIncludingRemoved(id) : null;</span>
+    }
+
+    protected void insertElementCollection(T entity, Attribute idAttribute, ID id, Map&lt;Attribute, Object&gt; ecAttributes) throws SQLException {
+<span class="nc" id="L1422">        TransactionLegacy txn = TransactionLegacy.currentTxn();</span>
+<span class="nc" id="L1423">        txn.start();</span>
+<span class="nc bnc" id="L1424" title="All 2 branches missed.">        for (Map.Entry&lt;Attribute, Object&gt; entry : ecAttributes.entrySet()) {</span>
+<span class="nc" id="L1425">            Attribute attr = entry.getKey();</span>
+<span class="nc" id="L1426">            Object obj = entry.getValue();</span>
+
+<span class="nc" id="L1428">            EcInfo ec = (EcInfo)attr.attache;</span>
+<span class="nc" id="L1429">            Enumeration&lt;?&gt; en = null;</span>
+<span class="nc bnc" id="L1430" title="All 2 branches missed.">            if (ec.rawClass == null) {</span>
+<span class="nc" id="L1431">                en = Collections.enumeration(Arrays.asList((Object[])obj));</span>
+<span class="nc" id="L1432">            } else {</span>
+<span class="nc" id="L1433">                en = Collections.enumeration((Collection)obj);</span>
+            }
+<span class="nc" id="L1435">            PreparedStatement pstmt = txn.prepareAutoCloseStatement(ec.clearSql);</span>
+<span class="nc" id="L1436">            prepareAttribute(1, pstmt, idAttribute, id);</span>
+<span class="nc" id="L1437">            pstmt.executeUpdate();</span>
+
+<span class="nc bnc" id="L1439" title="All 2 branches missed.">            while (en.hasMoreElements()) {</span>
+<span class="nc" id="L1440">                pstmt = txn.prepareAutoCloseStatement(ec.insertSql);</span>
+<span class="nc bnc" id="L1441" title="All 2 branches missed.">                if (ec.targetClass == Date.class) {</span>
+<span class="nc" id="L1442">                    pstmt.setString(1, DateUtil.getDateDisplayString(s_gmtTimeZone, (Date)en.nextElement()));</span>
+<span class="nc" id="L1443">                } else {</span>
+<span class="nc" id="L1444">                    pstmt.setObject(1, en.nextElement());</span>
+                }
+<span class="nc" id="L1446">                prepareAttribute(2, pstmt, idAttribute, id);</span>
+<span class="nc" id="L1447">                pstmt.executeUpdate();</span>
+            }
+        }
+<span class="nc" id="L1450">        txn.commit();</span>
+<span class="nc" id="L1451">    }</span>
+
+    @DB()
+    protected Object generateValue(final Attribute attr) {
+<span class="nc bnc" id="L1455" title="All 4 branches missed.">        if (attr.is(Attribute.Flag.Created) || attr.is(Attribute.Flag.Removed)) {</span>
+<span class="nc" id="L1456">            return new Date();</span>
+<span class="nc bnc" id="L1457" title="All 2 branches missed.">        } else if (attr.is(Attribute.Flag.TableGV)) {</span>
+<span class="nc" id="L1458">            return null;</span>
+            // Not sure what to do here.
+<span class="nc bnc" id="L1460" title="All 2 branches missed.">        } else if (attr.is(Attribute.Flag.AutoGV)) {</span>
+<span class="nc bnc" id="L1461" title="All 2 branches missed.">            if (attr.columnName.equals(GenericDao.XID_COLUMN)) {</span>
+<span class="nc" id="L1462">                return UUID.randomUUID().toString();</span>
+            }
+<span class="nc bnc" id="L1464" title="All 2 branches missed.">            assert (false) : &quot;Auto generation is not supported.&quot;;</span>
+<span class="nc" id="L1465">            return null;</span>
+<span class="nc bnc" id="L1466" title="All 2 branches missed.">        } else if (attr.is(Attribute.Flag.SequenceGV)) {</span>
+<span class="nc bnc" id="L1467" title="All 2 branches missed.">            assert (false) : &quot;Sequence generation is not supported.&quot;;</span>
+<span class="nc" id="L1468">            return null;</span>
+<span class="nc bnc" id="L1469" title="All 2 branches missed.">        } else if (attr.is(Attribute.Flag.DC)) {</span>
+<span class="nc" id="L1470">            return _discriminatorValues.get(attr.columnName);</span>
+        } else {
+<span class="nc bnc" id="L1472" title="All 2 branches missed.">            assert (false) : &quot;Attribute can't be auto generated: &quot; + attr.columnName;</span>
+<span class="nc" id="L1473">            return null;</span>
+        }
+    }
+
+    @DB()
+    protected void prepareAttribute(final int j, final PreparedStatement pstmt, final Attribute attr, Object value) throws SQLException {
+<span class="nc bnc" id="L1479" title="All 4 branches missed.">        if (attr.is(Attribute.Flag.DaoGenerated) &amp;&amp; value == null) {</span>
+<span class="nc" id="L1480">            value = generateValue(attr);</span>
+<span class="nc bnc" id="L1481" title="All 2 branches missed.">            if (attr.field == null) {</span>
+<span class="nc" id="L1482">                pstmt.setObject(j, value);</span>
+<span class="nc" id="L1483">                return;</span>
+            }
+        }
+<span class="nc bnc" id="L1486" title="All 2 branches missed.">        if (attr.field.getType() == String.class) {</span>
+<span class="nc" id="L1487">            final String str = (String)value;</span>
+<span class="nc bnc" id="L1488" title="All 2 branches missed.">            if (str == null) {</span>
+<span class="nc" id="L1489">                pstmt.setString(j, null);</span>
+<span class="nc" id="L1490">                return;</span>
+            }
+<span class="nc" id="L1492">            final Column column = attr.field.getAnnotation(Column.class);</span>
+<span class="nc bnc" id="L1493" title="All 2 branches missed.">            final int length = column != null ? column.length() : 255;</span>
+
+            // to support generic localization, utilize MySql UTF-8 support
+<span class="nc bnc" id="L1496" title="All 2 branches missed.">            if (length &lt; str.length()) {</span>
+                try {
+<span class="nc bnc" id="L1498" title="All 2 branches missed.">                    if (attr.is(Attribute.Flag.Encrypted)) {</span>
+<span class="nc" id="L1499">                        pstmt.setBytes(j, DBEncryptionUtil.encrypt(str.substring(0, length)).getBytes(&quot;UTF-8&quot;));</span>
+<span class="nc" id="L1500">                    } else {</span>
+<span class="nc" id="L1501">                        pstmt.setBytes(j, str.substring(0, length).getBytes(&quot;UTF-8&quot;));</span>
+                    }
+<span class="nc" id="L1503">                } catch (UnsupportedEncodingException e) {</span>
+                    // no-way it can't support UTF-8 encoding
+<span class="nc bnc" id="L1505" title="All 2 branches missed.">                    assert (false);</span>
+<span class="nc" id="L1506">                    throw new CloudRuntimeException(&quot;UnsupportedEncodingException when saving string as UTF-8 data&quot;);</span>
+                }
+            } else {
+                try {
+<span class="nc bnc" id="L1510" title="All 2 branches missed.">                    if (attr.is(Attribute.Flag.Encrypted)) {</span>
+<span class="nc" id="L1511">                        pstmt.setBytes(j, DBEncryptionUtil.encrypt(str).getBytes(&quot;UTF-8&quot;));</span>
+<span class="nc" id="L1512">                    } else {</span>
+<span class="nc" id="L1513">                        pstmt.setBytes(j, str.getBytes(&quot;UTF-8&quot;));</span>
+                    }
+<span class="nc" id="L1515">                } catch (UnsupportedEncodingException e) {</span>
+                    // no-way it can't support UTF-8 encoding
+<span class="nc bnc" id="L1517" title="All 2 branches missed.">                    assert (false);</span>
+<span class="nc" id="L1518">                    throw new CloudRuntimeException(&quot;UnsupportedEncodingException when saving string as UTF-8 data&quot;);</span>
+                }
+            }
+<span class="nc bnc" id="L1521" title="All 2 branches missed.">        } else if (attr.field.getType() == Date.class) {</span>
+<span class="nc" id="L1522">            final Date date = (Date)value;</span>
+<span class="nc bnc" id="L1523" title="All 2 branches missed.">            if (date == null) {</span>
+<span class="nc" id="L1524">                pstmt.setObject(j, null);</span>
+<span class="nc" id="L1525">                return;</span>
+            }
+<span class="nc bnc" id="L1527" title="All 2 branches missed.">            if (attr.is(Attribute.Flag.Date)) {</span>
+<span class="nc" id="L1528">                pstmt.setString(j, DateUtil.getDateDisplayString(s_gmtTimeZone, date));</span>
+<span class="nc bnc" id="L1529" title="All 2 branches missed.">            } else if (attr.is(Attribute.Flag.TimeStamp)) {</span>
+<span class="nc" id="L1530">                pstmt.setString(j, DateUtil.getDateDisplayString(s_gmtTimeZone, date));</span>
+<span class="nc bnc" id="L1531" title="All 2 branches missed.">            } else if (attr.is(Attribute.Flag.Time)) {</span>
+<span class="nc" id="L1532">                pstmt.setString(j, DateUtil.getDateDisplayString(s_gmtTimeZone, date));</span>
+            }
+<span class="nc bnc" id="L1534" title="All 2 branches missed.">        } else if (attr.field.getType() == Calendar.class) {</span>
+<span class="nc" id="L1535">            final Calendar cal = (Calendar)value;</span>
+<span class="nc bnc" id="L1536" title="All 2 branches missed.">            if (cal == null) {</span>
+<span class="nc" id="L1537">                pstmt.setObject(j, null);</span>
+<span class="nc" id="L1538">                return;</span>
+            }
+<span class="nc bnc" id="L1540" title="All 2 branches missed.">            if (attr.is(Attribute.Flag.Date)) {</span>
+<span class="nc" id="L1541">                pstmt.setString(j, DateUtil.getDateDisplayString(s_gmtTimeZone, cal.getTime()));</span>
+<span class="nc bnc" id="L1542" title="All 2 branches missed.">            } else if (attr.is(Attribute.Flag.TimeStamp)) {</span>
+<span class="nc" id="L1543">                pstmt.setString(j, DateUtil.getDateDisplayString(s_gmtTimeZone, cal.getTime()));</span>
+<span class="nc bnc" id="L1544" title="All 2 branches missed.">            } else if (attr.is(Attribute.Flag.Time)) {</span>
+<span class="nc" id="L1545">                pstmt.setString(j, DateUtil.getDateDisplayString(s_gmtTimeZone, cal.getTime()));</span>
+            }
+<span class="nc bnc" id="L1547" title="All 2 branches missed.">        } else if (attr.field.getType().isEnum()) {</span>
+<span class="nc" id="L1548">            final Enumerated enumerated = attr.field.getAnnotation(Enumerated.class);</span>
+<span class="nc bnc" id="L1549" title="All 2 branches missed.">            final EnumType type = (enumerated == null) ? EnumType.STRING : enumerated.value();</span>
+<span class="nc bnc" id="L1550" title="All 2 branches missed.">            if (type == EnumType.STRING) {</span>
+<span class="nc bnc" id="L1551" title="All 2 branches missed.">                pstmt.setString(j, value == null ? null : value.toString());</span>
+<span class="nc bnc" id="L1552" title="All 2 branches missed.">            } else if (type == EnumType.ORDINAL) {</span>
+<span class="nc bnc" id="L1553" title="All 2 branches missed.">                if (value == null) {</span>
+<span class="nc" id="L1554">                    pstmt.setObject(j, null);</span>
+<span class="nc" id="L1555">                } else {</span>
+<span class="nc" id="L1556">                    pstmt.setInt(j, ((Enum&lt;?&gt;)value).ordinal());</span>
+                }
+            }
+<span class="nc bnc" id="L1559" title="All 2 branches missed.">        } else if (attr.field.getType() == URI.class) {</span>
+<span class="nc bnc" id="L1560" title="All 2 branches missed.">            pstmt.setString(j, value == null ? null : value.toString());</span>
+<span class="nc bnc" id="L1561" title="All 2 branches missed.">        } else if (attr.field.getType() == URL.class) {</span>
+<span class="nc" id="L1562">            pstmt.setURL(j, (URL)value);</span>
+<span class="nc bnc" id="L1563" title="All 2 branches missed.">        } else if (attr.field.getType() == byte[].class) {</span>
+<span class="nc" id="L1564">            pstmt.setBytes(j, (byte[])value);</span>
+<span class="nc bnc" id="L1565" title="All 2 branches missed.">        } else if (attr.field.getType() == Ip.class) {</span>
+<span class="nc" id="L1566">            final Enumerated enumerated = attr.field.getAnnotation(Enumerated.class);</span>
+<span class="nc bnc" id="L1567" title="All 2 branches missed.">            final EnumType type = (enumerated == null) ? EnumType.ORDINAL : enumerated.value();</span>
+<span class="nc bnc" id="L1568" title="All 2 branches missed.">            if (type == EnumType.STRING) {</span>
+<span class="nc bnc" id="L1569" title="All 2 branches missed.">                pstmt.setString(j, value == null ? null : value.toString());</span>
+<span class="nc bnc" id="L1570" title="All 2 branches missed.">            } else if (type == EnumType.ORDINAL) {</span>
+<span class="nc bnc" id="L1571" title="All 2 branches missed.">                if (value == null) {</span>
+<span class="nc" id="L1572">                    pstmt.setObject(j, null);</span>
+<span class="nc" id="L1573">                } else {</span>
+<span class="nc bnc" id="L1574" title="All 2 branches missed.">                    pstmt.setLong(j, (value instanceof Ip) ? ((Ip)value).longValue() : NetUtils.ip2Long((String)value));</span>
+                }
+            }
+<span class="nc" id="L1577">        } else {</span>
+<span class="nc" id="L1578">            pstmt.setObject(j, value);</span>
+        }
+<span class="nc" id="L1580">    }</span>
+
+    @DB()
+    protected int prepareAttributes(final PreparedStatement pstmt, final Object entity, final Attribute[] attrs, final int index) throws SQLException {
+<span class="nc" id="L1584">        int j = 0;</span>
+<span class="nc bnc" id="L1585" title="All 2 branches missed.">        for (int i = 0; i &lt; attrs.length; i++) {</span>
+<span class="nc" id="L1586">            j = i + index;</span>
+            try {
+<span class="nc bnc" id="L1588" title="All 2 branches missed.">                prepareAttribute(j, pstmt, attrs[i], attrs[i].field != null ? attrs[i].field.get(entity) : null);</span>
+<span class="nc" id="L1589">            } catch (final IllegalArgumentException e) {</span>
+<span class="nc" id="L1590">                throw new CloudRuntimeException(&quot;IllegalArgumentException&quot;, e);</span>
+<span class="nc" id="L1591">            } catch (final IllegalAccessException e) {</span>
+<span class="nc" id="L1592">                throw new CloudRuntimeException(&quot;IllegalArgumentException&quot;, e);</span>
+            }
+        }
+
+<span class="nc" id="L1596">        return j;</span>
+    }
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    @DB()
+    protected T toEntityBean(final ResultSet result, final boolean cache) throws SQLException {
+<span class="nc" id="L1602">        final T entity = (T)_factory.newInstance(new Callback[] {NoOp.INSTANCE, new UpdateBuilder(this)});</span>
+
+<span class="nc" id="L1604">        toEntityBean(result, entity);</span>
+
+<span class="nc bnc" id="L1606" title="All 4 branches missed.">        if (cache &amp;&amp; _cache != null) {</span>
+            try {
+<span class="nc" id="L1608">                _cache.put(new Element(_idField.get(entity), entity));</span>
+<span class="nc" id="L1609">            } catch (final Exception e) {</span>
+<span class="nc" id="L1610">                s_logger.debug(&quot;Can't put it in the cache&quot;, e);</span>
+            }
+        }
+
+<span class="nc" id="L1614">        return entity;</span>
+    }
+
+    @DB()
+    protected T toVO(ResultSet result, boolean cache) throws SQLException {
+        T entity;
+        try {
+<span class="nc" id="L1621">            entity = _entityBeanType.newInstance();</span>
+<span class="nc" id="L1622">        } catch (InstantiationException e1) {</span>
+<span class="nc" id="L1623">            throw new CloudRuntimeException(&quot;Unable to instantiate entity&quot;, e1);</span>
+<span class="nc" id="L1624">        } catch (IllegalAccessException e1) {</span>
+<span class="nc" id="L1625">            throw new CloudRuntimeException(&quot;Illegal Access&quot;, e1);</span>
+        }
+<span class="nc" id="L1627">        toEntityBean(result, entity);</span>
+<span class="nc bnc" id="L1628" title="All 4 branches missed.">        if (cache &amp;&amp; _cache != null) {</span>
+            try {
+<span class="nc" id="L1630">                _cache.put(new Element(_idField.get(entity), entity));</span>
+<span class="nc" id="L1631">            } catch (final Exception e) {</span>
+<span class="nc" id="L1632">                s_logger.debug(&quot;Can't put it in the cache&quot;, e);</span>
+            }
+        }
+
+<span class="nc" id="L1636">        return entity;</span>
+    }
+
+    @DB()
+    protected void toEntityBean(final ResultSet result, final T entity) throws SQLException {
+<span class="nc" id="L1641">        ResultSetMetaData meta = result.getMetaData();</span>
+<span class="nc bnc" id="L1642" title="All 2 branches missed.">        for (int index = 1, max = meta.getColumnCount(); index &lt;= max; index++) {</span>
+<span class="nc" id="L1643">            setField(entity, result, meta, index);</span>
+        }
+<span class="nc bnc" id="L1645" title="All 2 branches missed.">        for (Attribute attr : _ecAttributes) {</span>
+<span class="nc" id="L1646">            loadCollection(entity, attr);</span>
+        }
+<span class="nc" id="L1648">    }</span>
+
+    @DB()
+    @SuppressWarnings(&quot;unchecked&quot;)
+    protected void loadCollection(T entity, Attribute attr) {
+<span class="nc" id="L1653">        EcInfo ec = (EcInfo)attr.attache;</span>
+<span class="nc" id="L1654">        TransactionLegacy txn = TransactionLegacy.currentTxn();</span>
+<span class="nc" id="L1655">        try(PreparedStatement pstmt = txn.prepareStatement(ec.selectSql);)</span>
+        {
+<span class="nc" id="L1657">            pstmt.setObject(1, _idField.get(entity));</span>
+<span class="nc" id="L1658">            try(ResultSet rs = pstmt.executeQuery();)</span>
+            {
+<span class="nc" id="L1660">                ArrayList lst = new ArrayList();</span>
+<span class="nc bnc" id="L1661" title="All 2 branches missed.">                if (ec.targetClass == Integer.class) {</span>
+<span class="nc bnc" id="L1662" title="All 2 branches missed.">                    while (rs.next()) {</span>
+<span class="nc" id="L1663">                        lst.add(rs.getInt(1));</span>
+                    }
+<span class="nc bnc" id="L1665" title="All 2 branches missed.">                } else if (ec.targetClass == Long.class) {</span>
+<span class="nc bnc" id="L1666" title="All 2 branches missed.">                    while (rs.next()) {</span>
+<span class="nc" id="L1667">                        lst.add(rs.getLong(1));</span>
+                    }
+<span class="nc bnc" id="L1669" title="All 2 branches missed.">                } else if (ec.targetClass == String.class) {</span>
+<span class="nc bnc" id="L1670" title="All 2 branches missed.">                    while (rs.next()) {</span>
+<span class="nc" id="L1671">                        lst.add(rs.getString(1));</span>
+                    }
+<span class="nc bnc" id="L1673" title="All 2 branches missed.">                } else if (ec.targetClass == Short.class) {</span>
+<span class="nc bnc" id="L1674" title="All 2 branches missed.">                    while (rs.next()) {</span>
+<span class="nc" id="L1675">                        lst.add(rs.getShort(1));</span>
+                    }
+<span class="nc bnc" id="L1677" title="All 2 branches missed.">                } else if (ec.targetClass == Date.class) {</span>
+<span class="nc bnc" id="L1678" title="All 2 branches missed.">                    while (rs.next()) {</span>
+<span class="nc" id="L1679">                        lst.add(DateUtil.parseDateString(s_gmtTimeZone, rs.getString(1)));</span>
+                    }
+<span class="nc bnc" id="L1681" title="All 2 branches missed.">                } else if (ec.targetClass == Boolean.class) {</span>
+<span class="nc bnc" id="L1682" title="All 2 branches missed.">                    while (rs.next()) {</span>
+<span class="nc" id="L1683">                        lst.add(rs.getBoolean(1));</span>
+                    }
+<span class="nc" id="L1685">                } else {</span>
+<span class="nc bnc" id="L1686" title="All 2 branches missed.">                    assert (false) : &quot;You'll need to add more classeses&quot;;</span>
+                }
+<span class="nc bnc" id="L1688" title="All 2 branches missed.">                if (ec.rawClass == null) {</span>
+<span class="nc" id="L1689">                    Object[] array = (Object[]) Array.newInstance(ec.targetClass);</span>
+<span class="nc" id="L1690">                    lst.toArray(array);</span>
+                    try {
+<span class="nc" id="L1692">                        attr.field.set(entity, array);</span>
+<span class="nc" id="L1693">                    } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L1694">                        throw new CloudRuntimeException(&quot;Come on we screen for this stuff, don't we?&quot;, e);</span>
+<span class="nc" id="L1695">                    } catch (IllegalAccessException e) {</span>
+<span class="nc" id="L1696">                        throw new CloudRuntimeException(&quot;Come on we screen for this stuff, don't we?&quot;, e);</span>
+                    }
+                } else {
+                    try {
+<span class="nc" id="L1700">                        Collection coll = (Collection) ec.rawClass.newInstance();</span>
+<span class="nc" id="L1701">                        coll.addAll(lst);</span>
+<span class="nc" id="L1702">                        attr.field.set(entity, coll);</span>
+<span class="nc" id="L1703">                    } catch (IllegalAccessException e) {</span>
+<span class="nc" id="L1704">                        throw new CloudRuntimeException(&quot;Come on we screen for this stuff, don't we?&quot;, e);</span>
+<span class="nc" id="L1705">                    } catch (InstantiationException e) {</span>
+<span class="nc" id="L1706">                        throw new CloudRuntimeException(&quot;Never should happen&quot;, e);</span>
+                    }
+                }
+<span class="nc bnc" id="L1709" title="All 8 branches missed.">            }</span>
+<span class="nc" id="L1710">            catch (SQLException e) {</span>
+<span class="nc" id="L1711">                throw new CloudRuntimeException(&quot;loadCollection: Exception : &quot; +e.getMessage(), e);</span>
+            }
+<span class="nc bnc" id="L1713" title="All 8 branches missed.">        } catch (SQLException e) {</span>
+<span class="nc" id="L1714">            throw new CloudRuntimeException(&quot;loadCollection: Exception : &quot; +e.getMessage(), e);</span>
+<span class="nc" id="L1715">        } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L1716">            throw new CloudRuntimeException(&quot;loadCollection: Exception : &quot; +e.getMessage(), e);</span>
+<span class="nc" id="L1717">        } catch (IllegalAccessException e) {</span>
+<span class="nc" id="L1718">            throw new CloudRuntimeException(&quot;loadCollection: Exception : &quot; +e.getMessage(), e);</span>
+        }
+<span class="nc" id="L1720">    }</span>
+
+    @Override
+    public void expunge() {
+<span class="nc bnc" id="L1724" title="All 2 branches missed.">        if (_removed == null) {</span>
+<span class="nc" id="L1725">            return;</span>
+        }
+<span class="nc" id="L1727">        final StringBuilder sql = new StringBuilder(&quot;DELETE FROM &quot;);</span>
+<span class="nc" id="L1728">        sql.append(_table).append(&quot; WHERE &quot;).append(_removed.first()).append(&quot; IS NOT NULL&quot;);</span>
+<span class="nc" id="L1729">        final TransactionLegacy txn = TransactionLegacy.currentTxn();</span>
+<span class="nc" id="L1730">        PreparedStatement pstmt = null;</span>
+        try {
+<span class="nc" id="L1732">            txn.start();</span>
+<span class="nc" id="L1733">            pstmt = txn.prepareAutoCloseStatement(sql.toString());</span>
+
+<span class="nc" id="L1735">            pstmt.executeUpdate();</span>
+<span class="nc" id="L1736">            txn.commit();</span>
+<span class="nc" id="L1737">        } catch (final SQLException e) {</span>
+<span class="nc" id="L1738">            throw new CloudRuntimeException(&quot;DB Exception on &quot; + pstmt, e);</span>
+        }
+<span class="nc" id="L1740">    }</span>
+
+    @DB()
+    protected void setField(final Object entity, final ResultSet rs, ResultSetMetaData meta, final int index) throws SQLException {
+<span class="nc" id="L1744">        Attribute attr = _allColumns.get(new Pair&lt;String, String&gt;(meta.getTableName(index), meta.getColumnName(index)));</span>
+<span class="nc bnc" id="L1745" title="All 2 branches missed.">        if (attr == null) {</span>
+            // work around for mysql bug to return original table name instead of view name in db view case
+<span class="nc" id="L1747">            Table tbl = entity.getClass().getSuperclass().getAnnotation(Table.class);</span>
+<span class="nc bnc" id="L1748" title="All 2 branches missed.">            if (tbl != null) {</span>
+<span class="nc" id="L1749">                attr = _allColumns.get(new Pair&lt;String, String&gt;(tbl.name(), meta.getColumnLabel(index)));</span>
+            }
+        }
+<span class="nc bnc" id="L1752" title="All 4 branches missed.">        assert (attr != null) : &quot;How come I can't find &quot; + meta.getCatalogName(index) + &quot;.&quot; + meta.getColumnName(index);</span>
+<span class="nc" id="L1753">        setField(entity, attr.field, rs, index);</span>
+<span class="nc" id="L1754">    }</span>
+
+    @Override
+    public boolean remove(final ID id) {
+<span class="nc bnc" id="L1758" title="All 2 branches missed.">        if (_removeSql == null) {</span>
+<span class="nc" id="L1759">            return expunge(id);</span>
+        }
+
+<span class="nc" id="L1762">        final TransactionLegacy txn = TransactionLegacy.currentTxn();</span>
+<span class="nc" id="L1763">        PreparedStatement pstmt = null;</span>
+        try {
+
+<span class="nc" id="L1766">            txn.start();</span>
+<span class="nc" id="L1767">            pstmt = txn.prepareAutoCloseStatement(_removeSql.first());</span>
+<span class="nc" id="L1768">            final Attribute[] attrs = _removeSql.second();</span>
+<span class="nc" id="L1769">            prepareAttribute(1, pstmt, attrs[attrs.length - 1], null);</span>
+<span class="nc bnc" id="L1770" title="All 2 branches missed.">            for (int i = 0; i &lt; attrs.length - 1; i++) {</span>
+<span class="nc" id="L1771">                prepareAttribute(i + 2, pstmt, attrs[i], id);</span>
+            }
+
+<span class="nc" id="L1774">            final int result = pstmt.executeUpdate();</span>
+<span class="nc" id="L1775">            txn.commit();</span>
+<span class="nc bnc" id="L1776" title="All 2 branches missed.">            if (_cache != null) {</span>
+<span class="nc" id="L1777">                _cache.remove(id);</span>
+            }
+<span class="nc bnc" id="L1779" title="All 2 branches missed.">            return result &gt; 0;</span>
+<span class="nc" id="L1780">        } catch (final SQLException e) {</span>
+<span class="nc" id="L1781">            throw new CloudRuntimeException(&quot;DB Exception on: &quot; + pstmt, e);</span>
+        }
+    }
+
+    @Override
+    public int remove(SearchCriteria&lt;T&gt; sc) {
+<span class="nc bnc" id="L1787" title="All 2 branches missed.">        if (_removeSql == null) {</span>
+<span class="nc" id="L1788">            return expunge(sc);</span>
+        }
+
+<span class="nc" id="L1791">        T vo = createForUpdate();</span>
+<span class="nc" id="L1792">        UpdateBuilder ub = getUpdateBuilder(vo);</span>
+
+<span class="nc" id="L1794">        ub.set(vo, _removed.second(), new Date());</span>
+<span class="nc" id="L1795">        return update(ub, sc, null);</span>
+    }
+
+    protected Cache _cache;
+
+    @DB()
+    protected void createCache(final Map&lt;String, ? extends Object&gt; params) {
+<span class="nc" id="L1802">        final String value = (String)params.get(&quot;cache.size&quot;);</span>
+
+<span class="nc bnc" id="L1804" title="All 2 branches missed.">        if (value != null) {</span>
+<span class="nc" id="L1805">            final CacheManager cm = CacheManager.create();</span>
+<span class="nc" id="L1806">            final int maxElements = NumbersUtil.parseInt(value, 0);</span>
+<span class="nc" id="L1807">            final int live = NumbersUtil.parseInt((String)params.get(&quot;cache.time.to.live&quot;), 300);</span>
+<span class="nc" id="L1808">            final int idle = NumbersUtil.parseInt((String)params.get(&quot;cache.time.to.idle&quot;), 300);</span>
+<span class="nc bnc" id="L1809" title="All 4 branches missed.">            _cache = new Cache(getName(), maxElements, false, live == -1, live == -1 ? Integer.MAX_VALUE : live, idle);</span>
+<span class="nc" id="L1810">            cm.addCache(_cache);</span>
+<span class="nc" id="L1811">            s_logger.info(&quot;Cache created: &quot; + _cache.toString());</span>
+<span class="nc" id="L1812">        } else {</span>
+<span class="nc" id="L1813">            _cache = null;</span>
+        }
+<span class="nc" id="L1815">    }</span>
+
+    @Override
+    @DB()
+    public boolean configure(final String name, final Map&lt;String, Object&gt; params) throws ConfigurationException {
+<span class="nc" id="L1820">        _name = name;</span>
+
+<span class="nc" id="L1822">        final String value = (String)params.get(&quot;lock.timeout&quot;);</span>
+<span class="nc" id="L1823">        _timeoutSeconds = NumbersUtil.parseInt(value, 300);</span>
+
+<span class="nc" id="L1825">        createCache(params);</span>
+<span class="nc" id="L1826">        final boolean load = Boolean.parseBoolean((String)params.get(&quot;cache.preload&quot;));</span>
+<span class="nc bnc" id="L1827" title="All 2 branches missed.">        if (load) {</span>
+<span class="nc" id="L1828">            listAll();</span>
+        }
+
+<span class="nc" id="L1831">        return true;</span>
+    }
+
+    @DB()
+    public static &lt;T&gt; UpdateBuilder getUpdateBuilder(final T entityObject) {
+<span class="nc" id="L1836">        final Factory factory = (Factory)entityObject;</span>
+<span class="nc bnc" id="L1837" title="All 4 branches missed.">        assert (factory != null);</span>
+<span class="nc" id="L1838">        return (UpdateBuilder)factory.getCallback(1);</span>
+    }
+
+    @Override
+    @DB()
+    public SearchBuilder&lt;T&gt; createSearchBuilder() {
+<span class="nc" id="L1844">        return new SearchBuilder&lt;T&gt;(_entityBeanType);</span>
+    }
+
+    @Override
+    @DB()
+    public SearchCriteria&lt;T&gt; createSearchCriteria() {
+<span class="nc" id="L1850">        SearchBuilder&lt;T&gt; builder = createSearchBuilder();</span>
+<span class="nc" id="L1851">        return builder.create();</span>
+    }
+
+    public Integer getDistinctCount(SearchCriteria&lt;T&gt; sc) {
+<span class="nc bnc" id="L1855" title="All 2 branches missed.">        String clause = sc != null ? sc.getWhereClause() : null;</span>
+<span class="nc bnc" id="L1856" title="All 4 branches missed.">        if (clause != null &amp;&amp; clause.length() == 0) {</span>
+<span class="nc" id="L1857">            clause = null;</span>
+        }
+
+<span class="nc bnc" id="L1860" title="All 2 branches missed.">        final StringBuilder str = createDistinctIdSelect(sc, clause != null);</span>
+<span class="nc bnc" id="L1861" title="All 2 branches missed.">        if (clause != null) {</span>
+<span class="nc" id="L1862">            str.append(clause);</span>
+        }
+
+<span class="nc" id="L1865">        Collection&lt;JoinBuilder&lt;SearchCriteria&lt;?&gt;&gt;&gt; joins = null;</span>
+<span class="nc bnc" id="L1866" title="All 2 branches missed.">        if (sc != null) {</span>
+<span class="nc" id="L1867">            joins = sc.getJoins();</span>
+<span class="nc bnc" id="L1868" title="All 2 branches missed.">            if (joins != null) {</span>
+<span class="nc" id="L1869">                addJoins(str, joins);</span>
+            }
+        }
+
+        // we have to disable group by in getting count, since count for groupBy clause will be different.
+        //List&lt;Object&gt; groupByValues = addGroupBy(str, sc);
+<span class="nc" id="L1875">        final TransactionLegacy txn = TransactionLegacy.currentTxn();</span>
+<span class="nc" id="L1876">        final String sql = &quot;SELECT COUNT(*) FROM (&quot; + str.toString() + &quot;) AS tmp&quot;;</span>
+
+<span class="nc" id="L1878">        PreparedStatement pstmt = null;</span>
+        try {
+<span class="nc" id="L1880">            pstmt = txn.prepareAutoCloseStatement(sql);</span>
+<span class="nc" id="L1881">            int i = 1;</span>
+<span class="nc bnc" id="L1882" title="All 2 branches missed.">            if (clause != null) {</span>
+<span class="nc bnc" id="L1883" title="All 2 branches missed.">                for (final Pair&lt;Attribute, Object&gt; value : sc.getValues()) {</span>
+<span class="nc" id="L1884">                    prepareAttribute(i++, pstmt, value.first(), value.second());</span>
+                }
+            }
+
+<span class="nc bnc" id="L1888" title="All 2 branches missed.">            if (joins != null) {</span>
+<span class="nc" id="L1889">                i = addJoinAttributes(i, pstmt, joins);</span>
+            }
+
+            /*
+            if (groupByValues != null) {
+                for (Object value : groupByValues) {
+                    pstmt.setObject(i++, value);
+                }
+            }
+             */
+
+<span class="nc" id="L1900">            final ResultSet rs = pstmt.executeQuery();</span>
+<span class="nc bnc" id="L1901" title="All 2 branches missed.">            while (rs.next()) {</span>
+<span class="nc" id="L1902">                return rs.getInt(1);</span>
+            }
+<span class="nc" id="L1904">            return 0;</span>
+<span class="nc" id="L1905">        } catch (final SQLException e) {</span>
+<span class="nc" id="L1906">            throw new CloudRuntimeException(&quot;DB Exception on: &quot; + pstmt, e);</span>
+<span class="nc" id="L1907">        } catch (final Throwable e) {</span>
+<span class="nc" id="L1908">            throw new CloudRuntimeException(&quot;Caught: &quot; + pstmt, e);</span>
+        }
+    }
+
+    public Integer getCount(SearchCriteria&lt;T&gt; sc) {
+<span class="nc bnc" id="L1913" title="All 2 branches missed.">        String clause = sc != null ? sc.getWhereClause() : null;</span>
+<span class="nc bnc" id="L1914" title="All 4 branches missed.">        if (clause != null &amp;&amp; clause.length() == 0) {</span>
+<span class="nc" id="L1915">            clause = null;</span>
+        }
+
+<span class="nc bnc" id="L1918" title="All 2 branches missed.">        final StringBuilder str = createCountSelect(sc, clause != null);</span>
+<span class="nc bnc" id="L1919" title="All 2 branches missed.">        if (clause != null) {</span>
+<span class="nc" id="L1920">            str.append(clause);</span>
+        }
+
+<span class="nc" id="L1923">        Collection&lt;JoinBuilder&lt;SearchCriteria&lt;?&gt;&gt;&gt; joins = null;</span>
+<span class="nc bnc" id="L1924" title="All 2 branches missed.">        if (sc != null) {</span>
+<span class="nc" id="L1925">            joins = sc.getJoins();</span>
+<span class="nc bnc" id="L1926" title="All 2 branches missed.">            if (joins != null) {</span>
+<span class="nc" id="L1927">                addJoins(str, joins);</span>
+            }
+        }
+
+        // we have to disable group by in getting count, since count for groupBy clause will be different.
+        //List&lt;Object&gt; groupByValues = addGroupBy(str, sc);
+<span class="nc" id="L1933">        final TransactionLegacy txn = TransactionLegacy.currentTxn();</span>
+<span class="nc" id="L1934">        final String sql = str.toString();</span>
+
+<span class="nc" id="L1936">        PreparedStatement pstmt = null;</span>
+        try {
+<span class="nc" id="L1938">            pstmt = txn.prepareAutoCloseStatement(sql);</span>
+<span class="nc" id="L1939">            int i = 1;</span>
+<span class="nc bnc" id="L1940" title="All 2 branches missed.">            if (clause != null) {</span>
+<span class="nc bnc" id="L1941" title="All 2 branches missed.">                for (final Pair&lt;Attribute, Object&gt; value : sc.getValues()) {</span>
+<span class="nc" id="L1942">                    prepareAttribute(i++, pstmt, value.first(), value.second());</span>
+                }
+            }
+
+<span class="nc bnc" id="L1946" title="All 2 branches missed.">            if (joins != null) {</span>
+<span class="nc" id="L1947">                i = addJoinAttributes(i, pstmt, joins);</span>
+            }
+
+            /*
+            if (groupByValues != null) {
+                for (Object value : groupByValues) {
+                    pstmt.setObject(i++, value);
+                }
+            }
+             */
+
+<span class="nc" id="L1958">            final ResultSet rs = pstmt.executeQuery();</span>
+<span class="nc bnc" id="L1959" title="All 2 branches missed.">            while (rs.next()) {</span>
+<span class="nc" id="L1960">                return rs.getInt(1);</span>
+            }
+<span class="nc" id="L1962">            return 0;</span>
+<span class="nc" id="L1963">        } catch (final SQLException e) {</span>
+<span class="nc" id="L1964">            throw new CloudRuntimeException(&quot;DB Exception on: &quot; + pstmt, e);</span>
+<span class="nc" id="L1965">        } catch (final Throwable e) {</span>
+<span class="nc" id="L1966">            throw new CloudRuntimeException(&quot;Caught: &quot; + pstmt, e);</span>
+        }
+    }
+
+    @DB()
+    protected StringBuilder createCountSelect(SearchCriteria&lt;?&gt; sc, final boolean whereClause) {
+<span class="nc" id="L1972">        StringBuilder sql = new StringBuilder(_count);</span>
+
+<span class="nc bnc" id="L1974" title="All 2 branches missed.">        if (!whereClause) {</span>
+<span class="nc bnc" id="L1975" title="All 2 branches missed.">            sql.delete(sql.length() - (_discriminatorClause == null ? 6 : 4), sql.length());</span>
+        }
+
+<span class="nc" id="L1978">        return sql;</span>
+    }
+
+    @DB()
+    protected StringBuilder createDistinctIdSelect(SearchCriteria&lt;?&gt; sc, final boolean whereClause) {
+<span class="nc" id="L1983">        StringBuilder sql = new StringBuilder(_distinctIdSql);</span>
+
+<span class="nc bnc" id="L1985" title="All 2 branches missed.">        if (!whereClause) {</span>
+<span class="nc bnc" id="L1986" title="All 2 branches missed.">            sql.delete(sql.length() - (_discriminatorClause == null ? 6 : 4), sql.length());</span>
+        }
+
+<span class="nc" id="L1989">        return sql;</span>
+    }
+
+    @DB()
+    protected Pair&lt;List&lt;T&gt;, Integer&gt; listAndCountIncludingRemovedBy(final SearchCriteria&lt;T&gt; sc, final Filter filter) {
+<span class="nc" id="L1994">        List&lt;T&gt; objects = searchIncludingRemoved(sc, filter, null, false);</span>
+<span class="nc" id="L1995">        Integer count = getCount(sc);</span>
+<span class="nc" id="L1996">        return new Pair&lt;List&lt;T&gt;, Integer&gt;(objects, count);</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>cloud-core (18-mrt-2016 13:14:54)</div></body></html>

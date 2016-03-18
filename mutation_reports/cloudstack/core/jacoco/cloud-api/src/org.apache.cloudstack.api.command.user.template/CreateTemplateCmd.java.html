@@ -1,0 +1,318 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>CreateTemplateCmd.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">cloud-core (18-mrt-2016 13:14:54)</a> &gt; <a href="../../index.html" class="el_group">cloud-api</a> &gt; <a href="../index.html" class="el_bundle">src</a> &gt; <a href="index.source.html" class="el_package">org.apache.cloudstack.api.command.user.template</a> &gt; <span class="el_source">CreateTemplateCmd.java</span></div><h1>CreateTemplateCmd.java</h1><pre class="source lang-java linenums">// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// &quot;License&quot;); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+package org.apache.cloudstack.api.command.user.template;
+
+import java.util.Collection;
+import java.util.List;
+import java.util.Map;
+
+import org.apache.cloudstack.acl.SecurityChecker;
+import org.apache.cloudstack.api.response.GuestOSResponse;
+import org.apache.cloudstack.api.response.SnapshotResponse;
+import org.apache.cloudstack.api.response.TemplateResponse;
+import org.apache.cloudstack.api.response.UserVmResponse;
+import org.apache.cloudstack.api.response.VolumeResponse;
+import org.apache.cloudstack.api.response.ProjectResponse;
+
+import org.apache.log4j.Logger;
+
+import org.apache.cloudstack.api.APICommand;
+import org.apache.cloudstack.api.ApiCommandJobType;
+import org.apache.cloudstack.api.ApiConstants;
+import org.apache.cloudstack.api.ApiErrorCode;
+import org.apache.cloudstack.api.BaseAsyncCreateCmd;
+import org.apache.cloudstack.api.Parameter;
+import org.apache.cloudstack.api.ResponseObject.ResponseView;
+import org.apache.cloudstack.api.ServerApiException;
+import org.apache.cloudstack.context.CallContext;
+
+import com.cloud.event.EventTypes;
+import com.cloud.exception.InvalidParameterValueException;
+import com.cloud.exception.PermissionDeniedException;
+import com.cloud.exception.ResourceAllocationException;
+import com.cloud.projects.Project;
+import com.cloud.storage.Snapshot;
+import com.cloud.storage.Volume;
+import com.cloud.template.VirtualMachineTemplate;
+import com.cloud.user.Account;
+
+@APICommand(name = &quot;createTemplate&quot;, responseObject = TemplateResponse.class, description = &quot;Creates a template of a virtual machine. &quot; + &quot;The virtual machine must be in a STOPPED state. &quot;
+        + &quot;A template created from this command is automatically designated as a private template visible to the account that created it.&quot;, responseView = ResponseView.Restricted,
+    requestHasSensitiveInfo = false, responseHasSensitiveInfo = false)
+<span class="nc" id="L56">public class CreateTemplateCmd extends BaseAsyncCreateCmd {</span>
+<span class="nc" id="L57">    public static final Logger s_logger = Logger.getLogger(CreateTemplateCmd.class.getName());</span>
+<span class="nc" id="L58">    private static final String s_name = &quot;createtemplateresponse&quot;;</span>
+
+    // ///////////////////////////////////////////////////
+    // ////////////// API parameters /////////////////////
+    // ///////////////////////////////////////////////////
+
+    @Parameter(name = ApiConstants.BITS, type = CommandType.INTEGER, description = &quot;32 or 64 bit&quot;)
+    private Integer bits;
+
+    @Parameter(name = ApiConstants.DISPLAY_TEXT,
+               type = CommandType.STRING,
+               required = true,
+               description = &quot;the display text of the template. This is usually used for display purposes.&quot;,
+               length = 4096)
+    private String displayText;
+
+    @Parameter(name = ApiConstants.IS_FEATURED, type = CommandType.BOOLEAN, description = &quot;true if this template is a featured template, false otherwise&quot;)
+    private Boolean featured;
+
+    @Parameter(name = ApiConstants.IS_PUBLIC, type = CommandType.BOOLEAN, description = &quot;true if this template is a public template, false otherwise&quot;)
+    private Boolean publicTemplate;
+
+    @Parameter(name = ApiConstants.NAME, type = CommandType.STRING, required = true, description = &quot;the name of the template&quot;)
+    private String templateName;
+
+    @Parameter(name = ApiConstants.OS_TYPE_ID,
+               type = CommandType.UUID,
+               entityType = GuestOSResponse.class,
+               required = true,
+               description = &quot;the ID of the OS Type that best represents the OS of this template.&quot;)
+    private Long osTypeId;
+
+    @Parameter(name = ApiConstants.PASSWORD_ENABLED,
+               type = CommandType.BOOLEAN,
+               description = &quot;true if the template supports the password reset feature; default is false&quot;)
+    private Boolean passwordEnabled;
+
+    @Parameter(name = ApiConstants.REQUIRES_HVM, type = CommandType.BOOLEAN, description = &quot;true if the template requres HVM, false otherwise&quot;)
+    private Boolean requiresHvm;
+
+    @Parameter(name = ApiConstants.SNAPSHOT_ID,
+               type = CommandType.UUID,
+               entityType = SnapshotResponse.class,
+            description = &quot;the ID of the snapshot the template is being created from. Either this parameter, or volumeId has to be passed in&quot;)
+    protected Long snapshotId;
+
+    @Parameter(name = ApiConstants.VOLUME_ID,
+               type = CommandType.UUID,
+               entityType = VolumeResponse.class,
+            description = &quot;the ID of the disk volume the template is being created from. Either this parameter, or snapshotId has to be passed in&quot;)
+    protected Long volumeId;
+
+    @Parameter(name=ApiConstants.VIRTUAL_MACHINE_ID, type=CommandType.UUID, entityType = UserVmResponse.class,
+            description=&quot;Optional, VM ID. If this presents, it is going to create a baremetal template for VM this ID refers to. This is only for VM whose hypervisor type is BareMetal&quot;)
+    protected Long vmId;
+
+    @Parameter(name = ApiConstants.URL,
+               type = CommandType.STRING,
+               description = &quot;Optional, only for baremetal hypervisor. The directory name where template stored on CIFS server&quot;)
+    private String url;
+
+    @Parameter(name = ApiConstants.TEMPLATE_TAG, type = CommandType.STRING, description = &quot;the tag for this template.&quot;)
+    private String templateTag;
+
+    @Parameter(name = ApiConstants.DETAILS, type = CommandType.MAP, description = &quot;Template details in key/value pairs using format details[i].keyname=keyvalue. Example: details[0].hypervisortoolsversion=xenserver61&quot;)
+    protected Map details;
+
+    @Parameter(name = ApiConstants.IS_DYNAMICALLY_SCALABLE,
+               type = CommandType.BOOLEAN,
+               description = &quot;true if template contains XS/VMWare tools inorder to support dynamic scaling of VM cpu/memory&quot;)
+    protected Boolean isDynamicallyScalable;
+
+    @Parameter(name = ApiConstants.PROJECT_ID, type = CommandType.UUID, entityType = ProjectResponse.class, description = &quot;create template for the project&quot;)
+    private Long projectId;
+
+    // ///////////////////////////////////////////////////
+    // ///////////////// Accessors ///////////////////////
+    // ///////////////////////////////////////////////////
+
+    public Integer getBits() {
+<span class="nc" id="L138">        return bits;</span>
+    }
+
+    public String getDisplayText() {
+<span class="nc" id="L142">        return displayText;</span>
+    }
+
+    public Boolean isFeatured() {
+<span class="nc" id="L146">        return featured;</span>
+    }
+
+    public Boolean isPublic() {
+<span class="nc" id="L150">        return publicTemplate;</span>
+    }
+
+    public String getTemplateName() {
+<span class="nc" id="L154">        return templateName;</span>
+    }
+
+    public Long getOsTypeId() {
+<span class="nc" id="L158">        return osTypeId;</span>
+    }
+
+    public Boolean isPasswordEnabled() {
+<span class="nc" id="L162">        return passwordEnabled;</span>
+    }
+
+    public Boolean getRequiresHvm() {
+<span class="nc" id="L166">        return requiresHvm;</span>
+    }
+
+    public Long getSnapshotId() {
+<span class="nc" id="L170">        return snapshotId;</span>
+    }
+
+    public Long getVolumeId() {
+<span class="nc" id="L174">        return volumeId;</span>
+    }
+
+    public Long getVmId() {
+<span class="nc" id="L178">        return vmId;</span>
+    }
+
+    public String getUrl() {
+<span class="nc" id="L182">        return url;</span>
+    }
+
+    public String getTemplateTag() {
+<span class="nc" id="L186">        return templateTag;</span>
+    }
+
+    public Map getDetails() {
+<span class="nc bnc" id="L190" title="All 4 branches missed.">        if (details == null || details.isEmpty()) {</span>
+<span class="nc" id="L191">            return null;</span>
+        }
+
+<span class="nc" id="L194">        Collection paramsCollection = details.values();</span>
+<span class="nc" id="L195">        Map params = (Map)(paramsCollection.toArray())[0];</span>
+<span class="nc" id="L196">        return params;</span>
+    }
+
+    public boolean isDynamicallyScalable() {
+<span class="nc bnc" id="L200" title="All 2 branches missed.">        return isDynamicallyScalable == null ? false : isDynamicallyScalable;</span>
+    }
+
+    // ///////////////////////////////////////////////////
+    // ///////////// API Implementation///////////////////
+    // ///////////////////////////////////////////////////
+
+    @Override
+    public String getCommandName() {
+<span class="nc" id="L209">        return s_name;</span>
+    }
+
+    public static String getResultObjectName() {
+<span class="nc" id="L213">        return &quot;template&quot;;</span>
+    }
+
+    @Override
+    public long getEntityOwnerId() {
+<span class="nc" id="L218">        Long volumeId = getVolumeId();</span>
+<span class="nc" id="L219">        Long snapshotId = getSnapshotId();</span>
+<span class="nc" id="L220">        Account callingAccount = CallContext.current().getCallingAccount();</span>
+<span class="nc bnc" id="L221" title="All 2 branches missed.">        if (volumeId != null) {</span>
+<span class="nc" id="L222">            Volume volume = _entityMgr.findById(Volume.class, volumeId);</span>
+<span class="nc bnc" id="L223" title="All 2 branches missed.">            if (volume != null) {</span>
+<span class="nc" id="L224">                _accountService.checkAccess(callingAccount, SecurityChecker.AccessType.UseEntry, false, volume);</span>
+<span class="nc" id="L225">            } else {</span>
+<span class="nc" id="L226">                throw new InvalidParameterValueException(&quot;Unable to find volume by id=&quot; + volumeId);</span>
+            }
+        } else {
+<span class="nc" id="L229">            Snapshot snapshot = _entityMgr.findById(Snapshot.class, snapshotId);</span>
+<span class="nc bnc" id="L230" title="All 2 branches missed.">            if (snapshot != null) {</span>
+<span class="nc" id="L231">                _accountService.checkAccess(callingAccount, SecurityChecker.AccessType.UseEntry, false, snapshot);</span>
+<span class="nc" id="L232">            } else {</span>
+<span class="nc" id="L233">                throw new InvalidParameterValueException(&quot;Unable to find snapshot by id=&quot; + snapshotId);</span>
+            }
+        }
+
+<span class="nc bnc" id="L237" title="All 2 branches missed.">        if(projectId != null){</span>
+<span class="nc" id="L238">            final Project project = _projectService.getProject(projectId);</span>
+<span class="nc bnc" id="L239" title="All 2 branches missed.">            if (project != null) {</span>
+<span class="nc bnc" id="L240" title="All 2 branches missed.">                if (project.getState() == Project.State.Active) {</span>
+<span class="nc" id="L241">                    Account projectAccount= _accountService.getAccount(project.getProjectAccountId());</span>
+<span class="nc" id="L242">                    _accountService.checkAccess(callingAccount, SecurityChecker.AccessType.UseEntry, false, projectAccount);</span>
+<span class="nc" id="L243">                    return project.getProjectAccountId();</span>
+                } else {
+<span class="nc" id="L245">                    final PermissionDeniedException ex =</span>
+<span class="nc" id="L246">                            new PermissionDeniedException(&quot;Can't add resources to the project with specified projectId in state=&quot; + project.getState() +</span>
+<span class="nc" id="L247">                                    &quot; as it's no longer active&quot;);</span>
+<span class="nc" id="L248">                    ex.addProxyObject(project.getUuid(), &quot;projectId&quot;);</span>
+<span class="nc" id="L249">                    throw ex;</span>
+                }
+            } else {
+<span class="nc" id="L252">                throw new InvalidParameterValueException(&quot;Unable to find project by id&quot;);</span>
+            }
+        }
+
+<span class="nc" id="L256">        return callingAccount.getId();</span>
+    }
+
+    @Override
+    public String getEventType() {
+<span class="nc" id="L261">        return EventTypes.EVENT_TEMPLATE_CREATE;</span>
+    }
+
+    @Override
+    public String getEventDescription() {
+<span class="nc" id="L266">        return &quot;creating template: &quot; + getTemplateName();</span>
+    }
+
+    @Override
+    public ApiCommandJobType getInstanceType() {
+<span class="nc" id="L271">        return ApiCommandJobType.Template;</span>
+    }
+
+    protected boolean isBareMetal() {
+<span class="nc bnc" id="L275" title="All 4 branches missed.">        return (getVmId() != null &amp;&amp; getUrl() != null);</span>
+    }
+
+    @Override
+    public void create() throws ResourceAllocationException {
+<span class="nc" id="L280">        VirtualMachineTemplate template = null;</span>
+        //TemplateOwner should be the caller https://issues.citrite.net/browse/CS-17530
+<span class="nc" id="L282">        template = _templateService.createPrivateTemplateRecord(this, _accountService.getAccount(getEntityOwnerId()));</span>
+<span class="nc bnc" id="L283" title="All 2 branches missed.">        if (template != null) {</span>
+<span class="nc" id="L284">            setEntityId(template.getId());</span>
+<span class="nc" id="L285">            setEntityUuid(template.getUuid());</span>
+<span class="nc" id="L286">        } else {</span>
+<span class="nc" id="L287">            throw new ServerApiException(ApiErrorCode.INTERNAL_ERROR, &quot;Failed to create a template&quot;);</span>
+        }
+
+<span class="nc" id="L290">    }</span>
+
+    @Override
+    public void execute() {
+<span class="nc" id="L294">        CallContext.current().setEventDetails(</span>
+<span class="nc bnc" id="L295" title="All 2 branches missed.">            &quot;Template Id: &quot; + getEntityId() + ((getSnapshotId() == null) ? &quot; from volume Id: &quot; + getVolumeId() : &quot; from snapshot Id: &quot; + getSnapshotId()));</span>
+<span class="nc" id="L296">        VirtualMachineTemplate template = null;</span>
+<span class="nc" id="L297">        template = _templateService.createPrivateTemplate(this);</span>
+
+<span class="nc bnc" id="L299" title="All 2 branches missed.">        if (template != null) {</span>
+            List&lt;TemplateResponse&gt; templateResponses;
+<span class="nc bnc" id="L301" title="All 2 branches missed.">            if (isBareMetal()) {</span>
+<span class="nc" id="L302">                templateResponses = _responseGenerator.createTemplateResponses(ResponseView.Restricted, template.getId(), vmId);</span>
+<span class="nc" id="L303">            } else {</span>
+<span class="nc" id="L304">                templateResponses = _responseGenerator.createTemplateResponses(ResponseView.Restricted, template.getId(), snapshotId, volumeId, false);</span>
+            }
+<span class="nc" id="L306">            TemplateResponse response = new TemplateResponse();</span>
+<span class="nc bnc" id="L307" title="All 4 branches missed.">            if (templateResponses != null &amp;&amp; !templateResponses.isEmpty()) {</span>
+<span class="nc" id="L308">                response = templateResponses.get(0);</span>
+            }
+<span class="nc" id="L310">            response.setResponseName(getCommandName());</span>
+<span class="nc" id="L311">            setResponseObject(response);</span>
+<span class="nc" id="L312">        } else {</span>
+<span class="nc" id="L313">            throw new ServerApiException(ApiErrorCode.INTERNAL_ERROR, &quot;Failed to create private template&quot;);</span>
+        }
+
+<span class="nc" id="L316">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>cloud-core (18-mrt-2016 13:14:54)</div></body></html>

@@ -1,0 +1,507 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>Script.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">cloud-core (18-mrt-2016 13:14:54)</a> &gt; <a href="../../index.html" class="el_group">cloud-utils</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">com.cloud.utils.script</a> &gt; <span class="el_source">Script.java</span></div><h1>Script.java</h1><pre class="source lang-java linenums">//
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// &quot;License&quot;); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+//
+
+package com.cloud.utils.script;
+
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.PrintWriter;
+import java.io.StringWriter;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.net.URL;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Properties;
+import java.util.concurrent.Callable;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+
+import org.apache.commons.io.IOUtils;
+import org.apache.log4j.Logger;
+
+import com.cloud.utils.PropertiesUtil;
+import com.cloud.utils.concurrency.NamedThreadFactory;
+import com.cloud.utils.script.OutputInterpreter.TimedOutLogger;
+
+public class Script implements Callable&lt;String&gt; {
+<span class="nc" id="L48">    private static final Logger s_logger = Logger.getLogger(Script.class);</span>
+
+    private final Logger _logger;
+
+    public static final String ERR_EXECUTE = &quot;execute.error&quot;;
+    public static final String ERR_TIMEOUT = &quot;timeout&quot;;
+<span class="nc" id="L54">    private int _defaultTimeout = 3600 * 1000; /* 1 hour */</span>
+<span class="nc" id="L55">    private volatile boolean _isTimeOut = false;</span>
+
+<span class="nc" id="L57">    private boolean _passwordCommand = false;</span>
+
+<span class="nc" id="L59">    private static final ScheduledExecutorService s_executors = Executors.newScheduledThreadPool(10, new NamedThreadFactory(&quot;Script&quot;));</span>
+
+    String _workDir;
+    ArrayList&lt;String&gt; _command;
+    long _timeout;
+    Process _process;
+    Thread _thread;
+
+    public int getExitValue()  {
+<span class="nc" id="L68">        return _process.exitValue();</span>
+    }
+
+<span class="nc" id="L71">    public Script(String command, long timeout, Logger logger) {</span>
+<span class="nc" id="L72">        _command = new ArrayList&lt;String&gt;();</span>
+<span class="nc" id="L73">        _command.add(command);</span>
+<span class="nc" id="L74">        _timeout = timeout;</span>
+<span class="nc bnc" id="L75" title="All 2 branches missed.">        if (_timeout == 0) {</span>
+            /* always using default timeout 1 hour to avoid thread hang */
+<span class="nc" id="L77">            _timeout = _defaultTimeout;</span>
+        }
+<span class="nc" id="L79">        _process = null;</span>
+<span class="nc bnc" id="L80" title="All 2 branches missed.">        _logger = logger != null ? logger : s_logger;</span>
+<span class="nc" id="L81">    }</span>
+
+    public Script(boolean runWithSudo, String command, long timeout, Logger logger) {
+<span class="nc" id="L84">        this(command, timeout, logger);</span>
+<span class="nc bnc" id="L85" title="All 2 branches missed.">        if (runWithSudo) {</span>
+<span class="nc" id="L86">            _command.add(0, &quot;sudo&quot;);</span>
+        }
+<span class="nc" id="L88">    }</span>
+
+    public Script(String command, Logger logger) {
+<span class="nc" id="L91">        this(command, 0, logger);</span>
+<span class="nc" id="L92">    }</span>
+
+    public Script(String command) {
+<span class="nc" id="L95">        this(command, 0, s_logger);</span>
+<span class="nc" id="L96">    }</span>
+
+    public Script(String command, long timeout) {
+<span class="nc" id="L99">        this(command, timeout, s_logger);</span>
+<span class="nc" id="L100">    }</span>
+
+    public void add(String... params) {
+<span class="nc bnc" id="L103" title="All 2 branches missed.">        for (String param : params) {</span>
+<span class="nc" id="L104">            _command.add(param);</span>
+        }
+<span class="nc" id="L106">    }</span>
+
+    public void add(String param) {
+<span class="nc" id="L109">        _command.add(param);</span>
+<span class="nc" id="L110">    }</span>
+
+    public Script set(String name, String value) {
+<span class="nc" id="L113">        _command.add(name);</span>
+<span class="nc" id="L114">        _command.add(value);</span>
+<span class="nc" id="L115">        return this;</span>
+    }
+
+    public void setWorkDir(String workDir) {
+<span class="nc" id="L119">        _workDir = workDir;</span>
+<span class="nc" id="L120">    }</span>
+
+    protected String buildCommandLine(String[] command) {
+<span class="nc" id="L123">        StringBuilder builder = new StringBuilder();</span>
+<span class="nc" id="L124">        boolean obscureParam = false;</span>
+<span class="nc bnc" id="L125" title="All 2 branches missed.">        for (int i = 0; i &lt; command.length; i++) {</span>
+<span class="nc" id="L126">            String cmd = command[i];</span>
+<span class="nc bnc" id="L127" title="All 2 branches missed.">            if (obscureParam) {</span>
+<span class="nc" id="L128">                builder.append(&quot;******&quot;).append(&quot; &quot;);</span>
+<span class="nc" id="L129">                obscureParam = false;</span>
+<span class="nc" id="L130">            } else {</span>
+<span class="nc" id="L131">                builder.append(command[i]).append(&quot; &quot;);</span>
+            }
+
+<span class="nc bnc" id="L134" title="All 4 branches missed.">            if (&quot;-y&quot;.equals(cmd) || &quot;-z&quot;.equals(cmd)) {</span>
+<span class="nc" id="L135">                obscureParam = true;</span>
+<span class="nc" id="L136">                _passwordCommand = true;</span>
+            }
+        }
+<span class="nc" id="L139">        return builder.toString();</span>
+    }
+
+    protected String buildCommandLine(List&lt;String&gt; command) {
+<span class="nc" id="L143">        StringBuilder builder = new StringBuilder();</span>
+<span class="nc" id="L144">        boolean obscureParam = false;</span>
+<span class="nc bnc" id="L145" title="All 2 branches missed.">        for (String cmd : command) {</span>
+<span class="nc bnc" id="L146" title="All 2 branches missed.">            if (obscureParam) {</span>
+<span class="nc" id="L147">                builder.append(&quot;******&quot;).append(&quot; &quot;);</span>
+<span class="nc" id="L148">                obscureParam = false;</span>
+<span class="nc" id="L149">            } else {</span>
+<span class="nc" id="L150">                builder.append(cmd).append(&quot; &quot;);</span>
+            }
+
+<span class="nc bnc" id="L153" title="All 4 branches missed.">            if (&quot;-y&quot;.equals(cmd) || &quot;-z&quot;.equals(cmd)) {</span>
+<span class="nc" id="L154">                obscureParam = true;</span>
+<span class="nc" id="L155">                _passwordCommand = true;</span>
+            }
+        }
+<span class="nc" id="L158">        return builder.toString();</span>
+    }
+
+    public long getTimeout() {
+<span class="nc" id="L162">        return _timeout;</span>
+    }
+
+    public String execute() {
+<span class="nc" id="L166">        return execute(new OutputInterpreter.OutputLogger(_logger));</span>
+    }
+
+    @Override
+    public String toString() {
+<span class="nc" id="L171">        String[] command = _command.toArray(new String[_command.size()]);</span>
+<span class="nc" id="L172">        return buildCommandLine(command);</span>
+    }
+
+    static String stackTraceAsString(Throwable throwable) {
+        //TODO: a StringWriter is bit to heavy weight
+<span class="nc" id="L177">        try(StringWriter out = new StringWriter(); PrintWriter writer = new PrintWriter(out);) {</span>
+<span class="nc" id="L178">            throwable.printStackTrace(writer);</span>
+<span class="nc" id="L179">            return out.toString();</span>
+<span class="nc bnc" id="L180" title="All 16 branches missed.">        } catch (IOException e) {</span>
+<span class="nc" id="L181">            return &quot;&quot;;</span>
+        }
+    }
+
+    public String execute(OutputInterpreter interpreter) {
+<span class="nc" id="L186">        String[] command = _command.toArray(new String[_command.size()]);</span>
+
+<span class="nc bnc" id="L188" title="All 2 branches missed.">        if (_logger.isDebugEnabled()) {</span>
+<span class="nc" id="L189">            _logger.debug(&quot;Executing: &quot; + buildCommandLine(command));</span>
+        }
+
+        try {
+<span class="nc" id="L193">            ProcessBuilder pb = new ProcessBuilder(command);</span>
+<span class="nc" id="L194">            pb.redirectErrorStream(true);</span>
+<span class="nc bnc" id="L195" title="All 2 branches missed.">            if (_workDir != null)</span>
+<span class="nc" id="L196">                pb.directory(new File(_workDir));</span>
+
+<span class="nc" id="L198">            _process = pb.start();</span>
+<span class="nc bnc" id="L199" title="All 2 branches missed.">            if (_process == null) {</span>
+<span class="nc" id="L200">                _logger.warn(&quot;Unable to execute: &quot; + buildCommandLine(command));</span>
+<span class="nc" id="L201">                return &quot;Unable to execute the command: &quot; + command[0];</span>
+            }
+
+<span class="nc" id="L204">            BufferedReader ir = new BufferedReader(new InputStreamReader(_process.getInputStream()));</span>
+
+<span class="nc" id="L206">            _thread = Thread.currentThread();</span>
+<span class="nc" id="L207">            ScheduledFuture&lt;String&gt; future = null;</span>
+<span class="nc bnc" id="L208" title="All 2 branches missed.">            if (_timeout &gt; 0) {</span>
+<span class="nc" id="L209">                future = s_executors.schedule(this, _timeout, TimeUnit.MILLISECONDS);</span>
+            }
+
+<span class="nc" id="L212">            Task task = null;</span>
+<span class="nc bnc" id="L213" title="All 4 branches missed.">            if (interpreter != null &amp;&amp; interpreter.drain()) {</span>
+<span class="nc" id="L214">                task = new Task(interpreter, ir);</span>
+<span class="nc" id="L215">                s_executors.execute(task);</span>
+            }
+
+            while (true) {
+                try {
+<span class="nc bnc" id="L220" title="All 2 branches missed.">                    if (_process.waitFor() == 0) {</span>
+<span class="nc" id="L221">                        _logger.debug(&quot;Execution is successful.&quot;);</span>
+<span class="nc bnc" id="L222" title="All 2 branches missed.">                        if (interpreter != null) {</span>
+<span class="nc bnc" id="L223" title="All 2 branches missed.">                            return interpreter.drain() ? task.getResult() : interpreter.interpret(ir);</span>
+                        } else {
+                            // null return exitValue apparently
+<span class="nc" id="L226">                            return String.valueOf(_process.exitValue());</span>
+                        }
+                    } else {
+<span class="nc" id="L229">                        break;</span>
+                    }
+<span class="nc" id="L231">                } catch (InterruptedException e) {</span>
+<span class="nc bnc" id="L232" title="All 2 branches missed.">                    if (!_isTimeOut) {</span>
+                        /*
+                         * This is not timeout, we are interrupted by others,
+                         * continue
+                         */
+<span class="nc" id="L237">                        _logger.debug(&quot;We are interrupted but it's not a timeout, just continue&quot;);</span>
+<span class="nc" id="L238">                        continue;</span>
+                    }
+
+<span class="nc" id="L241">                    TimedOutLogger log = new TimedOutLogger(_process);</span>
+<span class="nc" id="L242">                    Task timedoutTask = new Task(log, ir);</span>
+
+<span class="nc" id="L244">                    timedoutTask.run();</span>
+<span class="nc bnc" id="L245" title="All 2 branches missed.">                    if (!_passwordCommand) {</span>
+<span class="nc" id="L246">                        _logger.warn(&quot;Timed out: &quot; + buildCommandLine(command) + &quot;.  Output is: &quot; + timedoutTask.getResult());</span>
+<span class="nc" id="L247">                    } else {</span>
+<span class="nc" id="L248">                        _logger.warn(&quot;Timed out: &quot; + buildCommandLine(command));</span>
+                    }
+
+<span class="nc" id="L251">                    return ERR_TIMEOUT;</span>
+<span class="nc" id="L252">                } finally {</span>
+<span class="nc bnc" id="L253" title="All 12 branches missed.">                    if (future != null) {</span>
+<span class="nc" id="L254">                        future.cancel(false);</span>
+                    }
+<span class="nc" id="L256">                    Thread.interrupted();</span>
+<span class="nc" id="L257">                }</span>
+            }
+
+<span class="nc" id="L260">            _logger.debug(&quot;Exit value is &quot; + _process.exitValue());</span>
+
+<span class="nc" id="L262">            BufferedReader reader = new BufferedReader(new InputStreamReader(_process.getInputStream()), 128);</span>
+
+            String error;
+<span class="nc bnc" id="L265" title="All 2 branches missed.">            if (interpreter != null) {</span>
+<span class="nc" id="L266">                error = interpreter.processError(reader);</span>
+<span class="nc" id="L267">            } else {</span>
+<span class="nc" id="L268">                error = String.valueOf(_process.exitValue());</span>
+            }
+
+<span class="nc bnc" id="L271" title="All 2 branches missed.">            if (_logger.isDebugEnabled()) {</span>
+<span class="nc" id="L272">                _logger.debug(error);</span>
+            }
+<span class="nc" id="L274">            return error;</span>
+<span class="nc" id="L275">        } catch (SecurityException ex) {</span>
+<span class="nc" id="L276">            _logger.warn(&quot;Security Exception....not running as root?&quot;, ex);</span>
+<span class="nc" id="L277">            return stackTraceAsString(ex);</span>
+<span class="nc" id="L278">        } catch (Exception ex) {</span>
+<span class="nc" id="L279">            _logger.warn(&quot;Exception: &quot; + buildCommandLine(command), ex);</span>
+<span class="nc" id="L280">            return stackTraceAsString(ex);</span>
+<span class="nc" id="L281">        } finally {</span>
+<span class="nc bnc" id="L282" title="All 16 branches missed.">            if (_process != null) {</span>
+<span class="nc" id="L283">                IOUtils.closeQuietly(_process.getErrorStream());</span>
+<span class="nc" id="L284">                IOUtils.closeQuietly(_process.getOutputStream());</span>
+<span class="nc" id="L285">                IOUtils.closeQuietly(_process.getInputStream());</span>
+<span class="nc" id="L286">                _process.destroy();</span>
+            }
+<span class="nc" id="L288">        }</span>
+    }
+
+    @Override
+    public String call() {
+        try {
+<span class="nc" id="L294">            _logger.trace(&quot;Checking exit value of process&quot;);</span>
+<span class="nc" id="L295">            _process.exitValue();</span>
+<span class="nc" id="L296">            _logger.trace(&quot;Script ran within the alloted time&quot;);</span>
+<span class="nc" id="L297">        } catch (IllegalThreadStateException e) {</span>
+<span class="nc" id="L298">            _logger.warn(&quot;Interrupting script.&quot;);</span>
+<span class="nc" id="L299">            _isTimeOut = true;</span>
+<span class="nc" id="L300">            _thread.interrupt();</span>
+        }
+<span class="nc" id="L302">        return null;</span>
+    }
+
+    public static class Task implements Runnable {
+        OutputInterpreter interpreter;
+        BufferedReader reader;
+        String result;
+        boolean done;
+
+<span class="nc" id="L311">        public Task(OutputInterpreter interpreter, BufferedReader reader) {</span>
+<span class="nc" id="L312">            this.interpreter = interpreter;</span>
+<span class="nc" id="L313">            this.reader = reader;</span>
+<span class="nc" id="L314">            result = null;</span>
+<span class="nc" id="L315">        }</span>
+
+        @Override
+        public void run() {
+<span class="nc" id="L319">            synchronized(this) {</span>
+<span class="nc" id="L320">                done = false;</span>
+                try {
+<span class="nc" id="L322">                    result = interpreter.interpret(reader);</span>
+<span class="nc" id="L323">                } catch (IOException ex) {</span>
+<span class="nc" id="L324">                    result = stackTraceAsString(ex);</span>
+<span class="nc" id="L325">                } catch (Exception ex) {</span>
+<span class="nc" id="L326">                    result = stackTraceAsString(ex);</span>
+<span class="nc" id="L327">                } finally {</span>
+<span class="nc" id="L328">                        done = true;</span>
+<span class="nc" id="L329">                        notifyAll();</span>
+<span class="nc" id="L330">                        IOUtils.closeQuietly(reader);</span>
+<span class="nc" id="L331">                }</span>
+            }
+<span class="nc" id="L333">        }</span>
+
+        public synchronized String getResult() throws InterruptedException {
+<span class="nc bnc" id="L336" title="All 2 branches missed.">            if (!done) {</span>
+<span class="nc" id="L337">                wait();</span>
+            }
+<span class="nc" id="L339">            return result;</span>
+        }
+    }
+
+    public static String findScript(String path, String script) {
+<span class="nc" id="L344">        s_logger.debug(&quot;Looking for &quot; + script + &quot; in the classpath&quot;);</span>
+
+<span class="nc" id="L346">        URL url = ClassLoader.getSystemResource(script);</span>
+<span class="nc" id="L347">        s_logger.debug(&quot;System resource: &quot; + url);</span>
+<span class="nc" id="L348">        File file = null;</span>
+<span class="nc bnc" id="L349" title="All 2 branches missed.">        if (url != null) {</span>
+<span class="nc" id="L350">            file = new File(url.getFile());</span>
+<span class="nc" id="L351">            s_logger.debug(&quot;Absolute path =  &quot; + file.getAbsolutePath());</span>
+<span class="nc" id="L352">            return file.getAbsolutePath();</span>
+        }
+
+<span class="nc bnc" id="L355" title="All 2 branches missed.">        if (path == null) {</span>
+<span class="nc" id="L356">            s_logger.warn(&quot;No search path specified, unable to look for &quot; + script);</span>
+<span class="nc" id="L357">            return null;</span>
+        }
+<span class="nc" id="L359">        path = path.replace(&quot;/&quot;, File.separator);</span>
+
+        /**
+         * Look in WEB-INF/classes of the webapp
+         * URI workaround the URL encoding of url.getFile
+         */
+<span class="nc bnc" id="L365" title="All 2 branches missed.">        if (path.endsWith(File.separator)) {</span>
+<span class="nc" id="L366">            url = Script.class.getClassLoader().getResource(path + script);</span>
+<span class="nc" id="L367">        } else {</span>
+<span class="nc" id="L368">            url = Script.class.getClassLoader().getResource(path + File.separator + script);</span>
+        }
+<span class="nc" id="L370">        s_logger.debug(&quot;Classpath resource: &quot; + url);</span>
+<span class="nc bnc" id="L371" title="All 2 branches missed.">        if (url != null) {</span>
+            try {
+<span class="nc" id="L373">                file = new File(new URI(url.toString()).getPath());</span>
+<span class="nc" id="L374">                s_logger.debug(&quot;Absolute path =  &quot; + file.getAbsolutePath());</span>
+<span class="nc" id="L375">                return file.getAbsolutePath();</span>
+<span class="nc" id="L376">            } catch (URISyntaxException e) {</span>
+<span class="nc" id="L377">                s_logger.warn(&quot;Unable to convert &quot; + url.toString() + &quot; to a URI&quot;);</span>
+            }
+        }
+
+<span class="nc bnc" id="L381" title="All 2 branches missed.">        if (path.endsWith(File.separator)) {</span>
+<span class="nc" id="L382">            path = path.substring(0, path.lastIndexOf(File.separator));</span>
+        }
+
+<span class="nc bnc" id="L385" title="All 2 branches missed.">        if (path.startsWith(File.separator)) {</span>
+            // Path given was absolute so we assume the caller knows what they want.
+<span class="nc" id="L387">            file = new File(path + File.separator + script);</span>
+<span class="nc bnc" id="L388" title="All 2 branches missed.">            return file.exists() ? file.getAbsolutePath() : null;</span>
+        }
+
+<span class="nc" id="L391">        s_logger.debug(&quot;Looking for &quot; + script);</span>
+<span class="nc" id="L392">        String search = null;</span>
+<span class="nc bnc" id="L393" title="All 2 branches missed.">        for (int i = 0; i &lt; 3; i++) {</span>
+<span class="nc bnc" id="L394" title="All 2 branches missed.">            if (i == 0) {</span>
+<span class="nc" id="L395">                String cp = Script.class.getResource(Script.class.getSimpleName() + &quot;.class&quot;).toExternalForm();</span>
+<span class="nc" id="L396">                int begin = cp.indexOf(File.separator);</span>
+
+                // work around with the inconsistency of java classpath and file separator on Windows 7
+<span class="nc bnc" id="L399" title="All 2 branches missed.">                if (begin &lt; 0)</span>
+<span class="nc" id="L400">                    begin = cp.indexOf('/');</span>
+
+<span class="nc" id="L402">                int endBang = cp.lastIndexOf(&quot;!&quot;);</span>
+<span class="nc" id="L403">                int end = cp.lastIndexOf(File.separator, endBang);</span>
+<span class="nc bnc" id="L404" title="All 2 branches missed.">                if (end &lt; 0)</span>
+<span class="nc" id="L405">                    end = cp.lastIndexOf('/', endBang);</span>
+<span class="nc bnc" id="L406" title="All 2 branches missed.">                if (end &lt; 0)</span>
+<span class="nc" id="L407">                    cp = cp.substring(begin);</span>
+                else
+<span class="nc" id="L409">                    cp = cp.substring(begin, end);</span>
+
+<span class="nc" id="L411">                s_logger.debug(&quot;Current binaries reside at &quot; + cp);</span>
+<span class="nc" id="L412">                search = cp;</span>
+<span class="nc bnc" id="L413" title="All 2 branches missed.">            } else if (i == 1) {</span>
+<span class="nc" id="L414">                s_logger.debug(&quot;Searching in environment.properties&quot;);</span>
+                try {
+<span class="nc" id="L416">                    final File propsFile = PropertiesUtil.findConfigFile(&quot;environment.properties&quot;);</span>
+<span class="nc bnc" id="L417" title="All 2 branches missed.">                    if (propsFile == null) {</span>
+<span class="nc" id="L418">                        s_logger.debug(&quot;environment.properties could not be opened&quot;);</span>
+<span class="nc" id="L419">                    } else {</span>
+<span class="nc" id="L420">                        final Properties props = PropertiesUtil.loadFromFile(propsFile);</span>
+<span class="nc" id="L421">                        search = props.getProperty(&quot;paths.script&quot;);</span>
+                    }
+<span class="nc" id="L423">                } catch (IOException e) {</span>
+<span class="nc" id="L424">                    s_logger.debug(&quot;environment.properties could not be opened&quot;);</span>
+<span class="nc" id="L425">                    continue;</span>
+                }
+<span class="nc" id="L427">                s_logger.debug(&quot;environment.properties says scripts should be in &quot; + search);</span>
+<span class="nc" id="L428">            } else {</span>
+<span class="nc" id="L429">                s_logger.debug(&quot;Searching in the current directory&quot;);</span>
+<span class="nc" id="L430">                search = &quot;.&quot;;</span>
+            }
+
+<span class="nc" id="L433">            search += File.separatorChar + path + File.separator;</span>
+            do {
+<span class="nc" id="L435">                search = search.substring(0, search.lastIndexOf(File.separator));</span>
+<span class="nc" id="L436">                file = new File(search + File.separator + script);</span>
+<span class="nc" id="L437">                s_logger.debug(&quot;Looking for &quot; + script + &quot; in &quot; + file.getAbsolutePath());</span>
+<span class="nc bnc" id="L438" title="All 4 branches missed.">            } while (!file.exists() &amp;&amp; search.lastIndexOf(File.separator) != -1);</span>
+
+<span class="nc bnc" id="L440" title="All 2 branches missed.">            if (file.exists()) {</span>
+<span class="nc" id="L441">                return file.getAbsolutePath();</span>
+            }
+
+        }
+
+<span class="nc" id="L446">        search = System.getProperty(&quot;paths.script&quot;);</span>
+
+<span class="nc" id="L448">        search += File.separatorChar + path + File.separator;</span>
+        do {
+<span class="nc" id="L450">            search = search.substring(0, search.lastIndexOf(File.separator));</span>
+<span class="nc" id="L451">            file = new File(search + File.separator + script);</span>
+<span class="nc" id="L452">            s_logger.debug(&quot;Looking for &quot; + script + &quot; in &quot; + file.getAbsolutePath());</span>
+<span class="nc bnc" id="L453" title="All 4 branches missed.">        } while (!file.exists() &amp;&amp; search.lastIndexOf(File.separator) != -1);</span>
+
+<span class="nc bnc" id="L455" title="All 2 branches missed.">        if (file.exists()) {</span>
+<span class="nc" id="L456">            return file.getAbsolutePath();</span>
+        }
+
+<span class="nc" id="L459">        s_logger.warn(&quot;Unable to find script &quot; + script);</span>
+<span class="nc" id="L460">        return null;</span>
+    }
+
+    public static String runSimpleBashScript(String command) {
+<span class="nc" id="L464">        return Script.runSimpleBashScript(command, 0);</span>
+    }
+
+    public static String runSimpleBashScript(String command, int timeout) {
+
+<span class="nc" id="L469">        Script s = new Script(&quot;/bin/bash&quot;, timeout);</span>
+<span class="nc" id="L470">        s.add(&quot;-c&quot;);</span>
+<span class="nc" id="L471">        s.add(command);</span>
+
+<span class="nc" id="L473">        OutputInterpreter.OneLineParser parser = new OutputInterpreter.OneLineParser();</span>
+<span class="nc bnc" id="L474" title="All 2 branches missed.">        if (s.execute(parser) != null)</span>
+<span class="nc" id="L475">            return null;</span>
+
+<span class="nc" id="L477">        String result = parser.getLine();</span>
+<span class="nc bnc" id="L478" title="All 4 branches missed.">        if (result == null || result.trim().isEmpty())</span>
+<span class="nc" id="L479">            return null;</span>
+        else
+<span class="nc" id="L481">            return result.trim();</span>
+    }
+
+    public static int runSimpleBashScriptForExitValue(String command) {
+<span class="nc" id="L485">        return runSimpleBashScriptForExitValue(command, 0);</span>
+    }
+
+    public static int runSimpleBashScriptForExitValue(String command, int timeout) {
+
+<span class="nc" id="L490">        Script s = new Script(&quot;/bin/bash&quot;, timeout);</span>
+<span class="nc" id="L491">        s.add(&quot;-c&quot;);</span>
+<span class="nc" id="L492">        s.add(command);</span>
+
+<span class="nc" id="L494">        String result = s.execute(null);</span>
+<span class="nc bnc" id="L495" title="All 4 branches missed.">        if (result == null || result.trim().isEmpty())</span>
+<span class="nc" id="L496">            return -1;</span>
+        else {
+            try {
+<span class="nc" id="L499">                return Integer.parseInt(result.trim());</span>
+<span class="nc" id="L500">            } catch (NumberFormatException e) {</span>
+<span class="nc" id="L501">                return -1;</span>
+            }
+        }
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>cloud-core (18-mrt-2016 13:14:54)</div></body></html>

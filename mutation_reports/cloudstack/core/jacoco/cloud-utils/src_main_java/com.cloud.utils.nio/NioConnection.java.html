@@ -1,0 +1,502 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>NioConnection.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">cloud-core (18-mrt-2016 13:14:54)</a> &gt; <a href="../../index.html" class="el_group">cloud-utils</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">com.cloud.utils.nio</a> &gt; <span class="el_source">NioConnection.java</span></div><h1>NioConnection.java</h1><pre class="source lang-java linenums">//
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// &quot;License&quot;); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+//
+
+package com.cloud.utils.nio;
+
+import static com.cloud.utils.AutoCloseableUtil.closeAutoCloseable;
+
+import java.io.IOException;
+import java.net.ConnectException;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.nio.channels.CancelledKeyException;
+import java.nio.channels.ClosedChannelException;
+import java.nio.channels.ClosedSelectorException;
+import java.nio.channels.SelectionKey;
+import java.nio.channels.Selector;
+import java.nio.channels.ServerSocketChannel;
+import java.nio.channels.SocketChannel;
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLEngine;
+
+import org.apache.cloudstack.utils.security.SSLUtils;
+import org.apache.log4j.Logger;
+
+import com.cloud.utils.concurrency.NamedThreadFactory;
+import com.cloud.utils.exception.NioConnectionException;
+
+/**
+ * NioConnection abstracts the NIO socket operations.  The Java implementation
+ * provides that.
+ */
+public abstract class NioConnection implements Callable&lt;Boolean&gt; {
+<span class="nc" id="L61">    private static final Logger s_logger = Logger.getLogger(NioConnection.class);;</span>
+
+    protected Selector _selector;
+    protected ExecutorService _threadExecutor;
+    protected Future&lt;Boolean&gt; _futureTask;
+
+    protected boolean _isRunning;
+    protected boolean _isStartup;
+    protected int _port;
+    protected List&lt;ChangeRequest&gt; _todos;
+    protected HandlerFactory _factory;
+    protected String _name;
+    protected ExecutorService _executor;
+
+<span class="nc" id="L75">    public NioConnection(final String name, final int port, final int workers, final HandlerFactory factory) {</span>
+<span class="nc" id="L76">        _name = name;</span>
+<span class="nc" id="L77">        _isRunning = false;</span>
+<span class="nc" id="L78">        _selector = null;</span>
+<span class="nc" id="L79">        _port = port;</span>
+<span class="nc" id="L80">        _factory = factory;</span>
+<span class="nc" id="L81">        _executor = new ThreadPoolExecutor(workers, 5 * workers, 1, TimeUnit.DAYS, new LinkedBlockingQueue&lt;Runnable&gt;(), new NamedThreadFactory(name + &quot;-Handler&quot;));</span>
+<span class="nc" id="L82">    }</span>
+
+    public void start() throws NioConnectionException {
+<span class="nc" id="L85">        _todos = new ArrayList&lt;ChangeRequest&gt;();</span>
+
+        try {
+<span class="nc" id="L88">            init();</span>
+<span class="nc" id="L89">        } catch (final ConnectException e) {</span>
+<span class="nc" id="L90">            s_logger.warn(&quot;Unable to connect to remote: is there a server running on port &quot; + _port);</span>
+<span class="nc" id="L91">            return;</span>
+<span class="nc" id="L92">        } catch (final IOException e) {</span>
+<span class="nc" id="L93">            s_logger.error(&quot;Unable to initialize the threads.&quot;, e);</span>
+<span class="nc" id="L94">            throw new NioConnectionException(e.getMessage(), e);</span>
+<span class="nc" id="L95">        } catch (final Exception e) {</span>
+<span class="nc" id="L96">            s_logger.error(&quot;Unable to initialize the threads due to unknown exception.&quot;, e);</span>
+<span class="nc" id="L97">            throw new NioConnectionException(e.getMessage(), e);</span>
+        }
+<span class="nc" id="L99">        _isStartup = true;</span>
+
+<span class="nc" id="L101">        _threadExecutor = Executors.newSingleThreadExecutor();</span>
+<span class="nc" id="L102">        _futureTask = _threadExecutor.submit(this);</span>
+
+<span class="nc" id="L104">        _isRunning = true;</span>
+<span class="nc" id="L105">    }</span>
+
+    public void stop() {
+<span class="nc" id="L108">        _executor.shutdown();</span>
+<span class="nc" id="L109">        _isRunning = false;</span>
+<span class="nc bnc" id="L110" title="All 2 branches missed.">        if (_threadExecutor != null) {</span>
+<span class="nc" id="L111">            _futureTask.cancel(false);</span>
+<span class="nc" id="L112">            _threadExecutor.shutdown();</span>
+        }
+<span class="nc" id="L114">    }</span>
+
+    public boolean isRunning() {
+<span class="nc bnc" id="L117" title="All 2 branches missed.">        return !_futureTask.isDone();</span>
+    }
+
+    public boolean isStartup() {
+<span class="nc" id="L121">        return _isStartup;</span>
+    }
+
+    @Override
+    public Boolean call() throws NioConnectionException {
+<span class="nc bnc" id="L126" title="All 2 branches missed.">        while (_isRunning) {</span>
+            try {
+<span class="nc" id="L128">                _selector.select();</span>
+
+                // Someone is ready for I/O, get the ready keys
+<span class="nc" id="L131">                final Set&lt;SelectionKey&gt; readyKeys = _selector.selectedKeys();</span>
+<span class="nc" id="L132">                final Iterator&lt;SelectionKey&gt; i = readyKeys.iterator();</span>
+
+<span class="nc bnc" id="L134" title="All 2 branches missed.">                if (s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L135">                    s_logger.trace(&quot;Keys Processing: &quot; + readyKeys.size());</span>
+                }
+                // Walk through the ready keys collection.
+<span class="nc bnc" id="L138" title="All 2 branches missed.">                while (i.hasNext()) {</span>
+<span class="nc" id="L139">                    final SelectionKey sk = i.next();</span>
+<span class="nc" id="L140">                    i.remove();</span>
+
+<span class="nc bnc" id="L142" title="All 2 branches missed.">                    if (!sk.isValid()) {</span>
+<span class="nc bnc" id="L143" title="All 2 branches missed.">                        if (s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L144">                            s_logger.trace(&quot;Selection Key is invalid: &quot; + sk.toString());</span>
+                        }
+<span class="nc" id="L146">                        final Link link = (Link)sk.attachment();</span>
+<span class="nc bnc" id="L147" title="All 2 branches missed.">                        if (link != null) {</span>
+<span class="nc" id="L148">                            link.terminated();</span>
+<span class="nc" id="L149">                        } else {</span>
+<span class="nc" id="L150">                            closeConnection(sk);</span>
+                        }
+<span class="nc bnc" id="L152" title="All 2 branches missed.">                    } else if (sk.isReadable()) {</span>
+<span class="nc" id="L153">                        read(sk);</span>
+<span class="nc bnc" id="L154" title="All 2 branches missed.">                    } else if (sk.isWritable()) {</span>
+<span class="nc" id="L155">                        write(sk);</span>
+<span class="nc bnc" id="L156" title="All 2 branches missed.">                    } else if (sk.isAcceptable()) {</span>
+<span class="nc" id="L157">                        accept(sk);</span>
+<span class="nc bnc" id="L158" title="All 2 branches missed.">                    } else if (sk.isConnectable()) {</span>
+<span class="nc" id="L159">                        connect(sk);</span>
+                    }
+                }
+
+<span class="nc" id="L163">                s_logger.trace(&quot;Keys Done Processing.&quot;);</span>
+
+<span class="nc" id="L165">                processTodos();</span>
+<span class="nc" id="L166">            } catch (final ClosedSelectorException e) {</span>
+                /*
+                 * Exception occurred when calling java.nio.channels.Selector.selectedKeys() method. It means the connection has not yet been established. Let's continue trying
+                 * We do not log it here otherwise we will fill the disk with messages.
+                 */
+<span class="nc" id="L171">            } catch (final IOException e) {</span>
+<span class="nc" id="L172">                s_logger.error(&quot;Agent will die due to this IOException!&quot;, e);</span>
+<span class="nc" id="L173">                throw new NioConnectionException(e.getMessage(), e);</span>
+            }
+        }
+<span class="nc" id="L176">        _isStartup = false;</span>
+<span class="nc" id="L177">        return true;</span>
+    }
+
+    abstract void init() throws IOException;
+
+    abstract void registerLink(InetSocketAddress saddr, Link link);
+
+    abstract void unregisterLink(InetSocketAddress saddr);
+
+    protected void accept(final SelectionKey key) throws IOException {
+<span class="nc" id="L187">        final ServerSocketChannel serverSocketChannel = (ServerSocketChannel)key.channel();</span>
+
+<span class="nc" id="L189">        final SocketChannel socketChannel = serverSocketChannel.accept();</span>
+<span class="nc" id="L190">        final Socket socket = socketChannel.socket();</span>
+<span class="nc" id="L191">        socket.setKeepAlive(true);</span>
+
+<span class="nc bnc" id="L193" title="All 2 branches missed.">        if (s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L194">            s_logger.trace(&quot;Connection accepted for &quot; + socket);</span>
+        }
+
+        // Begin SSL handshake in BLOCKING mode
+<span class="nc" id="L198">        socketChannel.configureBlocking(true);</span>
+
+<span class="nc" id="L200">        SSLEngine sslEngine = null;</span>
+        try {
+<span class="nc" id="L202">            final SSLContext sslContext = Link.initSSLContext(false);</span>
+<span class="nc" id="L203">            sslEngine = sslContext.createSSLEngine();</span>
+<span class="nc" id="L204">            sslEngine.setUseClientMode(false);</span>
+<span class="nc" id="L205">            sslEngine.setNeedClientAuth(false);</span>
+<span class="nc" id="L206">            sslEngine.setEnabledProtocols(SSLUtils.getSupportedProtocols(sslEngine.getEnabledProtocols()));</span>
+
+<span class="nc" id="L208">            Link.doHandshake(socketChannel, sslEngine, false);</span>
+
+<span class="nc" id="L210">        } catch (final Exception e) {</span>
+<span class="nc bnc" id="L211" title="All 2 branches missed.">            if (s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L212">                s_logger.trace(&quot;Socket &quot; + socket + &quot; closed on read.  Probably -1 returned: &quot; + e.getMessage());</span>
+            }
+<span class="nc" id="L214">            closeAutoCloseable(socketChannel, &quot;accepting socketChannel&quot;);</span>
+<span class="nc" id="L215">            closeAutoCloseable(socket, &quot;opened socket&quot;);</span>
+<span class="nc" id="L216">            return;</span>
+        }
+
+<span class="nc bnc" id="L219" title="All 2 branches missed.">        if (s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L220">            s_logger.trace(&quot;SSL: Handshake done&quot;);</span>
+        }
+<span class="nc" id="L222">        socketChannel.configureBlocking(false);</span>
+<span class="nc" id="L223">        final InetSocketAddress saddr = (InetSocketAddress)socket.getRemoteSocketAddress();</span>
+<span class="nc" id="L224">        final Link link = new Link(saddr, this);</span>
+<span class="nc" id="L225">        link.setSSLEngine(sslEngine);</span>
+<span class="nc" id="L226">        link.setKey(socketChannel.register(key.selector(), SelectionKey.OP_READ, link));</span>
+<span class="nc" id="L227">        final Task task = _factory.create(Task.Type.CONNECT, link, null);</span>
+<span class="nc" id="L228">        registerLink(saddr, link);</span>
+
+        try {
+<span class="nc" id="L231">            _executor.submit(task);</span>
+<span class="nc" id="L232">        } catch (final Exception e) {</span>
+<span class="nc" id="L233">            s_logger.warn(&quot;Exception occurred when submitting the task&quot;, e);</span>
+        }
+<span class="nc" id="L235">    }</span>
+
+    protected void terminate(final SelectionKey key) {
+<span class="nc" id="L238">        final Link link = (Link)key.attachment();</span>
+<span class="nc" id="L239">        closeConnection(key);</span>
+<span class="nc bnc" id="L240" title="All 2 branches missed.">        if (link != null) {</span>
+<span class="nc" id="L241">            link.terminated();</span>
+<span class="nc" id="L242">            final Task task = _factory.create(Task.Type.DISCONNECT, link, null);</span>
+<span class="nc" id="L243">            unregisterLink(link.getSocketAddress());</span>
+
+            try {
+<span class="nc" id="L246">                _executor.submit(task);</span>
+<span class="nc" id="L247">            } catch (final Exception e) {</span>
+<span class="nc" id="L248">                s_logger.warn(&quot;Exception occurred when submitting the task&quot;, e);</span>
+            }
+        }
+<span class="nc" id="L251">    }</span>
+
+    protected void read(final SelectionKey key) throws IOException {
+<span class="nc" id="L254">        final Link link = (Link)key.attachment();</span>
+        try {
+<span class="nc" id="L256">            final SocketChannel socketChannel = (SocketChannel)key.channel();</span>
+<span class="nc bnc" id="L257" title="All 2 branches missed.">            if (s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L258">                s_logger.trace(&quot;Reading from: &quot; + socketChannel.socket().toString());</span>
+            }
+<span class="nc" id="L260">            final byte[] data = link.read(socketChannel);</span>
+<span class="nc bnc" id="L261" title="All 2 branches missed.">            if (data == null) {</span>
+<span class="nc bnc" id="L262" title="All 2 branches missed.">                if (s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L263">                    s_logger.trace(&quot;Packet is incomplete.  Waiting for more.&quot;);</span>
+                }
+<span class="nc" id="L265">                return;</span>
+            }
+<span class="nc" id="L267">            final Task task = _factory.create(Task.Type.DATA, link, data);</span>
+
+            try {
+<span class="nc" id="L270">                _executor.submit(task);</span>
+<span class="nc" id="L271">            } catch (final Exception e) {</span>
+<span class="nc" id="L272">                s_logger.warn(&quot;Exception occurred when submitting the task&quot;, e);</span>
+            }
+<span class="nc" id="L274">        } catch (final Exception e) {</span>
+<span class="nc" id="L275">            logDebug(e, key, 1);</span>
+<span class="nc" id="L276">            terminate(key);</span>
+        }
+<span class="nc" id="L278">    }</span>
+
+    protected void logTrace(final Exception e, final SelectionKey key, final int loc) {
+<span class="nc bnc" id="L281" title="All 2 branches missed.">        if (s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L282">            Socket socket = null;</span>
+<span class="nc bnc" id="L283" title="All 2 branches missed.">            if (key != null) {</span>
+<span class="nc" id="L284">                final SocketChannel ch = (SocketChannel)key.channel();</span>
+<span class="nc bnc" id="L285" title="All 2 branches missed.">                if (ch != null) {</span>
+<span class="nc" id="L286">                    socket = ch.socket();</span>
+                }
+            }
+
+<span class="nc" id="L290">            s_logger.trace(&quot;Location &quot; + loc + &quot;: Socket &quot; + socket + &quot; closed on read.  Probably -1 returned.&quot;);</span>
+        }
+<span class="nc" id="L292">    }</span>
+
+    protected void logDebug(final Exception e, final SelectionKey key, final int loc) {
+<span class="nc bnc" id="L295" title="All 2 branches missed.">        if (s_logger.isDebugEnabled()) {</span>
+<span class="nc" id="L296">            Socket socket = null;</span>
+<span class="nc bnc" id="L297" title="All 2 branches missed.">            if (key != null) {</span>
+<span class="nc" id="L298">                final SocketChannel ch = (SocketChannel)key.channel();</span>
+<span class="nc bnc" id="L299" title="All 2 branches missed.">                if (ch != null) {</span>
+<span class="nc" id="L300">                    socket = ch.socket();</span>
+                }
+            }
+
+<span class="nc" id="L304">            s_logger.debug(&quot;Location &quot; + loc + &quot;: Socket &quot; + socket + &quot; closed on read.  Probably -1 returned: &quot; + e.getMessage());</span>
+        }
+<span class="nc" id="L306">    }</span>
+
+    protected void processTodos() {
+        List&lt;ChangeRequest&gt; todos;
+<span class="nc bnc" id="L310" title="All 2 branches missed.">        if (_todos.size() == 0) {</span>
+<span class="nc" id="L311">            return;             // Nothing to do.</span>
+        }
+
+<span class="nc" id="L314">        synchronized (this) {</span>
+<span class="nc" id="L315">            todos = _todos;</span>
+<span class="nc" id="L316">            _todos = new ArrayList&lt;ChangeRequest&gt;();</span>
+        }
+
+<span class="nc bnc" id="L319" title="All 2 branches missed.">        if (s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L320">            s_logger.trace(&quot;Todos Processing: &quot; + todos.size());</span>
+        }
+        SelectionKey key;
+<span class="nc bnc" id="L323" title="All 2 branches missed.">        for (final ChangeRequest todo : todos) {</span>
+<span class="nc bnc" id="L324" title="All 4 branches missed.">            switch (todo.type) {</span>
+            case ChangeRequest.CHANGEOPS:
+                try {
+<span class="nc" id="L327">                    key = (SelectionKey)todo.key;</span>
+<span class="nc bnc" id="L328" title="All 4 branches missed.">                    if (key != null &amp;&amp; key.isValid()) {</span>
+<span class="nc bnc" id="L329" title="All 2 branches missed.">                        if (todo.att != null) {</span>
+<span class="nc" id="L330">                            key.attach(todo.att);</span>
+<span class="nc" id="L331">                            final Link link = (Link)todo.att;</span>
+<span class="nc" id="L332">                            link.setKey(key);</span>
+                        }
+<span class="nc" id="L334">                        key.interestOps(todo.ops);</span>
+                    }
+<span class="nc" id="L336">                } catch (final CancelledKeyException e) {</span>
+<span class="nc" id="L337">                    s_logger.debug(&quot;key has been cancelled&quot;);</span>
+                }
+<span class="nc" id="L339">                break;</span>
+            case ChangeRequest.REGISTER:
+                try {
+<span class="nc" id="L342">                    key = ((SocketChannel)todo.key).register(_selector, todo.ops, todo.att);</span>
+<span class="nc bnc" id="L343" title="All 2 branches missed.">                    if (todo.att != null) {</span>
+<span class="nc" id="L344">                        final Link link = (Link)todo.att;</span>
+<span class="nc" id="L345">                        link.setKey(key);</span>
+                    }
+<span class="nc" id="L347">                } catch (final ClosedChannelException e) {</span>
+<span class="nc" id="L348">                    s_logger.warn(&quot;Couldn't register socket: &quot; + todo.key);</span>
+                    try {
+<span class="nc" id="L350">                        ((SocketChannel)todo.key).close();</span>
+<span class="nc" id="L351">                    } catch (final IOException ignore) {</span>
+<span class="nc" id="L352">                        s_logger.info(&quot;[ignored] socket channel&quot;);</span>
+<span class="nc" id="L353">                    } finally {</span>
+<span class="nc" id="L354">                        final Link link = (Link)todo.att;</span>
+<span class="nc" id="L355">                        link.terminated();</span>
+<span class="nc" id="L356">                    }</span>
+                }
+<span class="nc" id="L358">                break;</span>
+            case ChangeRequest.CLOSE:
+<span class="nc bnc" id="L360" title="All 2 branches missed.">                if (s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L361">                    s_logger.trace(&quot;Trying to close &quot; + todo.key);</span>
+                }
+<span class="nc" id="L363">                key = (SelectionKey)todo.key;</span>
+<span class="nc" id="L364">                closeConnection(key);</span>
+<span class="nc bnc" id="L365" title="All 2 branches missed.">                if (key != null) {</span>
+<span class="nc" id="L366">                    final Link link = (Link)key.attachment();</span>
+<span class="nc bnc" id="L367" title="All 2 branches missed.">                    if (link != null) {</span>
+<span class="nc" id="L368">                        link.terminated();</span>
+                    }
+                }
+<span class="nc" id="L371">                break;</span>
+            default:
+<span class="nc" id="L373">                s_logger.warn(&quot;Shouldn't be here&quot;);</span>
+<span class="nc" id="L374">                throw new RuntimeException(&quot;Shouldn't be here&quot;);</span>
+            }
+        }
+<span class="nc" id="L377">        s_logger.trace(&quot;Todos Done processing&quot;);</span>
+<span class="nc" id="L378">    }</span>
+
+    protected void connect(final SelectionKey key) throws IOException {
+<span class="nc" id="L381">        final SocketChannel socketChannel = (SocketChannel)key.channel();</span>
+
+        try {
+<span class="nc" id="L384">            socketChannel.finishConnect();</span>
+<span class="nc" id="L385">            key.interestOps(SelectionKey.OP_READ);</span>
+<span class="nc" id="L386">            final Socket socket = socketChannel.socket();</span>
+<span class="nc bnc" id="L387" title="All 2 branches missed.">            if (!socket.getKeepAlive()) {</span>
+<span class="nc" id="L388">                socket.setKeepAlive(true);</span>
+            }
+<span class="nc bnc" id="L390" title="All 2 branches missed.">            if (s_logger.isDebugEnabled()) {</span>
+<span class="nc" id="L391">                s_logger.debug(&quot;Connected to &quot; + socket);</span>
+            }
+<span class="nc" id="L393">            final Link link = new Link((InetSocketAddress)socket.getRemoteSocketAddress(), this);</span>
+<span class="nc" id="L394">            link.setKey(key);</span>
+<span class="nc" id="L395">            key.attach(link);</span>
+<span class="nc" id="L396">            final Task task = _factory.create(Task.Type.CONNECT, link, null);</span>
+
+            try {
+<span class="nc" id="L399">                _executor.submit(task);</span>
+<span class="nc" id="L400">            } catch (final Exception e) {</span>
+<span class="nc" id="L401">                s_logger.warn(&quot;Exception occurred when submitting the task&quot;, e);</span>
+            }
+<span class="nc" id="L403">        } catch (final IOException e) {</span>
+<span class="nc" id="L404">            logTrace(e, key, 2);</span>
+<span class="nc" id="L405">            terminate(key);</span>
+        }
+<span class="nc" id="L407">    }</span>
+
+    protected void scheduleTask(final Task task) {
+        try {
+<span class="nc" id="L411">            _executor.submit(task);</span>
+<span class="nc" id="L412">        } catch (final Exception e) {</span>
+<span class="nc" id="L413">            s_logger.warn(&quot;Exception occurred when submitting the task&quot;, e);</span>
+        }
+<span class="nc" id="L415">    }</span>
+
+    protected void write(final SelectionKey key) throws IOException {
+<span class="nc" id="L418">        final Link link = (Link)key.attachment();</span>
+        try {
+<span class="nc bnc" id="L420" title="All 2 branches missed.">            if (s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L421">                s_logger.trace(&quot;Writing to &quot; + link.getSocketAddress().toString());</span>
+            }
+<span class="nc" id="L423">            final boolean close = link.write((SocketChannel)key.channel());</span>
+<span class="nc bnc" id="L424" title="All 2 branches missed.">            if (close) {</span>
+<span class="nc" id="L425">                closeConnection(key);</span>
+<span class="nc" id="L426">                link.terminated();</span>
+<span class="nc" id="L427">            } else {</span>
+<span class="nc" id="L428">                key.interestOps(SelectionKey.OP_READ);</span>
+            }
+<span class="nc" id="L430">        } catch (final Exception e) {</span>
+<span class="nc" id="L431">            logDebug(e, key, 3);</span>
+<span class="nc" id="L432">            terminate(key);</span>
+        }
+<span class="nc" id="L434">    }</span>
+
+    protected void closeConnection(final SelectionKey key) {
+<span class="nc bnc" id="L437" title="All 2 branches missed.">        if (key != null) {</span>
+<span class="nc" id="L438">            final SocketChannel channel = (SocketChannel)key.channel();</span>
+<span class="nc" id="L439">            key.cancel();</span>
+            try {
+<span class="nc bnc" id="L441" title="All 2 branches missed.">                if (channel != null) {</span>
+<span class="nc bnc" id="L442" title="All 2 branches missed.">                    if (s_logger.isDebugEnabled()) {</span>
+<span class="nc" id="L443">                        s_logger.debug(&quot;Closing socket &quot; + channel.socket());</span>
+                    }
+<span class="nc" id="L445">                    channel.close();</span>
+                }
+<span class="nc" id="L447">            } catch (final IOException ignore) {</span>
+<span class="nc" id="L448">                s_logger.info(&quot;[ignored] channel&quot;);</span>
+            }
+        }
+<span class="nc" id="L451">    }</span>
+
+    public void register(final int ops, final SocketChannel key, final Object att) {
+<span class="nc" id="L454">        final ChangeRequest todo = new ChangeRequest(key, ChangeRequest.REGISTER, ops, att);</span>
+<span class="nc" id="L455">        synchronized (this) {</span>
+<span class="nc" id="L456">            _todos.add(todo);</span>
+        }
+<span class="nc" id="L458">        _selector.wakeup();</span>
+<span class="nc" id="L459">    }</span>
+
+    public void change(final int ops, final SelectionKey key, final Object att) {
+<span class="nc" id="L462">        final ChangeRequest todo = new ChangeRequest(key, ChangeRequest.CHANGEOPS, ops, att);</span>
+<span class="nc" id="L463">        synchronized (this) {</span>
+<span class="nc" id="L464">            _todos.add(todo);</span>
+        }
+<span class="nc" id="L466">        _selector.wakeup();</span>
+<span class="nc" id="L467">    }</span>
+
+    public void close(final SelectionKey key) {
+<span class="nc" id="L470">        final ChangeRequest todo = new ChangeRequest(key, ChangeRequest.CLOSE, 0, null);</span>
+<span class="nc" id="L471">        synchronized (this) {</span>
+<span class="nc" id="L472">            _todos.add(todo);</span>
+        }
+<span class="nc" id="L474">        _selector.wakeup();</span>
+<span class="nc" id="L475">    }</span>
+
+    /* Release the resource used by the instance */
+    public void cleanUp() throws IOException {
+<span class="nc bnc" id="L479" title="All 2 branches missed.">        if (_selector != null) {</span>
+<span class="nc" id="L480">            _selector.close();</span>
+        }
+<span class="nc" id="L482">    }</span>
+
+    public class ChangeRequest {
+        public static final int REGISTER = 1;
+        public static final int CHANGEOPS = 2;
+        public static final int CLOSE = 3;
+
+        public Object key;
+        public int type;
+        public int ops;
+        public Object att;
+
+<span class="nc" id="L494">        public ChangeRequest(final Object key, final int type, final int ops, final Object att) {</span>
+<span class="nc" id="L495">            this.key = key;</span>
+<span class="nc" id="L496">            this.type = type;</span>
+<span class="nc" id="L497">            this.ops = ops;</span>
+<span class="nc" id="L498">            this.att = att;</span>
+<span class="nc" id="L499">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>cloud-core (18-mrt-2016 13:14:54)</div></body></html>

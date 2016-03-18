@@ -1,0 +1,416 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>Merovingian2.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">cloud-core (18-mrt-2016 13:14:54)</a> &gt; <a href="../../index.html" class="el_group">cloud-framework-db</a> &gt; <a href="../index.html" class="el_bundle">src</a> &gt; <a href="index.source.html" class="el_package">com.cloud.utils.db</a> &gt; <span class="el_source">Merovingian2.java</span></div><h1>Merovingian2.java</h1><pre class="source lang-java linenums">// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+<span class="nc bnc" id="L5" title="All 4 branches missed.">// to you under the Apache License, Version 2.0 (the</span>
+// &quot;License&quot;); you may not use this file except in compliance
+// the License.  You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+package com.cloud.utils.db;
+
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.TimeZone;
+
+import javax.management.StandardMBean;
+
+import org.apache.log4j.Logger;
+
+import com.cloud.utils.DateUtil;
+import com.cloud.utils.exception.CloudRuntimeException;
+import com.cloud.utils.mgmt.JmxUtil;
+import com.cloud.utils.time.InaccurateClock;
+
+<span class="nc bnc" id="L39" title="All 2 branches missed.">public class Merovingian2 extends StandardMBean implements MerovingianMBean {</span>
+<span class="nc" id="L40">    private static final Logger s_logger = Logger.getLogger(Merovingian2.class);</span>
+
+    private static final String ACQUIRE_SQL =
+            &quot;INSERT INTO op_lock (op_lock.key, op_lock.mac, op_lock.ip, op_lock.thread, op_lock.acquired_on, waiters) VALUES (?, ?, ?, ?, ?, 1)&quot;;
+    private static final String INCREMENT_SQL = &quot;UPDATE op_lock SET waiters=waiters+1 where op_lock.key=? AND op_lock.mac=? AND op_lock.ip=? AND op_lock.thread=?&quot;;
+    private static final String SELECT_SQL = &quot;SELECT op_lock.key, mac, ip, thread, acquired_on, waiters FROM op_lock&quot;;
+    private static final String INQUIRE_SQL = SELECT_SQL + &quot; WHERE op_lock.key=?&quot;;
+    private static final String DECREMENT_SQL = &quot;UPDATE op_lock SET waiters=waiters-1 where op_lock.key=? AND op_lock.mac=? AND op_lock.ip=? AND op_lock.thread=?&quot;;
+    private static final String RELEASE_LOCK_SQL = &quot;DELETE FROM op_lock WHERE op_lock.key = ?&quot;;
+    private static final String RELEASE_SQL = RELEASE_LOCK_SQL + &quot; AND op_lock.mac=? AND waiters=0&quot;;
+    private static final String CLEANUP_MGMT_LOCKS_SQL = &quot;DELETE FROM op_lock WHERE op_lock.mac = ?&quot;;
+    private static final String SELECT_MGMT_LOCKS_SQL = SELECT_SQL + &quot; WHERE mac=?&quot;;
+    private static final String SELECT_THREAD_LOCKS_SQL = SELECT_SQL + &quot; WHERE mac=? AND ip=?&quot;;
+    private static final String CLEANUP_THREAD_LOCKS_SQL = &quot;DELETE FROM op_lock WHERE mac=? AND ip=? AND thread=?&quot;;
+
+<span class="nc" id="L55">    TimeZone _gmtTimeZone = TimeZone.getTimeZone(&quot;GMT&quot;);</span>
+
+    private final long _msId;
+
+<span class="nc" id="L59">    private static Merovingian2 s_instance = null;</span>
+<span class="nc" id="L60">    private ConnectionConcierge _concierge = null;</span>
+<span class="nc" id="L61">    private static ThreadLocal&lt;Count&gt; s_tls = new ThreadLocal&lt;Count&gt;();</span>
+
+    private Merovingian2(long msId) {
+<span class="nc" id="L64">        super(MerovingianMBean.class, false);</span>
+<span class="nc" id="L65">        _msId = msId;</span>
+<span class="nc" id="L66">        Connection conn = null;</span>
+        try {
+<span class="nc" id="L68">            conn = TransactionLegacy.getStandaloneConnectionWithException();</span>
+<span class="nc" id="L69">            conn.setTransactionIsolation(Connection.TRANSACTION_READ_COMMITTED);</span>
+<span class="nc" id="L70">            conn.setAutoCommit(true);</span>
+<span class="nc" id="L71">            _concierge = new ConnectionConcierge(&quot;LockMaster&quot;, conn, true);</span>
+<span class="nc" id="L72">        } catch (SQLException e) {</span>
+<span class="nc" id="L73">            s_logger.error(&quot;Unable to get a new db connection&quot;, e);</span>
+<span class="nc" id="L74">            throw new CloudRuntimeException(&quot;Unable to initialize a connection to the database for locking purposes&quot;, e);</span>
+<span class="nc" id="L75">        } finally {</span>
+<span class="nc bnc" id="L76" title="All 8 branches missed.">            if (_concierge == null &amp;&amp; conn != null) {</span>
+                try {
+<span class="nc" id="L78">                    conn.close();</span>
+<span class="nc" id="L79">                } catch (SQLException e) {</span>
+<span class="nc" id="L80">                    s_logger.debug(&quot;closing connection failed after everything else.&quot;, e);</span>
+                }
+            }
+<span class="nc" id="L83">        }</span>
+<span class="nc" id="L84">    }</span>
+
+    public static synchronized Merovingian2 createLockMaster(long msId) {
+<span class="nc bnc" id="L87" title="All 4 branches missed.">        assert s_instance == null : &quot;No lock can serve two masters.  Either he will hate the one and love the other, or he will be devoted to the one and despise the other.&quot;;</span>
+<span class="nc" id="L88">        s_instance = new Merovingian2(msId);</span>
+<span class="nc" id="L89">        s_instance.cleanupThisServer();</span>
+        try {
+<span class="nc" id="L91">            JmxUtil.registerMBean(&quot;Locks&quot;, &quot;Locks&quot;, s_instance);</span>
+<span class="nc" id="L92">        } catch (Exception e) {</span>
+<span class="nc" id="L93">            s_logger.error(&quot;Unable to register for JMX&quot;, e);</span>
+        }
+<span class="nc" id="L95">        return s_instance;</span>
+    }
+
+    public static Merovingian2 getLockMaster() {
+<span class="nc" id="L99">        return s_instance;</span>
+    }
+
+    protected void incrCount() {
+<span class="nc" id="L103">        Count count = s_tls.get();</span>
+<span class="nc bnc" id="L104" title="All 2 branches missed.">        if (count == null) {</span>
+<span class="nc" id="L105">            count = new Count();</span>
+<span class="nc" id="L106">            s_tls.set(count);</span>
+        }
+
+<span class="nc" id="L109">        count.count++;</span>
+<span class="nc" id="L110">    }</span>
+
+    protected void decrCount() {
+<span class="nc" id="L113">        Count count = s_tls.get();</span>
+<span class="nc bnc" id="L114" title="All 2 branches missed.">        if (count == null) {</span>
+<span class="nc" id="L115">            return;</span>
+        }
+
+<span class="nc" id="L118">        count.count--;</span>
+<span class="nc" id="L119">    }</span>
+
+    public boolean acquire(String key, int timeInSeconds) {
+<span class="nc" id="L122">        Thread th = Thread.currentThread();</span>
+<span class="nc" id="L123">        String threadName = th.getName();</span>
+<span class="nc" id="L124">        int threadId = System.identityHashCode(th);</span>
+
+<span class="nc bnc" id="L126" title="All 2 branches missed.">        if (s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L127">            s_logger.trace(&quot;Acquiring lck-&quot; + key + &quot; with wait time of &quot; + timeInSeconds);</span>
+        }
+<span class="nc" id="L129">        long startTime = InaccurateClock.getTime();</span>
+
+<span class="nc bnc" id="L131" title="All 2 branches missed.">        while ((InaccurateClock.getTime() - startTime) &lt; (timeInSeconds * 1000l)) {</span>
+<span class="nc" id="L132">            int count = owns(key);</span>
+
+<span class="nc bnc" id="L134" title="All 2 branches missed.">            if (count &gt;= 1) {</span>
+<span class="nc" id="L135">                return increment(key, threadName, threadId);</span>
+<span class="nc bnc" id="L136" title="All 2 branches missed.">            } else if (count == 0) {</span>
+<span class="nc bnc" id="L137" title="All 2 branches missed.">                if (doAcquire(key, threadName, threadId)) {</span>
+<span class="nc" id="L138">                    return true;</span>
+                }
+            }
+            try {
+<span class="nc bnc" id="L142" title="All 2 branches missed.">                if (s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L143">                    s_logger.trace(&quot;Sleeping more time while waiting for lck-&quot; + key);</span>
+                }
+<span class="nc" id="L145">                Thread.sleep(5000);</span>
+<span class="nc" id="L146">            } catch (InterruptedException e) {</span>
+<span class="nc" id="L147">                s_logger.debug(&quot;[ignored] interupted while aquiring &quot; + key);</span>
+            }
+        }
+<span class="nc" id="L150">        String msg = &quot;Timed out on acquiring lock &quot; + key + &quot; .  Waited for &quot; + ((InaccurateClock.getTime() - startTime)/1000) +  &quot;seconds&quot;;</span>
+<span class="nc" id="L151">        Exception e = new CloudRuntimeException(msg);</span>
+<span class="nc" id="L152">        s_logger.warn(msg, e);</span>
+<span class="nc" id="L153">        return false;</span>
+    }
+
+    protected boolean increment(String key, String threadName, int threadId) {
+<span class="nc" id="L157">      try (PreparedStatement pstmt = _concierge.conn().prepareStatement(INCREMENT_SQL);){</span>
+<span class="nc" id="L158">            pstmt.setString(1, key);</span>
+<span class="nc" id="L159">            pstmt.setLong(2, _msId);</span>
+<span class="nc" id="L160">            pstmt.setString(3, threadName);</span>
+<span class="nc" id="L161">            pstmt.setInt(4, threadId);</span>
+<span class="nc" id="L162">            int rows = pstmt.executeUpdate();</span>
+<span class="nc bnc" id="L163" title="All 4 branches missed.">            assert (rows &lt;= 1) : &quot;hmm...non unique key? &quot; + pstmt;</span>
+<span class="nc bnc" id="L164" title="All 2 branches missed.">            if (s_logger.isTraceEnabled()) {</span>
+<span class="nc bnc" id="L165" title="All 2 branches missed.">                s_logger.trace(&quot;lck-&quot; + key + (rows == 1 ? &quot; acquired again&quot; : &quot; failed to acquire again&quot;));</span>
+            }
+<span class="nc bnc" id="L167" title="All 2 branches missed.">            if (rows == 1) {</span>
+<span class="nc" id="L168">                incrCount();</span>
+<span class="nc" id="L169">                return true;</span>
+            }
+<span class="nc" id="L171">            return false;</span>
+<span class="nc bnc" id="L172" title="All 10 branches missed.">        } catch (Exception e) {</span>
+<span class="nc" id="L173">            s_logger.error(&quot;increment:Exception:&quot;+e.getMessage());</span>
+<span class="nc" id="L174">            throw new CloudRuntimeException(&quot;increment:Exception:&quot;+e.getMessage(), e);</span>
+        }
+    }
+
+    protected boolean doAcquire(String key, String threadName, int threadId) {
+<span class="nc" id="L179">        long startTime = InaccurateClock.getTime();</span>
+<span class="nc" id="L180">        try(PreparedStatement pstmt = _concierge.conn().prepareStatement(ACQUIRE_SQL);) {</span>
+<span class="nc" id="L181">            pstmt.setString(1, key);</span>
+<span class="nc" id="L182">            pstmt.setLong(2, _msId);</span>
+<span class="nc" id="L183">            pstmt.setString(3, threadName);</span>
+<span class="nc" id="L184">            pstmt.setInt(4, threadId);</span>
+<span class="nc" id="L185">            pstmt.setString(5, DateUtil.getDateDisplayString(_gmtTimeZone, new Date()));</span>
+            try {
+<span class="nc" id="L187">                int rows = pstmt.executeUpdate();</span>
+<span class="nc bnc" id="L188" title="All 2 branches missed.">                if (rows == 1) {</span>
+<span class="nc bnc" id="L189" title="All 2 branches missed.">                    if (s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L190">                        s_logger.trace(&quot;Acquired for lck-&quot; + key);</span>
+                    }
+<span class="nc" id="L192">                    incrCount();</span>
+<span class="nc" id="L193">                    return true;</span>
+                }
+<span class="nc" id="L195">            } catch (SQLException e) {</span>
+                if (!(e.getSQLState().equals(&quot;23000&quot;) &amp;&amp; e.getErrorCode() == 1062)) {
+<span class="nc" id="L197">                    throw new CloudRuntimeException(&quot;Unable to lock &quot; + key + &quot;.  Waited &quot; + (InaccurateClock.getTime() - startTime), e);</span>
+                }
+            }
+<span class="nc bnc" id="L200" title="All 10 branches missed.">        } catch (SQLException e) {</span>
+<span class="nc" id="L201">            s_logger.error(&quot;doAcquire:Exception:&quot;+e.getMessage());</span>
+<span class="nc" id="L202">            throw new CloudRuntimeException(&quot;Unable to lock &quot; + key + &quot;.  Waited &quot; + (InaccurateClock.getTime() - startTime), e);</span>
+        }
+
+<span class="nc" id="L205">        s_logger.trace(&quot;Unable to acquire lck-&quot; + key);</span>
+<span class="nc" id="L206">        return false;</span>
+    }
+
+    protected Map&lt;String, String&gt; isLocked(String key) {
+<span class="nc" id="L210">        try (PreparedStatement pstmt = _concierge.conn().prepareStatement(INQUIRE_SQL);){</span>
+<span class="nc" id="L211">            pstmt.setString(1, key);</span>
+<span class="nc" id="L212">            try(ResultSet rs = pstmt.executeQuery();)</span>
+            {
+<span class="nc bnc" id="L214" title="All 2 branches missed.">                if (!rs.next()) {</span>
+<span class="nc" id="L215">                    return null;</span>
+                }
+<span class="nc" id="L217">                return toLock(rs);</span>
+<span class="nc bnc" id="L218" title="All 10 branches missed.">            }catch (SQLException e) {</span>
+<span class="nc" id="L219">                s_logger.error(&quot;isLocked:Exception:&quot;+e.getMessage());</span>
+<span class="nc" id="L220">                throw new CloudRuntimeException(&quot;isLocked:Exception:&quot;+e.getMessage(), e);</span>
+            }
+<span class="nc bnc" id="L222" title="All 10 branches missed.">        } catch (SQLException e) {</span>
+<span class="nc" id="L223">            s_logger.error(&quot;isLocked:Exception:&quot;+e.getMessage());</span>
+<span class="nc" id="L224">            throw new CloudRuntimeException(&quot;isLocked:Exception:&quot;+e.getMessage(), e);</span>
+        }
+    }
+
+    public void cleanupThisServer() {
+<span class="nc" id="L229">        cleanupForServer(_msId);</span>
+<span class="nc" id="L230">    }</span>
+
+    @Override
+    public void cleanupForServer(long msId) {
+<span class="nc" id="L234">        s_logger.info(&quot;Cleaning up locks for &quot; + msId);</span>
+        try {
+<span class="nc" id="L236">            synchronized (_concierge.conn()) {</span>
+<span class="nc" id="L237">                try(PreparedStatement pstmt = _concierge.conn().prepareStatement(CLEANUP_MGMT_LOCKS_SQL);) {</span>
+<span class="nc" id="L238">                    pstmt.setLong(1, msId);</span>
+<span class="nc" id="L239">                    int rows = pstmt.executeUpdate();</span>
+<span class="nc" id="L240">                    s_logger.info(&quot;Released &quot; + rows + &quot; locks for &quot; + msId);</span>
+<span class="nc bnc" id="L241" title="All 8 branches missed.">                }catch (Exception e) {</span>
+<span class="nc" id="L242">                    s_logger.error(&quot;cleanupForServer:Exception:&quot;+e.getMessage());</span>
+<span class="nc" id="L243">                    throw new CloudRuntimeException(&quot;cleanupForServer:Exception:&quot;+e.getMessage(), e);</span>
+                }
+            }
+<span class="nc" id="L246">        } catch (Exception e) {</span>
+<span class="nc" id="L247">            s_logger.error(&quot;cleanupForServer:Exception:&quot;+e.getMessage());</span>
+<span class="nc" id="L248">            throw new CloudRuntimeException(&quot;cleanupForServer:Exception:&quot;+e.getMessage(), e);</span>
+        }
+<span class="nc" id="L250">    }</span>
+
+    public boolean release(String key) {
+<span class="nc" id="L253">        Thread th = Thread.currentThread();</span>
+<span class="nc" id="L254">        String threadName = th.getName();</span>
+<span class="nc" id="L255">        int threadId = System.identityHashCode(th);</span>
+<span class="nc" id="L256">        try (PreparedStatement pstmt = _concierge.conn().prepareStatement(DECREMENT_SQL);)</span>
+        {
+<span class="nc" id="L258">            pstmt.setString(1, key);</span>
+<span class="nc" id="L259">            pstmt.setLong(2, _msId);</span>
+<span class="nc" id="L260">            pstmt.setString(3, threadName);</span>
+<span class="nc" id="L261">            pstmt.setLong(4, threadId);</span>
+<span class="nc" id="L262">            int rows = pstmt.executeUpdate();</span>
+<span class="nc bnc" id="L263" title="All 4 branches missed.">            assert (rows &lt;= 1) : &quot;hmmm....keys not unique? &quot; + pstmt;</span>
+
+<span class="nc bnc" id="L265" title="All 2 branches missed.">            if (s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L266">                s_logger.trace(&quot;lck-&quot; + key + &quot; released&quot;);</span>
+            }
+<span class="nc bnc" id="L268" title="All 2 branches missed.">            if (rows == 1) {</span>
+<span class="nc" id="L269">                try (PreparedStatement rel_sql_pstmt = _concierge.conn().prepareStatement(RELEASE_SQL);) {</span>
+<span class="nc" id="L270">                    rel_sql_pstmt.setString(1, key);</span>
+<span class="nc" id="L271">                    rel_sql_pstmt.setLong(2, _msId);</span>
+<span class="nc" id="L272">                    int result = rel_sql_pstmt.executeUpdate();</span>
+<span class="nc bnc" id="L273" title="All 4 branches missed.">                    if (result == 1 &amp;&amp; s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L274">                        s_logger.trace(&quot;lck-&quot; + key + &quot; removed&quot;);</span>
+                    }
+<span class="nc" id="L276">                    decrCount();</span>
+<span class="nc bnc" id="L277" title="All 8 branches missed.">                }catch (Exception e) {</span>
+<span class="nc" id="L278">                    s_logger.error(&quot;release:Exception:&quot;+ e.getMessage());</span>
+<span class="nc" id="L279">                    throw new CloudRuntimeException(&quot;release:Exception:&quot;+ e.getMessage(), e);</span>
+                }
+<span class="nc bnc" id="L281" title="All 2 branches missed.">            } else if (rows &lt; 1) {</span>
+<span class="nc" id="L282">                String msg = (&quot;Was unable to find lock for the key &quot; + key + &quot; and thread id &quot; + threadId);</span>
+<span class="nc" id="L283">                Exception e = new CloudRuntimeException(msg);</span>
+<span class="nc" id="L284">                s_logger.warn(msg, e);</span>
+            }
+<span class="nc bnc" id="L286" title="All 2 branches missed.">            return rows == 1;</span>
+<span class="nc bnc" id="L287" title="All 8 branches missed.">        } catch (Exception e) {</span>
+<span class="nc" id="L288">            s_logger.error(&quot;release:Exception:&quot;+ e.getMessage());</span>
+<span class="nc" id="L289">            throw new CloudRuntimeException(&quot;release:Exception:&quot;+ e.getMessage(), e);</span>
+        }
+    }
+
+    protected Map&lt;String, String&gt; toLock(ResultSet rs) throws SQLException {
+<span class="nc" id="L294">        Map&lt;String, String&gt; map = new HashMap&lt;String, String&gt;();</span>
+<span class="nc" id="L295">        map.put(&quot;key&quot;, rs.getString(1));</span>
+<span class="nc" id="L296">        map.put(&quot;mgmt&quot;, rs.getString(2));</span>
+<span class="nc" id="L297">        map.put(&quot;name&quot;, rs.getString(3));</span>
+<span class="nc" id="L298">        map.put(&quot;tid&quot;, Integer.toString(rs.getInt(4)));</span>
+<span class="nc" id="L299">        map.put(&quot;date&quot;, rs.getString(5));</span>
+<span class="nc" id="L300">        map.put(&quot;count&quot;, Integer.toString(rs.getInt(6)));</span>
+<span class="nc" id="L301">        return map;</span>
+
+    }
+
+    protected List&lt;Map&lt;String, String&gt;&gt; toLocks(ResultSet rs) throws SQLException {
+<span class="nc" id="L306">        LinkedList&lt;Map&lt;String, String&gt;&gt; results = new LinkedList&lt;Map&lt;String, String&gt;&gt;();</span>
+<span class="nc bnc" id="L307" title="All 2 branches missed.">        while (rs.next()) {</span>
+<span class="nc" id="L308">            results.add(toLock(rs));</span>
+        }
+<span class="nc" id="L310">        return results;</span>
+    }
+
+    protected List&lt;Map&lt;String, String&gt;&gt; getLocks(String sql, Long msId) {
+<span class="nc" id="L314">        try (PreparedStatement pstmt = _concierge.conn().prepareStatement(sql);)</span>
+        {
+<span class="nc bnc" id="L316" title="All 2 branches missed.">            if (msId != null) {</span>
+<span class="nc" id="L317">                pstmt.setLong(1, msId);</span>
+            }
+<span class="nc" id="L319">            try(ResultSet rs = pstmt.executeQuery();)</span>
+            {
+<span class="nc" id="L321">                return toLocks(rs);</span>
+<span class="nc bnc" id="L322" title="All 8 branches missed.">            }catch (Exception e) {</span>
+<span class="nc" id="L323">                s_logger.error(&quot;getLocks:Exception:&quot;+e.getMessage());</span>
+<span class="nc" id="L324">                throw new CloudRuntimeException(&quot;getLocks:Exception:&quot;+e.getMessage(), e);</span>
+            }
+<span class="nc bnc" id="L326" title="All 8 branches missed.">       } catch (Exception e) {</span>
+<span class="nc" id="L327">            s_logger.error(&quot;getLocks:Exception:&quot;+e.getMessage());</span>
+<span class="nc" id="L328">            throw new CloudRuntimeException(&quot;getLocks:Exception:&quot;+e.getMessage(), e);</span>
+        }
+    }
+
+    @Override
+    public List&lt;Map&lt;String, String&gt;&gt; getAllLocks() {
+<span class="nc" id="L334">        return getLocks(SELECT_SQL, null);</span>
+    }
+
+    @Override
+    public List&lt;Map&lt;String, String&gt;&gt; getLocksAcquiredByThisServer() {
+<span class="nc" id="L339">        return getLocks(SELECT_MGMT_LOCKS_SQL, _msId);</span>
+    }
+
+    public int owns(String key) {
+<span class="nc" id="L343">        Thread th = Thread.currentThread();</span>
+<span class="nc" id="L344">        int threadId = System.identityHashCode(th);</span>
+<span class="nc" id="L345">        Map&lt;String, String&gt; owner = isLocked(key);</span>
+<span class="nc bnc" id="L346" title="All 2 branches missed.">        if (owner == null) {</span>
+<span class="nc" id="L347">            return 0;</span>
+        }
+<span class="nc bnc" id="L349" title="All 4 branches missed.">        if (owner.get(&quot;mgmt&quot;).equals(Long.toString(_msId)) &amp;&amp; owner.get(&quot;tid&quot;).equals(Integer.toString(threadId))) {</span>
+<span class="nc" id="L350">            return Integer.parseInt(owner.get(&quot;count&quot;));</span>
+        }
+<span class="nc" id="L352">        return -1;</span>
+    }
+
+    public List&lt;Map&lt;String, String&gt;&gt; getLocksAcquiredBy(long msId, String threadName) {
+<span class="nc" id="L356">        try (PreparedStatement pstmt = _concierge.conn().prepareStatement(SELECT_THREAD_LOCKS_SQL);){</span>
+<span class="nc" id="L357">            pstmt.setLong(1, msId);</span>
+<span class="nc" id="L358">            pstmt.setString(2, threadName);</span>
+<span class="nc" id="L359">            try (ResultSet rs =pstmt.executeQuery();) {</span>
+<span class="nc" id="L360">                return toLocks(rs);</span>
+<span class="nc bnc" id="L361" title="All 8 branches missed.">            }</span>
+<span class="nc" id="L362">            catch (Exception e) {</span>
+<span class="nc" id="L363">                s_logger.error(&quot;getLocksAcquiredBy:Exception:&quot;+e.getMessage());</span>
+<span class="nc" id="L364">                throw new CloudRuntimeException(&quot;Can't get locks &quot; + pstmt, e);</span>
+            }
+<span class="nc bnc" id="L366" title="All 8 branches missed.">        } catch (Exception e) {</span>
+<span class="nc" id="L367">            s_logger.error(&quot;getLocksAcquiredBy:Exception:&quot;+e.getMessage());</span>
+<span class="nc" id="L368">            throw new CloudRuntimeException(&quot;getLocksAcquiredBy:Exception:&quot;+e.getMessage(), e);</span>
+        }
+    }
+
+    public void cleanupThread() {
+
+<span class="nc" id="L374">        Count count = s_tls.get();</span>
+<span class="nc bnc" id="L375" title="All 4 branches missed.">        if (count == null || count.count == 0) {</span>
+<span class="nc" id="L376">            return;</span>
+        }
+<span class="nc" id="L378">        int c = count.count;</span>
+<span class="nc" id="L379">        count.count = 0;</span>
+
+<span class="nc" id="L381">        Thread th = Thread.currentThread();</span>
+<span class="nc" id="L382">        String threadName = th.getName();</span>
+<span class="nc" id="L383">        int threadId = System.identityHashCode(th);</span>
+<span class="nc" id="L384">        try (PreparedStatement pstmt = _concierge.conn().prepareStatement(CLEANUP_THREAD_LOCKS_SQL);)</span>
+        {
+<span class="nc" id="L386">            pstmt.setLong(1, _msId);</span>
+<span class="nc" id="L387">            pstmt.setString(2, threadName);</span>
+<span class="nc" id="L388">            pstmt.setInt(3, threadId);</span>
+<span class="nc" id="L389">            int rows = pstmt.executeUpdate();</span>
+<span class="nc bnc" id="L390" title="All 2 branches missed.">            assert (false) : &quot;Abandon hope, all ye who enter here....There were still &quot; + rows + &quot;:&quot; + c +</span>
+<span class="nc" id="L391">            &quot; locks not released when the transaction ended, check for lock not released or @DB is not added to the code that using the locks!&quot;;</span>
+<span class="nc bnc" id="L392" title="All 8 branches missed.">        } catch (Exception e) {</span>
+<span class="nc" id="L393">            s_logger.error(&quot;cleanupThread:Exception:&quot; +  e.getMessage());</span>
+<span class="nc" id="L394">            throw new CloudRuntimeException(&quot;cleanupThread:Exception:&quot; +  e.getMessage(), e);</span>
+        }
+<span class="nc" id="L396">    }</span>
+
+    @Override
+    public boolean releaseLockAsLastResortAndIReallyKnowWhatIAmDoing(String key) {
+<span class="nc" id="L400">        s_logger.info(&quot;Releasing a lock from JMX lck-&quot; + key);</span>
+<span class="nc" id="L401">        try (PreparedStatement pstmt = _concierge.conn().prepareStatement(RELEASE_LOCK_SQL);)</span>
+        {
+<span class="nc" id="L403">            pstmt.setString(1, key);</span>
+<span class="nc" id="L404">            int rows = pstmt.executeUpdate();</span>
+<span class="nc bnc" id="L405" title="All 2 branches missed.">            return rows &gt; 0;</span>
+<span class="nc bnc" id="L406" title="All 8 branches missed.">        } catch (Exception e) {</span>
+<span class="nc" id="L407">            s_logger.error(&quot;releaseLockAsLastResortAndIReallyKnowWhatIAmDoing : Exception: &quot; +  e.getMessage());</span>
+<span class="nc" id="L408">            return  false;</span>
+        }
+    }
+
+<span class="nc" id="L412">    protected static class Count {</span>
+<span class="nc" id="L413">        public int count = 0;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>cloud-core (18-mrt-2016 13:14:54)</div></body></html>

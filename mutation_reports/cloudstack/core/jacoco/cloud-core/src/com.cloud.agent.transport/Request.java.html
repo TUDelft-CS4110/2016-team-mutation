@@ -1,0 +1,660 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>Request.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">cloud-core (18-mrt-2016 13:14:54)</a> &gt; <a href="../../index.html" class="el_group">cloud-core</a> &gt; <a href="../index.html" class="el_bundle">src</a> &gt; <a href="index.source.html" class="el_package">com.cloud.agent.transport</a> &gt; <span class="el_source">Request.java</span></div><h1>Request.java</h1><pre class="source lang-java linenums"><span class="pc" id="L1">//</span>
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// &quot;License&quot;); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+//
+
+package com.cloud.agent.transport;
+
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.StringReader;
+import java.lang.reflect.Type;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.List;
+import java.util.zip.GZIPInputStream;
+import java.util.zip.GZIPOutputStream;
+
+import org.apache.log4j.Level;
+import org.apache.log4j.Logger;
+
+import com.google.gson.Gson;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonDeserializationContext;
+import com.google.gson.JsonDeserializer;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonNull;
+import com.google.gson.JsonParseException;
+import com.google.gson.JsonSerializationContext;
+import com.google.gson.JsonSerializer;
+import com.google.gson.stream.JsonReader;
+
+import com.cloud.agent.api.Answer;
+import com.cloud.agent.api.Command;
+import com.cloud.agent.api.SecStorageFirewallCfgCommand.PortConfig;
+import com.cloud.exception.UnsupportedVersionException;
+import com.cloud.serializer.GsonHelper;
+import com.cloud.utils.NumbersUtil;
+import com.cloud.utils.Pair;
+import com.cloud.utils.StringUtils;
+import com.cloud.utils.exception.CloudRuntimeException;
+
+/**
+ * Request is a simple wrapper around command and answer to add sequencing,
+ * versioning, and flags. Note that the version here represents the changes
+ * in the over the wire protocol. For example, if we decide to not use Gson.
+ * It does not version the changes in the actual commands. That's expected
+ * to be done by adding new classes to the command and answer list.
+ *
+ * A request looks as follows:
+ * 1. Version - 1 byte;
+ * 2. Flags - 3 bytes;
+ * 3. Sequence - 8 bytes;
+ * 4. Length - 4 bytes;
+ * 5. ManagementServerId - 8 bytes;
+ * 6. AgentId - 8 bytes;
+ * 7. Data Package.
+ *
+ */
+<span class="pc bpc" id="L76" title="1 of 2 branches missed.">public class Request {</span>
+<span class="fc" id="L77">    private static final Logger s_logger = Logger.getLogger(Request.class);</span>
+
+<span class="fc" id="L79">    protected static final Gson s_gson = GsonHelper.getGson();</span>
+<span class="fc" id="L80">    protected static final Gson s_gogger = GsonHelper.getGsonLogger();</span>
+<span class="fc" id="L81">    protected static final Logger s_gsonLogger = GsonHelper.getLogger();</span>
+
+<span class="fc" id="L83">    public enum Version {</span>
+<span class="fc" id="L84">        v1, // using gson to marshall</span>
+<span class="fc" id="L85">        v2, // now using gson as marshalled.</span>
+<span class="fc" id="L86">        v3; // Adding routing information into the Request data structure.</span>
+
+        public static Version get(final byte ver) throws UnsupportedVersionException {
+<span class="pc bpc" id="L89" title="1 of 2 branches missed.">            for (final Version version : Version.values()) {</span>
+<span class="pc bpc" id="L90" title="1 of 2 branches missed.">                if (ver == version.ordinal()) {</span>
+<span class="fc" id="L91">                    return version;</span>
+                }
+            }
+<span class="nc" id="L94">            throw new UnsupportedVersionException(&quot;Can't lookup version: &quot; + ver, UnsupportedVersionException.UnknownVersion);</span>
+        }
+    };
+
+    protected static final short FLAG_RESPONSE = 0x0;
+    protected static final short FLAG_REQUEST = 0x1;
+    protected static final short FLAG_STOP_ON_ERROR = 0x2;
+    protected static final short FLAG_IN_SEQUENCE = 0x4;
+    protected static final short FLAG_FROM_SERVER = 0x20;
+    protected static final short FLAG_CONTROL = 0x40;
+<span class="fc" id="L104">    protected static final short FLAG_COMPRESSED = 0x80;</span>
+
+    protected Version _ver;
+    protected long _session;
+    protected long _seq;
+    protected short _flags;
+    protected long _mgmtId;
+    protected long _via;
+    protected long _agentId;
+    protected Command[] _cmds;
+    protected String _content;
+    protected String _agentName;
+
+<span class="nc" id="L117">    protected Request() {</span>
+<span class="nc" id="L118">    }</span>
+
+<span class="fc" id="L120">    protected Request(Version ver, long seq, long agentId, long mgmtId, long via, short flags, final Command[] cmds) {</span>
+<span class="fc" id="L121">        _ver = ver;</span>
+<span class="fc" id="L122">        _cmds = cmds;</span>
+<span class="fc" id="L123">        _flags = flags;</span>
+<span class="fc" id="L124">        _seq = seq;</span>
+<span class="fc" id="L125">        _via = via;</span>
+<span class="fc" id="L126">        _agentId = agentId;</span>
+<span class="fc" id="L127">        _mgmtId = mgmtId;</span>
+<span class="fc" id="L128">        setInSequence(cmds);</span>
+<span class="fc" id="L129">    }</span>
+
+    protected Request(Version ver, long seq, long agentId, long mgmtId, short flags, final Command[] cmds) {
+<span class="fc" id="L132">        this(ver, seq, agentId, mgmtId, agentId, flags, cmds);</span>
+<span class="fc" id="L133">    }</span>
+
+    protected Request(Version ver, long seq, long agentId, long mgmtId, long via, short flags, final String content) {
+<span class="fc" id="L136">        this(ver, seq, agentId, mgmtId, via, flags, (Command[])null);</span>
+<span class="fc" id="L137">        _content = content;</span>
+<span class="fc" id="L138">    }</span>
+
+    public Request(long agentId, long mgmtId, Command command, boolean fromServer) {
+<span class="fc" id="L141">        this(agentId, mgmtId, new Command[] {command}, true, fromServer);</span>
+<span class="fc" id="L142">    }</span>
+
+    public Request(long agentId, long mgmtId, Command[] cmds, boolean stopOnError, boolean fromServer) {
+<span class="fc" id="L145">        this(Version.v1, -1l, agentId, mgmtId, (short)0, cmds);</span>
+<span class="fc" id="L146">        setStopOnError(stopOnError);</span>
+<span class="fc" id="L147">        setFromServer(fromServer);</span>
+<span class="fc" id="L148">    }</span>
+
+    public Request(long agentId, String agentName, long mgmtId, Command[] cmds, boolean stopOnError, boolean fromServer) {
+<span class="nc" id="L151">        this(agentId, mgmtId, cmds, stopOnError, fromServer);</span>
+<span class="nc" id="L152">        setAgentName(agentName);</span>
+<span class="nc" id="L153">    }</span>
+
+    public void setSequence(long seq) {
+<span class="fc" id="L156">        _seq = seq;</span>
+<span class="fc" id="L157">    }</span>
+
+    protected void setInSequence(Command[] cmds) {
+<span class="fc bfc" id="L160" title="All 2 branches covered.">        if (cmds == null) {</span>
+<span class="fc" id="L161">            return;</span>
+        }
+<span class="fc bfc" id="L163" title="All 2 branches covered.">        for (Command cmd : cmds) {</span>
+<span class="fc bfc" id="L164" title="All 2 branches covered.">            if (cmd.executeInSequence()) {</span>
+<span class="fc" id="L165">                setInSequence(true);</span>
+<span class="fc" id="L166">                break;</span>
+            }
+        }
+<span class="fc" id="L169">    }</span>
+
+<span class="fc" id="L171">    protected Request(final Request that, final Command[] cmds) {</span>
+<span class="fc" id="L172">        _ver = that._ver;</span>
+<span class="fc" id="L173">        _seq = that._seq;</span>
+<span class="fc" id="L174">        setInSequence(that.executeInSequence());</span>
+<span class="fc" id="L175">        setStopOnError(that.stopOnError());</span>
+<span class="fc" id="L176">        _cmds = cmds;</span>
+<span class="fc" id="L177">        _mgmtId = that._mgmtId;</span>
+<span class="fc" id="L178">        _via = that._via;</span>
+<span class="fc" id="L179">        _agentId = that._agentId;</span>
+<span class="fc" id="L180">        _agentName = that._agentName;</span>
+<span class="pc bpc" id="L181" title="1 of 2 branches missed.">        setFromServer(!that.isFromServer());</span>
+<span class="fc" id="L182">    }</span>
+
+    private final void setStopOnError(boolean stopOnError) {
+<span class="pc bpc" id="L185" title="1 of 2 branches missed.">        _flags |= (stopOnError ? FLAG_STOP_ON_ERROR : 0);</span>
+<span class="fc" id="L186">    }</span>
+
+    private final void setAgentName(String agentName) {
+<span class="nc" id="L189">        _agentName = agentName;</span>
+<span class="nc" id="L190">    }</span>
+
+    private final void setInSequence(boolean inSequence) {
+<span class="fc bfc" id="L193" title="All 2 branches covered.">        _flags |= (inSequence ? FLAG_IN_SEQUENCE : 0);</span>
+<span class="fc" id="L194">    }</span>
+
+    public boolean isControl() {
+<span class="nc bnc" id="L197" title="All 2 branches missed.">        return (_flags &amp; FLAG_CONTROL) &gt; 0;</span>
+    }
+
+    public void setControl(boolean control) {
+<span class="nc bnc" id="L201" title="All 2 branches missed.">        _flags |= (control ? FLAG_CONTROL : 0);</span>
+<span class="nc" id="L202">    }</span>
+
+    private final void setFromServer(boolean fromServer) {
+<span class="fc bfc" id="L205" title="All 2 branches covered.">        _flags |= (fromServer ? FLAG_FROM_SERVER : 0);</span>
+<span class="fc" id="L206">    }</span>
+
+    public long getManagementServerId() {
+<span class="nc" id="L209">        return _mgmtId;</span>
+    }
+
+    public boolean isFromServer() {
+<span class="pc bpc" id="L213" title="1 of 2 branches missed.">        return (_flags &amp; FLAG_FROM_SERVER) &gt; 0;</span>
+    }
+
+    public Version getVersion() {
+<span class="nc" id="L217">        return _ver;</span>
+    }
+
+    public void setAgentId(long agentId) {
+<span class="nc" id="L221">        _agentId = agentId;</span>
+<span class="nc" id="L222">    }</span>
+
+    public void setVia(long viaId) {
+<span class="nc" id="L225">        _via = viaId;</span>
+<span class="nc" id="L226">    }</span>
+
+    public boolean executeInSequence() {
+<span class="pc bpc" id="L229" title="1 of 2 branches missed.">        return (_flags &amp; FLAG_IN_SEQUENCE) &gt; 0;</span>
+    }
+
+    public long getSequence() {
+<span class="nc" id="L233">        return _seq;</span>
+    }
+
+    public boolean stopOnError() {
+<span class="pc bpc" id="L237" title="1 of 2 branches missed.">        return (_flags &amp; FLAG_STOP_ON_ERROR) &gt; 0;</span>
+    }
+
+    public Command getCommand() {
+<span class="fc" id="L241">        getCommands();</span>
+<span class="fc" id="L242">        return _cmds[0];</span>
+    }
+
+    public Command[] getCommands() {
+<span class="fc bfc" id="L246" title="All 2 branches covered.">        if (_cmds == null) {</span>
+            try {
+<span class="fc" id="L248">                StringReader reader = new StringReader(_content);</span>
+<span class="fc" id="L249">                JsonReader jsonReader = new JsonReader(reader);</span>
+<span class="fc" id="L250">                jsonReader.setLenient(true);</span>
+<span class="fc" id="L251">                _cmds = s_gson.fromJson(jsonReader, (Type)Command[].class);</span>
+<span class="pc" id="L252">            } catch (RuntimeException e) {</span>
+<span class="nc" id="L253">                s_logger.error(&quot;Caught problem with &quot; + _content, e);</span>
+<span class="nc" id="L254">                throw e;</span>
+            }
+        }
+<span class="fc" id="L257">        return _cmds;</span>
+    }
+
+    protected String getType() {
+<span class="fc" id="L261">        return &quot;Cmd &quot;;</span>
+    }
+
+    protected ByteBuffer serializeHeader(final int contentSize) {
+<span class="fc" id="L265">        final ByteBuffer buffer = ByteBuffer.allocate(40);</span>
+<span class="fc" id="L266">        buffer.put(getVersionInByte());</span>
+<span class="fc" id="L267">        buffer.put((byte)0);</span>
+<span class="fc" id="L268">        buffer.putShort(getFlags());</span>
+<span class="fc" id="L269">        buffer.putLong(_seq);</span>
+        // The size here is uncompressed size, if the data is compressed.
+<span class="fc" id="L271">        buffer.putInt(contentSize);</span>
+<span class="fc" id="L272">        buffer.putLong(_mgmtId);</span>
+<span class="fc" id="L273">        buffer.putLong(_agentId);</span>
+<span class="fc" id="L274">        buffer.putLong(_via);</span>
+<span class="fc" id="L275">        buffer.flip();</span>
+
+<span class="fc" id="L277">        return buffer;</span>
+    }
+
+    public static ByteBuffer doDecompress(ByteBuffer buffer, int length) {
+<span class="fc" id="L281">        byte[] byteArrayIn = new byte[1024];</span>
+        ByteArrayInputStream byteIn;
+<span class="pc bpc" id="L283" title="1 of 2 branches missed.">        if (buffer.hasArray()) {</span>
+<span class="fc" id="L284">            byteIn = new ByteArrayInputStream(buffer.array(), buffer.position() + buffer.arrayOffset(), buffer.remaining());</span>
+<span class="fc" id="L285">        } else {</span>
+<span class="nc" id="L286">            byte[] array = new byte[buffer.limit() - buffer.position()];</span>
+<span class="nc" id="L287">            buffer.get(array);</span>
+<span class="nc" id="L288">            byteIn = new ByteArrayInputStream(array);</span>
+        }
+<span class="fc" id="L290">        ByteBuffer retBuff = ByteBuffer.allocate(length);</span>
+<span class="fc" id="L291">        int len = 0;</span>
+        try {
+<span class="fc" id="L293">            GZIPInputStream in = new GZIPInputStream(byteIn);</span>
+<span class="fc bfc" id="L294" title="All 2 branches covered.">            while ((len = in.read(byteArrayIn)) &gt; 0) {</span>
+<span class="fc" id="L295">                retBuff.put(byteArrayIn, 0, len);</span>
+            }
+<span class="fc" id="L297">            in.close();</span>
+<span class="pc" id="L298">        } catch (IOException e) {</span>
+<span class="nc" id="L299">            s_logger.error(&quot;Fail to decompress the request!&quot;, e);</span>
+        }
+<span class="fc" id="L301">        retBuff.flip();</span>
+<span class="fc" id="L302">        return retBuff;</span>
+    }
+
+    public static ByteBuffer doCompress(ByteBuffer buffer, int length) {
+<span class="fc" id="L306">        ByteArrayOutputStream byteOut = new ByteArrayOutputStream(length);</span>
+        byte[] array;
+<span class="pc bpc" id="L308" title="1 of 2 branches missed.">        if (buffer.hasArray()) {</span>
+<span class="fc" id="L309">            array = buffer.array();</span>
+<span class="fc" id="L310">        } else {</span>
+<span class="nc" id="L311">            array = new byte[buffer.capacity()];</span>
+<span class="nc" id="L312">            buffer.get(array);</span>
+        }
+        try {
+<span class="fc" id="L315">            GZIPOutputStream out = new GZIPOutputStream(byteOut, length);</span>
+<span class="fc" id="L316">            out.write(array);</span>
+<span class="fc" id="L317">            out.finish();</span>
+<span class="fc" id="L318">            out.close();</span>
+<span class="pc" id="L319">        } catch (IOException e) {</span>
+<span class="nc" id="L320">            s_logger.error(&quot;Fail to compress the request!&quot;, e);</span>
+        }
+<span class="fc" id="L322">        return ByteBuffer.wrap(byteOut.toByteArray());</span>
+    }
+
+    public ByteBuffer[] toBytes() {
+<span class="fc" id="L326">        final ByteBuffer[] buffers = new ByteBuffer[2];</span>
+        ByteBuffer tmp;
+
+<span class="pc bpc" id="L329" title="1 of 2 branches missed.">        if (_content == null) {</span>
+<span class="fc" id="L330">            _content = s_gson.toJson(_cmds, _cmds.getClass());</span>
+        }
+<span class="fc" id="L332">        tmp = ByteBuffer.wrap(_content.getBytes());</span>
+<span class="fc" id="L333">        int capacity = tmp.capacity();</span>
+        /* Check if we need to compress the data */
+<span class="pc bpc" id="L335" title="1 of 2 branches missed.">        if (capacity &gt;= 8192) {</span>
+<span class="nc" id="L336">            tmp = doCompress(tmp, capacity);</span>
+<span class="nc" id="L337">            _flags |= FLAG_COMPRESSED;</span>
+        }
+<span class="fc" id="L339">        buffers[1] = tmp;</span>
+<span class="fc" id="L340">        buffers[0] = serializeHeader(capacity);</span>
+
+<span class="fc" id="L342">        return buffers;</span>
+    }
+
+    public byte[] getBytes() {
+<span class="fc" id="L346">        final ByteBuffer[] buffers = toBytes();</span>
+<span class="fc" id="L347">        final int len1 = buffers[0].remaining();</span>
+<span class="fc" id="L348">        final int len2 = buffers[1].remaining();</span>
+<span class="fc" id="L349">        final byte[] bytes = new byte[len1 + len2];</span>
+<span class="fc" id="L350">        buffers[0].get(bytes, 0, len1);</span>
+<span class="fc" id="L351">        buffers[1].get(bytes, len1, len2);</span>
+<span class="fc" id="L352">        return bytes;</span>
+    }
+
+    protected byte getVersionInByte() {
+<span class="fc" id="L356">        return (byte)_ver.ordinal();</span>
+    }
+
+    protected short getFlags() {
+<span class="fc bfc" id="L360" title="All 2 branches covered.">        return (short)(((this instanceof Response) ? FLAG_RESPONSE : FLAG_REQUEST) | _flags);</span>
+    }
+
+    public void logD(String msg) {
+<span class="fc" id="L364">        logD(msg, true);</span>
+<span class="fc" id="L365">    }</span>
+
+    public void logD(String msg, boolean logContent) {
+<span class="pc bpc" id="L368" title="1 of 2 branches missed.">        if (s_logger.isDebugEnabled()) {</span>
+<span class="fc" id="L369">            String log = log(msg, logContent, Level.DEBUG);</span>
+<span class="pc bpc" id="L370" title="1 of 2 branches missed.">            if (log != null) {</span>
+<span class="fc" id="L371">                s_logger.debug(log);</span>
+            }
+        }
+<span class="fc" id="L374">    }</span>
+
+    public void logT(String msg, boolean logD) {
+<span class="nc bnc" id="L377" title="All 2 branches missed.">        if (s_logger.isTraceEnabled()) {</span>
+<span class="nc" id="L378">            String log = log(msg, true, Level.TRACE);</span>
+<span class="nc bnc" id="L379" title="All 2 branches missed.">            if (log != null) {</span>
+<span class="nc" id="L380">                s_logger.trace(log);</span>
+            }
+<span class="nc bnc" id="L382" title="All 4 branches missed.">        } else if (logD &amp;&amp; s_logger.isDebugEnabled()) {</span>
+<span class="nc" id="L383">            String log = log(msg, false, Level.DEBUG);</span>
+<span class="nc bnc" id="L384" title="All 2 branches missed.">            if (log != null) {</span>
+<span class="nc" id="L385">                s_logger.debug(log);</span>
+            }
+        }
+<span class="nc" id="L388">    }</span>
+
+    @Override
+    public String toString() {
+<span class="nc" id="L392">        return log(&quot;&quot;, true, Level.DEBUG);</span>
+    }
+
+    protected String log(String msg, boolean logContent, Level level) {
+<span class="fc" id="L396">        StringBuilder content = new StringBuilder();</span>
+<span class="fc bfc" id="L397" title="All 2 branches covered.">        if (logContent) {</span>
+<span class="pc bpc" id="L398" title="1 of 2 branches missed.">            if (_cmds == null) {</span>
+                try {
+<span class="nc bnc" id="L400" title="All 2 branches missed.">                    _cmds = s_gson.fromJson(_content, this instanceof Response ? Answer[].class : Command[].class);</span>
+<span class="nc" id="L401">                } catch (RuntimeException e) {</span>
+<span class="nc" id="L402">                    s_logger.error(&quot;Unable to convert to json: &quot; + _content);</span>
+<span class="nc" id="L403">                    throw e;</span>
+                }
+            }
+            try {
+<span class="fc" id="L407">                s_gogger.toJson(_cmds, content);</span>
+<span class="pc" id="L408">            } catch (Throwable e) {</span>
+<span class="nc" id="L409">                StringBuilder buff = new StringBuilder();</span>
+<span class="nc bnc" id="L410" title="All 2 branches missed.">                for (Command cmd : _cmds) {</span>
+<span class="nc" id="L411">                    buff.append(cmd.getClass().getSimpleName()).append(&quot;/&quot;);</span>
+                }
+<span class="nc" id="L413">                s_logger.error(&quot;Gson serialization error &quot; + buff.toString(), e);</span>
+<span class="nc bnc" id="L414" title="All 2 branches missed.">                assert false : &quot;More gson errors on &quot; + buff.toString();</span>
+<span class="nc" id="L415">                return &quot;&quot;;</span>
+            }
+<span class="fc bfc" id="L417" title="All 2 branches covered.">            if (content.length() &lt;= (1 + _cmds.length * 3)) {</span>
+<span class="fc" id="L418">                return null;</span>
+            }
+        } else {
+<span class="pc bpc" id="L421" title="1 of 2 branches missed.">            if (_cmds == null) {</span>
+<span class="nc bnc" id="L422" title="All 2 branches missed.">                _cmds = s_gson.fromJson(_content, this instanceof Response ? Answer[].class : Command[].class);</span>
+            }
+<span class="fc" id="L424">            content.append(&quot;{ &quot;);</span>
+<span class="fc bfc" id="L425" title="All 2 branches covered.">            for (Command cmd : _cmds) {</span>
+<span class="fc" id="L426">                content.append(cmd.getClass().getSimpleName()).append(&quot;, &quot;);</span>
+            }
+<span class="fc" id="L428">            content.replace(content.length() - 2, content.length(), &quot; }&quot;);</span>
+
+        }
+
+<span class="fc" id="L432">        StringBuilder buf = new StringBuilder(&quot;Seq &quot;);</span>
+
+<span class="fc" id="L434">        buf.append(_agentId).append(&quot;-&quot;).append(_seq).append(&quot;: &quot;);</span>
+
+<span class="fc" id="L436">        buf.append(msg);</span>
+<span class="fc" id="L437">        buf.append(&quot; { &quot;).append(getType());</span>
+<span class="pc bpc" id="L438" title="1 of 2 branches missed.">        if (_agentName != null) {</span>
+<span class="nc" id="L439">            buf.append(&quot;, MgmtId: &quot;).append(_mgmtId).append(&quot;, via: &quot;).append(_via).append(&quot;(&quot; + _agentName + &quot;)&quot;);</span>
+<span class="nc" id="L440">        } else {</span>
+<span class="fc" id="L441">            buf.append(&quot;, MgmtId: &quot;).append(_mgmtId).append(&quot;, via: &quot;).append(_via);</span>
+        }
+<span class="fc" id="L443">        buf.append(&quot;, Ver: &quot;).append(_ver.toString());</span>
+<span class="fc" id="L444">        buf.append(&quot;, Flags: &quot;).append(Integer.toBinaryString(getFlags())).append(&quot;, &quot;);</span>
+<span class="fc" id="L445">        String cleanContent = content.toString();</span>
+<span class="pc bpc" id="L446" title="1 of 2 branches missed.">        if(cleanContent.contains(&quot;password&quot;)) {</span>
+<span class="nc" id="L447">            buf.append(cleanPassword(cleanContent));</span>
+<span class="nc" id="L448">        } else {</span>
+<span class="fc" id="L449">            buf.append(content);</span>
+        }
+<span class="fc" id="L451">        buf.append(&quot; }&quot;);</span>
+<span class="fc" id="L452">        return buf.toString();</span>
+    }
+
+    public static String cleanPassword(String logString) {
+<span class="nc" id="L456">        String cleanLogString = null;</span>
+<span class="nc bnc" id="L457" title="All 2 branches missed.">        if (logString != null) {</span>
+<span class="nc" id="L458">            cleanLogString = logString;</span>
+<span class="nc" id="L459">            String[] temp = logString.split(&quot;,&quot;);</span>
+<span class="nc" id="L460">            int i = 0;</span>
+<span class="nc bnc" id="L461" title="All 2 branches missed.">            if (temp != null) {</span>
+<span class="nc bnc" id="L462" title="All 2 branches missed.">                while (i &lt; temp.length) {</span>
+<span class="nc" id="L463">                    temp[i] = StringUtils.cleanString(temp[i]);</span>
+<span class="nc" id="L464">                    i++;</span>
+                }
+<span class="nc" id="L466">                List&lt;String&gt; stringList = new ArrayList&lt;String&gt;();</span>
+<span class="nc" id="L467">                Collections.addAll(stringList, temp);</span>
+<span class="nc" id="L468">                cleanLogString = StringUtils.join(stringList, &quot;,&quot;);</span>
+            }
+        }
+<span class="nc" id="L471">        return cleanLogString;</span>
+    }
+
+    /**
+     * Factory method for Request and Response. It expects the bytes to be
+     * correctly formed so it's possible that it throws underflow exceptions
+     * but you shouldn't be concerned about that since that all bytes sent in
+     * should already be formatted correctly.
+     *
+     * @param bytes bytes to be converted.
+     * @return Request or Response depending on the data.
+     * @throws ClassNotFoundException if the Command or Answer can not be formed.
+     * @throws
+     */
+    public static Request parse(final byte[] bytes) throws ClassNotFoundException, UnsupportedVersionException {
+<span class="fc" id="L486">        ByteBuffer buff = ByteBuffer.wrap(bytes);</span>
+<span class="fc" id="L487">        final byte ver = buff.get();</span>
+<span class="fc" id="L488">        final Version version = Version.get(ver);</span>
+<span class="pc bpc" id="L489" title="3 of 4 branches missed.">        if (version.ordinal() != Version.v1.ordinal() &amp;&amp; version.ordinal() != Version.v3.ordinal()) {</span>
+<span class="nc" id="L490">            throw new UnsupportedVersionException(&quot;This version is no longer supported: &quot; + version.toString(), UnsupportedVersionException.IncompatibleVersion);</span>
+        }
+<span class="fc" id="L492">        buff.get();</span>
+<span class="fc" id="L493">        final short flags = buff.getShort();</span>
+<span class="fc bfc" id="L494" title="All 2 branches covered.">        final boolean isRequest = (flags &amp; FLAG_REQUEST) &gt; 0;</span>
+
+<span class="fc" id="L496">        final long seq = buff.getLong();</span>
+        // The size here is uncompressed size, if the data is compressed.
+<span class="fc" id="L498">        final int size = buff.getInt();</span>
+<span class="fc" id="L499">        final long mgmtId = buff.getLong();</span>
+<span class="fc" id="L500">        final long agentId = buff.getLong();</span>
+
+        long via;
+<span class="pc bpc" id="L503" title="1 of 2 branches missed.">        if (version.ordinal() == Version.v1.ordinal()) {</span>
+<span class="fc" id="L504">            via = buff.getLong();</span>
+<span class="fc" id="L505">        } else {</span>
+<span class="nc" id="L506">            via = agentId;</span>
+        }
+
+<span class="pc bpc" id="L509" title="1 of 2 branches missed.">        if ((flags &amp; FLAG_COMPRESSED) != 0) {</span>
+<span class="nc" id="L510">            buff = doDecompress(buff, size);</span>
+        }
+
+<span class="fc" id="L513">        byte[] command = null;</span>
+<span class="fc" id="L514">        int offset = 0;</span>
+<span class="pc bpc" id="L515" title="1 of 2 branches missed.">        if (buff.hasArray()) {</span>
+<span class="fc" id="L516">            command = buff.array();</span>
+<span class="fc" id="L517">            offset = buff.arrayOffset() + buff.position();</span>
+<span class="fc" id="L518">        } else {</span>
+<span class="nc" id="L519">            command = new byte[buff.remaining()];</span>
+<span class="nc" id="L520">            buff.get(command);</span>
+<span class="nc" id="L521">            offset = 0;</span>
+        }
+
+<span class="fc" id="L524">        final String content = new String(command, offset, command.length - offset);</span>
+
+<span class="fc bfc" id="L526" title="All 2 branches covered.">        if (isRequest) {</span>
+<span class="fc" id="L527">            return new Request(version, seq, agentId, mgmtId, via, flags, content);</span>
+        } else {
+<span class="fc" id="L529">            return new Response(Version.get(ver), seq, agentId, mgmtId, via, flags, content);</span>
+        }
+    }
+
+    public long getAgentId() {
+<span class="nc" id="L534">        return _agentId;</span>
+    }
+
+    public long getViaAgentId() {
+<span class="nc" id="L538">        return _via;</span>
+    }
+
+    public static boolean requiresSequentialExecution(final byte[] bytes) {
+<span class="nc bnc" id="L542" title="All 2 branches missed.">        return (bytes[3] &amp; FLAG_IN_SEQUENCE) &gt; 0;</span>
+    }
+
+    public static Version getVersion(final byte[] bytes) throws UnsupportedVersionException {
+        try {
+<span class="nc" id="L547">            return Version.get(bytes[0]);</span>
+<span class="nc" id="L548">        } catch (UnsupportedVersionException e) {</span>
+<span class="nc" id="L549">            throw new CloudRuntimeException(&quot;Unsupported version: &quot; + bytes[0]);</span>
+        }
+    }
+
+    public static long getManagementServerId(final byte[] bytes) {
+<span class="nc" id="L554">        return NumbersUtil.bytesToLong(bytes, 16);</span>
+    }
+
+    public static long getAgentId(final byte[] bytes) {
+<span class="nc" id="L558">        return NumbersUtil.bytesToLong(bytes, 24);</span>
+    }
+
+    public static long getViaAgentId(final byte[] bytes) {
+<span class="nc" id="L562">        return NumbersUtil.bytesToLong(bytes, 32);</span>
+    }
+
+    public static boolean fromServer(final byte[] bytes) {
+<span class="nc bnc" id="L566" title="All 2 branches missed.">        return (bytes[3] &amp; FLAG_FROM_SERVER) &gt; 0;</span>
+    }
+
+    public static boolean isRequest(final byte[] bytes) {
+<span class="nc bnc" id="L570" title="All 2 branches missed.">        return (bytes[3] &amp; FLAG_REQUEST) &gt; 0;</span>
+    }
+
+    public static long getSequence(final byte[] bytes) {
+<span class="nc" id="L574">        return NumbersUtil.bytesToLong(bytes, 4);</span>
+    }
+
+    public static boolean isControl(final byte[] bytes) {
+<span class="nc bnc" id="L578" title="All 2 branches missed.">        return (bytes[3] &amp; FLAG_CONTROL) &gt; 0;</span>
+    }
+
+    public static class NwGroupsCommandTypeAdaptor implements JsonDeserializer&lt;Pair&lt;Long, Long&gt;&gt;, JsonSerializer&lt;Pair&lt;Long, Long&gt;&gt; {
+
+<span class="fc" id="L583">        public NwGroupsCommandTypeAdaptor() {</span>
+<span class="fc" id="L584">        }</span>
+
+        @Override
+        public JsonElement serialize(Pair&lt;Long, Long&gt; src, java.lang.reflect.Type typeOfSrc, JsonSerializationContext context) {
+<span class="nc" id="L588">            JsonArray array = new JsonArray();</span>
+<span class="nc bnc" id="L589" title="All 2 branches missed.">            if (src.first() != null) {</span>
+<span class="nc" id="L590">                array.add(s_gson.toJsonTree(src.first()));</span>
+<span class="nc" id="L591">            } else {</span>
+<span class="nc" id="L592">                array.add(new JsonNull());</span>
+            }
+
+<span class="nc bnc" id="L595" title="All 2 branches missed.">            if (src.second() != null) {</span>
+<span class="nc" id="L596">                array.add(s_gson.toJsonTree(src.second()));</span>
+<span class="nc" id="L597">            } else {</span>
+<span class="nc" id="L598">                array.add(new JsonNull());</span>
+            }
+
+<span class="nc" id="L601">            return array;</span>
+        }
+
+        @Override
+        public Pair&lt;Long, Long&gt; deserialize(JsonElement json, java.lang.reflect.Type type, JsonDeserializationContext context) throws JsonParseException {
+<span class="nc" id="L606">            Pair&lt;Long, Long&gt; pairs = new Pair&lt;Long, Long&gt;(null, null);</span>
+<span class="nc" id="L607">            JsonArray array = json.getAsJsonArray();</span>
+<span class="nc bnc" id="L608" title="All 2 branches missed.">            if (array.size() != 2) {</span>
+<span class="nc" id="L609">                return pairs;</span>
+            }
+<span class="nc" id="L611">            JsonElement element = array.get(0);</span>
+<span class="nc bnc" id="L612" title="All 2 branches missed.">            if (!element.isJsonNull()) {</span>
+<span class="nc" id="L613">                pairs.first(element.getAsLong());</span>
+            }
+
+<span class="nc" id="L616">            element = array.get(1);</span>
+<span class="nc bnc" id="L617" title="All 2 branches missed.">            if (!element.isJsonNull()) {</span>
+<span class="nc" id="L618">                pairs.second(element.getAsLong());</span>
+            }
+
+<span class="nc" id="L621">            return pairs;</span>
+        }
+
+    }
+
+    public static class PortConfigListTypeAdaptor implements JsonDeserializer&lt;List&lt;PortConfig&gt;&gt;, JsonSerializer&lt;List&lt;PortConfig&gt;&gt; {
+
+<span class="fc" id="L628">        public PortConfigListTypeAdaptor() {</span>
+<span class="fc" id="L629">        }</span>
+
+        @Override
+        public JsonElement serialize(List&lt;PortConfig&gt; src, Type typeOfSrc, JsonSerializationContext context) {
+<span class="pc bpc" id="L633" title="1 of 2 branches missed.">            if (src.size() == 0) {</span>
+<span class="nc" id="L634">                return new JsonNull();</span>
+            }
+<span class="fc" id="L636">            JsonArray array = new JsonArray();</span>
+<span class="fc bfc" id="L637" title="All 2 branches covered.">            for (PortConfig pc : src) {</span>
+<span class="fc" id="L638">                array.add(s_gson.toJsonTree(pc));</span>
+            }
+
+<span class="fc" id="L641">            return array;</span>
+        }
+
+        @Override
+        public List&lt;PortConfig&gt; deserialize(JsonElement json, Type typeOfT, JsonDeserializationContext context) throws JsonParseException {
+<span class="pc bpc" id="L646" title="1 of 2 branches missed.">            if (json.isJsonNull()) {</span>
+<span class="nc" id="L647">                return new ArrayList&lt;PortConfig&gt;();</span>
+            }
+<span class="fc" id="L649">            List&lt;PortConfig&gt; pcs = new ArrayList&lt;PortConfig&gt;();</span>
+<span class="fc" id="L650">            JsonArray array = json.getAsJsonArray();</span>
+<span class="fc" id="L651">            Iterator&lt;JsonElement&gt; it = array.iterator();</span>
+<span class="fc bfc" id="L652" title="All 2 branches covered.">            while (it.hasNext()) {</span>
+<span class="fc" id="L653">                JsonElement element = it.next();</span>
+<span class="fc" id="L654">                pcs.add(s_gson.fromJson(element, PortConfig.class));</span>
+            }
+<span class="fc" id="L656">            return pcs;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>cloud-core (18-mrt-2016 13:14:54)</div></body></html>

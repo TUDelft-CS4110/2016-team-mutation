@@ -1,0 +1,458 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>HttpTemplateDownloader.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">cloud-core (18-mrt-2016 13:14:54)</a> &gt; <a href="../../index.html" class="el_group">cloud-core</a> &gt; <a href="../index.html" class="el_bundle">src</a> &gt; <a href="index.source.html" class="el_package">com.cloud.storage.template</a> &gt; <span class="el_source">HttpTemplateDownloader.java</span></div><h1>HttpTemplateDownloader.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">//</span>
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// &quot;License&quot;); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+//
+
+package com.cloud.storage.template;
+
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.RandomAccessFile;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.net.URL;
+import java.util.Date;
+
+import org.apache.cloudstack.utils.imagestore.ImageStoreUtil;
+import org.apache.commons.httpclient.Credentials;
+import org.apache.commons.httpclient.Header;
+import org.apache.commons.httpclient.HttpClient;
+import org.apache.commons.httpclient.HttpException;
+import org.apache.commons.httpclient.HttpMethod;
+import org.apache.commons.httpclient.HttpMethodRetryHandler;
+import org.apache.commons.httpclient.HttpStatus;
+import org.apache.commons.httpclient.MultiThreadedHttpConnectionManager;
+import org.apache.commons.httpclient.NoHttpResponseException;
+import org.apache.commons.httpclient.UsernamePasswordCredentials;
+import org.apache.commons.httpclient.auth.AuthScope;
+import org.apache.commons.httpclient.methods.GetMethod;
+import org.apache.commons.httpclient.params.HttpMethodParams;
+import org.apache.log4j.Logger;
+
+import org.apache.cloudstack.managed.context.ManagedContextRunnable;
+import org.apache.cloudstack.storage.command.DownloadCommand.ResourceType;
+
+import com.cloud.storage.StorageLayer;
+import com.cloud.utils.Pair;
+import com.cloud.utils.UriUtils;
+import com.cloud.utils.net.Proxy;
+
+/**
+ * Download a template file using HTTP
+ *
+ */
+public class HttpTemplateDownloader extends ManagedContextRunnable implements TemplateDownloader {
+<span class="nc" id="L60">    public static final Logger s_logger = Logger.getLogger(HttpTemplateDownloader.class.getName());</span>
+<span class="nc" id="L61">    private static final MultiThreadedHttpConnectionManager s_httpClientManager = new MultiThreadedHttpConnectionManager();</span>
+
+<span class="nc" id="L63">    private static final int CHUNK_SIZE = 1024 * 1024; //1M</span>
+    private String downloadUrl;
+    private String toFile;
+<span class="nc" id="L66">    public TemplateDownloader.Status status = TemplateDownloader.Status.NOT_STARTED;</span>
+<span class="nc" id="L67">    public String errorString = &quot; &quot;;</span>
+<span class="nc" id="L68">    private long remoteSize = 0;</span>
+<span class="nc" id="L69">    public long downloadTime = 0;</span>
+    public long totalBytes;
+    private final HttpClient client;
+    private GetMethod request;
+<span class="nc" id="L73">    private boolean resume = false;</span>
+    private DownloadCompleteCallback completionCallback;
+    StorageLayer _storage;
+<span class="nc" id="L76">    boolean inited = true;</span>
+
+    private String toDir;
+    private long maxTemplateSizeInBytes;
+<span class="nc" id="L80">    private ResourceType resourceType = ResourceType.TEMPLATE;</span>
+    private final HttpMethodRetryHandler myretryhandler;
+
+<span class="nc" id="L83">    public HttpTemplateDownloader(StorageLayer storageLayer, String downloadUrl, String toDir, DownloadCompleteCallback callback, long maxTemplateSizeInBytes,</span>
+            String user, String password, Proxy proxy, ResourceType resourceType) {
+<span class="nc" id="L85">        _storage = storageLayer;</span>
+<span class="nc" id="L86">        this.downloadUrl = downloadUrl;</span>
+<span class="nc" id="L87">        setToDir(toDir);</span>
+<span class="nc" id="L88">        status = TemplateDownloader.Status.NOT_STARTED;</span>
+<span class="nc" id="L89">        this.resourceType = resourceType;</span>
+<span class="nc" id="L90">        this.maxTemplateSizeInBytes = maxTemplateSizeInBytes;</span>
+
+<span class="nc" id="L92">        totalBytes = 0;</span>
+<span class="nc" id="L93">        client = new HttpClient(s_httpClientManager);</span>
+
+<span class="nc" id="L95">        myretryhandler = new HttpMethodRetryHandler() {</span>
+            @Override
+            public boolean retryMethod(final HttpMethod method, final IOException exception, int executionCount) {
+<span class="nc bnc" id="L98" title="All 2 branches missed.">                if (executionCount &gt;= 2) {</span>
+                    // Do not retry if over max retry count
+<span class="nc" id="L100">                    return false;</span>
+                }
+<span class="nc bnc" id="L102" title="All 2 branches missed.">                if (exception instanceof NoHttpResponseException) {</span>
+                    // Retry if the server dropped connection on us
+<span class="nc" id="L104">                    return true;</span>
+                }
+<span class="nc bnc" id="L106" title="All 2 branches missed.">                if (!method.isRequestSent()) {</span>
+                    // Retry if the request has not been sent fully or
+                    // if it's OK to retry methods that have been sent
+<span class="nc" id="L109">                    return true;</span>
+                }
+                // otherwise do not retry
+<span class="nc" id="L112">                return false;</span>
+            }
+        };
+
+        try {
+<span class="nc" id="L117">            request = new GetMethod(downloadUrl);</span>
+<span class="nc" id="L118">            request.getParams().setParameter(HttpMethodParams.RETRY_HANDLER, myretryhandler);</span>
+<span class="nc" id="L119">            completionCallback = callback;</span>
+            //this.request.setFollowRedirects(false);
+
+<span class="nc" id="L122">            File f = File.createTempFile(&quot;dnld&quot;, &quot;tmp_&quot;, new File(toDir));</span>
+
+<span class="nc bnc" id="L124" title="All 2 branches missed.">            if (_storage != null) {</span>
+<span class="nc" id="L125">                _storage.setWorldReadableAndWriteable(f);</span>
+            }
+
+<span class="nc" id="L128">            toFile = f.getAbsolutePath();</span>
+<span class="nc" id="L129">            Pair&lt;String, Integer&gt; hostAndPort = UriUtils.validateUrl(downloadUrl);</span>
+
+<span class="nc bnc" id="L131" title="All 2 branches missed.">            if (proxy != null) {</span>
+<span class="nc" id="L132">                client.getHostConfiguration().setProxy(proxy.getHost(), proxy.getPort());</span>
+<span class="nc bnc" id="L133" title="All 2 branches missed.">                if (proxy.getUserName() != null) {</span>
+<span class="nc" id="L134">                    Credentials proxyCreds = new UsernamePasswordCredentials(proxy.getUserName(), proxy.getPassword());</span>
+<span class="nc" id="L135">                    client.getState().setProxyCredentials(AuthScope.ANY, proxyCreds);</span>
+                }
+            }
+<span class="nc bnc" id="L138" title="All 4 branches missed.">            if ((user != null) &amp;&amp; (password != null)) {</span>
+<span class="nc" id="L139">                client.getParams().setAuthenticationPreemptive(true);</span>
+<span class="nc" id="L140">                Credentials defaultcreds = new UsernamePasswordCredentials(user, password);</span>
+<span class="nc" id="L141">                client.getState().setCredentials(new AuthScope(hostAndPort.first(), hostAndPort.second(), AuthScope.ANY_REALM), defaultcreds);</span>
+<span class="nc" id="L142">                s_logger.info(&quot;Added username=&quot; + user + &quot;, password=&quot; + password + &quot;for host &quot; + hostAndPort.first() + &quot;:&quot; + hostAndPort.second());</span>
+<span class="nc" id="L143">            } else {</span>
+<span class="nc" id="L144">                s_logger.info(&quot;No credentials configured for host=&quot; + hostAndPort.first() + &quot;:&quot; + hostAndPort.second());</span>
+            }
+<span class="nc" id="L146">        } catch (IllegalArgumentException iae) {</span>
+<span class="nc" id="L147">            errorString = iae.getMessage();</span>
+<span class="nc" id="L148">            status = TemplateDownloader.Status.UNRECOVERABLE_ERROR;</span>
+<span class="nc" id="L149">            inited = false;</span>
+<span class="nc" id="L150">        } catch (Exception ex) {</span>
+<span class="nc" id="L151">            errorString = &quot;Unable to start download -- check url? &quot;;</span>
+<span class="nc" id="L152">            status = TemplateDownloader.Status.UNRECOVERABLE_ERROR;</span>
+<span class="nc" id="L153">            s_logger.warn(&quot;Exception in constructor -- &quot; + ex.toString());</span>
+<span class="nc" id="L154">        } catch (Throwable th) {</span>
+<span class="nc" id="L155">            s_logger.warn(&quot;throwable caught &quot;, th);</span>
+        }
+<span class="nc" id="L157">    }</span>
+
+    @Override
+    public long download(boolean resume, DownloadCompleteCallback callback) {
+<span class="nc bnc" id="L161" title="All 2 branches missed.">        switch (status) {</span>
+            case ABORTED:
+            case UNRECOVERABLE_ERROR:
+            case DOWNLOAD_FINISHED:
+<span class="nc" id="L165">                return 0;</span>
+            default:
+
+        }
+<span class="nc" id="L169">        int bytes = 0;</span>
+<span class="nc" id="L170">        File file = new File(toFile);</span>
+        try {
+
+<span class="nc" id="L173">            long localFileSize = 0;</span>
+<span class="nc bnc" id="L174" title="All 4 branches missed.">            if (file.exists() &amp;&amp; resume) {</span>
+<span class="nc" id="L175">                localFileSize = file.length();</span>
+<span class="nc" id="L176">                s_logger.info(&quot;Resuming download to file (current size)=&quot; + localFileSize);</span>
+            }
+
+<span class="nc" id="L179">            Date start = new Date();</span>
+
+<span class="nc" id="L181">            int responseCode = 0;</span>
+
+<span class="nc bnc" id="L183" title="All 2 branches missed.">            if (localFileSize &gt; 0) {</span>
+                // require partial content support for resume
+<span class="nc" id="L185">                request.addRequestHeader(&quot;Range&quot;, &quot;bytes=&quot; + localFileSize + &quot;-&quot;);</span>
+<span class="nc bnc" id="L186" title="All 2 branches missed.">                if (client.executeMethod(request) != HttpStatus.SC_PARTIAL_CONTENT) {</span>
+<span class="nc" id="L187">                    errorString = &quot;HTTP Server does not support partial get&quot;;</span>
+<span class="nc" id="L188">                    status = TemplateDownloader.Status.UNRECOVERABLE_ERROR;</span>
+<span class="nc" id="L189">                    return 0;</span>
+                }
+<span class="nc bnc" id="L191" title="All 2 branches missed.">            } else if ((responseCode = client.executeMethod(request)) != HttpStatus.SC_OK) {</span>
+<span class="nc" id="L192">                status = TemplateDownloader.Status.UNRECOVERABLE_ERROR;</span>
+<span class="nc" id="L193">                errorString = &quot; HTTP Server returned &quot; + responseCode + &quot; (expected 200 OK) &quot;;</span>
+<span class="nc" id="L194">                return 0; //FIXME: retry?</span>
+            }
+
+<span class="nc" id="L197">            Header contentLengthHeader = request.getResponseHeader(&quot;Content-Length&quot;);</span>
+<span class="nc" id="L198">            boolean chunked = false;</span>
+<span class="nc" id="L199">            long remoteSize2 = 0;</span>
+<span class="nc bnc" id="L200" title="All 2 branches missed.">            if (contentLengthHeader == null) {</span>
+<span class="nc" id="L201">                Header chunkedHeader = request.getResponseHeader(&quot;Transfer-Encoding&quot;);</span>
+<span class="nc bnc" id="L202" title="All 4 branches missed.">                if (chunkedHeader == null || !&quot;chunked&quot;.equalsIgnoreCase(chunkedHeader.getValue())) {</span>
+<span class="nc" id="L203">                    status = TemplateDownloader.Status.UNRECOVERABLE_ERROR;</span>
+<span class="nc" id="L204">                    errorString = &quot; Failed to receive length of download &quot;;</span>
+<span class="nc" id="L205">                    return 0; //FIXME: what status do we put here? Do we retry?</span>
+<span class="nc bnc" id="L206" title="All 2 branches missed.">                } else if (&quot;chunked&quot;.equalsIgnoreCase(chunkedHeader.getValue())) {</span>
+<span class="nc" id="L207">                    chunked = true;</span>
+                }
+<span class="nc" id="L209">            } else {</span>
+<span class="nc" id="L210">                remoteSize2 = Long.parseLong(contentLengthHeader.getValue());</span>
+<span class="nc bnc" id="L211" title="All 2 branches missed.">                if (remoteSize2 == 0) {</span>
+<span class="nc" id="L212">                    status = TemplateDownloader.Status.DOWNLOAD_FINISHED;</span>
+<span class="nc" id="L213">                    String downloaded = &quot;(download complete remote=&quot; + remoteSize + &quot;bytes)&quot;;</span>
+<span class="nc" id="L214">                    errorString = &quot;Downloaded &quot; + totalBytes + &quot; bytes &quot; + downloaded;</span>
+<span class="nc" id="L215">                    downloadTime = 0;</span>
+<span class="nc" id="L216">                    return 0;</span>
+                }
+            }
+
+<span class="nc bnc" id="L220" title="All 2 branches missed.">            if (remoteSize == 0) {</span>
+<span class="nc" id="L221">                remoteSize = remoteSize2;</span>
+            }
+
+<span class="nc bnc" id="L224" title="All 2 branches missed.">            if (remoteSize &gt; maxTemplateSizeInBytes) {</span>
+<span class="nc" id="L225">                s_logger.info(&quot;Remote size is too large: &quot; + remoteSize + &quot; , max=&quot; + maxTemplateSizeInBytes);</span>
+<span class="nc" id="L226">                status = Status.UNRECOVERABLE_ERROR;</span>
+<span class="nc" id="L227">                errorString = &quot;Download file size is too large&quot;;</span>
+<span class="nc" id="L228">                return 0;</span>
+            }
+
+<span class="nc bnc" id="L231" title="All 2 branches missed.">            if (remoteSize == 0) {</span>
+<span class="nc" id="L232">                remoteSize = maxTemplateSizeInBytes;</span>
+            }
+
+<span class="nc" id="L235">            URL url = new URL(getDownloadUrl());</span>
+<span class="nc" id="L236">            InputStream in = url.openStream();</span>
+
+<span class="nc" id="L238">            RandomAccessFile out = new RandomAccessFile(file, &quot;rw&quot;);</span>
+<span class="nc" id="L239">            out.seek(localFileSize);</span>
+
+<span class="nc" id="L241">            s_logger.info(&quot;Starting download from &quot; + getDownloadUrl() + &quot; to &quot; + toFile + &quot; remoteSize=&quot; + remoteSize + &quot; , max size=&quot; + maxTemplateSizeInBytes);</span>
+
+<span class="nc" id="L243">            byte[] block = new byte[CHUNK_SIZE];</span>
+<span class="nc" id="L244">            long offset = 0;</span>
+<span class="nc" id="L245">            boolean done = false;</span>
+<span class="nc" id="L246">            boolean verifiedFormat=false;</span>
+<span class="nc" id="L247">            status = TemplateDownloader.Status.IN_PROGRESS;</span>
+<span class="nc bnc" id="L248" title="All 6 branches missed.">            while (!done &amp;&amp; status != Status.ABORTED &amp;&amp; offset &lt;= remoteSize) {</span>
+<span class="nc bnc" id="L249" title="All 2 branches missed.">                if ((bytes = in.read(block, 0, CHUNK_SIZE)) &gt; -1) {</span>
+<span class="nc" id="L250">                    out.write(block, 0, bytes);</span>
+<span class="nc" id="L251">                    offset += bytes;</span>
+<span class="nc" id="L252">                    out.seek(offset);</span>
+<span class="nc" id="L253">                    totalBytes += bytes;</span>
+<span class="nc bnc" id="L254" title="All 6 branches missed.">                        if (!verifiedFormat &amp;&amp; (offset &gt;= 1048576 || offset &gt;= remoteSize)) { //let's check format after we get 1MB or full file</span>
+<span class="nc" id="L255">                        String uripath = null;</span>
+                        try {
+<span class="nc" id="L257">                            URI str = new URI(getDownloadUrl());</span>
+<span class="nc" id="L258">                            uripath = str.getPath();</span>
+<span class="nc" id="L259">                        } catch (URISyntaxException e) {</span>
+<span class="nc" id="L260">                            s_logger.warn(&quot;Invalid download url: &quot; + getDownloadUrl() + &quot;, This should not happen since we have validated the url before!!&quot;);</span>
+                        }
+<span class="nc" id="L262">                        String unsupportedFormat = ImageStoreUtil.checkTemplateFormat(file.getAbsolutePath(), uripath);</span>
+<span class="nc bnc" id="L263" title="All 4 branches missed.">                            if (unsupportedFormat == null || !unsupportedFormat.isEmpty()) {</span>
+                                 try {
+<span class="nc" id="L265">                                     request.abort();</span>
+<span class="nc" id="L266">                                     out.close();</span>
+<span class="nc" id="L267">                                     in.close();</span>
+<span class="nc" id="L268">                                 } catch (Exception ex) {</span>
+<span class="nc" id="L269">                                     s_logger.debug(&quot;Error on http connection : &quot; + ex.getMessage());</span>
+                                 }
+<span class="nc" id="L271">                                 status = Status.UNRECOVERABLE_ERROR;</span>
+<span class="nc" id="L272">                                 errorString = &quot;Template content is unsupported, or mismatch between selected format and template content. Found  : &quot; + unsupportedFormat;</span>
+<span class="nc" id="L273">                                 return 0;</span>
+                            }
+<span class="nc" id="L275">                            s_logger.debug(&quot;Verified format of downloading file &quot; + file.getAbsolutePath() + &quot; is supported&quot;);</span>
+<span class="nc" id="L276">                            verifiedFormat = true;</span>
+                        }
+<span class="nc" id="L278">                } else {</span>
+<span class="nc" id="L279">                    done = true;</span>
+                }
+            }
+<span class="nc" id="L282">            out.getFD().sync();</span>
+
+<span class="nc" id="L284">            Date finish = new Date();</span>
+<span class="nc" id="L285">            String downloaded = &quot;(incomplete download)&quot;;</span>
+<span class="nc bnc" id="L286" title="All 2 branches missed.">            if (totalBytes &gt;= remoteSize) {</span>
+<span class="nc" id="L287">                status = TemplateDownloader.Status.DOWNLOAD_FINISHED;</span>
+<span class="nc" id="L288">                downloaded = &quot;(download complete remote=&quot; + remoteSize + &quot;bytes)&quot;;</span>
+            }
+<span class="nc" id="L290">            errorString = &quot;Downloaded &quot; + totalBytes + &quot; bytes &quot; + downloaded;</span>
+<span class="nc" id="L291">            downloadTime += finish.getTime() - start.getTime();</span>
+<span class="nc" id="L292">            in.close();</span>
+<span class="nc" id="L293">            out.close();</span>
+
+<span class="nc" id="L295">            return totalBytes;</span>
+<span class="nc" id="L296">        } catch (HttpException hte) {</span>
+<span class="nc" id="L297">            status = TemplateDownloader.Status.UNRECOVERABLE_ERROR;</span>
+<span class="nc" id="L298">            errorString = hte.getMessage();</span>
+<span class="nc" id="L299">        } catch (IOException ioe) {</span>
+<span class="nc" id="L300">            status = TemplateDownloader.Status.UNRECOVERABLE_ERROR; //probably a file write error?</span>
+<span class="nc" id="L301">            errorString = ioe.getMessage();</span>
+<span class="nc" id="L302">        } finally {</span>
+<span class="nc bnc" id="L303" title="All 60 branches missed.">            if (status == Status.UNRECOVERABLE_ERROR &amp;&amp; file.exists() &amp;&amp; !file.isDirectory()) {</span>
+<span class="nc" id="L304">                file.delete();</span>
+            }
+<span class="nc" id="L306">            request.releaseConnection();</span>
+<span class="nc bnc" id="L307" title="All 20 branches missed.">            if (callback != null) {</span>
+<span class="nc" id="L308">                callback.downloadComplete(status);</span>
+            }
+<span class="nc" id="L310">        }</span>
+<span class="nc" id="L311">        return 0;</span>
+    }
+
+    public String getDownloadUrl() {
+<span class="nc" id="L315">        return downloadUrl;</span>
+    }
+
+    public String getToFile() {
+<span class="nc" id="L319">        File file = new File(toFile);</span>
+
+<span class="nc" id="L321">        return file.getAbsolutePath();</span>
+    }
+
+    @Override
+    public TemplateDownloader.Status getStatus() {
+<span class="nc" id="L326">        return status;</span>
+    }
+
+    @Override
+    public long getDownloadTime() {
+<span class="nc" id="L331">        return downloadTime;</span>
+    }
+
+    @Override
+    public long getDownloadedBytes() {
+<span class="nc" id="L336">        return totalBytes;</span>
+    }
+
+    @Override
+    @SuppressWarnings(&quot;fallthrough&quot;)
+    public boolean stopDownload() {
+<span class="nc bnc" id="L342" title="All 4 branches missed.">        switch (getStatus()) {</span>
+            case IN_PROGRESS:
+<span class="nc bnc" id="L344" title="All 2 branches missed.">                if (request != null) {</span>
+<span class="nc" id="L345">                    request.abort();</span>
+                }
+<span class="nc" id="L347">                status = TemplateDownloader.Status.ABORTED;</span>
+<span class="nc" id="L348">                return true;</span>
+            case UNKNOWN:
+            case NOT_STARTED:
+            case RECOVERABLE_ERROR:
+            case UNRECOVERABLE_ERROR:
+            case ABORTED:
+<span class="nc" id="L354">                status = TemplateDownloader.Status.ABORTED;</span>
+            case DOWNLOAD_FINISHED:
+<span class="nc" id="L356">                File f = new File(toFile);</span>
+<span class="nc bnc" id="L357" title="All 2 branches missed.">                if (f.exists()) {</span>
+<span class="nc" id="L358">                    f.delete();</span>
+                }
+<span class="nc" id="L360">                return true;</span>
+
+            default:
+<span class="nc" id="L363">                return true;</span>
+        }
+    }
+
+    @Override
+    public int getDownloadPercent() {
+<span class="nc bnc" id="L369" title="All 2 branches missed.">        if (remoteSize == 0) {</span>
+<span class="nc" id="L370">            return 0;</span>
+        }
+
+<span class="nc" id="L373">        return (int)(100.0 * totalBytes / remoteSize);</span>
+    }
+
+    @Override
+    protected void runInContext() {
+        try {
+<span class="nc" id="L379">            download(resume, completionCallback);</span>
+<span class="nc" id="L380">        } catch (Throwable t) {</span>
+<span class="nc" id="L381">            s_logger.warn(&quot;Caught exception during download &quot; + t.getMessage(), t);</span>
+<span class="nc" id="L382">            errorString = &quot;Failed to install: &quot; + t.getMessage();</span>
+<span class="nc" id="L383">            status = TemplateDownloader.Status.UNRECOVERABLE_ERROR;</span>
+        }
+
+<span class="nc" id="L386">    }</span>
+
+    @Override
+    public void setStatus(TemplateDownloader.Status status) {
+<span class="nc" id="L390">        this.status = status;</span>
+<span class="nc" id="L391">    }</span>
+
+    public boolean isResume() {
+<span class="nc" id="L394">        return resume;</span>
+    }
+
+    @Override
+    public String getDownloadError() {
+<span class="nc" id="L399">        return errorString;</span>
+    }
+
+    @Override
+    public String getDownloadLocalPath() {
+<span class="nc" id="L404">        return getToFile();</span>
+    }
+
+    @Override
+    public void setResume(boolean resume) {
+<span class="nc" id="L409">        this.resume = resume;</span>
+<span class="nc" id="L410">    }</span>
+
+    public void setToDir(String toDir) {
+<span class="nc" id="L413">        this.toDir = toDir;</span>
+<span class="nc" id="L414">    }</span>
+
+    public String getToDir() {
+<span class="nc" id="L417">        return toDir;</span>
+    }
+
+    @Override
+    public long getMaxTemplateSizeInBytes() {
+<span class="nc" id="L422">        return maxTemplateSizeInBytes;</span>
+    }
+
+    public static void main(String[] args) {
+<span class="nc" id="L426">        String url = &quot;http:// dev.mysql.com/get/Downloads/MySQL-5.0/mysql-noinstall-5.0.77-win32.zip/from/http://mirror.services.wisc.edu/mysql/&quot;;</span>
+        try {
+<span class="nc" id="L428">            new java.net.URI(url);</span>
+<span class="nc" id="L429">        } catch (URISyntaxException e) {</span>
+            // TODO Auto-generated catch block
+<span class="nc" id="L431">            e.printStackTrace();</span>
+        }
+<span class="nc" id="L433">        TemplateDownloader td = new HttpTemplateDownloader(null, url, &quot;/tmp/mysql&quot;, null, TemplateDownloader.DEFAULT_MAX_TEMPLATE_SIZE_IN_BYTES, null, null, null, null);</span>
+<span class="nc" id="L434">        long bytes = td.download(true, null);</span>
+<span class="nc bnc" id="L435" title="All 2 branches missed.">        if (bytes &gt; 0) {</span>
+<span class="nc" id="L436">            System.out.println(&quot;Downloaded  (&quot; + bytes + &quot; bytes)&quot; + &quot; in &quot; + td.getDownloadTime() / 1000 + &quot; secs&quot;);</span>
+<span class="nc" id="L437">        } else {</span>
+<span class="nc" id="L438">            System.out.println(&quot;Failed download&quot;);</span>
+        }
+
+<span class="nc" id="L441">    }</span>
+
+    @Override
+    public void setDownloadError(String error) {
+<span class="nc" id="L445">        errorString = error;</span>
+<span class="nc" id="L446">    }</span>
+
+    @Override
+    public boolean isInited() {
+<span class="nc" id="L450">        return inited;</span>
+    }
+
+    public ResourceType getResourceType() {
+<span class="nc" id="L454">        return resourceType;</span>
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>cloud-core (18-mrt-2016 13:14:54)</div></body></html>

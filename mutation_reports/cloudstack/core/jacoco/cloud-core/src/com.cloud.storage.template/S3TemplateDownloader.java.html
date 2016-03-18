@@ -1,0 +1,377 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>S3TemplateDownloader.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">cloud-core (18-mrt-2016 13:14:54)</a> &gt; <a href="../../index.html" class="el_group">cloud-core</a> &gt; <a href="../index.html" class="el_bundle">src</a> &gt; <a href="index.source.html" class="el_package">com.cloud.storage.template</a> &gt; <span class="el_source">S3TemplateDownloader.java</span></div><h1>S3TemplateDownloader.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">//</span>
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// &quot;License&quot;); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+//
+
+package com.cloud.storage.template;
+
+import com.amazonaws.event.ProgressEvent;
+import com.amazonaws.event.ProgressEventType;
+import com.amazonaws.event.ProgressListener;
+import com.amazonaws.services.s3.model.ObjectMetadata;
+import com.amazonaws.services.s3.model.PutObjectRequest;
+import com.amazonaws.services.s3.model.StorageClass;
+import com.amazonaws.services.s3.transfer.Upload;
+import com.cloud.agent.api.to.S3TO;
+import com.cloud.utils.net.HTTPUtils;
+import com.cloud.utils.net.Proxy;
+import com.cloud.utils.storage.S3.S3Utils;
+import org.apache.cloudstack.managed.context.ManagedContextRunnable;
+import org.apache.cloudstack.storage.command.DownloadCommand.ResourceType;
+import org.apache.commons.httpclient.Header;
+import org.apache.commons.httpclient.HttpClient;
+import org.apache.commons.httpclient.URIException;
+import org.apache.commons.httpclient.methods.GetMethod;
+import org.apache.commons.httpclient.params.HttpMethodParams;
+import org.apache.commons.lang.StringUtils;
+import org.apache.log4j.Logger;
+
+import java.io.BufferedInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.Date;
+
+import static com.cloud.utils.StringUtils.join;
+import static java.util.Arrays.asList;
+
+/**
+ * Download a template file using HTTP(S)
+ *
+ * This class, once instantiated, has the purpose to download a single Template to an S3 Image Store.
+ *
+ * Execution of the instance is started when runInContext() is called.
+ */
+public class S3TemplateDownloader extends ManagedContextRunnable implements TemplateDownloader {
+<span class="nc" id="L59">    private static final Logger LOGGER = Logger.getLogger(S3TemplateDownloader.class.getName());</span>
+
+    private final String downloadUrl;
+    private final String s3Key;
+    private final String fileExtension;
+    private final HttpClient httpClient;
+    private final GetMethod getMethod;
+    private final DownloadCompleteCallback downloadCompleteCallback;
+    private final S3TO s3TO;
+<span class="nc" id="L68">    private String errorString = &quot;&quot;;</span>
+<span class="nc" id="L69">    private TemplateDownloader.Status status = TemplateDownloader.Status.NOT_STARTED;</span>
+<span class="nc" id="L70">    private ResourceType resourceType = ResourceType.TEMPLATE;</span>
+    private long remoteSize;
+    private long downloadTime;
+    private long totalBytes;
+    private long maxTemplateSizeInByte;
+
+<span class="nc" id="L76">    private boolean resume = false;</span>
+
+<span class="nc" id="L78">    public S3TemplateDownloader(S3TO s3TO, String downloadUrl, String installPath, DownloadCompleteCallback downloadCompleteCallback,</span>
+            long maxTemplateSizeInBytes, String username, String password, Proxy proxy, ResourceType resourceType) {
+<span class="nc" id="L80">        this.downloadUrl = downloadUrl;</span>
+<span class="nc" id="L81">        this.s3TO = s3TO;</span>
+<span class="nc" id="L82">        this.resourceType = resourceType;</span>
+<span class="nc" id="L83">        this.maxTemplateSizeInByte = maxTemplateSizeInBytes;</span>
+<span class="nc" id="L84">        this.httpClient = HTTPUtils.getHTTPClient();</span>
+<span class="nc" id="L85">        this.downloadCompleteCallback = downloadCompleteCallback;</span>
+
+        // Create a GET method for the download url.
+<span class="nc" id="L88">        this.getMethod = new GetMethod(downloadUrl);</span>
+
+        // Set the retry handler, default to retry 5 times.
+<span class="nc" id="L91">        this.getMethod.getParams().setParameter(HttpMethodParams.RETRY_HANDLER, HTTPUtils.getHttpMethodRetryHandler(5));</span>
+
+        // Follow redirects
+<span class="nc" id="L94">        this.getMethod.setFollowRedirects(true);</span>
+
+        // Set file extension.
+<span class="nc" id="L97">        this.fileExtension = StringUtils.substringAfterLast(StringUtils.substringAfterLast(downloadUrl, &quot;/&quot;), &quot;.&quot;);</span>
+
+        // Calculate and set S3 Key.
+<span class="nc" id="L100">        this.s3Key = join(asList(installPath, StringUtils.substringAfterLast(downloadUrl, &quot;/&quot;)), S3Utils.SEPARATOR);</span>
+
+        // Set proxy if available.
+<span class="nc" id="L103">        HTTPUtils.setProxy(proxy, this.httpClient);</span>
+
+        // Set credentials if available.
+<span class="nc" id="L106">        HTTPUtils.setCredentials(username, password, this.httpClient);</span>
+<span class="nc" id="L107">    }</span>
+
+    @Override
+    public long download(boolean resume, DownloadCompleteCallback callback) {
+<span class="nc bnc" id="L111" title="All 2 branches missed.">        if (!status.equals(Status.NOT_STARTED)) {</span>
+            // Only start downloading if we haven't started yet.
+<span class="nc" id="L113">            LOGGER.debug(&quot;Template download is already started, not starting again. Template: &quot; + downloadUrl);</span>
+
+<span class="nc" id="L115">            return 0;</span>
+        }
+
+        int responseCode;
+<span class="nc bnc" id="L119" title="All 2 branches missed.">        if ((responseCode = HTTPUtils.executeMethod(httpClient, getMethod)) == -1) {</span>
+<span class="nc" id="L120">            errorString = &quot;Exception while executing HttpMethod &quot; + getMethod.getName() + &quot; on URL &quot; + downloadUrl;</span>
+<span class="nc" id="L121">            LOGGER.warn(errorString);</span>
+
+<span class="nc" id="L123">            status = Status.UNRECOVERABLE_ERROR;</span>
+<span class="nc" id="L124">            return 0;</span>
+        }
+
+<span class="nc bnc" id="L127" title="All 2 branches missed.">        if (!HTTPUtils.verifyResponseCode(responseCode)) {</span>
+<span class="nc" id="L128">            errorString = &quot;Response code for GetMethod of &quot; + downloadUrl + &quot; is incorrect, responseCode: &quot; + responseCode;</span>
+<span class="nc" id="L129">            LOGGER.warn(errorString);</span>
+
+<span class="nc" id="L131">            status = Status.UNRECOVERABLE_ERROR;</span>
+<span class="nc" id="L132">            return 0;</span>
+        }
+
+        // Headers
+<span class="nc" id="L136">        Header contentLengthHeader = getMethod.getResponseHeader(&quot;Content-Length&quot;);</span>
+<span class="nc" id="L137">        Header contentTypeHeader = getMethod.getResponseHeader(&quot;Content-Type&quot;);</span>
+
+        // Check the contentLengthHeader and transferEncodingHeader.
+<span class="nc bnc" id="L140" title="All 2 branches missed.">        if (contentLengthHeader == null) {</span>
+<span class="nc" id="L141">            errorString = &quot;The ContentLengthHeader of &quot; + downloadUrl + &quot; isn't supplied&quot;;</span>
+<span class="nc" id="L142">            LOGGER.warn(errorString);</span>
+
+<span class="nc" id="L144">            status = Status.UNRECOVERABLE_ERROR;</span>
+<span class="nc" id="L145">            return 0;</span>
+        } else {
+            // The ContentLengthHeader is supplied, parse it's value.
+<span class="nc" id="L148">            remoteSize = Long.parseLong(contentLengthHeader.getValue());</span>
+        }
+
+<span class="nc bnc" id="L151" title="All 2 branches missed.">        if (remoteSize &gt; maxTemplateSizeInByte) {</span>
+<span class="nc" id="L152">            errorString = &quot;Remote size is too large for template &quot; + downloadUrl + &quot; remote size is &quot; + remoteSize + &quot; max allowed is &quot; + maxTemplateSizeInByte;</span>
+<span class="nc" id="L153">            LOGGER.warn(errorString);</span>
+
+<span class="nc" id="L155">            status = Status.UNRECOVERABLE_ERROR;</span>
+<span class="nc" id="L156">            return 0;</span>
+        }
+
+        InputStream inputStream;
+
+        try {
+<span class="nc" id="L162">            inputStream = new BufferedInputStream(getMethod.getResponseBodyAsStream());</span>
+<span class="nc" id="L163">        } catch (IOException e) {</span>
+<span class="nc" id="L164">            errorString = &quot;Exception occurred while opening InputStream for template &quot; + downloadUrl;</span>
+<span class="nc" id="L165">            LOGGER.warn(errorString);</span>
+
+<span class="nc" id="L167">            status = Status.UNRECOVERABLE_ERROR;</span>
+<span class="nc" id="L168">            return 0;</span>
+        }
+
+<span class="nc" id="L171">        LOGGER.info(&quot;Starting download from &quot; + downloadUrl + &quot; to S3 bucket &quot; + s3TO.getBucketName() + &quot; and size &quot; + remoteSize + &quot; bytes&quot;);</span>
+
+        // Time the upload starts.
+<span class="nc" id="L174">        final Date start = new Date();</span>
+
+<span class="nc" id="L176">        ObjectMetadata objectMetadata = new ObjectMetadata();</span>
+<span class="nc" id="L177">        objectMetadata.setContentLength(remoteSize);</span>
+
+<span class="nc bnc" id="L179" title="All 2 branches missed.">        if (contentTypeHeader.getValue() != null) {</span>
+<span class="nc" id="L180">            objectMetadata.setContentType(contentTypeHeader.getValue());</span>
+        }
+
+        // Create the PutObjectRequest.
+<span class="nc" id="L184">        PutObjectRequest putObjectRequest = new PutObjectRequest(s3TO.getBucketName(), s3Key, inputStream, objectMetadata);</span>
+
+        // If reduced redundancy is enabled, set it.
+<span class="nc bnc" id="L187" title="All 2 branches missed.">        if (s3TO.getEnableRRS()) {</span>
+<span class="nc" id="L188">            putObjectRequest.withStorageClass(StorageClass.ReducedRedundancy);</span>
+        }
+
+<span class="nc" id="L191">        Upload upload = S3Utils.putObject(s3TO, putObjectRequest);</span>
+
+<span class="nc" id="L193">        upload.addProgressListener(new ProgressListener() {</span>
+            @Override
+            public void progressChanged(ProgressEvent progressEvent) {
+
+                // Record the amount of bytes transferred.
+<span class="nc" id="L198">                totalBytes += progressEvent.getBytesTransferred();</span>
+
+<span class="nc" id="L200">                LOGGER.trace(&quot;Template download from &quot; + downloadUrl + &quot; to S3 bucket &quot; + s3TO.getBucketName() + &quot; transferred  &quot; + totalBytes + &quot; in &quot; + ((new Date().getTime() - start.getTime()) / 1000) + &quot; seconds&quot;);</span>
+
+<span class="nc bnc" id="L202" title="All 2 branches missed.">                if (progressEvent.getEventType() == ProgressEventType.TRANSFER_STARTED_EVENT) {</span>
+<span class="nc" id="L203">                    status = Status.IN_PROGRESS;</span>
+<span class="nc bnc" id="L204" title="All 2 branches missed.">                } else if (progressEvent.getEventType() == ProgressEventType.TRANSFER_COMPLETED_EVENT) {</span>
+<span class="nc" id="L205">                    status = Status.DOWNLOAD_FINISHED;</span>
+<span class="nc bnc" id="L206" title="All 2 branches missed.">                } else if (progressEvent.getEventType() == ProgressEventType.TRANSFER_CANCELED_EVENT) {</span>
+<span class="nc" id="L207">                    status = Status.ABORTED;</span>
+<span class="nc bnc" id="L208" title="All 2 branches missed.">                } else if (progressEvent.getEventType() == ProgressEventType.TRANSFER_FAILED_EVENT) {</span>
+<span class="nc" id="L209">                    status = Status.UNRECOVERABLE_ERROR;</span>
+                }
+<span class="nc" id="L211">            }</span>
+        });
+
+        try {
+            // Wait for the upload to complete.
+<span class="nc" id="L216">            upload.waitForCompletion();</span>
+<span class="nc" id="L217">        } catch (InterruptedException e) {</span>
+            // Interruption while waiting for the upload to complete.
+<span class="nc" id="L219">            LOGGER.warn(&quot;Interruption occurred while waiting for upload of &quot; + downloadUrl + &quot; to complete&quot;);</span>
+        }
+
+<span class="nc" id="L222">        downloadTime = new Date().getTime() - start.getTime();</span>
+
+<span class="nc bnc" id="L224" title="All 2 branches missed.">        if (status == Status.DOWNLOAD_FINISHED) {</span>
+<span class="nc" id="L225">            LOGGER.info(&quot;Template download from &quot; + downloadUrl + &quot; to S3 bucket &quot; + s3TO.getBucketName() + &quot; transferred  &quot; + totalBytes + &quot; in &quot; + (downloadTime / 1000) + &quot; seconds, completed successfully!&quot;);</span>
+<span class="nc" id="L226">        } else {</span>
+<span class="nc" id="L227">            LOGGER.warn(&quot;Template download from &quot; + downloadUrl + &quot; to S3 bucket &quot; + s3TO.getBucketName() + &quot; transferred  &quot; + totalBytes + &quot; in &quot; + (downloadTime / 1000) + &quot; seconds, completed with status &quot; + status.toString());</span>
+        }
+
+        // Close input stream
+<span class="nc" id="L231">        getMethod.releaseConnection();</span>
+
+        // Call the callback!
+<span class="nc bnc" id="L234" title="All 2 branches missed.">        if (callback != null) {</span>
+<span class="nc" id="L235">            callback.downloadComplete(status);</span>
+        }
+
+<span class="nc" id="L238">        return totalBytes;</span>
+    }
+
+    public String getDownloadUrl() {
+        try {
+<span class="nc" id="L243">            return getMethod.getURI().toString();</span>
+<span class="nc" id="L244">        } catch (URIException e) {</span>
+<span class="nc" id="L245">            return null;</span>
+        }
+    }
+
+    @Override
+    public Status getStatus() {
+<span class="nc" id="L251">        return status;</span>
+    }
+
+    @Override
+    public long getDownloadTime() {
+<span class="nc" id="L256">        return downloadTime;</span>
+    }
+
+    @Override
+    public long getDownloadedBytes() {
+<span class="nc" id="L261">        return totalBytes;</span>
+    }
+
+    /**
+     * Returns an InputStream only when the status is DOWNLOAD_FINISHED.
+     *
+     * The caller of this method must close the InputStream to prevent resource leaks!
+     *
+     * @return S3ObjectInputStream of the object.
+     */
+    public InputStream getS3ObjectInputStream() {
+        // Check if the download is finished
+<span class="nc bnc" id="L273" title="All 2 branches missed.">        if (status != Status.DOWNLOAD_FINISHED) {</span>
+<span class="nc" id="L274">            return null;</span>
+        }
+
+<span class="nc" id="L277">        return S3Utils.getObjectStream(s3TO, s3TO.getBucketName(), s3Key);</span>
+    }
+
+    public void cleanupAfterError() {
+<span class="nc" id="L281">        LOGGER.warn(&quot;Cleanup after error, trying to remove object: &quot; + s3Key);</span>
+
+<span class="nc" id="L283">        S3Utils.deleteObject(s3TO, s3TO.getBucketName(), s3Key);</span>
+<span class="nc" id="L284">    }</span>
+
+    @Override
+    public boolean stopDownload() {
+<span class="nc bnc" id="L288" title="All 3 branches missed.">        switch (status) {</span>
+            case IN_PROGRESS:
+<span class="nc bnc" id="L290" title="All 2 branches missed.">                if (getMethod != null) {</span>
+<span class="nc" id="L291">                    getMethod.abort();</span>
+                }
+<span class="nc" id="L293">                break;</span>
+            case UNKNOWN:
+            case NOT_STARTED:
+            case RECOVERABLE_ERROR:
+            case UNRECOVERABLE_ERROR:
+            case ABORTED:
+            case DOWNLOAD_FINISHED:
+                // Remove the object if it already has been uploaded.
+<span class="nc" id="L301">                S3Utils.deleteObject(s3TO, s3TO.getBucketName(), s3Key);</span>
+<span class="nc" id="L302">                break;</span>
+            default:
+                break;
+        }
+
+<span class="nc" id="L307">        status = TemplateDownloader.Status.ABORTED;</span>
+<span class="nc" id="L308">        return true;</span>
+    }
+
+    @Override
+    public int getDownloadPercent() {
+<span class="nc bnc" id="L313" title="All 2 branches missed.">        if (remoteSize == 0) {</span>
+<span class="nc" id="L314">            return 0;</span>
+        }
+
+<span class="nc" id="L317">        return (int) (100.0 * totalBytes / remoteSize);</span>
+    }
+
+    @Override
+    protected void runInContext() {
+        // Start the download!
+<span class="nc" id="L323">        download(resume, downloadCompleteCallback);</span>
+<span class="nc" id="L324">    }</span>
+
+    @Override
+    public void setStatus(Status status) {
+<span class="nc" id="L328">        this.status = status;</span>
+<span class="nc" id="L329">    }</span>
+
+    public boolean isResume() {
+<span class="nc" id="L332">        return resume;</span>
+    }
+
+    @Override
+    public String getDownloadError() {
+<span class="nc" id="L337">        return errorString;</span>
+    }
+
+    @Override
+    public String getDownloadLocalPath() {
+<span class="nc" id="L342">        return s3Key;</span>
+    }
+
+    @Override
+    public void setResume(boolean resume) {
+<span class="nc" id="L347">        this.resume = resume;</span>
+<span class="nc" id="L348">    }</span>
+
+    @Override
+    public long getMaxTemplateSizeInBytes() {
+<span class="nc" id="L352">        return maxTemplateSizeInByte;</span>
+    }
+
+    @Override
+    public void setDownloadError(String error) {
+<span class="nc" id="L357">        errorString = error;</span>
+<span class="nc" id="L358">    }</span>
+
+    @Override
+    public boolean isInited() {
+<span class="nc" id="L362">        return true;</span>
+    }
+
+    public ResourceType getResourceType() {
+<span class="nc" id="L366">        return resourceType;</span>
+    }
+
+    public long getTotalBytes() {
+<span class="nc" id="L370">        return totalBytes;</span>
+    }
+
+    public String getFileExtension() {
+<span class="nc" id="L374">        return fileExtension;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>cloud-core (18-mrt-2016 13:14:54)</div></body></html>

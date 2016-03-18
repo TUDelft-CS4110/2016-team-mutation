@@ -1,0 +1,401 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>VirtualRoutingResource.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">cloud-core (18-mrt-2016 13:14:54)</a> &gt; <a href="../../index.html" class="el_group">cloud-core</a> &gt; <a href="../index.html" class="el_bundle">src</a> &gt; <a href="index.source.html" class="el_package">com.cloud.agent.resource.virtualnetwork</a> &gt; <span class="el_source">VirtualRoutingResource.java</span></div><h1>VirtualRoutingResource.java</h1><pre class="source lang-java linenums">//
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// &quot;License&quot;); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+//
+
+package com.cloud.agent.resource.virtualnetwork;
+
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.nio.channels.SocketChannel;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Queue;
+import java.util.UUID;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+
+import javax.naming.ConfigurationException;
+
+import org.apache.log4j.Logger;
+
+import com.cloud.agent.api.Answer;
+import com.cloud.agent.api.CheckRouterAnswer;
+import com.cloud.agent.api.CheckRouterCommand;
+import com.cloud.agent.api.CheckS2SVpnConnectionsAnswer;
+import com.cloud.agent.api.CheckS2SVpnConnectionsCommand;
+import com.cloud.agent.api.GetDomRVersionAnswer;
+import com.cloud.agent.api.GetDomRVersionCmd;
+import com.cloud.agent.api.GetRouterAlertsAnswer;
+import com.cloud.agent.api.routing.AggregationControlCommand;
+import com.cloud.agent.api.routing.AggregationControlCommand.Action;
+import com.cloud.agent.api.routing.GetRouterAlertsCommand;
+import com.cloud.agent.api.routing.GroupAnswer;
+import com.cloud.agent.api.routing.NetworkElementCommand;
+import com.cloud.agent.resource.virtualnetwork.facade.AbstractConfigItemFacade;
+import com.cloud.utils.ExecutionResult;
+import com.cloud.utils.NumbersUtil;
+import com.cloud.utils.exception.CloudRuntimeException;
+
+/**
+ * VirtualNetworkResource controls and configures virtual networking
+ *
+ * @config
+ * {@table
+ *    || Param Name | Description | Values | Default ||
+ *  }
+ **/
+<span class="nc bnc" id="L65" title="All 2 branches missed.">public class VirtualRoutingResource {</span>
+
+<span class="nc" id="L67">    private static final Logger s_logger = Logger.getLogger(VirtualRoutingResource.class);</span>
+    private VirtualRouterDeployer _vrDeployer;
+    private Map&lt;String, Queue&lt;NetworkElementCommand&gt;&gt; _vrAggregateCommandsSet;
+<span class="nc" id="L70">    protected Map&lt;String, Lock&gt; _vrLockMap = new HashMap&lt;String, Lock&gt;();</span>
+
+    private String _name;
+    private int _sleep;
+    private int _retry;
+    private int _port;
+    private int _eachTimeout;
+
+<span class="nc" id="L78">    private String _cfgVersion = &quot;1.0&quot;;</span>
+
+<span class="nc" id="L80">    public VirtualRoutingResource(VirtualRouterDeployer deployer) {</span>
+<span class="nc" id="L81">        _vrDeployer = deployer;</span>
+<span class="nc" id="L82">    }</span>
+
+    public Answer executeRequest(final NetworkElementCommand cmd) {
+<span class="nc" id="L85">        boolean aggregated = false;</span>
+<span class="nc" id="L86">        String routerName = cmd.getAccessDetail(NetworkElementCommand.ROUTER_NAME);</span>
+        Lock lock;
+<span class="nc bnc" id="L88" title="All 2 branches missed.">        if (_vrLockMap.containsKey(routerName)) {</span>
+<span class="nc" id="L89">            lock = _vrLockMap.get(routerName);</span>
+<span class="nc" id="L90">        } else {</span>
+<span class="nc" id="L91">            lock = new ReentrantLock();</span>
+<span class="nc" id="L92">            _vrLockMap.put(routerName, lock);</span>
+        }
+<span class="nc" id="L94">        lock.lock();</span>
+
+        try {
+<span class="nc" id="L97">            ExecutionResult rc = _vrDeployer.prepareCommand(cmd);</span>
+<span class="nc bnc" id="L98" title="All 2 branches missed.">            if (!rc.isSuccess()) {</span>
+<span class="nc" id="L99">                s_logger.error(&quot;Failed to prepare VR command due to &quot; + rc.getDetails());</span>
+<span class="nc" id="L100">                return new Answer(cmd, false, rc.getDetails());</span>
+            }
+
+<span class="nc bnc" id="L103" title="All 4 branches missed.">            assert cmd.getRouterAccessIp() != null : &quot;Why there is no access IP for VR?&quot;;</span>
+
+<span class="nc bnc" id="L105" title="All 2 branches missed.">            if (cmd.isQuery()) {</span>
+<span class="nc" id="L106">                return executeQueryCommand(cmd);</span>
+            }
+
+<span class="nc bnc" id="L109" title="All 2 branches missed.">            if (cmd instanceof AggregationControlCommand) {</span>
+<span class="nc" id="L110">                return execute((AggregationControlCommand)cmd);</span>
+            }
+
+<span class="nc bnc" id="L113" title="All 2 branches missed.">            if (_vrAggregateCommandsSet.containsKey(routerName)) {</span>
+<span class="nc" id="L114">                _vrAggregateCommandsSet.get(routerName).add(cmd);</span>
+<span class="nc" id="L115">                aggregated = true;</span>
+                // Clean up would be done after command has been executed
+                //TODO: Deal with group answer as well
+<span class="nc" id="L118">                return new Answer(cmd);</span>
+            }
+
+<span class="nc" id="L121">            List&lt;ConfigItem&gt; cfg = generateCommandCfg(cmd);</span>
+<span class="nc bnc" id="L122" title="All 2 branches missed.">            if (cfg == null) {</span>
+<span class="nc" id="L123">                return Answer.createUnsupportedCommandAnswer(cmd);</span>
+            }
+
+<span class="nc" id="L126">            return applyConfig(cmd, cfg);</span>
+<span class="nc" id="L127">        } catch (final IllegalArgumentException e) {</span>
+<span class="nc" id="L128">            return new Answer(cmd, false, e.getMessage());</span>
+<span class="nc" id="L129">        } finally {</span>
+<span class="nc" id="L130">            lock.unlock();</span>
+<span class="nc bnc" id="L131" title="All 16 branches missed.">            if (!aggregated) {</span>
+<span class="nc" id="L132">                ExecutionResult rc = _vrDeployer.cleanupCommand(cmd);</span>
+<span class="nc bnc" id="L133" title="All 16 branches missed.">                if (!rc.isSuccess()) {</span>
+<span class="nc" id="L134">                    s_logger.error(&quot;Failed to cleanup VR command due to &quot; + rc.getDetails());</span>
+                }
+            }
+<span class="nc" id="L137">        }</span>
+    }
+
+    private Answer executeQueryCommand(NetworkElementCommand cmd) {
+<span class="nc bnc" id="L141" title="All 2 branches missed.">        if (cmd instanceof CheckRouterCommand) {</span>
+<span class="nc" id="L142">            return execute((CheckRouterCommand)cmd);</span>
+<span class="nc bnc" id="L143" title="All 2 branches missed.">        } else if (cmd instanceof GetDomRVersionCmd) {</span>
+<span class="nc" id="L144">            return execute((GetDomRVersionCmd)cmd);</span>
+<span class="nc bnc" id="L145" title="All 2 branches missed.">        } else if (cmd instanceof CheckS2SVpnConnectionsCommand) {</span>
+<span class="nc" id="L146">            return execute((CheckS2SVpnConnectionsCommand) cmd);</span>
+<span class="nc bnc" id="L147" title="All 2 branches missed.">        } else if (cmd instanceof GetRouterAlertsCommand) {</span>
+<span class="nc" id="L148">            return execute((GetRouterAlertsCommand)cmd);</span>
+        } else {
+<span class="nc" id="L150">            s_logger.error(&quot;Unknown query command in VirtualRoutingResource!&quot;);</span>
+<span class="nc" id="L151">            return Answer.createUnsupportedCommandAnswer(cmd);</span>
+        }
+    }
+
+    private ExecutionResult applyConfigToVR(String routerAccessIp, ConfigItem c) {
+<span class="nc" id="L156">        return applyConfigToVR(routerAccessIp, c, VRScripts.DEFAULT_EXECUTEINVR_TIMEOUT);</span>
+    }
+
+    private ExecutionResult applyConfigToVR(String routerAccessIp, ConfigItem c, int timeout) {
+<span class="nc bnc" id="L160" title="All 2 branches missed.">        if (c instanceof FileConfigItem) {</span>
+<span class="nc" id="L161">            FileConfigItem configItem = (FileConfigItem)c;</span>
+<span class="nc" id="L162">            return _vrDeployer.createFileInVR(routerAccessIp, configItem.getFilePath(), configItem.getFileName(), configItem.getFileContents());</span>
+<span class="nc bnc" id="L163" title="All 2 branches missed.">        } else if (c instanceof ScriptConfigItem) {</span>
+<span class="nc" id="L164">            ScriptConfigItem configItem = (ScriptConfigItem)c;</span>
+<span class="nc" id="L165">            return _vrDeployer.executeInVR(routerAccessIp, configItem.getScript(), configItem.getArgs(), timeout);</span>
+        }
+<span class="nc" id="L167">        throw new CloudRuntimeException(&quot;Unable to apply unknown configitem of type &quot; + c.getClass().getSimpleName());</span>
+    }
+
+
+    private Answer applyConfig(NetworkElementCommand cmd, List&lt;ConfigItem&gt; cfg) {
+
+
+<span class="nc bnc" id="L174" title="All 2 branches missed.">        if (cfg.isEmpty()) {</span>
+<span class="nc" id="L175">            return new Answer(cmd, true, &quot;Nothing to do&quot;);</span>
+        }
+
+<span class="nc" id="L178">        List&lt;ExecutionResult&gt; results = new ArrayList&lt;ExecutionResult&gt;();</span>
+<span class="nc" id="L179">        List&lt;String&gt; details = new ArrayList&lt;String&gt;();</span>
+<span class="nc" id="L180">        boolean finalResult = false;</span>
+<span class="nc bnc" id="L181" title="All 2 branches missed.">        for (ConfigItem configItem : cfg) {</span>
+<span class="nc" id="L182">            long startTimestamp = System.currentTimeMillis();</span>
+<span class="nc" id="L183">            ExecutionResult result = applyConfigToVR(cmd.getRouterAccessIp(), configItem);</span>
+<span class="nc bnc" id="L184" title="All 2 branches missed.">            if (s_logger.isDebugEnabled()) {</span>
+<span class="nc" id="L185">                long elapsed = System.currentTimeMillis() - startTimestamp;</span>
+<span class="nc" id="L186">                s_logger.debug(&quot;Processing &quot; + configItem + &quot; took &quot; + elapsed + &quot;ms&quot;);</span>
+            }
+<span class="nc bnc" id="L188" title="All 2 branches missed.">            if (result == null) {</span>
+<span class="nc" id="L189">                result = new ExecutionResult(false, &quot;null execution result&quot;);</span>
+            }
+<span class="nc" id="L191">            results.add(result);</span>
+<span class="nc bnc" id="L192" title="All 2 branches missed.">            details.add(configItem.getInfo() + (result.isSuccess() ? &quot; - success: &quot; : &quot; - failed: &quot;) + result.getDetails());</span>
+<span class="nc" id="L193">            finalResult = result.isSuccess();</span>
+        }
+
+        // Not sure why this matters, but log it anyway
+<span class="nc bnc" id="L197" title="All 2 branches missed.">        if (cmd.getAnswersCount() != results.size()) {</span>
+<span class="nc" id="L198">            s_logger.warn(&quot;Expected &quot; + cmd.getAnswersCount() + &quot; answers while executing &quot; + cmd.getClass().getSimpleName() + &quot; but received &quot; + results.size());</span>
+        }
+
+
+<span class="nc bnc" id="L202" title="All 2 branches missed.">        if (results.size() == 1) {</span>
+<span class="nc" id="L203">            return new Answer(cmd, finalResult, results.get(0).getDetails());</span>
+        } else {
+<span class="nc" id="L205">            return new GroupAnswer(cmd, finalResult, results.size(), details.toArray(new String[details.size()]));</span>
+        }
+    }
+
+    private CheckS2SVpnConnectionsAnswer execute(CheckS2SVpnConnectionsCommand cmd) {
+
+<span class="nc" id="L211">        StringBuffer buff = new StringBuffer();</span>
+<span class="nc bnc" id="L212" title="All 2 branches missed.">        for (String ip : cmd.getVpnIps()) {</span>
+<span class="nc" id="L213">            buff.append(ip);</span>
+<span class="nc" id="L214">            buff.append(&quot; &quot;);</span>
+        }
+<span class="nc" id="L216">        ExecutionResult result = _vrDeployer.executeInVR(cmd.getRouterAccessIp(), VRScripts.S2SVPN_CHECK, buff.toString());</span>
+<span class="nc" id="L217">        return new CheckS2SVpnConnectionsAnswer(cmd, result.isSuccess(), result.getDetails());</span>
+    }
+
+    private GetRouterAlertsAnswer execute(GetRouterAlertsCommand cmd) {
+
+<span class="nc" id="L222">        String routerIp = cmd.getAccessDetail(NetworkElementCommand.ROUTER_IP);</span>
+<span class="nc" id="L223">        String args = cmd.getPreviousAlertTimeStamp();</span>
+
+<span class="nc" id="L225">        ExecutionResult result = _vrDeployer.executeInVR(routerIp, VRScripts.ROUTER_ALERTS, args);</span>
+<span class="nc" id="L226">        String alerts[] = null;</span>
+<span class="nc" id="L227">        String lastAlertTimestamp = null;</span>
+
+<span class="nc bnc" id="L229" title="All 2 branches missed.">        if (result.isSuccess()) {</span>
+<span class="nc bnc" id="L230" title="All 4 branches missed.">            if (!result.getDetails().isEmpty() &amp;&amp; !result.getDetails().trim().equals(&quot;No Alerts&quot;)) {</span>
+<span class="nc" id="L231">                alerts = result.getDetails().trim().split(&quot;\\\\n&quot;);</span>
+<span class="nc" id="L232">                String[] lastAlert = alerts[alerts.length - 1].split(&quot;,&quot;);</span>
+<span class="nc" id="L233">                lastAlertTimestamp = lastAlert[0];</span>
+            }
+<span class="nc" id="L235">            return new GetRouterAlertsAnswer(cmd, alerts, lastAlertTimestamp);</span>
+        } else {
+<span class="nc" id="L237">            return new GetRouterAlertsAnswer(cmd, result.getDetails());</span>
+        }
+    }
+
+    private Answer execute(CheckRouterCommand cmd) {
+<span class="nc" id="L242">        final ExecutionResult result = _vrDeployer.executeInVR(cmd.getRouterAccessIp(), VRScripts.RVR_CHECK, null);</span>
+<span class="nc bnc" id="L243" title="All 2 branches missed.">        if (!result.isSuccess()) {</span>
+<span class="nc" id="L244">            return new CheckRouterAnswer(cmd, result.getDetails());</span>
+        }
+<span class="nc" id="L246">        return new CheckRouterAnswer(cmd, result.getDetails(), true);</span>
+    }
+
+    private Answer execute(GetDomRVersionCmd cmd) {
+<span class="nc" id="L250">        final ExecutionResult result = _vrDeployer.executeInVR(cmd.getRouterAccessIp(), VRScripts.VERSION, null);</span>
+<span class="nc bnc" id="L251" title="All 2 branches missed.">        if (!result.isSuccess()) {</span>
+<span class="nc" id="L252">            return new GetDomRVersionAnswer(cmd, &quot;GetDomRVersionCmd failed&quot;);</span>
+        }
+<span class="nc" id="L254">        String[] lines = result.getDetails().split(&quot;&amp;&quot;);</span>
+<span class="nc bnc" id="L255" title="All 2 branches missed.">        if (lines.length != 2) {</span>
+<span class="nc" id="L256">            return new GetDomRVersionAnswer(cmd, result.getDetails());</span>
+        }
+<span class="nc" id="L258">        return new GetDomRVersionAnswer(cmd, result.getDetails(), lines[0], lines[1]);</span>
+    }
+
+    public boolean configure(final String name, final Map&lt;String, Object&gt; params) throws ConfigurationException {
+<span class="nc" id="L262">        _name = name;</span>
+
+<span class="nc" id="L264">        String value = (String)params.get(&quot;ssh.sleep&quot;);</span>
+<span class="nc" id="L265">        _sleep = NumbersUtil.parseInt(value, 10) * 1000;</span>
+
+<span class="nc" id="L267">        value = (String)params.get(&quot;ssh.retry&quot;);</span>
+<span class="nc" id="L268">        _retry = NumbersUtil.parseInt(value, 36);</span>
+
+<span class="nc" id="L270">        value = (String)params.get(&quot;ssh.port&quot;);</span>
+<span class="nc" id="L271">        _port = NumbersUtil.parseInt(value, 3922);</span>
+
+<span class="nc" id="L273">        value = (String)params.get(&quot;router.aggregation.command.each.timeout&quot;);</span>
+<span class="nc" id="L274">        _eachTimeout = NumbersUtil.parseInt(value, 3);</span>
+
+<span class="nc bnc" id="L276" title="All 2 branches missed.">        if (_vrDeployer == null) {</span>
+<span class="nc" id="L277">            throw new ConfigurationException(&quot;Unable to find the resource for VirtualRouterDeployer!&quot;);</span>
+        }
+
+<span class="nc" id="L280">        _vrAggregateCommandsSet = new HashMap&lt;&gt;();</span>
+<span class="nc" id="L281">        return true;</span>
+    }
+
+    public boolean connect(final String ipAddress) {
+<span class="nc" id="L285">        return connect(ipAddress, _port);</span>
+    }
+
+    public boolean connect(final String ipAddress, final int port) {
+<span class="nc" id="L289">        return connect(ipAddress, port, _sleep);</span>
+    }
+
+    public boolean connect(final String ipAddress, int retry, int sleep) {
+<span class="nc bnc" id="L293" title="All 2 branches missed.">        for (int i = 0; i &lt;= retry; i++) {</span>
+<span class="nc" id="L294">            SocketChannel sch = null;</span>
+            try {
+<span class="nc bnc" id="L296" title="All 2 branches missed.">                if (s_logger.isDebugEnabled()) {</span>
+<span class="nc" id="L297">                    s_logger.debug(&quot;Trying to connect to &quot; + ipAddress);</span>
+                }
+<span class="nc" id="L299">                sch = SocketChannel.open();</span>
+<span class="nc" id="L300">                sch.configureBlocking(true);</span>
+
+<span class="nc" id="L302">                final InetSocketAddress addr = new InetSocketAddress(ipAddress, _port);</span>
+<span class="nc" id="L303">                sch.connect(addr);</span>
+<span class="nc" id="L304">                return true;</span>
+<span class="nc" id="L305">            } catch (final IOException e) {</span>
+<span class="nc bnc" id="L306" title="All 2 branches missed.">                if (s_logger.isDebugEnabled()) {</span>
+<span class="nc" id="L307">                    s_logger.debug(&quot;Could not connect to &quot; + ipAddress);</span>
+                }
+<span class="nc" id="L309">            } finally {</span>
+<span class="nc bnc" id="L310" title="All 6 branches missed.">                if (sch != null) {</span>
+                    try {
+<span class="nc" id="L312">                        sch.close();</span>
+<span class="nc" id="L313">                    } catch (final IOException e) {</span>
+                    }
+                }
+<span class="nc" id="L316">            }</span>
+            try {
+<span class="nc" id="L318">                Thread.sleep(sleep);</span>
+<span class="nc" id="L319">            } catch (final InterruptedException e) {</span>
+            }
+        }
+
+<span class="nc" id="L323">        s_logger.debug(&quot;Unable to logon to &quot; + ipAddress);</span>
+
+<span class="nc" id="L325">        return false;</span>
+    }
+
+    private List&lt;ConfigItem&gt; generateCommandCfg(NetworkElementCommand cmd) {
+        /*
+         * [TODO] Still have to migrate LoadBalancerConfigCommand and BumpUpPriorityCommand
+         * [FIXME] Have a look at SetSourceNatConfigItem
+         */
+<span class="nc" id="L333">        s_logger.debug(&quot;Transforming &quot; + cmd.getClass().getCanonicalName() + &quot; to ConfigItems&quot;);</span>
+
+<span class="nc" id="L335">        final AbstractConfigItemFacade configItemFacade = AbstractConfigItemFacade.getInstance(cmd.getClass());</span>
+
+<span class="nc" id="L337">        return configItemFacade.generateConfig(cmd);</span>
+    }
+
+    private Answer execute(AggregationControlCommand cmd) {
+<span class="nc" id="L341">        Action action = cmd.getAction();</span>
+<span class="nc" id="L342">        String routerName = cmd.getAccessDetail(NetworkElementCommand.ROUTER_NAME);</span>
+<span class="nc bnc" id="L343" title="All 4 branches missed.">        assert routerName != null;</span>
+<span class="nc bnc" id="L344" title="All 4 branches missed.">        assert cmd.getRouterAccessIp() != null;</span>
+
+<span class="nc bnc" id="L346" title="All 2 branches missed.">        if (action == Action.Start) {</span>
+<span class="nc bnc" id="L347" title="All 4 branches missed.">            assert (!_vrAggregateCommandsSet.containsKey(routerName));</span>
+
+<span class="nc" id="L349">            Queue&lt;NetworkElementCommand&gt; queue = new LinkedBlockingQueue&lt;&gt;();</span>
+<span class="nc" id="L350">            _vrAggregateCommandsSet.put(routerName, queue);</span>
+<span class="nc" id="L351">            return new Answer(cmd, true, &quot;Command aggregation started&quot;);</span>
+<span class="nc bnc" id="L352" title="All 2 branches missed.">        } else if (action == Action.Finish) {</span>
+<span class="nc" id="L353">            Queue&lt;NetworkElementCommand&gt; queue = _vrAggregateCommandsSet.get(routerName);</span>
+<span class="nc" id="L354">            int answerCounts = 0;</span>
+            try {
+<span class="nc" id="L356">                StringBuilder sb = new StringBuilder();</span>
+<span class="nc" id="L357">                sb.append(&quot;#Apache CloudStack Virtual Router Config File\n&quot;);</span>
+<span class="nc" id="L358">                sb.append(&quot;&lt;version&gt;\n&quot; + _cfgVersion + &quot;\n&lt;/version&gt;\n&quot;);</span>
+<span class="nc bnc" id="L359" title="All 2 branches missed.">                for (NetworkElementCommand command : queue) {</span>
+<span class="nc" id="L360">                    answerCounts += command.getAnswersCount();</span>
+<span class="nc" id="L361">                    List&lt;ConfigItem&gt; cfg = generateCommandCfg(command);</span>
+<span class="nc bnc" id="L362" title="All 2 branches missed.">                    if (cfg == null) {</span>
+<span class="nc" id="L363">                        s_logger.warn(&quot;Unknown commands for VirtualRoutingResource, but continue: &quot; + cmd.toString());</span>
+<span class="nc" id="L364">                        continue;</span>
+                    }
+
+<span class="nc bnc" id="L367" title="All 2 branches missed.">                    for (ConfigItem c : cfg) {</span>
+<span class="nc" id="L368">                        sb.append(c.getAggregateCommand());</span>
+                    }
+                }
+
+                // TODO replace with applyConfig with a stop on fail
+<span class="nc" id="L373">                String cfgFileName = &quot;VR-&quot;+ UUID.randomUUID().toString() + &quot;.cfg&quot;;</span>
+<span class="nc" id="L374">                FileConfigItem fileConfigItem = new FileConfigItem(VRScripts.CONFIG_CACHE_LOCATION, cfgFileName, sb.toString());</span>
+<span class="nc" id="L375">                ScriptConfigItem scriptConfigItem = new ScriptConfigItem(VRScripts.VR_CFG, &quot;-c &quot; + VRScripts.CONFIG_CACHE_LOCATION + cfgFileName);</span>
+                // 120s is the minimal timeout
+<span class="nc" id="L377">                int timeout = answerCounts * _eachTimeout;</span>
+<span class="nc bnc" id="L378" title="All 2 branches missed.">                if (timeout &lt; 120) {</span>
+<span class="nc" id="L379">                    timeout = 120;</span>
+                }
+
+<span class="nc" id="L382">                ExecutionResult result = applyConfigToVR(cmd.getRouterAccessIp(), fileConfigItem);</span>
+<span class="nc bnc" id="L383" title="All 2 branches missed.">                if (!result.isSuccess()) {</span>
+<span class="nc" id="L384">                    return new Answer(cmd, false, result.getDetails());</span>
+                }
+
+<span class="nc" id="L387">                result = applyConfigToVR(cmd.getRouterAccessIp(), scriptConfigItem, timeout);</span>
+<span class="nc bnc" id="L388" title="All 2 branches missed.">                if (!result.isSuccess()) {</span>
+<span class="nc" id="L389">                    return new Answer(cmd, false, result.getDetails());</span>
+                }
+
+<span class="nc" id="L392">                return new Answer(cmd, true, &quot;Command aggregation finished&quot;);</span>
+<span class="nc" id="L393">            } finally {</span>
+<span class="nc" id="L394">                queue.clear();</span>
+<span class="nc" id="L395">                _vrAggregateCommandsSet.remove(routerName);</span>
+<span class="nc" id="L396">            }</span>
+        }
+<span class="nc" id="L398">        return new Answer(cmd, false, &quot;Fail to recongize aggregation action &quot; + action.toString());</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>cloud-core (18-mrt-2016 13:14:54)</div></body></html>

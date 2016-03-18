@@ -1,0 +1,157 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>DefaultManagedContext.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">cloud-core (18-mrt-2016 13:14:54)</a> &gt; <a href="../../index.html" class="el_group">cloud-framework-managed-context</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">org.apache.cloudstack.managed.context.impl</a> &gt; <span class="el_source">DefaultManagedContext.java</span></div><h1>DefaultManagedContext.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">/*</span>
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * &quot;License&quot;); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.cloudstack.managed.context.impl;
+
+import java.util.List;
+import java.util.Stack;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CopyOnWriteArrayList;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cloudstack.managed.context.ManagedContext;
+import org.apache.cloudstack.managed.context.ManagedContextListener;
+import org.apache.cloudstack.managed.context.ManagedContextUtils;
+import org.apache.cloudstack.managed.threadlocal.ManagedThreadLocal;
+
+<span class="fc" id="L34">public class DefaultManagedContext implements ManagedContext {</span>
+
+<span class="fc" id="L36">    private static final Logger log = LoggerFactory.getLogger(DefaultManagedContext.class);</span>
+
+<span class="fc" id="L38">    List&lt;ManagedContextListener&lt;?&gt;&gt; listeners = new CopyOnWriteArrayList&lt;ManagedContextListener&lt;?&gt;&gt;();</span>
+
+    @Override
+    public void registerListener(ManagedContextListener&lt;?&gt; listener) {
+<span class="nc" id="L42">        listeners.add(listener);</span>
+<span class="nc" id="L43">    }</span>
+
+    @Override
+    public void unregisterListener(ManagedContextListener&lt;?&gt; listener) {
+<span class="nc" id="L47">        listeners.remove(listener);</span>
+<span class="nc" id="L48">    }</span>
+
+    @Override
+    public void runWithContext(final Runnable run) {
+        try {
+<span class="nc" id="L53">            callWithContext(new Callable&lt;Object&gt;() {</span>
+                @Override
+                public Object call() throws Exception {
+<span class="nc" id="L56">                    run.run();</span>
+<span class="nc" id="L57">                    return null;</span>
+                }
+            });
+<span class="nc" id="L60">        } catch (Exception e) {</span>
+            /* Only care about non-checked exceptions
+             * as the nature of runnable prevents checked
+             * exceptions from happening
+             */
+<span class="nc" id="L65">            ManagedContextUtils.rethrowException(e);</span>
+        }
+<span class="nc" id="L67">    }</span>
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    @Override
+    public &lt;T&gt; T callWithContext(Callable&lt;T&gt; callable) throws Exception {
+<span class="nc" id="L72">        Object owner = new Object();</span>
+
+<span class="nc" id="L74">        Stack&lt;ListenerInvocation&gt; invocations = new Stack&lt;ListenerInvocation&gt;();</span>
+<span class="nc bnc" id="L75" title="All 2 branches missed.">        boolean reentry = !ManagedContextUtils.setAndCheckOwner(owner);</span>
+<span class="nc" id="L76">        Throwable firstError = null;</span>
+
+        try {
+<span class="nc bnc" id="L79" title="All 2 branches missed.">            for (ManagedContextListener&lt;?&gt; listener : listeners) {</span>
+<span class="nc" id="L80">                Object data = null;</span>
+
+                try {
+<span class="nc" id="L83">                    data = listener.onEnterContext(reentry);</span>
+<span class="nc" id="L84">                } catch (Throwable t) {</span>
+                    /* If one listener fails, still call all other listeners
+                     * and then we will call onLeaveContext for all
+                     */
+<span class="nc bnc" id="L88" title="All 2 branches missed.">                    if (firstError == null) {</span>
+<span class="nc" id="L89">                        firstError = t;</span>
+                    }
+<span class="nc" id="L91">                    log.error(&quot;Failed onEnterContext for listener [{}]&quot;, listener, t);</span>
+                }
+
+                /* Stack data structure is used because in between onEnter and onLeave
+                 * the listeners list could have changed
+                 */
+<span class="nc" id="L97">                invocations.push(new ListenerInvocation((ManagedContextListener&lt;Object&gt;)listener, data));</span>
+            }
+
+            try {
+<span class="nc bnc" id="L101" title="All 2 branches missed.">                if (firstError == null) {</span>
+                    /* Only call if all the listeners didn't blow up on onEnterContext */
+<span class="nc" id="L103">                    return callable.call();</span>
+                } else {
+<span class="nc" id="L105">                    throwException(firstError);</span>
+<span class="nc" id="L106">                    return null;</span>
+                }
+<span class="nc" id="L108">            } finally {</span>
+<span class="nc" id="L109">                Throwable lastError = null;</span>
+
+<span class="nc bnc" id="L111" title="All 6 branches missed.">                while (!invocations.isEmpty()) {</span>
+<span class="nc" id="L112">                    ListenerInvocation invocation = invocations.pop();</span>
+                    try {
+<span class="nc" id="L114">                        invocation.listener.onLeaveContext(invocation.data, reentry);</span>
+<span class="nc" id="L115">                    } catch (Throwable t) {</span>
+<span class="nc" id="L116">                        lastError = t;</span>
+<span class="nc" id="L117">                        log.error(&quot;Failed onLeaveContext for listener [{}]&quot;, invocation.listener, t);</span>
+                    }
+                }
+
+<span class="nc bnc" id="L121" title="All 12 branches missed.">                if (firstError == null &amp;&amp; lastError != null) {</span>
+<span class="nc" id="L122">                    throwException(lastError);</span>
+                }
+<span class="nc" id="L124">            }</span>
+<span class="nc" id="L125">        } finally {</span>
+<span class="nc bnc" id="L126" title="All 6 branches missed.">            if (ManagedContextUtils.clearOwner(owner))</span>
+<span class="nc" id="L127">                ManagedThreadLocal.reset();</span>
+<span class="nc" id="L128">        }</span>
+    };
+
+    protected void throwException(Throwable t) throws Exception {
+<span class="nc" id="L132">        ManagedContextUtils.rethrowException(t);</span>
+<span class="nc bnc" id="L133" title="All 2 branches missed.">        if (t instanceof Exception) {</span>
+<span class="nc" id="L134">            throw (Exception)t;</span>
+        }
+<span class="nc" id="L136">    }</span>
+
+    public List&lt;ManagedContextListener&lt;?&gt;&gt; getListeners() {
+<span class="nc" id="L139">        return listeners;</span>
+    }
+
+    public void setListeners(List&lt;ManagedContextListener&lt;?&gt;&gt; listeners) {
+<span class="nc" id="L143">        this.listeners = new CopyOnWriteArrayList&lt;ManagedContextListener&lt;?&gt;&gt;(listeners);</span>
+<span class="nc" id="L144">    }</span>
+
+    private static class ListenerInvocation {
+        ManagedContextListener&lt;Object&gt; listener;
+        Object data;
+
+        public ListenerInvocation(ManagedContextListener&lt;Object&gt; listener, Object data) {
+<span class="nc" id="L151">            super();</span>
+<span class="nc" id="L152">            this.listener = listener;</span>
+<span class="nc" id="L153">            this.data = data;</span>
+<span class="nc" id="L154">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>cloud-core (18-mrt-2016 13:14:54)</div></body></html>

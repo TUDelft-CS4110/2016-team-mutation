@@ -1,0 +1,218 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>ConnectionConcierge.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">cloud-core (18-mrt-2016 13:14:54)</a> &gt; <a href="../../index.html" class="el_group">cloud-framework-db</a> &gt; <a href="../index.html" class="el_bundle">src</a> &gt; <a href="index.source.html" class="el_package">com.cloud.utils.db</a> &gt; <span class="el_source">ConnectionConcierge.java</span></div><h1>ConnectionConcierge.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">// Licensed to the Apache Software Foundation (ASF) under one</span>
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// &quot;License&quot;); you may not use this file except in compliance
+// the License.  You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+package com.cloud.utils.db;
+
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import javax.management.StandardMBean;
+
+import org.apache.log4j.Logger;
+
+import org.apache.cloudstack.managed.context.ManagedContextRunnable;
+
+import com.cloud.utils.concurrency.NamedThreadFactory;
+import com.cloud.utils.exception.CloudRuntimeException;
+import com.cloud.utils.mgmt.JmxUtil;
+
+/**
+ * ConnectionConcierge keeps stand alone database connections alive.  This is
+ * needs someone to keep that database connection from being garbage collected
+ *
+ */
+public class ConnectionConcierge {
+
+<span class="nc" id="L48">    static final Logger s_logger = Logger.getLogger(ConnectionConcierge.class);</span>
+
+<span class="nc" id="L50">    static final ConnectionConciergeManager s_mgr = new ConnectionConciergeManager();</span>
+
+    Connection _conn;
+    String _name;
+    boolean _keepAlive;
+    boolean _autoCommit;
+    int _isolationLevel;
+    int _holdability;
+
+<span class="nc" id="L59">    public ConnectionConcierge(String name, Connection conn, boolean keepAlive) {</span>
+<span class="nc" id="L60">        _name = name + s_mgr.getNextId();</span>
+<span class="nc" id="L61">        _keepAlive = keepAlive;</span>
+        try {
+<span class="nc" id="L63">            _autoCommit = conn.getAutoCommit();</span>
+<span class="nc" id="L64">            _isolationLevel = conn.getTransactionIsolation();</span>
+<span class="nc" id="L65">            _holdability = conn.getHoldability();</span>
+<span class="nc" id="L66">        } catch (SQLException e) {</span>
+<span class="nc" id="L67">            throw new CloudRuntimeException(&quot;Unable to get information from the connection object&quot;, e);</span>
+        }
+<span class="nc" id="L69">        reset(conn);</span>
+<span class="nc" id="L70">    }</span>
+
+    public void reset(Connection conn) {
+        try {
+<span class="nc" id="L74">            release();</span>
+<span class="nc" id="L75">        } catch (Throwable th) {</span>
+<span class="nc" id="L76">            s_logger.error(&quot;Unable to release a connection&quot;, th);</span>
+        }
+<span class="nc" id="L78">        _conn = conn;</span>
+        try {
+<span class="nc" id="L80">            _conn.setAutoCommit(_autoCommit);</span>
+<span class="nc" id="L81">            _conn.setHoldability(_holdability);</span>
+<span class="nc" id="L82">            _conn.setTransactionIsolation(_isolationLevel);</span>
+<span class="nc" id="L83">        } catch (SQLException e) {</span>
+<span class="nc" id="L84">            s_logger.error(&quot;Unable to release a connection&quot;, e);</span>
+        }
+<span class="nc" id="L86">        s_mgr.register(_name, this);</span>
+<span class="nc" id="L87">        s_logger.debug(&quot;Registering a database connection for &quot; + _name);</span>
+<span class="nc" id="L88">    }</span>
+
+    public final Connection conn() {
+<span class="nc" id="L91">        return _conn;</span>
+    }
+
+    public void release() {
+<span class="nc" id="L95">        s_mgr.unregister(_name);</span>
+        try {
+<span class="nc bnc" id="L97" title="All 2 branches missed.">            if (_conn != null) {</span>
+<span class="nc" id="L98">                _conn.close();</span>
+            }
+<span class="nc" id="L100">            _conn = null;</span>
+<span class="nc" id="L101">        } catch (SQLException e) {</span>
+<span class="nc" id="L102">            throw new CloudRuntimeException(&quot;Problem in closing a connection&quot;, e);</span>
+        }
+<span class="nc" id="L104">    }</span>
+
+    @Override
+    protected void finalize() throws Exception {
+<span class="nc bnc" id="L108" title="All 2 branches missed.">        if (_conn != null) {</span>
+<span class="nc" id="L109">            release();</span>
+        }
+<span class="nc" id="L111">    }</span>
+
+    public boolean keepAlive() {
+<span class="nc" id="L114">        return _keepAlive;</span>
+    }
+
+    protected static class ConnectionConciergeManager extends StandardMBean implements ConnectionConciergeMBean {
+<span class="nc" id="L118">        ScheduledExecutorService _executor = Executors.newScheduledThreadPool(1, new NamedThreadFactory(&quot;ConnectionKeeper&quot;));</span>
+<span class="nc" id="L119">        final ConcurrentHashMap&lt;String, ConnectionConcierge&gt; _conns = new ConcurrentHashMap&lt;String, ConnectionConcierge&gt;();</span>
+<span class="nc" id="L120">        final AtomicInteger _idGenerator = new AtomicInteger();</span>
+
+        ConnectionConciergeManager() {
+<span class="nc" id="L123">            super(ConnectionConciergeMBean.class, false);</span>
+<span class="nc" id="L124">            resetKeepAliveTask(20);</span>
+            try {
+<span class="nc" id="L126">                JmxUtil.registerMBean(&quot;DB Connections&quot;, &quot;DB Connections&quot;, this);</span>
+<span class="nc" id="L127">            } catch (Exception e) {</span>
+<span class="nc" id="L128">                s_logger.error(&quot;Unable to register mbean&quot;, e);</span>
+            }
+<span class="nc" id="L130">        }</span>
+
+        public Integer getNextId() {
+<span class="nc" id="L133">            return _idGenerator.incrementAndGet();</span>
+        }
+
+        public void register(String name, ConnectionConcierge concierge) {
+<span class="nc" id="L137">            _conns.put(name, concierge);</span>
+<span class="nc" id="L138">        }</span>
+
+        public void unregister(String name) {
+<span class="nc" id="L141">            _conns.remove(name);</span>
+<span class="nc" id="L142">        }</span>
+
+        protected String testValidity(String name, Connection conn) {
+<span class="nc bnc" id="L145" title="All 2 branches missed.">            if (conn != null) {</span>
+<span class="nc" id="L146">                synchronized (conn) {</span>
+<span class="nc" id="L147">                    try (PreparedStatement pstmt = conn.prepareStatement(&quot;SELECT 1&quot;);) {</span>
+<span class="nc" id="L148">                        pstmt.executeQuery();</span>
+<span class="nc bnc" id="L149" title="All 8 branches missed.">                    } catch (Throwable th) {</span>
+<span class="nc" id="L150">                        s_logger.error(&quot;Unable to keep the db connection for &quot; + name, th);</span>
+<span class="nc" id="L151">                        return th.toString();</span>
+                    }
+                }
+            }
+<span class="nc" id="L155">            return null;</span>
+        }
+
+        @Override
+        public List&lt;String&gt; testValidityOfConnections() {
+<span class="nc" id="L160">            ArrayList&lt;String&gt; results = new ArrayList&lt;String&gt;(_conns.size());</span>
+<span class="nc bnc" id="L161" title="All 2 branches missed.">            for (Map.Entry&lt;String, ConnectionConcierge&gt; entry : _conns.entrySet()) {</span>
+<span class="nc" id="L162">                String result = testValidity(entry.getKey(), entry.getValue().conn());</span>
+<span class="nc bnc" id="L163" title="All 2 branches missed.">                results.add(entry.getKey() + &quot;=&quot; + (result == null ? &quot;OK&quot; : result));</span>
+            }
+<span class="nc" id="L165">            return results;</span>
+        }
+
+        @Override
+        public String resetConnection(String name) {
+<span class="nc" id="L170">            ConnectionConcierge concierge = _conns.get(name);</span>
+<span class="nc bnc" id="L171" title="All 2 branches missed.">            if (concierge == null) {</span>
+<span class="nc" id="L172">                return &quot;Not Found&quot;;</span>
+            }
+
+<span class="nc" id="L175">            Connection conn = TransactionLegacy.getStandaloneConnection();</span>
+<span class="nc bnc" id="L176" title="All 2 branches missed.">            if (conn == null) {</span>
+<span class="nc" id="L177">                return &quot;Unable to get anotehr db connection&quot;;</span>
+            }
+
+<span class="nc" id="L180">            concierge.reset(conn);</span>
+<span class="nc" id="L181">            return &quot;Done&quot;;</span>
+        }
+
+        @Override
+        public String resetKeepAliveTask(int seconds) {
+<span class="nc bnc" id="L186" title="All 2 branches missed.">            if (_executor != null) {</span>
+                try {
+<span class="nc" id="L188">                    _executor.shutdown();</span>
+<span class="nc" id="L189">                } catch (Exception e) {</span>
+<span class="nc" id="L190">                    s_logger.error(&quot;Unable to shutdown executor&quot;, e);</span>
+                }
+            }
+
+<span class="nc" id="L194">            _executor = Executors.newScheduledThreadPool(1, new NamedThreadFactory(&quot;ConnectionConcierge&quot;));</span>
+
+<span class="nc" id="L196">            _executor.scheduleAtFixedRate(new ManagedContextRunnable() {</span>
+                @Override
+                protected void runInContext() {
+<span class="nc" id="L199">                    s_logger.trace(&quot;connection concierge keep alive task&quot;);</span>
+<span class="nc bnc" id="L200" title="All 2 branches missed.">                    for (Map.Entry&lt;String, ConnectionConcierge&gt; entry : _conns.entrySet()) {</span>
+<span class="nc" id="L201">                        ConnectionConcierge concierge = entry.getValue();</span>
+<span class="nc bnc" id="L202" title="All 2 branches missed.">                        if (concierge.keepAlive()) {</span>
+<span class="nc" id="L203">                            testValidity(entry.getKey(), entry.getValue().conn());</span>
+                        }
+                    }
+<span class="nc" id="L206">                }</span>
+<span class="nc" id="L207">            }, 0, seconds, TimeUnit.SECONDS);</span>
+
+<span class="nc" id="L209">            return &quot;As you wish.&quot;;</span>
+        }
+
+        @Override
+        public List&lt;String&gt; getConnectionsNotPooled() {
+<span class="nc" id="L214">            return new ArrayList&lt;String&gt;(_conns.keySet());</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>cloud-core (18-mrt-2016 13:14:54)</div></body></html>

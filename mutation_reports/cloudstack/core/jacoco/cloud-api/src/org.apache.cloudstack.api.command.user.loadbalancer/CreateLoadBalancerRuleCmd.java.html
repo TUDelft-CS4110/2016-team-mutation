@@ -1,0 +1,429 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>CreateLoadBalancerRuleCmd.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">cloud-core (18-mrt-2016 13:14:54)</a> &gt; <a href="../../index.html" class="el_group">cloud-api</a> &gt; <a href="../index.html" class="el_bundle">src</a> &gt; <a href="index.source.html" class="el_package">org.apache.cloudstack.api.command.user.loadbalancer</a> &gt; <span class="el_source">CreateLoadBalancerRuleCmd.java</span></div><h1>CreateLoadBalancerRuleCmd.java</h1><pre class="source lang-java linenums">// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// &quot;License&quot;); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+package org.apache.cloudstack.api.command.user.loadbalancer;
+
+import java.util.List;
+
+import org.apache.cloudstack.acl.RoleType;
+import org.apache.cloudstack.api.APICommand;
+import org.apache.cloudstack.api.ApiCommandJobType;
+import org.apache.cloudstack.api.ApiConstants;
+import org.apache.cloudstack.api.ApiErrorCode;
+import org.apache.cloudstack.api.BaseAsyncCmd;
+import org.apache.cloudstack.api.BaseAsyncCreateCmd;
+import org.apache.cloudstack.api.Parameter;
+import org.apache.cloudstack.api.ServerApiException;
+import org.apache.cloudstack.api.response.DomainResponse;
+import org.apache.cloudstack.api.response.IPAddressResponse;
+import org.apache.cloudstack.api.response.LoadBalancerResponse;
+import org.apache.cloudstack.api.response.NetworkResponse;
+import org.apache.cloudstack.api.response.ZoneResponse;
+import org.apache.cloudstack.context.CallContext;
+import org.apache.log4j.Logger;
+
+import com.cloud.dc.DataCenter;
+import com.cloud.dc.DataCenter.NetworkType;
+import com.cloud.event.EventTypes;
+import com.cloud.exception.InsufficientAddressCapacityException;
+import com.cloud.exception.InvalidParameterValueException;
+import com.cloud.exception.NetworkRuleConflictException;
+import com.cloud.exception.ResourceAllocationException;
+import com.cloud.exception.ResourceUnavailableException;
+import com.cloud.network.IpAddress;
+import com.cloud.network.Network;
+import com.cloud.network.rules.LoadBalancer;
+import com.cloud.user.Account;
+import com.cloud.utils.net.NetUtils;
+
+@APICommand(name = &quot;createLoadBalancerRule&quot;, description = &quot;Creates a load balancer rule&quot;, responseObject = LoadBalancerResponse.class,
+        requestHasSensitiveInfo = false, responseHasSensitiveInfo = false)
+<span class="nc" id="L54">public class CreateLoadBalancerRuleCmd extends BaseAsyncCreateCmd /*implements LoadBalancer */{</span>
+<span class="nc" id="L55">    public static final Logger s_logger = Logger.getLogger(CreateLoadBalancerRuleCmd.class.getName());</span>
+
+<span class="nc" id="L57">    private static final String s_name = &quot;createloadbalancerruleresponse&quot;;</span>
+
+    /////////////////////////////////////////////////////
+    //////////////// API parameters /////////////////////
+    /////////////////////////////////////////////////////
+
+    @Parameter(name = ApiConstants.ALGORITHM, type = CommandType.STRING, required = true, description = &quot;load balancer algorithm (source, roundrobin, leastconn)&quot;)
+    private String algorithm;
+
+    @Parameter(name = ApiConstants.DESCRIPTION, type = CommandType.STRING, description = &quot;the description of the load balancer rule&quot;, length = 4096)
+    private String description;
+
+    @Parameter(name = ApiConstants.NAME, type = CommandType.STRING, required = true, description = &quot;name of the load balancer rule&quot;)
+    private String loadBalancerRuleName;
+
+    @Parameter(name = ApiConstants.PRIVATE_PORT,
+               type = CommandType.INTEGER,
+               required = true,
+               description = &quot;the private port of the private IP address/virtual machine where the network traffic will be load balanced to&quot;)
+    private Integer privatePort;
+
+    @Parameter(name = ApiConstants.PUBLIC_IP_ID,
+               type = CommandType.UUID,
+               entityType = IPAddressResponse.class,
+               description = &quot;public IP address ID from where the network traffic will be load balanced from&quot;)
+    private Long publicIpId;
+
+    @Parameter(name = ApiConstants.ZONE_ID,
+               type = CommandType.UUID,
+               entityType = ZoneResponse.class,
+               required = false,
+               description = &quot;zone where the load balancer is going to be created. This parameter is required when LB service provider is ElasticLoadBalancerVm&quot;)
+    private Long zoneId;
+
+    @Parameter(name = ApiConstants.PUBLIC_PORT,
+               type = CommandType.INTEGER,
+               required = true,
+               description = &quot;the public port from where the network traffic will be load balanced from&quot;)
+    private Integer publicPort;
+
+    @Parameter(name = ApiConstants.OPEN_FIREWALL, type = CommandType.BOOLEAN, description = &quot;if true, firewall rule for&quot;
+        + &quot; source/end public port is automatically created; if false - firewall rule has to be created explicitely. If not specified 1) defaulted to false when LB&quot;
+        + &quot; rule is being created for VPC guest network 2) in all other cases defaulted to true&quot;)
+    private Boolean openFirewall;
+
+    @Parameter(name = ApiConstants.ACCOUNT,
+               type = CommandType.STRING,
+               description = &quot;the account associated with the load balancer. Must be used with the domainId parameter.&quot;)
+    private String accountName;
+
+    @Parameter(name = ApiConstants.DOMAIN_ID, type = CommandType.UUID, entityType = DomainResponse.class, description = &quot;the domain ID associated with the load balancer&quot;)
+    private Long domainId;
+
+    @Parameter(name = ApiConstants.CIDR_LIST, type = CommandType.LIST, collectionType = CommandType.STRING, description = &quot;the CIDR list to forward traffic from&quot;)
+    private List&lt;String&gt; cidrlist;
+
+    @Parameter(name = ApiConstants.NETWORK_ID, type = CommandType.UUID, entityType = NetworkResponse.class, description = &quot;The guest network this &quot;
+        + &quot;rule will be created for. Required when public Ip address is not associated with any Guest network yet (VPC case)&quot;)
+    private Long networkId;
+
+    @Parameter(name = ApiConstants.PROTOCOL, type = CommandType.STRING, description = &quot;The protocol for the LB&quot;)
+    private String lbProtocol;
+
+    @Parameter(name = ApiConstants.FOR_DISPLAY, type = CommandType.BOOLEAN, description = &quot;an optional field, whether to the display the rule to the end user or not&quot;, since = &quot;4.4&quot;, authorized = {RoleType.Admin})
+    private Boolean display;
+
+    /////////////////////////////////////////////////////
+    /////////////////// Accessors ///////////////////////
+    /////////////////////////////////////////////////////
+
+    @Override
+    public boolean isDisplay() {
+<span class="nc bnc" id="L129" title="All 2 branches missed.">        if (display != null) {</span>
+<span class="nc" id="L130">            return display;</span>
+        } else {
+<span class="nc" id="L132">            return true;</span>
+        }
+    }
+
+    public String getAlgorithm() {
+<span class="nc" id="L137">        return algorithm;</span>
+    }
+
+    public String getDescription() {
+<span class="nc" id="L141">        return description;</span>
+    }
+
+    public String getLoadBalancerRuleName() {
+<span class="nc" id="L145">        return loadBalancerRuleName;</span>
+    }
+
+    public Integer getPrivatePort() {
+<span class="nc" id="L149">        return privatePort;</span>
+    }
+
+    public Long getSourceIpAddressId() {
+<span class="nc bnc" id="L153" title="All 2 branches missed.">        if (publicIpId != null) {</span>
+<span class="nc" id="L154">            IpAddress ipAddr = _networkService.getIp(publicIpId);</span>
+<span class="nc bnc" id="L155" title="All 4 branches missed.">            if (ipAddr == null || !ipAddr.readyToUse()) {</span>
+<span class="nc" id="L156">                throw new InvalidParameterValueException(&quot;Unable to create load balancer rule, invalid IP address ID &quot; + publicIpId);</span>
+            }
+<span class="nc bnc" id="L158" title="All 2 branches missed.">        } else if (getEntityId() != null) {</span>
+<span class="nc" id="L159">            LoadBalancer rule = _entityMgr.findById(LoadBalancer.class, getEntityId());</span>
+<span class="nc" id="L160">            return rule.getSourceIpAddressId();</span>
+        }
+
+<span class="nc" id="L163">        return publicIpId;</span>
+    }
+
+    private Long getVpcId() {
+<span class="nc bnc" id="L167" title="All 2 branches missed.">        if (publicIpId != null) {</span>
+<span class="nc" id="L168">            IpAddress ipAddr = _networkService.getIp(publicIpId);</span>
+<span class="nc bnc" id="L169" title="All 4 branches missed.">            if (ipAddr == null || !ipAddr.readyToUse()) {</span>
+<span class="nc" id="L170">                throw new InvalidParameterValueException(&quot;Unable to create load balancer rule, invalid IP address ID &quot; + publicIpId);</span>
+            } else {
+<span class="nc" id="L172">                return ipAddr.getVpcId();</span>
+            }
+        }
+<span class="nc" id="L175">        return null;</span>
+    }
+
+    public long getNetworkId() {
+<span class="nc bnc" id="L179" title="All 2 branches missed.">        if (networkId != null) {</span>
+<span class="nc" id="L180">            return networkId;</span>
+        }
+<span class="nc" id="L182">        Long zoneId = getZoneId();</span>
+
+<span class="nc bnc" id="L184" title="All 2 branches missed.">        if (zoneId == null) {</span>
+<span class="nc" id="L185">            Long ipId = getSourceIpAddressId();</span>
+<span class="nc bnc" id="L186" title="All 2 branches missed.">            if (ipId == null) {</span>
+<span class="nc" id="L187">                throw new InvalidParameterValueException(&quot;Either networkId or zoneId or publicIpId has to be specified&quot;);</span>
+            }
+        }
+
+<span class="nc bnc" id="L191" title="All 2 branches missed.">        if (zoneId != null) {</span>
+<span class="nc" id="L192">            DataCenter zone = _entityMgr.findById(DataCenter.class, zoneId);</span>
+<span class="nc bnc" id="L193" title="All 2 branches missed.">            if (zone.getNetworkType() == NetworkType.Advanced) {</span>
+<span class="nc" id="L194">                List&lt;? extends Network&gt; networks = _networkService.getIsolatedNetworksOwnedByAccountInZone(getZoneId(), _accountService.getAccount(getEntityOwnerId()));</span>
+<span class="nc bnc" id="L195" title="All 2 branches missed.">                if (networks.size() == 0) {</span>
+<span class="nc" id="L196">                    String domain = _domainService.getDomain(getDomainId()).getName();</span>
+<span class="nc" id="L197">                    throw new InvalidParameterValueException(&quot;Account name=&quot; + getAccountName() + &quot; domain=&quot; + domain + &quot; doesn't have virtual networks in zone=&quot; +</span>
+<span class="nc" id="L198">                        zone.getName());</span>
+                }
+
+<span class="nc bnc" id="L201" title="All 2 branches missed.">                if (networks.size() &lt; 1) {</span>
+<span class="nc" id="L202">                    throw new InvalidParameterValueException(&quot;Account doesn't have any isolated networks in the zone&quot;);</span>
+<span class="nc bnc" id="L203" title="All 2 branches missed.">                } else if (networks.size() &gt; 1) {</span>
+<span class="nc" id="L204">                    throw new InvalidParameterValueException(&quot;Account has more than one isolated network in the zone&quot;);</span>
+                }
+
+<span class="nc" id="L207">                return networks.get(0).getId();</span>
+            } else {
+<span class="nc" id="L209">                Network defaultGuestNetwork = _networkService.getExclusiveGuestNetwork(zoneId);</span>
+<span class="nc bnc" id="L210" title="All 2 branches missed.">                if (defaultGuestNetwork == null) {</span>
+<span class="nc" id="L211">                    throw new InvalidParameterValueException(&quot;Unable to find a default guest network for account &quot; + getAccountName() + &quot; in domain ID=&quot; + getDomainId());</span>
+                } else {
+<span class="nc" id="L213">                    return defaultGuestNetwork.getId();</span>
+                }
+            }
+        } else {
+<span class="nc" id="L217">            IpAddress ipAddr = _networkService.getIp(publicIpId);</span>
+<span class="nc bnc" id="L218" title="All 2 branches missed.">            if (ipAddr.getAssociatedWithNetworkId() != null) {</span>
+<span class="nc" id="L219">                return ipAddr.getAssociatedWithNetworkId();</span>
+            } else {
+<span class="nc" id="L221">                throw new InvalidParameterValueException(&quot;IP address ID=&quot; + publicIpId + &quot; is not associated with any network&quot;);</span>
+            }
+        }
+    }
+
+    public Integer getPublicPort() {
+<span class="nc" id="L227">        return publicPort;</span>
+    }
+
+    public String getName() {
+<span class="nc" id="L231">        return loadBalancerRuleName;</span>
+    }
+
+    public Boolean getOpenFirewall() {
+<span class="nc bnc" id="L235" title="All 2 branches missed.">        boolean isVpc = getVpcId() == null ? false : true;</span>
+<span class="nc bnc" id="L236" title="All 2 branches missed.">        if (openFirewall != null) {</span>
+<span class="nc bnc" id="L237" title="All 4 branches missed.">            if (isVpc &amp;&amp; openFirewall) {</span>
+<span class="nc" id="L238">                throw new InvalidParameterValueException(&quot;Can't have openFirewall=true when IP address belongs to VPC&quot;);</span>
+            }
+<span class="nc" id="L240">            return openFirewall;</span>
+        } else {
+<span class="nc bnc" id="L242" title="All 2 branches missed.">            if (isVpc) {</span>
+<span class="nc" id="L243">                return false;</span>
+            }
+<span class="nc" id="L245">            return true;</span>
+        }
+    }
+
+    public List&lt;String&gt; getSourceCidrList() {
+<span class="nc bnc" id="L250" title="All 2 branches missed.">        if (cidrlist != null) {</span>
+<span class="nc" id="L251">            throw new InvalidParameterValueException(</span>
+<span class="nc" id="L252">                &quot;Parameter cidrList is deprecated; if you need to open firewall rule for the specific CIDR, please refer to createFirewallRule command&quot;);</span>
+        }
+<span class="nc" id="L254">        return null;</span>
+    }
+
+    public String getLbProtocol() {
+<span class="nc" id="L258">        return lbProtocol;</span>
+    }
+
+    /////////////////////////////////////////////////////
+    /////////////// API Implementation///////////////////
+    /////////////////////////////////////////////////////
+
+    @Override
+    public String getCommandName() {
+<span class="nc" id="L267">        return s_name;</span>
+    }
+
+    @Override
+    public void execute() throws ResourceAllocationException, ResourceUnavailableException {
+
+<span class="nc" id="L273">        CallContext callerContext = CallContext.current();</span>
+<span class="nc" id="L274">        boolean success = true;</span>
+<span class="nc" id="L275">        LoadBalancer rule = null;</span>
+        try {
+<span class="nc" id="L277">            CallContext.current().setEventDetails(&quot;Rule Id: &quot; + getEntityId());</span>
+
+<span class="nc bnc" id="L279" title="All 2 branches missed.">            if (getOpenFirewall()) {</span>
+<span class="nc bnc" id="L280" title="All 4 branches missed.">                success = success &amp;&amp; _firewallService.applyIngressFirewallRules(getSourceIpAddressId(), callerContext.getCallingAccount());</span>
+            }
+
+            // State might be different after the rule is applied, so get new object here
+<span class="nc" id="L284">            rule = _entityMgr.findById(LoadBalancer.class, getEntityId());</span>
+<span class="nc" id="L285">            LoadBalancerResponse lbResponse = new LoadBalancerResponse();</span>
+<span class="nc bnc" id="L286" title="All 2 branches missed.">            if (rule != null) {</span>
+<span class="nc" id="L287">                lbResponse = _responseGenerator.createLoadBalancerResponse(rule);</span>
+<span class="nc" id="L288">                setResponseObject(lbResponse);</span>
+            }
+<span class="nc" id="L290">            lbResponse.setResponseName(getCommandName());</span>
+<span class="nc" id="L291">        } catch (Exception ex) {</span>
+<span class="nc" id="L292">            s_logger.warn(&quot;Failed to create LB rule due to exception &quot;, ex);</span>
+<span class="nc" id="L293">        } finally {</span>
+<span class="nc bnc" id="L294" title="All 12 branches missed.">            if (!success || rule == null) {</span>
+
+<span class="nc bnc" id="L296" title="All 6 branches missed.">                if (getOpenFirewall()) {</span>
+<span class="nc" id="L297">                    _firewallService.revokeRelatedFirewallRule(getEntityId(), true);</span>
+                }
+                // no need to apply the rule on the backend as it exists in the db only
+<span class="nc" id="L300">                _lbService.deleteLoadBalancerRule(getEntityId(), false);</span>
+
+<span class="nc" id="L302">                throw new ServerApiException(ApiErrorCode.INTERNAL_ERROR, &quot;Failed to create load balancer rule&quot;);</span>
+            }
+<span class="nc" id="L304">        }</span>
+<span class="nc" id="L305">    }</span>
+
+    @Override
+    public void create() {
+        //cidr list parameter is deprecated
+<span class="nc bnc" id="L310" title="All 2 branches missed.">        if (cidrlist != null) {</span>
+<span class="nc" id="L311">            throw new InvalidParameterValueException(</span>
+<span class="nc" id="L312">                &quot;Parameter cidrList is deprecated; if you need to open firewall rule for the specific CIDR, please refer to createFirewallRule command&quot;);</span>
+        }
+        try {
+<span class="nc" id="L315">            LoadBalancer result =</span>
+<span class="nc" id="L316">                _lbService.createPublicLoadBalancerRule(getXid(), getName(), getDescription(), getSourcePortStart(), getSourcePortEnd(), getDefaultPortStart(),</span>
+<span class="nc" id="L317">                    getDefaultPortEnd(), getSourceIpAddressId(), getProtocol(), getAlgorithm(), getNetworkId(), getEntityOwnerId(), getOpenFirewall(), getLbProtocol(), isDisplay());</span>
+<span class="nc" id="L318">            this.setEntityId(result.getId());</span>
+<span class="nc" id="L319">            this.setEntityUuid(result.getUuid());</span>
+<span class="nc" id="L320">        } catch (NetworkRuleConflictException e) {</span>
+<span class="nc" id="L321">            s_logger.warn(&quot;Exception: &quot;, e);</span>
+<span class="nc" id="L322">            throw new ServerApiException(ApiErrorCode.NETWORK_RULE_CONFLICT_ERROR, e.getMessage());</span>
+<span class="nc" id="L323">        } catch (InsufficientAddressCapacityException e) {</span>
+<span class="nc" id="L324">            s_logger.warn(&quot;Exception: &quot;, e);</span>
+<span class="nc" id="L325">            throw new ServerApiException(ApiErrorCode.INSUFFICIENT_CAPACITY_ERROR, e.getMessage());</span>
+<span class="nc" id="L326">        } catch (InvalidParameterValueException e) {</span>
+<span class="nc" id="L327">            throw new ServerApiException(ApiErrorCode.PARAM_ERROR, e.getMessage());</span>
+        }
+<span class="nc" id="L329">    }</span>
+
+    public Integer getSourcePortStart() {
+<span class="nc" id="L332">        return publicPort.intValue();</span>
+    }
+
+    public Integer getSourcePortEnd() {
+<span class="nc" id="L336">        return publicPort.intValue();</span>
+    }
+
+    public String getProtocol() {
+<span class="nc" id="L340">        return NetUtils.TCP_PROTO;</span>
+    }
+
+    public long getAccountId() {
+<span class="nc bnc" id="L344" title="All 2 branches missed.">        if (publicIpId != null)</span>
+<span class="nc" id="L345">            return _networkService.getIp(getSourceIpAddressId()).getAccountId();</span>
+
+<span class="nc" id="L347">        Account account = null;</span>
+<span class="nc bnc" id="L348" title="All 4 branches missed.">        if ((domainId != null) &amp;&amp; (accountName != null)) {</span>
+<span class="nc" id="L349">            account = _responseGenerator.findAccountByNameDomain(accountName, domainId);</span>
+<span class="nc bnc" id="L350" title="All 2 branches missed.">            if (account != null) {</span>
+<span class="nc" id="L351">                return account.getId();</span>
+            } else {
+<span class="nc" id="L353">                throw new InvalidParameterValueException(&quot;Unable to find account &quot; + accountName + &quot; in domain ID=&quot; + domainId);</span>
+            }
+        } else {
+<span class="nc" id="L356">            throw new InvalidParameterValueException(&quot;Can't define IP owner. Either specify account/domainId or publicIpId&quot;);</span>
+        }
+    }
+
+    public long getDomainId() {
+<span class="nc bnc" id="L361" title="All 2 branches missed.">        if (publicIpId != null)</span>
+<span class="nc" id="L362">            return _networkService.getIp(getSourceIpAddressId()).getDomainId();</span>
+<span class="nc bnc" id="L363" title="All 2 branches missed.">        if (domainId != null) {</span>
+<span class="nc" id="L364">            return domainId;</span>
+        }
+<span class="nc" id="L366">        return CallContext.current().getCallingAccount().getDomainId();</span>
+    }
+
+    public int getDefaultPortStart() {
+<span class="nc" id="L370">        return privatePort.intValue();</span>
+    }
+
+    public int getDefaultPortEnd() {
+<span class="nc" id="L374">        return privatePort.intValue();</span>
+    }
+
+    @Override
+    public long getEntityOwnerId() {
+<span class="nc" id="L379">        return getAccountId();</span>
+    }
+
+    public String getAccountName() {
+<span class="nc" id="L383">        return accountName;</span>
+    }
+
+    public Long getZoneId() {
+<span class="nc" id="L387">        return zoneId;</span>
+    }
+
+    public void setPublicIpId(Long publicIpId) {
+<span class="nc" id="L391">        this.publicIpId = publicIpId;</span>
+<span class="nc" id="L392">    }</span>
+
+    @Override
+    public String getEventType() {
+<span class="nc" id="L396">        return EventTypes.EVENT_LOAD_BALANCER_CREATE;</span>
+    }
+
+    @Override
+    public String getEventDescription() {
+<span class="nc" id="L401">        return &quot;creating load balancer: &quot; + getName() + &quot; account: &quot; + getAccountName();</span>
+
+    }
+
+    public String getXid() {
+        /*FIXME*/
+<span class="nc" id="L407">        return null;</span>
+    }
+
+    public void setSourceIpAddressId(Long ipId) {
+<span class="nc" id="L411">        this.publicIpId = ipId;</span>
+<span class="nc" id="L412">    }</span>
+
+    @Override
+    public ApiCommandJobType getInstanceType() {
+<span class="nc" id="L416">        return ApiCommandJobType.FirewallRule;</span>
+    }
+
+    @Override
+    public String getSyncObjType() {
+<span class="nc" id="L421">        return BaseAsyncCmd.networkSyncObject;</span>
+    }
+
+    @Override
+    public Long getSyncObjId() {
+<span class="nc" id="L426">        return getNetworkId();</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>cloud-core (18-mrt-2016 13:14:54)</div></body></html>

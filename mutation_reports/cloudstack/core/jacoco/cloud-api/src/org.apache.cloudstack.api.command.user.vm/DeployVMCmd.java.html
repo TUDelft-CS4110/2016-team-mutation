@@ -1,0 +1,627 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>DeployVMCmd.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">cloud-core (18-mrt-2016 13:14:54)</a> &gt; <a href="../../index.html" class="el_group">cloud-api</a> &gt; <a href="../index.html" class="el_bundle">src</a> &gt; <a href="index.source.html" class="el_package">org.apache.cloudstack.api.command.user.vm</a> &gt; <span class="el_source">DeployVMCmd.java</span></div><h1>DeployVMCmd.java</h1><pre class="source lang-java linenums">// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// &quot;License&quot;); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+package org.apache.cloudstack.api.command.user.vm;
+
+import com.cloud.dc.DataCenter;
+import com.cloud.dc.DataCenter.NetworkType;
+import com.cloud.event.EventTypes;
+import com.cloud.exception.ConcurrentOperationException;
+import com.cloud.exception.InsufficientCapacityException;
+import com.cloud.exception.InsufficientServerCapacityException;
+import com.cloud.exception.InvalidParameterValueException;
+import com.cloud.exception.ResourceAllocationException;
+import com.cloud.exception.ResourceUnavailableException;
+import com.cloud.hypervisor.Hypervisor.HypervisorType;
+import com.cloud.network.Network;
+import com.cloud.network.Network.IpAddresses;
+import com.cloud.offering.DiskOffering;
+import com.cloud.offering.ServiceOffering;
+import com.cloud.template.VirtualMachineTemplate;
+import com.cloud.user.Account;
+import com.cloud.uservm.UserVm;
+import com.cloud.utils.net.NetUtils;
+import com.cloud.vm.VirtualMachine;
+import org.apache.cloudstack.acl.RoleType;
+import org.apache.cloudstack.affinity.AffinityGroupResponse;
+import org.apache.cloudstack.api.ACL;
+import org.apache.cloudstack.api.APICommand;
+import org.apache.cloudstack.api.ApiCommandJobType;
+import org.apache.cloudstack.api.ApiConstants;
+import org.apache.cloudstack.api.ApiErrorCode;
+import org.apache.cloudstack.api.BaseAsyncCreateCustomIdCmd;
+import org.apache.cloudstack.api.Parameter;
+import org.apache.cloudstack.api.ResponseObject.ResponseView;
+import org.apache.cloudstack.api.ServerApiException;
+import org.apache.cloudstack.api.response.DiskOfferingResponse;
+import org.apache.cloudstack.api.response.DomainResponse;
+import org.apache.cloudstack.api.response.HostResponse;
+import org.apache.cloudstack.api.response.NetworkResponse;
+import org.apache.cloudstack.api.response.ProjectResponse;
+import org.apache.cloudstack.api.response.SecurityGroupResponse;
+import org.apache.cloudstack.api.response.ServiceOfferingResponse;
+import org.apache.cloudstack.api.response.TemplateResponse;
+import org.apache.cloudstack.api.response.UserVmResponse;
+import org.apache.cloudstack.api.response.ZoneResponse;
+import org.apache.cloudstack.context.CallContext;
+import org.apache.log4j.Logger;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+@APICommand(name = &quot;deployVirtualMachine&quot;, description = &quot;Creates and automatically starts a virtual machine based on a service offering, disk offering, and template.&quot;, responseObject = UserVmResponse.class, responseView = ResponseView.Restricted, entityType = {VirtualMachine.class},
+        requestHasSensitiveInfo = false, responseHasSensitiveInfo = true)
+<span class="nc" id="L72">public class DeployVMCmd extends BaseAsyncCreateCustomIdCmd {</span>
+<span class="nc" id="L73">    public static final Logger s_logger = Logger.getLogger(DeployVMCmd.class.getName());</span>
+
+<span class="nc" id="L75">    private static final String s_name = &quot;deployvirtualmachineresponse&quot;;</span>
+
+    /////////////////////////////////////////////////////
+    //////////////// API parameters /////////////////////
+    /////////////////////////////////////////////////////
+
+    @Parameter(name = ApiConstants.ZONE_ID, type = CommandType.UUID, entityType = ZoneResponse.class, required = true, description = &quot;availability zone for the virtual machine&quot;)
+    private Long zoneId;
+
+    @ACL
+    @Parameter(name = ApiConstants.SERVICE_OFFERING_ID, type = CommandType.UUID, entityType = ServiceOfferingResponse.class, required = true, description = &quot;the ID of the service offering for the virtual machine&quot;)
+    private Long serviceOfferingId;
+
+    @ACL
+    @Parameter(name = ApiConstants.TEMPLATE_ID, type = CommandType.UUID, entityType = TemplateResponse.class, required = true, description = &quot;the ID of the template for the virtual machine&quot;)
+    private Long templateId;
+
+    @Parameter(name = ApiConstants.NAME, type = CommandType.STRING, description = &quot;host name for the virtual machine&quot;)
+    private String name;
+
+    @Parameter(name = ApiConstants.DISPLAY_NAME, type = CommandType.STRING, description = &quot;an optional user generated name for the virtual machine&quot;)
+    private String displayName;
+
+    //Owner information
+    @Parameter(name = ApiConstants.ACCOUNT, type = CommandType.STRING, description = &quot;an optional account for the virtual machine. Must be used with domainId.&quot;)
+    private String accountName;
+
+    @Parameter(name = ApiConstants.DOMAIN_ID, type = CommandType.UUID, entityType = DomainResponse.class, description = &quot;an optional domainId for the virtual machine. If the account parameter is used, domainId must also be used.&quot;)
+    private Long domainId;
+
+    //Network information
+    //@ACL(accessType = AccessType.UseEntry)
+    @Parameter(name = ApiConstants.NETWORK_IDS, type = CommandType.LIST, collectionType = CommandType.UUID, entityType = NetworkResponse.class, description = &quot;list of network ids used by virtual machine. Can't be specified with ipToNetworkList parameter&quot;)
+    private List&lt;Long&gt; networkIds;
+
+    //DataDisk information
+    @ACL
+    @Parameter(name = ApiConstants.DISK_OFFERING_ID, type = CommandType.UUID, entityType = DiskOfferingResponse.class, description = &quot;the ID of the disk offering for the virtual machine. If the template is of ISO format,&quot;
+            + &quot; the diskOfferingId is for the root disk volume. Otherwise this parameter is used to indicate the &quot;
+            + &quot;offering for the data disk volume. If the templateId parameter passed is from a Template object,&quot;
+            + &quot; the diskOfferingId refers to a DATA Disk Volume created. If the templateId parameter passed is &quot;
+            + &quot;from an ISO object, the diskOfferingId refers to a ROOT Disk Volume created.&quot;)
+    private Long diskOfferingId;
+
+    @Parameter(name = ApiConstants.SIZE, type = CommandType.LONG, description = &quot;the arbitrary size for the DATADISK volume. Mutually exclusive with diskOfferingId&quot;)
+    private Long size;
+
+    @Parameter(name = ApiConstants.ROOT_DISK_SIZE,
+            type = CommandType.LONG,
+            description = &quot;Optional field to resize root disk on deploy. Value is in GB. Only applies to template-based deployments. Analogous to details[0].rootdisksize, which takes precedence over this parameter if both are provided&quot;,
+            since = &quot;4.4&quot;)
+    private Long rootdisksize;
+
+    @Parameter(name = ApiConstants.GROUP, type = CommandType.STRING, description = &quot;an optional group for the virtual machine&quot;)
+    private String group;
+
+    @Parameter(name = ApiConstants.HYPERVISOR, type = CommandType.STRING, description = &quot;the hypervisor on which to deploy the virtual machine. &quot;
+            + &quot;The parameter is required and respected only when hypervisor info is not set on the ISO/Template passed to the call&quot;)
+    private String hypervisor;
+
+    @Parameter(name = ApiConstants.USER_DATA, type = CommandType.STRING, description = &quot;an optional binary data that can be sent to the virtual machine upon a successful deployment. This binary data must be base64 encoded before adding it to the request. Using HTTP GET (via querystring), you can send up to 2KB of data after base64 encoding. Using HTTP POST(via POST body), you can send up to 32K of data after base64 encoding.&quot;, length = 32768)
+    private String userData;
+
+    @Parameter(name = ApiConstants.SSH_KEYPAIR, type = CommandType.STRING, description = &quot;name of the ssh key pair used to login to the virtual machine&quot;)
+    private String sshKeyPairName;
+
+    @Parameter(name = ApiConstants.HOST_ID, type = CommandType.UUID, entityType = HostResponse.class, description = &quot;destination Host ID to deploy the VM to - parameter available for root admin only&quot;)
+    private Long hostId;
+
+    @ACL
+    @Parameter(name = ApiConstants.SECURITY_GROUP_IDS, type = CommandType.LIST, collectionType = CommandType.UUID, entityType = SecurityGroupResponse.class, description = &quot;comma separated list of security groups id that going to be applied to the virtual machine. &quot;
+            + &quot;Should be passed only when vm is created from a zone with Basic Network support.&quot; + &quot; Mutually exclusive with securitygroupnames parameter&quot;)
+    private List&lt;Long&gt; securityGroupIdList;
+
+    @ACL
+    @Parameter(name = ApiConstants.SECURITY_GROUP_NAMES, type = CommandType.LIST, collectionType = CommandType.STRING, entityType = SecurityGroupResponse.class, description = &quot;comma separated list of security groups names that going to be applied to the virtual machine.&quot;
+            + &quot; Should be passed only when vm is created from a zone with Basic Network support. &quot; + &quot;Mutually exclusive with securitygroupids parameter&quot;)
+    private List&lt;String&gt; securityGroupNameList;
+
+    @Parameter(name = ApiConstants.IP_NETWORK_LIST, type = CommandType.MAP, description = &quot;ip to network mapping. Can't be specified with networkIds parameter.&quot;
+            + &quot; Example: iptonetworklist[0].ip=10.10.10.11&amp;iptonetworklist[0].ipv6=fc00:1234:5678::abcd&amp;iptonetworklist[0].networkid=uuid - requests to use ip 10.10.10.11 in network id=uuid&quot;)
+    private Map ipToNetworkList;
+
+    @Parameter(name = ApiConstants.IP_ADDRESS, type = CommandType.STRING, description = &quot;the ip address for default vm's network&quot;)
+    private String ipAddress;
+
+    @Parameter(name = ApiConstants.IP6_ADDRESS, type = CommandType.STRING, description = &quot;the ipv6 address for default vm's network&quot;)
+    private String ip6Address;
+
+    @Parameter(name = ApiConstants.KEYBOARD, type = CommandType.STRING, description = &quot;an optional keyboard device type for the virtual machine. valid value can be one of de,de-ch,es,fi,fr,fr-be,fr-ch,is,it,jp,nl-be,no,pt,uk,us&quot;)
+    private String keyboard;
+
+    @Parameter(name = ApiConstants.PROJECT_ID, type = CommandType.UUID, entityType = ProjectResponse.class, description = &quot;Deploy vm for the project&quot;)
+    private Long projectId;
+
+    @Parameter(name = ApiConstants.START_VM, type = CommandType.BOOLEAN, description = &quot;true if start vm after creating; defaulted to true if not specified&quot;)
+    private Boolean startVm;
+
+    @ACL
+    @Parameter(name = ApiConstants.AFFINITY_GROUP_IDS, type = CommandType.LIST, collectionType = CommandType.UUID, entityType = AffinityGroupResponse.class, description = &quot;comma separated list of affinity groups id that are going to be applied to the virtual machine.&quot;
+            + &quot; Mutually exclusive with affinitygroupnames parameter&quot;)
+    private List&lt;Long&gt; affinityGroupIdList;
+
+    @ACL
+    @Parameter(name = ApiConstants.AFFINITY_GROUP_NAMES, type = CommandType.LIST, collectionType = CommandType.STRING, entityType = AffinityGroupResponse.class, description = &quot;comma separated list of affinity groups names that are going to be applied to the virtual machine.&quot;
+            + &quot;Mutually exclusive with affinitygroupids parameter&quot;)
+    private List&lt;String&gt; affinityGroupNameList;
+
+    @Parameter(name = ApiConstants.DISPLAY_VM, type = CommandType.BOOLEAN, since = &quot;4.2&quot;, description = &quot;an optional field, whether to the display the vm to the end user or not.&quot;, authorized = {RoleType.Admin})
+    private Boolean displayVm;
+
+    @Parameter(name = ApiConstants.DETAILS, type = CommandType.MAP, since = &quot;4.3&quot;, description = &quot;used to specify the custom parameters.&quot;)
+    private Map details;
+
+    @Parameter(name = ApiConstants.DEPLOYMENT_PLANNER, type = CommandType.STRING, description = &quot;Deployment planner to use for vm allocation. Available to ROOT admin only&quot;, since = &quot;4.4&quot;, authorized = { RoleType.Admin })
+    private String deploymentPlanner;
+
+    /////////////////////////////////////////////////////
+    /////////////////// Accessors ///////////////////////
+    /////////////////////////////////////////////////////
+
+    public String getAccountName() {
+<span class="nc bnc" id="L197" title="All 2 branches missed.">        if (accountName == null) {</span>
+<span class="nc" id="L198">            return CallContext.current().getCallingAccount().getAccountName();</span>
+        }
+<span class="nc" id="L200">        return accountName;</span>
+    }
+
+    public Long getDiskOfferingId() {
+<span class="nc" id="L204">        return diskOfferingId;</span>
+    }
+
+    public String getDeploymentPlanner() {
+<span class="nc" id="L208">        return deploymentPlanner;</span>
+    }
+
+    public String getDisplayName() {
+<span class="nc" id="L212">        return displayName;</span>
+    }
+
+    public Long getDomainId() {
+<span class="nc bnc" id="L216" title="All 2 branches missed.">        if (domainId == null) {</span>
+<span class="nc" id="L217">            return CallContext.current().getCallingAccount().getDomainId();</span>
+        }
+<span class="nc" id="L219">        return domainId;</span>
+    }
+
+    public Map&lt;String, String&gt; getDetails() {
+<span class="nc" id="L223">        Map&lt;String, String&gt; customparameterMap = new HashMap&lt;String, String&gt;();</span>
+<span class="nc bnc" id="L224" title="All 4 branches missed.">        if (details != null &amp;&amp; details.size() != 0) {</span>
+<span class="nc" id="L225">            Collection parameterCollection = details.values();</span>
+<span class="nc" id="L226">            Iterator iter = parameterCollection.iterator();</span>
+<span class="nc bnc" id="L227" title="All 2 branches missed.">            while (iter.hasNext()) {</span>
+<span class="nc" id="L228">                HashMap&lt;String, String&gt; value = (HashMap&lt;String, String&gt;)iter.next();</span>
+<span class="nc bnc" id="L229" title="All 2 branches missed.">                for (Map.Entry&lt;String,String&gt; entry: value.entrySet()) {</span>
+<span class="nc" id="L230">                    customparameterMap.put(entry.getKey(),entry.getValue());</span>
+                }
+            }
+        }
+<span class="nc bnc" id="L234" title="All 4 branches missed.">        if (rootdisksize != null &amp;&amp; !customparameterMap.containsKey(&quot;rootdisksize&quot;)) {</span>
+<span class="nc" id="L235">            customparameterMap.put(&quot;rootdisksize&quot;, rootdisksize.toString());</span>
+        }
+<span class="nc" id="L237">        return customparameterMap;</span>
+    }
+
+    public String getGroup() {
+<span class="nc" id="L241">        return group;</span>
+    }
+
+    public HypervisorType getHypervisor() {
+<span class="nc" id="L245">        return HypervisorType.getType(hypervisor);</span>
+    }
+
+    public Boolean getDisplayVm() {
+<span class="nc" id="L249">        return displayVm;</span>
+    }
+
+    @Override
+    public boolean isDisplay() {
+<span class="nc bnc" id="L254" title="All 2 branches missed.">        if(displayVm == null)</span>
+<span class="nc" id="L255">            return true;</span>
+        else
+<span class="nc" id="L257">            return displayVm;</span>
+    }
+
+    public List&lt;Long&gt; getSecurityGroupIdList() {
+<span class="nc bnc" id="L261" title="All 4 branches missed.">        if (securityGroupNameList != null &amp;&amp; securityGroupIdList != null) {</span>
+<span class="nc" id="L262">            throw new InvalidParameterValueException(&quot;securitygroupids parameter is mutually exclusive with securitygroupnames parameter&quot;);</span>
+        }
+
+       //transform group names to ids here
+<span class="nc bnc" id="L266" title="All 2 branches missed.">       if (securityGroupNameList != null) {</span>
+<span class="nc" id="L267">            List&lt;Long&gt; securityGroupIds = new ArrayList&lt;Long&gt;();</span>
+<span class="nc bnc" id="L268" title="All 2 branches missed.">            for (String groupName : securityGroupNameList) {</span>
+<span class="nc" id="L269">                Long groupId = _responseGenerator.getSecurityGroupId(groupName, getEntityOwnerId());</span>
+<span class="nc bnc" id="L270" title="All 2 branches missed.">                if (groupId == null) {</span>
+<span class="nc" id="L271">                    throw new InvalidParameterValueException(&quot;Unable to find group by name &quot; + groupName);</span>
+                } else {
+<span class="nc" id="L273">                    securityGroupIds.add(groupId);</span>
+                }
+            }
+<span class="nc" id="L276">            return securityGroupIds;</span>
+        } else {
+<span class="nc" id="L278">            return securityGroupIdList;</span>
+        }
+    }
+
+    public Long getServiceOfferingId() {
+<span class="nc" id="L283">        return serviceOfferingId;</span>
+    }
+
+    public Long getSize() {
+<span class="nc" id="L287">        return size;</span>
+    }
+
+    public Long getTemplateId() {
+<span class="nc" id="L291">        return templateId;</span>
+    }
+
+    public String getUserData() {
+<span class="nc" id="L295">        return userData;</span>
+    }
+
+    public Long getZoneId() {
+<span class="nc" id="L299">        return zoneId;</span>
+    }
+
+    public List&lt;Long&gt; getNetworkIds() {
+<span class="nc bnc" id="L303" title="All 4 branches missed.">       if (ipToNetworkList != null &amp;&amp; !ipToNetworkList.isEmpty()) {</span>
+<span class="nc bnc" id="L304" title="All 8 branches missed.">           if ((networkIds != null &amp;&amp; !networkIds.isEmpty()) || ipAddress != null || getIp6Address() != null) {</span>
+<span class="nc" id="L305">               throw new InvalidParameterValueException(&quot;ipToNetworkMap can't be specified along with networkIds or ipAddress&quot;);</span>
+           } else {
+<span class="nc" id="L307">               List&lt;Long&gt; networks = new ArrayList&lt;Long&gt;();</span>
+<span class="nc" id="L308">               networks.addAll(getIpToNetworkMap().keySet());</span>
+<span class="nc" id="L309">               return networks;</span>
+           }
+       }
+<span class="nc" id="L312">        return networkIds;</span>
+    }
+
+    public String getName() {
+<span class="nc" id="L316">        return name;</span>
+    }
+
+    public String getSSHKeyPairName() {
+<span class="nc" id="L320">        return sshKeyPairName;</span>
+    }
+
+    public Long getHostId() {
+<span class="nc" id="L324">        return hostId;</span>
+    }
+
+    public boolean getStartVm() {
+<span class="nc bnc" id="L328" title="All 2 branches missed.">        return startVm == null ? true : startVm;</span>
+    }
+
+    private Map&lt;Long, IpAddresses&gt; getIpToNetworkMap() {
+<span class="nc bnc" id="L332" title="All 8 branches missed.">        if ((networkIds != null || ipAddress != null || getIp6Address() != null) &amp;&amp; ipToNetworkList != null) {</span>
+<span class="nc" id="L333">            throw new InvalidParameterValueException(&quot;NetworkIds and ipAddress can't be specified along with ipToNetworkMap parameter&quot;);</span>
+        }
+<span class="nc" id="L335">        LinkedHashMap&lt;Long, IpAddresses&gt; ipToNetworkMap = null;</span>
+<span class="nc bnc" id="L336" title="All 4 branches missed.">        if (ipToNetworkList != null &amp;&amp; !ipToNetworkList.isEmpty()) {</span>
+<span class="nc" id="L337">            ipToNetworkMap = new LinkedHashMap&lt;Long, IpAddresses&gt;();</span>
+<span class="nc" id="L338">            Collection ipsCollection = ipToNetworkList.values();</span>
+<span class="nc" id="L339">            Iterator iter = ipsCollection.iterator();</span>
+<span class="nc bnc" id="L340" title="All 2 branches missed.">            while (iter.hasNext()) {</span>
+<span class="nc" id="L341">                HashMap&lt;String, String&gt; ips = (HashMap&lt;String, String&gt;)iter.next();</span>
+                Long networkId;
+<span class="nc" id="L343">                Network network = _networkService.getNetwork(ips.get(&quot;networkid&quot;));</span>
+<span class="nc bnc" id="L344" title="All 2 branches missed.">                if (network != null) {</span>
+<span class="nc" id="L345">                    networkId = network.getId();</span>
+<span class="nc" id="L346">                } else {</span>
+                    try {
+<span class="nc" id="L348">                        networkId = Long.parseLong(ips.get(&quot;networkid&quot;));</span>
+<span class="nc" id="L349">                    } catch (NumberFormatException e) {</span>
+<span class="nc" id="L350">                        throw new InvalidParameterValueException(&quot;Unable to translate and find entity with networkId: &quot; + ips.get(&quot;networkid&quot;));</span>
+                    }
+                }
+<span class="nc" id="L353">                String requestedIp = ips.get(&quot;ip&quot;);</span>
+<span class="nc" id="L354">                String requestedIpv6 = ips.get(&quot;ipv6&quot;);</span>
+<span class="nc bnc" id="L355" title="All 2 branches missed.">                if (requestedIpv6 != null) {</span>
+<span class="nc" id="L356">                    requestedIpv6 = NetUtils.standardizeIp6Address(requestedIpv6);</span>
+                }
+<span class="nc" id="L358">                IpAddresses addrs = new IpAddresses(requestedIp, requestedIpv6);</span>
+<span class="nc" id="L359">                ipToNetworkMap.put(networkId, addrs);</span>
+            }
+        }
+
+<span class="nc" id="L363">        return ipToNetworkMap;</span>
+    }
+
+    public String getIp6Address() {
+<span class="nc bnc" id="L367" title="All 2 branches missed.">        if (ip6Address == null) {</span>
+<span class="nc" id="L368">            return null;</span>
+        }
+<span class="nc" id="L370">        return NetUtils.standardizeIp6Address(ip6Address);</span>
+    }
+
+    public List&lt;Long&gt; getAffinityGroupIdList() {
+<span class="nc bnc" id="L374" title="All 4 branches missed.">        if (affinityGroupNameList != null &amp;&amp; affinityGroupIdList != null) {</span>
+<span class="nc" id="L375">            throw new InvalidParameterValueException(&quot;affinitygroupids parameter is mutually exclusive with affinitygroupnames parameter&quot;);</span>
+        }
+
+        // transform group names to ids here
+<span class="nc bnc" id="L379" title="All 2 branches missed.">        if (affinityGroupNameList != null) {</span>
+<span class="nc" id="L380">            List&lt;Long&gt; affinityGroupIds = new ArrayList&lt;Long&gt;();</span>
+<span class="nc bnc" id="L381" title="All 2 branches missed.">            for (String groupName : affinityGroupNameList) {</span>
+<span class="nc" id="L382">                Long groupId = _responseGenerator.getAffinityGroupId(groupName, getEntityOwnerId());</span>
+<span class="nc bnc" id="L383" title="All 2 branches missed.">                if (groupId == null) {</span>
+<span class="nc" id="L384">                    throw new InvalidParameterValueException(&quot;Unable to find affinity group by name &quot; + groupName);</span>
+                } else {
+<span class="nc" id="L386">                    affinityGroupIds.add(groupId);</span>
+                }
+            }
+<span class="nc" id="L389">            return affinityGroupIds;</span>
+        } else {
+<span class="nc" id="L391">            return affinityGroupIdList;</span>
+        }
+    }
+
+    /////////////////////////////////////////////////////
+    /////////////// API Implementation///////////////////
+    /////////////////////////////////////////////////////
+
+    @Override
+    public String getCommandName() {
+<span class="nc" id="L401">        return s_name;</span>
+    }
+
+    public static String getResultObjectName() {
+<span class="nc" id="L405">        return &quot;virtualmachine&quot;;</span>
+    }
+
+    @Override
+    public long getEntityOwnerId() {
+<span class="nc" id="L410">        Long accountId = _accountService.finalyzeAccountId(accountName, domainId, projectId, true);</span>
+<span class="nc bnc" id="L411" title="All 2 branches missed.">        if (accountId == null) {</span>
+<span class="nc" id="L412">            return CallContext.current().getCallingAccount().getId();</span>
+        }
+
+<span class="nc" id="L415">        return accountId;</span>
+    }
+
+    @Override
+    public String getEventType() {
+<span class="nc" id="L420">        return EventTypes.EVENT_VM_CREATE;</span>
+    }
+
+    @Override
+    public String getCreateEventType() {
+<span class="nc" id="L425">        return EventTypes.EVENT_VM_CREATE;</span>
+    }
+
+    @Override
+    public String getCreateEventDescription() {
+<span class="nc" id="L430">        return &quot;creating Vm&quot;;</span>
+    }
+
+    @Override
+    public String getEventDescription() {
+<span class="nc" id="L435">        return &quot;starting Vm. Vm Id: &quot; + getEntityId();</span>
+    }
+
+    @Override
+    public ApiCommandJobType getInstanceType() {
+<span class="nc" id="L440">        return ApiCommandJobType.VirtualMachine;</span>
+    }
+
+    @Override
+    public void execute() {
+        UserVm result;
+
+<span class="nc bnc" id="L447" title="All 2 branches missed.">        if (getStartVm()) {</span>
+            try {
+<span class="nc" id="L449">                CallContext.current().setEventDetails(&quot;Vm Id: &quot; + getEntityId());</span>
+<span class="nc" id="L450">                result = _userVmService.startVirtualMachine(this);</span>
+<span class="nc" id="L451">            } catch (ResourceUnavailableException ex) {</span>
+<span class="nc" id="L452">                s_logger.warn(&quot;Exception: &quot;, ex);</span>
+<span class="nc" id="L453">                throw new ServerApiException(ApiErrorCode.RESOURCE_UNAVAILABLE_ERROR, ex.getMessage());</span>
+<span class="nc" id="L454">            } catch (ConcurrentOperationException ex) {</span>
+<span class="nc" id="L455">                s_logger.warn(&quot;Exception: &quot;, ex);</span>
+<span class="nc" id="L456">                throw new ServerApiException(ApiErrorCode.INTERNAL_ERROR, ex.getMessage());</span>
+<span class="nc" id="L457">            } catch (InsufficientCapacityException ex) {</span>
+<span class="nc" id="L458">                StringBuilder message = new StringBuilder(ex.getMessage());</span>
+<span class="nc bnc" id="L459" title="All 2 branches missed.">                if (ex instanceof InsufficientServerCapacityException) {</span>
+<span class="nc bnc" id="L460" title="All 2 branches missed.">                    if (((InsufficientServerCapacityException)ex).isAffinityApplied()) {</span>
+<span class="nc" id="L461">                        message.append(&quot;, Please check the affinity groups provided, there may not be sufficient capacity to follow them&quot;);</span>
+                    }
+                }
+<span class="nc" id="L464">                s_logger.info(ex);</span>
+<span class="nc" id="L465">                s_logger.info(message.toString(), ex);</span>
+<span class="nc" id="L466">                throw new ServerApiException(ApiErrorCode.INSUFFICIENT_CAPACITY_ERROR, message.toString());</span>
+            }
+        } else {
+<span class="nc" id="L469">            result = _userVmService.getUserVm(getEntityId());</span>
+        }
+
+<span class="nc bnc" id="L472" title="All 2 branches missed.">        if (result != null) {</span>
+<span class="nc" id="L473">            UserVmResponse response = _responseGenerator.createUserVmResponse(ResponseView.Restricted, &quot;virtualmachine&quot;, result).get(0);</span>
+<span class="nc" id="L474">            response.setResponseName(getCommandName());</span>
+<span class="nc" id="L475">            setResponseObject(response);</span>
+<span class="nc" id="L476">        } else {</span>
+<span class="nc" id="L477">            throw new ServerApiException(ApiErrorCode.INTERNAL_ERROR, &quot;Failed to deploy vm uuid:&quot;+getEntityUuid());</span>
+        }
+<span class="nc" id="L479">    }</span>
+
+    // this is an opportunity to verify that parameters that came in via the Details Map are OK
+    // for example, minIops and maxIops should either both be specified or neither be specified and,
+    // if specified, minIops should be &lt;= maxIops
+    private void verifyDetails() {
+<span class="nc" id="L485">        Map&lt;String, String&gt; map = getDetails();</span>
+
+<span class="nc bnc" id="L487" title="All 2 branches missed.">        if (map != null) {</span>
+<span class="nc" id="L488">            String minIops = (String)map.get(&quot;minIops&quot;);</span>
+<span class="nc" id="L489">            String maxIops = (String)map.get(&quot;maxIops&quot;);</span>
+
+<span class="nc" id="L491">            verifyMinAndMaxIops(minIops, maxIops);</span>
+
+<span class="nc" id="L493">            minIops = (String)map.get(&quot;minIopsDo&quot;);</span>
+<span class="nc" id="L494">            maxIops = (String)map.get(&quot;maxIopsDo&quot;);</span>
+
+<span class="nc" id="L496">            verifyMinAndMaxIops(minIops, maxIops);</span>
+        }
+<span class="nc" id="L498">    }</span>
+
+    private void verifyMinAndMaxIops(String minIops, String maxIops) {
+<span class="nc bnc" id="L501" title="All 8 branches missed.">        if ((minIops != null &amp;&amp; maxIops == null) || (minIops == null &amp;&amp; maxIops != null)) {</span>
+<span class="nc" id="L502">            throw new InvalidParameterValueException(&quot;Either 'Min IOPS' and 'Max IOPS' must both be specified or neither be specified.&quot;);</span>
+        }
+
+        long lMinIops;
+
+        try {
+<span class="nc bnc" id="L508" title="All 2 branches missed.">            if (minIops != null) {</span>
+<span class="nc" id="L509">                lMinIops = Long.parseLong(minIops);</span>
+<span class="nc" id="L510">            }</span>
+            else {
+<span class="nc" id="L512">                lMinIops = 0;</span>
+            }
+<span class="nc" id="L514">        }</span>
+<span class="nc" id="L515">        catch (NumberFormatException ex) {</span>
+<span class="nc" id="L516">            throw new InvalidParameterValueException(&quot;'Min IOPS' must be a whole number.&quot;);</span>
+        }
+
+        long lMaxIops;
+
+        try {
+<span class="nc bnc" id="L522" title="All 2 branches missed.">            if (maxIops != null) {</span>
+<span class="nc" id="L523">                lMaxIops = Long.parseLong(maxIops);</span>
+<span class="nc" id="L524">            }</span>
+            else {
+<span class="nc" id="L526">                lMaxIops = 0;</span>
+            }
+<span class="nc" id="L528">        }</span>
+<span class="nc" id="L529">        catch (NumberFormatException ex) {</span>
+<span class="nc" id="L530">            throw new InvalidParameterValueException(&quot;'Max IOPS' must be a whole number.&quot;);</span>
+        }
+
+<span class="nc bnc" id="L533" title="All 2 branches missed.">        if (lMinIops &gt; lMaxIops) {</span>
+<span class="nc" id="L534">            throw new InvalidParameterValueException(&quot;'Min IOPS' must be less than or equal to 'Max IOPS'.&quot;);</span>
+        }
+<span class="nc" id="L536">    }</span>
+
+    @Override
+    public void create() throws ResourceAllocationException {
+        try {
+            //Verify that all objects exist before passing them to the service
+<span class="nc" id="L542">            Account owner = _accountService.getActiveAccountById(getEntityOwnerId());</span>
+
+<span class="nc" id="L544">            verifyDetails();</span>
+
+<span class="nc" id="L546">            DataCenter zone = _entityMgr.findById(DataCenter.class, zoneId);</span>
+<span class="nc bnc" id="L547" title="All 2 branches missed.">            if (zone == null) {</span>
+<span class="nc" id="L548">                throw new InvalidParameterValueException(&quot;Unable to find zone by id=&quot; + zoneId);</span>
+            }
+
+<span class="nc" id="L551">            ServiceOffering serviceOffering = _entityMgr.findById(ServiceOffering.class, serviceOfferingId);</span>
+<span class="nc bnc" id="L552" title="All 2 branches missed.">            if (serviceOffering == null) {</span>
+<span class="nc" id="L553">                throw new InvalidParameterValueException(&quot;Unable to find service offering: &quot; + serviceOfferingId);</span>
+            }
+
+<span class="nc" id="L556">            VirtualMachineTemplate template = _entityMgr.findById(VirtualMachineTemplate.class, templateId);</span>
+            // Make sure a valid template ID was specified
+<span class="nc bnc" id="L558" title="All 2 branches missed.">            if (template == null) {</span>
+<span class="nc" id="L559">                throw new InvalidParameterValueException(&quot;Unable to find the template &quot; + templateId);</span>
+            }
+
+<span class="nc" id="L562">            DiskOffering diskOffering = null;</span>
+<span class="nc bnc" id="L563" title="All 2 branches missed.">            if (diskOfferingId != null) {</span>
+<span class="nc" id="L564">                diskOffering = _entityMgr.findById(DiskOffering.class, diskOfferingId);</span>
+<span class="nc bnc" id="L565" title="All 2 branches missed.">                if (diskOffering == null) {</span>
+<span class="nc" id="L566">                    throw new InvalidParameterValueException(&quot;Unable to find disk offering &quot; + diskOfferingId);</span>
+                }
+            }
+
+<span class="nc bnc" id="L570" title="All 2 branches missed.">            if (!zone.isLocalStorageEnabled()) {</span>
+<span class="nc bnc" id="L571" title="All 2 branches missed.">                if (serviceOffering.getUseLocalStorage()) {</span>
+<span class="nc" id="L572">                    throw new InvalidParameterValueException(&quot;Zone is not configured to use local storage but service offering &quot; + serviceOffering.getName() + &quot; uses it&quot;);</span>
+                }
+<span class="nc bnc" id="L574" title="All 4 branches missed.">                if (diskOffering != null &amp;&amp; diskOffering.getUseLocalStorage()) {</span>
+<span class="nc" id="L575">                    throw new InvalidParameterValueException(&quot;Zone is not configured to use local storage but disk offering &quot; + diskOffering.getName() + &quot; uses it&quot;);</span>
+                }
+            }
+
+<span class="nc" id="L579">            UserVm vm = null;</span>
+<span class="nc" id="L580">            IpAddresses addrs = new IpAddresses(ipAddress, getIp6Address());</span>
+<span class="nc bnc" id="L581" title="All 2 branches missed.">            if (zone.getNetworkType() == NetworkType.Basic) {</span>
+<span class="nc bnc" id="L582" title="All 2 branches missed.">                if (getNetworkIds() != null) {</span>
+<span class="nc" id="L583">                    throw new InvalidParameterValueException(&quot;Can't specify network Ids in Basic zone&quot;);</span>
+                } else {
+<span class="nc" id="L585">                    vm = _userVmService.createBasicSecurityGroupVirtualMachine(zone, serviceOffering, template, getSecurityGroupIdList(), owner, name, displayName, diskOfferingId,</span>
+<span class="nc" id="L586">                            size, group, getHypervisor(), getHttpMethod(), userData, sshKeyPairName, getIpToNetworkMap(), addrs, displayVm, keyboard, getAffinityGroupIdList(),</span>
+<span class="nc" id="L587">                            getDetails(), getCustomId());</span>
+                }
+<span class="nc" id="L589">            } else {</span>
+<span class="nc bnc" id="L590" title="All 2 branches missed.">                if (zone.isSecurityGroupEnabled())  {</span>
+<span class="nc" id="L591">                    vm = _userVmService.createAdvancedSecurityGroupVirtualMachine(zone, serviceOffering, template, getNetworkIds(), getSecurityGroupIdList(), owner, name,</span>
+<span class="nc" id="L592">                            displayName, diskOfferingId, size, group, getHypervisor(), getHttpMethod(), userData, sshKeyPairName, getIpToNetworkMap(), addrs, displayVm, keyboard,</span>
+<span class="nc" id="L593">                            getAffinityGroupIdList(), getDetails(), getCustomId());</span>
+
+<span class="nc" id="L595">                } else {</span>
+<span class="nc bnc" id="L596" title="All 4 branches missed.">                    if (getSecurityGroupIdList() != null &amp;&amp; !getSecurityGroupIdList().isEmpty()) {</span>
+<span class="nc" id="L597">                        throw new InvalidParameterValueException(&quot;Can't create vm with security groups; security group feature is not enabled per zone&quot;);</span>
+                    }
+<span class="nc" id="L599">                    vm = _userVmService.createAdvancedVirtualMachine(zone, serviceOffering, template, getNetworkIds(), owner, name, displayName, diskOfferingId, size, group,</span>
+<span class="nc" id="L600">                            getHypervisor(), getHttpMethod(), userData, sshKeyPairName, getIpToNetworkMap(), addrs, displayVm, keyboard, getAffinityGroupIdList(), getDetails(),</span>
+<span class="nc" id="L601">                            getCustomId());</span>
+                }
+            }
+
+<span class="nc bnc" id="L605" title="All 2 branches missed.">            if (vm != null) {</span>
+<span class="nc" id="L606">                setEntityId(vm.getId());</span>
+<span class="nc" id="L607">                setEntityUuid(vm.getUuid());</span>
+<span class="nc" id="L608">            } else {</span>
+<span class="nc" id="L609">                throw new ServerApiException(ApiErrorCode.INTERNAL_ERROR, &quot;Failed to deploy vm&quot;);</span>
+            }
+<span class="nc" id="L611">        } catch (InsufficientCapacityException ex) {</span>
+<span class="nc" id="L612">            s_logger.info(ex);</span>
+<span class="nc" id="L613">            s_logger.trace(ex.getMessage(), ex);</span>
+<span class="nc" id="L614">            throw new ServerApiException(ApiErrorCode.INSUFFICIENT_CAPACITY_ERROR, ex.getMessage());</span>
+<span class="nc" id="L615">        } catch (ResourceUnavailableException ex) {</span>
+<span class="nc" id="L616">            s_logger.warn(&quot;Exception: &quot;, ex);</span>
+<span class="nc" id="L617">            throw new ServerApiException(ApiErrorCode.RESOURCE_UNAVAILABLE_ERROR, ex.getMessage());</span>
+<span class="nc" id="L618">        }  catch (ConcurrentOperationException ex) {</span>
+<span class="nc" id="L619">            s_logger.warn(&quot;Exception: &quot;, ex);</span>
+<span class="nc" id="L620">            throw new ServerApiException(ApiErrorCode.INTERNAL_ERROR, ex.getMessage());</span>
+<span class="nc" id="L621">        } catch (ResourceAllocationException ex) {</span>
+<span class="nc" id="L622">            s_logger.warn(&quot;Exception: &quot;, ex);</span>
+<span class="nc" id="L623">            throw new ServerApiException(ApiErrorCode.RESOURCE_ALLOCATION_ERROR, ex.getMessage());</span>
+        }
+<span class="nc" id="L625">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>cloud-core (18-mrt-2016 13:14:54)</div></body></html>

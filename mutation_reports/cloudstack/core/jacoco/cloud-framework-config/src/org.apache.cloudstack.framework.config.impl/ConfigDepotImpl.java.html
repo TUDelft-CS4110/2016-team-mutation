@@ -1,0 +1,211 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>ConfigDepotImpl.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">cloud-core (18-mrt-2016 13:14:54)</a> &gt; <a href="../../index.html" class="el_group">cloud-framework-config</a> &gt; <a href="../index.html" class="el_bundle">src</a> &gt; <a href="index.source.html" class="el_package">org.apache.cloudstack.framework.config.impl</a> &gt; <span class="el_source">ConfigDepotImpl.java</span></div><h1>ConfigDepotImpl.java</h1><pre class="source lang-java linenums">// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// &quot;License&quot;); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+package org.apache.cloudstack.framework.config.impl;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+
+import javax.annotation.PostConstruct;
+import javax.inject.Inject;
+
+import org.apache.cloudstack.framework.config.ConfigDepot;
+import org.apache.cloudstack.framework.config.ConfigDepotAdmin;
+import org.apache.cloudstack.framework.config.ConfigKey;
+import org.apache.cloudstack.framework.config.Configurable;
+import org.apache.cloudstack.framework.config.ScopedConfigStorage;
+import org.apache.cloudstack.framework.config.dao.ConfigurationDao;
+import org.apache.commons.lang.ObjectUtils;
+import org.apache.log4j.Logger;
+
+import com.cloud.utils.Pair;
+import com.cloud.utils.exception.CloudRuntimeException;
+
+/**
+ * ConfigDepotImpl implements the ConfigDepot and ConfigDepotAdmin interface.
+ * Its functionalities include:
+ *   - Control how dynamic config values are cached and refreshed.
+ *   - Control how scoped config values are stored.
+ *   - Gather all of the Configurable interfaces and insert their config
+ *     variables into the config table.
+ *   - Hide the data source where configs are stored and retrieved.
+ *
+ * When dealing with this class, we must be very careful on cluster situations.
+ *
+ * TODO:
+ *   - Move the rest of the changes to the config table to here.
+ *   - Add the code to mark the rows in configuration table without
+ *     the corresponding keys to be null.
+ *   - Move all of the configurations to using ConfigDepot
+ *   - Completely eliminate Config.java
+ *   - Figure out the correct categories.
+ *   - Add a scope for management server, where if the scope is management server
+ *     then the override is retrieved from a properties file.  Imagine adding a
+ *     new management server node and it is much more capable system than previous
+ *     management servers, you want the adjustments to thread pools etc to be
+ *     very different than other management serves.
+ *   - Add validation methods to ConfigKey&lt;?&gt;.  If a validation class is declared
+ *     when constructing a ConfigKey then configuration server should use the
+ *     validation class to validate the value the admin input for the key.
+ */
+public class ConfigDepotImpl implements ConfigDepot, ConfigDepotAdmin {
+<span class="nc" id="L70">    private final static Logger s_logger = Logger.getLogger(ConfigDepotImpl.class);</span>
+    @Inject
+    ConfigurationDao _configDao;
+    List&lt;Configurable&gt; _configurables;
+    List&lt;ScopedConfigStorage&gt; _scopedStorages;
+<span class="nc" id="L75">    Set&lt;Configurable&gt; _configured = Collections.synchronizedSet(new HashSet&lt;Configurable&gt;());</span>
+
+<span class="nc" id="L77">    HashMap&lt;String, Pair&lt;String, ConfigKey&lt;?&gt;&gt;&gt; _allKeys = new HashMap&lt;String, Pair&lt;String, ConfigKey&lt;?&gt;&gt;&gt;(1007);</span>
+
+<span class="nc" id="L79">    HashMap&lt;ConfigKey.Scope, Set&lt;ConfigKey&lt;?&gt;&gt;&gt; _scopeLevelConfigsMap = new HashMap&lt;ConfigKey.Scope, Set&lt;ConfigKey&lt;?&gt;&gt;&gt;();</span>
+
+<span class="nc" id="L81">    public ConfigDepotImpl() {</span>
+<span class="nc" id="L82">        ConfigKey.init(this);</span>
+<span class="nc" id="L83">        _scopeLevelConfigsMap.put(ConfigKey.Scope.Zone, new HashSet&lt;ConfigKey&lt;?&gt;&gt;());</span>
+<span class="nc" id="L84">        _scopeLevelConfigsMap.put(ConfigKey.Scope.Cluster, new HashSet&lt;ConfigKey&lt;?&gt;&gt;());</span>
+<span class="nc" id="L85">        _scopeLevelConfigsMap.put(ConfigKey.Scope.StoragePool, new HashSet&lt;ConfigKey&lt;?&gt;&gt;());</span>
+<span class="nc" id="L86">        _scopeLevelConfigsMap.put(ConfigKey.Scope.Account, new HashSet&lt;ConfigKey&lt;?&gt;&gt;());</span>
+<span class="nc" id="L87">    }</span>
+
+    @Override
+    public ConfigKey&lt;?&gt; get(String key) {
+<span class="nc" id="L91">        Pair&lt;String, ConfigKey&lt;?&gt;&gt; value = _allKeys.get(key);</span>
+<span class="nc bnc" id="L92" title="All 2 branches missed.">        return value != null ? value.second() : null;</span>
+    }
+
+    @PostConstruct
+    @Override
+    public void populateConfigurations() {
+<span class="nc" id="L98">        Date date = new Date();</span>
+<span class="nc bnc" id="L99" title="All 2 branches missed.">        for (Configurable configurable : _configurables) {</span>
+<span class="nc" id="L100">            populateConfiguration(date, configurable);</span>
+        }
+<span class="nc" id="L102">    }</span>
+
+    protected void populateConfiguration(Date date, Configurable configurable) {
+<span class="nc bnc" id="L105" title="All 2 branches missed.">        if (_configured.contains(configurable))</span>
+<span class="nc" id="L106">            return;</span>
+
+<span class="nc" id="L108">        s_logger.debug(&quot;Retrieving keys from &quot; + configurable.getClass().getSimpleName());</span>
+
+<span class="nc bnc" id="L110" title="All 2 branches missed.">        for (ConfigKey&lt;?&gt; key : configurable.getConfigKeys()) {</span>
+<span class="nc" id="L111">            Pair&lt;String, ConfigKey&lt;?&gt;&gt; previous = _allKeys.get(key.key());</span>
+<span class="nc bnc" id="L112" title="All 4 branches missed.">            if (previous != null &amp;&amp; !previous.first().equals(configurable.getConfigComponentName())) {</span>
+<span class="nc" id="L113">                throw new CloudRuntimeException(&quot;Configurable &quot; + configurable.getConfigComponentName() + &quot; is adding a key that has been added before by &quot; +</span>
+<span class="nc" id="L114">                    previous.first() + &quot;: &quot; + key.toString());</span>
+            }
+<span class="nc" id="L116">            _allKeys.put(key.key(), new Pair&lt;String, ConfigKey&lt;?&gt;&gt;(configurable.getConfigComponentName(), key));</span>
+
+<span class="nc" id="L118">            createOrupdateConfigObject(date, configurable.getConfigComponentName(), key, null);</span>
+
+<span class="nc bnc" id="L120" title="All 4 branches missed.">            if ((key.scope() != null) &amp;&amp; (key.scope() != ConfigKey.Scope.Global)) {</span>
+<span class="nc" id="L121">                Set&lt;ConfigKey&lt;?&gt;&gt; currentConfigs = _scopeLevelConfigsMap.get(key.scope());</span>
+<span class="nc" id="L122">                currentConfigs.add(key);</span>
+            }
+        }
+
+<span class="nc" id="L126">        _configured.add(configurable);</span>
+<span class="nc" id="L127">    }</span>
+
+    private void createOrupdateConfigObject(Date date, String componentName, ConfigKey&lt;?&gt; key, String value) {
+<span class="nc" id="L130">        ConfigurationVO vo = _configDao.findById(key.key());</span>
+<span class="nc bnc" id="L131" title="All 2 branches missed.">        if (vo == null) {</span>
+<span class="nc" id="L132">            vo = new ConfigurationVO(componentName, key);</span>
+<span class="nc" id="L133">            vo.setUpdated(date);</span>
+<span class="nc bnc" id="L134" title="All 2 branches missed.">            if (value != null) {</span>
+<span class="nc" id="L135">                vo.setValue(value);</span>
+            }
+<span class="nc" id="L137">            _configDao.persist(vo);</span>
+<span class="nc" id="L138">        } else {</span>
+<span class="nc bnc" id="L139" title="All 6 branches missed.">            if (vo.isDynamic() != key.isDynamic() || !ObjectUtils.equals(vo.getDescription(), key.description()) || !ObjectUtils.equals(vo.getDefaultValue(), key.defaultValue()) ||</span>
+<span class="nc bnc" id="L140" title="All 2 branches missed.">                !ObjectUtils.equals(vo.getScope(), key.scope().toString()) ||</span>
+<span class="nc bnc" id="L141" title="All 2 branches missed.">                !ObjectUtils.equals(vo.getComponent(), componentName)) {</span>
+<span class="nc" id="L142">                vo.setDynamic(key.isDynamic());</span>
+<span class="nc" id="L143">                vo.setDescription(key.description());</span>
+<span class="nc" id="L144">                vo.setDefaultValue(key.defaultValue());</span>
+<span class="nc" id="L145">                vo.setScope(key.scope().toString());</span>
+<span class="nc" id="L146">                vo.setComponent(componentName);</span>
+<span class="nc" id="L147">                vo.setUpdated(date);</span>
+<span class="nc" id="L148">                _configDao.persist(vo);</span>
+            }
+        }
+<span class="nc" id="L151">    }</span>
+
+    @Override
+    public void populateConfiguration(Configurable configurable) {
+<span class="nc" id="L155">        populateConfiguration(new Date(), configurable);</span>
+<span class="nc" id="L156">    }</span>
+
+    @Override
+    public List&lt;String&gt; getComponentsInDepot() {
+<span class="nc" id="L160">        return new ArrayList&lt;String&gt;();</span>
+    }
+
+    public ConfigurationDao global() {
+<span class="nc" id="L164">        return _configDao;</span>
+    }
+
+    public ScopedConfigStorage scoped(ConfigKey&lt;?&gt; config) {
+<span class="nc bnc" id="L168" title="All 2 branches missed.">        for (ScopedConfigStorage storage : _scopedStorages) {</span>
+<span class="nc bnc" id="L169" title="All 2 branches missed.">            if (storage.getScope() == config.scope()) {</span>
+<span class="nc" id="L170">                return storage;</span>
+            }
+        }
+
+<span class="nc" id="L174">        throw new CloudRuntimeException(&quot;Unable to find config storage for this scope: &quot; + config.scope() + &quot; for &quot; + config.key());</span>
+    }
+
+    public List&lt;ScopedConfigStorage&gt; getScopedStorages() {
+<span class="nc" id="L178">        return _scopedStorages;</span>
+    }
+
+    @Inject
+    public void setScopedStorages(List&lt;ScopedConfigStorage&gt; scopedStorages) {
+<span class="nc" id="L183">        _scopedStorages = scopedStorages;</span>
+<span class="nc" id="L184">    }</span>
+
+    public List&lt;Configurable&gt; getConfigurables() {
+<span class="nc" id="L187">        return _configurables;</span>
+    }
+
+    @Inject
+    public void setConfigurables(List&lt;Configurable&gt; configurables) {
+<span class="nc" id="L192">        _configurables = configurables;</span>
+<span class="nc" id="L193">    }</span>
+
+    @Override
+    public Set&lt;ConfigKey&lt;?&gt;&gt; getConfigListByScope(String scope) {
+<span class="nc" id="L197">        return _scopeLevelConfigsMap.get(ConfigKey.Scope.valueOf(scope));</span>
+    }
+
+    @Override
+    public &lt;T&gt; void set(ConfigKey&lt;T&gt; key, T value) {
+<span class="nc" id="L202">        _configDao.update(key.key(), value.toString());</span>
+<span class="nc" id="L203">    }</span>
+
+    @Override
+    public &lt;T&gt; void createOrUpdateConfigObject(String componentName, ConfigKey&lt;T&gt; key, String value) {
+<span class="nc" id="L207">        createOrupdateConfigObject(new Date(), componentName, key, value);</span>
+
+<span class="nc" id="L209">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>cloud-core (18-mrt-2016 13:14:54)</div></body></html>

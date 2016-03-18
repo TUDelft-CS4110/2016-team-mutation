@@ -1,0 +1,239 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>GlobalLock.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">cloud-core (18-mrt-2016 13:14:54)</a> &gt; <a href="../../index.html" class="el_group">cloud-framework-db</a> &gt; <a href="../index.html" class="el_bundle">src</a> &gt; <a href="index.source.html" class="el_package">com.cloud.utils.db</a> &gt; <span class="el_source">GlobalLock.java</span></div><h1>GlobalLock.java</h1><pre class="source lang-java linenums">// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// &quot;License&quot;); you may not use this file except in compliance
+// the License.  You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// &quot;AS IS&quot; BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+package com.cloud.utils.db;
+
+import static java.lang.String.format;
+
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.Callable;
+
+import org.apache.log4j.Logger;
+
+import com.cloud.utils.Profiler;
+
+//
+// Wrapper class for global database lock to reduce contention for database connections from within process
+//
+// Example of using dynamic named locks
+//
+//        GlobalLock lock = GlobalLock.getInternLock(&quot;some table name&quot; + rowId);
+//
+//        if(lock.lock()) {
+//            try {
+//                do something
+//            } finally {
+//                lock.unlock();
+//            }
+//        }
+//        lock.releaseRef();
+//
+public class GlobalLock {
+<span class="nc" id="L46">    protected final static Logger s_logger = Logger.getLogger(GlobalLock.class);</span>
+
+    private String name;
+<span class="nc" id="L49">    private int lockCount = 0;</span>
+<span class="nc" id="L50">    private Thread ownerThread = null;</span>
+
+<span class="nc" id="L52">    private int referenceCount = 0;</span>
+<span class="nc" id="L53">    private long holdingStartTick = 0;</span>
+
+<span class="nc" id="L55">    private static Map&lt;String, GlobalLock&gt; s_lockMap = new HashMap&lt;String, GlobalLock&gt;();</span>
+
+<span class="nc" id="L57">    private GlobalLock(String name) {</span>
+<span class="nc" id="L58">        this.name = name;</span>
+<span class="nc" id="L59">    }</span>
+
+    public int addRef() {
+<span class="nc" id="L62">        synchronized (this) {</span>
+<span class="nc" id="L63">            referenceCount++;</span>
+<span class="nc" id="L64">            return referenceCount;</span>
+        }
+    }
+
+    public int releaseRef() {
+        int refCount;
+
+<span class="nc" id="L71">        boolean needToRemove = false;</span>
+<span class="nc" id="L72">        synchronized (this) {</span>
+<span class="nc" id="L73">            referenceCount--;</span>
+<span class="nc" id="L74">            refCount = referenceCount;</span>
+
+<span class="nc bnc" id="L76" title="All 2 branches missed.">            if (referenceCount &lt; 0)</span>
+<span class="nc" id="L77">                s_logger.warn(&quot;Unmatched Global lock &quot; + name + &quot; reference usage detected, check your code!&quot;);</span>
+
+<span class="nc bnc" id="L79" title="All 2 branches missed.">            if (referenceCount == 0)</span>
+<span class="nc" id="L80">                needToRemove = true;</span>
+        }
+
+<span class="nc bnc" id="L83" title="All 2 branches missed.">        if (needToRemove)</span>
+<span class="nc" id="L84">            releaseInternLock(name);</span>
+
+<span class="nc" id="L86">        return refCount;</span>
+    }
+
+    public static GlobalLock getInternLock(String name) {
+<span class="nc" id="L90">        synchronized (s_lockMap) {</span>
+<span class="nc bnc" id="L91" title="All 2 branches missed.">            if (s_lockMap.containsKey(name)) {</span>
+<span class="nc" id="L92">                GlobalLock lock = s_lockMap.get(name);</span>
+<span class="nc" id="L93">                lock.addRef();</span>
+<span class="nc" id="L94">                return lock;</span>
+            } else {
+<span class="nc" id="L96">                GlobalLock lock = new GlobalLock(name);</span>
+<span class="nc" id="L97">                lock.addRef();</span>
+<span class="nc" id="L98">                s_lockMap.put(name, lock);</span>
+<span class="nc" id="L99">                return lock;</span>
+            }
+        }
+    }
+
+    private static void releaseInternLock(String name) {
+<span class="nc" id="L105">        synchronized (s_lockMap) {</span>
+<span class="nc" id="L106">            GlobalLock lock = s_lockMap.get(name);</span>
+<span class="nc bnc" id="L107" title="All 2 branches missed.">            if (lock != null) {</span>
+<span class="nc bnc" id="L108" title="All 2 branches missed.">                if (lock.referenceCount == 0)</span>
+<span class="nc" id="L109">                    s_lockMap.remove(name);</span>
+<span class="nc" id="L110">            } else {</span>
+<span class="nc" id="L111">                s_logger.warn(&quot;Releasing &quot; + name + &quot;, but it is already released.&quot;);</span>
+            }
+        }
+<span class="nc" id="L114">    }</span>
+
+    public boolean lock(int timeoutSeconds) {
+<span class="nc" id="L117">        int remainingMilliSeconds = timeoutSeconds * 1000;</span>
+<span class="nc" id="L118">        Profiler profiler = new Profiler();</span>
+<span class="nc" id="L119">        boolean interrupted = false;</span>
+        try {
+            while (true) {
+<span class="nc" id="L122">                synchronized (this) {</span>
+<span class="nc bnc" id="L123" title="All 4 branches missed.">                    if (ownerThread != null &amp;&amp; ownerThread == Thread.currentThread()) {</span>
+<span class="nc" id="L124">                        s_logger.warn(&quot;Global lock re-entrance detected&quot;);</span>
+
+<span class="nc" id="L126">                        lockCount++;</span>
+
+<span class="nc bnc" id="L128" title="All 2 branches missed.">                        if (s_logger.isTraceEnabled())</span>
+<span class="nc" id="L129">                            s_logger.trace(&quot;lock &quot; + name + &quot; is acquired, lock count :&quot; + lockCount);</span>
+<span class="nc" id="L130">                        return true;</span>
+                    }
+
+<span class="nc bnc" id="L133" title="All 2 branches missed.">                    if (ownerThread != null) {</span>
+<span class="nc" id="L134">                        profiler.start();</span>
+                        try {
+<span class="nc" id="L136">                            wait((timeoutSeconds) * 1000L);</span>
+<span class="nc" id="L137">                        } catch (InterruptedException e) {</span>
+<span class="nc" id="L138">                            interrupted = true;</span>
+                        }
+<span class="nc" id="L140">                        profiler.stop();</span>
+
+<span class="nc" id="L142">                        remainingMilliSeconds -= profiler.getDurationInMillis();</span>
+<span class="nc bnc" id="L143" title="All 2 branches missed.">                        if (remainingMilliSeconds &lt; 0)</span>
+<span class="nc" id="L144">                            return false;</span>
+
+<span class="nc" id="L146">                        continue;</span>
+                    } else {
+                        // take ownership temporarily to prevent others enter into stage of acquiring DB lock
+<span class="nc" id="L149">                        ownerThread = Thread.currentThread();</span>
+<span class="nc" id="L150">                        addRef();</span>
+                    }
+                }
+
+<span class="nc bnc" id="L154" title="All 2 branches missed.">                if (DbUtil.getGlobalLock(name, remainingMilliSeconds / 1000)) {</span>
+<span class="nc" id="L155">                    synchronized (this) {</span>
+<span class="nc" id="L156">                        lockCount++;</span>
+<span class="nc" id="L157">                        holdingStartTick = System.currentTimeMillis();</span>
+
+<span class="nc bnc" id="L159" title="All 2 branches missed.">                        if (s_logger.isTraceEnabled())</span>
+<span class="nc" id="L160">                            s_logger.trace(&quot;lock &quot; + name + &quot; is acquired, lock count :&quot; + lockCount);</span>
+<span class="nc" id="L161">                        return true;</span>
+                    }
+                } else {
+<span class="nc" id="L164">                    synchronized (this) {</span>
+<span class="nc" id="L165">                        ownerThread = null;</span>
+<span class="nc" id="L166">                        releaseRef();</span>
+<span class="nc" id="L167">                        return false;</span>
+                    }
+                }
+            }
+<span class="nc" id="L171">        } finally {</span>
+<span class="nc bnc" id="L172" title="All 10 branches missed.">            if (interrupted) {</span>
+<span class="nc" id="L173">                Thread.currentThread().interrupt();</span>
+            }
+<span class="nc" id="L175">        }</span>
+    }
+
+    public boolean unlock() {
+<span class="nc" id="L179">        synchronized (this) {</span>
+<span class="nc bnc" id="L180" title="All 4 branches missed.">            if (ownerThread != null &amp;&amp; ownerThread == Thread.currentThread()) {</span>
+<span class="nc" id="L181">                lockCount--;</span>
+<span class="nc bnc" id="L182" title="All 2 branches missed.">                if (lockCount == 0) {</span>
+<span class="nc" id="L183">                    ownerThread = null;</span>
+<span class="nc" id="L184">                    DbUtil.releaseGlobalLock(name);</span>
+
+<span class="nc bnc" id="L186" title="All 2 branches missed.">                    if (s_logger.isTraceEnabled())</span>
+<span class="nc" id="L187">                        s_logger.trace(&quot;lock &quot; + name + &quot; is returned to free state, total holding time :&quot; + (System.currentTimeMillis() - holdingStartTick));</span>
+<span class="nc" id="L188">                    holdingStartTick = 0;</span>
+
+                    // release holding position in intern map when we released the DB connection
+<span class="nc" id="L191">                    releaseRef();</span>
+<span class="nc" id="L192">                    notifyAll();</span>
+                }
+
+<span class="nc bnc" id="L195" title="All 2 branches missed.">                if (s_logger.isTraceEnabled())</span>
+<span class="nc" id="L196">                    s_logger.trace(&quot;lock &quot; + name + &quot; is released, lock count :&quot; + lockCount);</span>
+<span class="nc" id="L197">                return true;</span>
+            }
+<span class="nc" id="L199">            return false;</span>
+        }
+    }
+
+    public String getName() {
+<span class="nc" id="L204">        return name;</span>
+    }
+
+    public static &lt;T&gt; T executeWithLock(final String operationId, final int lockAcquisitionTimeout, final Callable&lt;T&gt; operation) throws Exception {
+
+<span class="nc" id="L209">        final GlobalLock lock = GlobalLock.getInternLock(operationId);</span>
+
+        try {
+
+<span class="nc bnc" id="L213" title="All 2 branches missed.">            if (!lock.lock(lockAcquisitionTimeout)) {</span>
+<span class="nc bnc" id="L214" title="All 2 branches missed.">                if (s_logger.isDebugEnabled()) {</span>
+<span class="nc" id="L215">                    s_logger.debug(format(&quot;Failed to acquire lock for operation id %1$s&quot;, operationId));</span>
+                }
+<span class="nc" id="L217">                return null;</span>
+            }
+
+<span class="nc" id="L220">            return operation.call();</span>
+
+<span class="nc" id="L222">        } finally {</span>
+
+<span class="nc bnc" id="L224" title="All 6 branches missed.">            if (lock != null) {</span>
+<span class="nc" id="L225">                lock.unlock();</span>
+            }
+
+<span class="nc" id="L228">        }</span>
+
+    }
+
+    public static &lt;T&gt; T executeWithNoWaitLock(final String operationId, final Callable&lt;T&gt; operation) throws Exception {
+
+<span class="nc" id="L234">        return executeWithLock(operationId, 0, operation);</span>
+
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>cloud-core (18-mrt-2016 13:14:54)</div></body></html>
