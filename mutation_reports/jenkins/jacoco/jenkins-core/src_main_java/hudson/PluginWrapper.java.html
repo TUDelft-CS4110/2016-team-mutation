@@ -1,0 +1,707 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>PluginWrapper.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson</a> &gt; <span class="el_source">PluginWrapper.java</span></div><h1>PluginWrapper.java</h1><pre class="source lang-java linenums">/*
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2010, Sun Microsystems, Inc., Kohsuke Kawaguchi,
+ * Yahoo! Inc., Erik Ramfelt, Tom Huybrechts
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson;
+
+import com.google.common.collect.ImmutableSet;
+import hudson.PluginManager.PluginInstanceStore;
+import hudson.model.Api;
+import hudson.model.ModelObject;
+import jenkins.YesNoMaybe;
+import jenkins.model.Jenkins;
+import hudson.model.UpdateCenter;
+import hudson.model.UpdateSite;
+import hudson.util.VersionNumber;
+
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.io.Closeable;
+import java.net.URL;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.Set;
+import java.util.jar.Manifest;
+import java.util.logging.Logger;
+import static java.util.logging.Level.WARNING;
+import static org.apache.commons.io.FilenameUtils.getBaseName;
+import org.apache.commons.lang.StringUtils;
+import org.apache.commons.logging.LogFactory;
+import org.kohsuke.stapler.HttpResponse;
+import org.kohsuke.stapler.HttpResponses;
+import org.kohsuke.stapler.export.Exported;
+import org.kohsuke.stapler.export.ExportedBean;
+import org.kohsuke.stapler.interceptor.RequirePOST;
+
+import java.util.Enumeration;
+import java.util.jar.JarFile;
+import java.util.logging.Level;
+import javax.annotation.CheckForNull;
+import javax.annotation.Nonnull;
+
+/**
+ * Represents a Jenkins plug-in and associated control information
+ * for Jenkins to control {@link Plugin}.
+ *
+ * &lt;p&gt;
+ * A plug-in is packaged into a jar file whose extension is &lt;tt&gt;&quot;.jpi&quot;&lt;/tt&gt; (or &lt;tt&gt;&quot;.hpi&quot;&lt;/tt&gt; for backward compatibility),
+ * A plugin needs to have a special manifest entry to identify what it is.
+ *
+ * &lt;p&gt;
+ * At the runtime, a plugin has two distinct state axis.
+ * &lt;ol&gt;
+ *  &lt;li&gt;Enabled/Disabled. If enabled, Jenkins is going to use it
+ *      next time Jenkins runs. Otherwise the next run will ignore it.
+ *  &lt;li&gt;Activated/Deactivated. If activated, that means Jenkins is using
+ *      the plugin in this session. Otherwise it's not.
+ * &lt;/ol&gt;
+ * &lt;p&gt;
+ * For example, an activated but disabled plugin is still running but the next
+ * time it won't.
+ *
+ * @author Kohsuke Kawaguchi
+ */
+@ExportedBean
+public class PluginWrapper implements Comparable&lt;PluginWrapper&gt;, ModelObject {
+    /**
+     * {@link PluginManager} to which this belongs to.
+     */
+    public final PluginManager parent;
+
+    /**
+     * Plugin manifest.
+     * Contains description of the plugin.
+     */
+    private final Manifest manifest;
+
+    /**
+     * {@link ClassLoader} for loading classes from this plugin.
+     * Null if disabled.
+     */
+    public final ClassLoader classLoader;
+
+    /**
+     * Base URL for loading static resources from this plugin.
+     * Null if disabled. The static resources are mapped under
+     * &lt;tt&gt;CONTEXTPATH/plugin/SHORTNAME/&lt;/tt&gt;.
+     */
+    public final URL baseResourceURL;
+
+    /**
+     * Used to control enable/disable setting of the plugin.
+     * If this file exists, plugin will be disabled.
+     */
+    private final File disableFile;
+
+    /**
+     * Used to control the unpacking of the bundled plugin.
+     * If a pin file exists, Jenkins assumes that the user wants to pin down a particular version
+     * of a plugin, and will not try to overwrite it. Otherwise, it'll be overwritten
+     * by a bundled copy, to ensure consistency across upgrade/downgrade.
+     * @since 1.325
+     */
+    private final File pinFile;
+
+    /**
+     * A .jpi file, an exploded plugin directory, or a .jpl file.
+     */
+    private final File archive;
+
+    /**
+     * Short name of the plugin. The artifact Id of the plugin.
+     * This is also used in the URL within Jenkins, so it needs
+     * to remain stable even when the *.jpi file name is changed
+     * (like Maven does.)
+     */
+    private final String shortName;
+
+    /**
+     * True if this plugin is activated for this session.
+     * The snapshot of &lt;tt&gt;disableFile.exists()&lt;/tt&gt; as of the start up.
+     */
+    private final boolean active;
+    
+<span class="nc" id="L148">    private boolean hasCycleDependency = false;</span>
+
+    private final List&lt;Dependency&gt; dependencies;
+    private final List&lt;Dependency&gt; optionalDependencies;
+
+    /**
+     * Is this plugin bundled in jenkins.war?
+     */
+    /*package*/ boolean isBundled;
+
+    /**
+     * List of plugins that depend on this plugin.
+     */
+<span class="nc" id="L161">    private Set&lt;String&gt; dependants = Collections.emptySet();</span>
+
+    /**
+     * The core can depend on a plugin if it is bundled. Sometimes it's the only thing that
+     * depends on the plugin e.g. UI support library bundle plugin.
+     */
+<span class="nc" id="L167">    private static Set&lt;String&gt; CORE_ONLY_DEPENDANT = ImmutableSet.copyOf(Arrays.asList(&quot;jenkins-core&quot;));</span>
+
+    /**
+     * Set the list of components that depend on this plugin.
+     * @param dependants The list of components that depend on this plugin.
+     */
+    public void setDependants(@Nonnull Set&lt;String&gt; dependants) {
+<span class="nc" id="L174">        this.dependants = dependants;</span>
+<span class="nc" id="L175">    }</span>
+
+    /**
+     * Get the list of components that depend on this plugin.
+     * @return The list of components that depend on this plugin.
+     */
+    public @Nonnull Set&lt;String&gt; getDependants() {
+<span class="nc bnc" id="L182" title="All 4 branches missed.">        if (isBundled &amp;&amp; dependants.isEmpty()) {</span>
+<span class="nc" id="L183">            return CORE_ONLY_DEPENDANT;</span>
+        } else {
+<span class="nc" id="L185">            return dependants;</span>
+        }
+    }
+
+    /**
+     * Does this plugin have anything that depends on it.
+     * @return {@code true} if something (Jenkins core, or another plugin) depends on this
+     * plugin, otherwise {@code false}.
+     */
+    public boolean hasDependants() {
+<span class="nc bnc" id="L195" title="All 4 branches missed.">        return (isBundled || !dependants.isEmpty());</span>
+    }
+    
+    /**
+     * Does this plugin depend on any other plugins.
+     * @return {@code true} if this plugin depends on other plugins, otherwise {@code false}.
+     */
+    public boolean hasDependencies() {
+<span class="nc bnc" id="L203" title="All 4 branches missed.">        return (dependencies != null &amp;&amp; !dependencies.isEmpty());</span>
+    }
+
+    @ExportedBean
+    public static final class Dependency {
+        @Exported
+        public final String shortName;
+        @Exported
+        public final String version;
+        @Exported
+        public final boolean optional;
+
+<span class="nc" id="L215">        public Dependency(String s) {</span>
+<span class="nc" id="L216">            int idx = s.indexOf(':');</span>
+<span class="nc bnc" id="L217" title="All 2 branches missed.">            if(idx==-1)</span>
+<span class="nc" id="L218">                throw new IllegalArgumentException(&quot;Illegal dependency specifier &quot;+s);</span>
+<span class="nc" id="L219">            this.shortName = s.substring(0,idx);</span>
+<span class="nc" id="L220">            this.version = s.substring(idx+1);</span>
+            
+<span class="nc" id="L222">            boolean isOptional = false;</span>
+<span class="nc" id="L223">            String[] osgiProperties = s.split(&quot;;&quot;);</span>
+<span class="nc bnc" id="L224" title="All 2 branches missed.">            for (int i = 1; i &lt; osgiProperties.length; i++) {</span>
+<span class="nc" id="L225">                String osgiProperty = osgiProperties[i].trim();</span>
+<span class="nc bnc" id="L226" title="All 2 branches missed.">                if (osgiProperty.equalsIgnoreCase(&quot;resolution:=optional&quot;)) {</span>
+<span class="nc" id="L227">                    isOptional = true;</span>
+                }
+            }
+<span class="nc" id="L230">            this.optional = isOptional;</span>
+<span class="nc" id="L231">        }</span>
+
+        @Override
+        public String toString() {
+<span class="nc" id="L235">            return shortName + &quot; (&quot; + version + &quot;)&quot;;</span>
+        }        
+    }
+
+    /**
+     * @param archive
+     *      A .jpi archive file jar file, or a .jpl linked plugin.
+     *  @param manifest
+     *  	The manifest for the plugin
+     *  @param baseResourceURL
+     *  	A URL pointing to the resources for this plugin
+     *  @param classLoader
+     *  	a classloader that loads classes from this plugin and its dependencies
+     *  @param disableFile
+     *  	if this file exists on startup, the plugin will not be activated
+     *  @param dependencies a list of mandatory dependencies
+     *  @param optionalDependencies a list of optional dependencies
+     */
+<span class="nc" id="L253">    public PluginWrapper(PluginManager parent, File archive, Manifest manifest, URL baseResourceURL, </span>
+			ClassLoader classLoader, File disableFile, 
+			List&lt;Dependency&gt; dependencies, List&lt;Dependency&gt; optionalDependencies) {
+<span class="nc" id="L256">        this.parent = parent;</span>
+<span class="nc" id="L257">		this.manifest = manifest;</span>
+<span class="nc" id="L258">		this.shortName = computeShortName(manifest, archive.getName());</span>
+<span class="nc" id="L259">		this.baseResourceURL = baseResourceURL;</span>
+<span class="nc" id="L260">		this.classLoader = classLoader;</span>
+<span class="nc" id="L261">		this.disableFile = disableFile;</span>
+<span class="nc" id="L262">        this.pinFile = new File(archive.getPath() + &quot;.pinned&quot;);</span>
+<span class="nc bnc" id="L263" title="All 2 branches missed.">		this.active = !disableFile.exists();</span>
+<span class="nc" id="L264">		this.dependencies = dependencies;</span>
+<span class="nc" id="L265">		this.optionalDependencies = optionalDependencies;</span>
+<span class="nc" id="L266">        this.archive = archive;</span>
+<span class="nc" id="L267">    }</span>
+
+    public String getDisplayName() {
+<span class="nc" id="L270">        return StringUtils.removeStart(getLongName(), &quot;Jenkins &quot;);</span>
+    }
+
+    public Api getApi() {
+<span class="nc" id="L274">        return new Api(this);</span>
+    }
+
+    /**
+     * Returns the URL of the index page jelly script.
+     */
+    public URL getIndexPage() {
+        // In the current impl dependencies are checked first, so the plugin itself
+        // will add the last entry in the getResources result.
+<span class="nc" id="L283">        URL idx = null;</span>
+        try {
+<span class="nc" id="L285">            Enumeration&lt;URL&gt; en = classLoader.getResources(&quot;index.jelly&quot;);</span>
+<span class="nc bnc" id="L286" title="All 2 branches missed.">            while (en.hasMoreElements())</span>
+<span class="nc" id="L287">                idx = en.nextElement();</span>
+<span class="nc" id="L288">        } catch (IOException ignore) { }</span>
+        // In case plugin has dependencies but is missing its own index.jelly,
+        // check that result has this plugin's artifactId in it:
+<span class="nc bnc" id="L291" title="All 4 branches missed.">        return idx != null &amp;&amp; idx.toString().contains(shortName) ? idx : null;</span>
+    }
+
+    static String computeShortName(Manifest manifest, String fileName) {
+        // use the name captured in the manifest, as often plugins
+        // depend on the specific short name in its URLs.
+<span class="nc" id="L297">        String n = manifest.getMainAttributes().getValue(&quot;Short-Name&quot;);</span>
+<span class="nc bnc" id="L298" title="All 2 branches missed.">        if(n!=null)     return n;</span>
+
+        // maven seems to put this automatically, so good fallback to check.
+<span class="nc" id="L301">        n = manifest.getMainAttributes().getValue(&quot;Extension-Name&quot;);</span>
+<span class="nc bnc" id="L302" title="All 2 branches missed.">        if(n!=null)     return n;</span>
+
+        // otherwise infer from the file name, since older plugins don't have
+        // this entry.
+<span class="nc" id="L306">        return getBaseName(fileName);</span>
+    }
+
+    @Exported
+    public List&lt;Dependency&gt; getDependencies() {
+<span class="nc" id="L311">        return dependencies;</span>
+    }
+
+    public List&lt;Dependency&gt; getOptionalDependencies() {
+<span class="nc" id="L315">        return optionalDependencies;</span>
+    }
+
+
+    /**
+     * Returns the short name suitable for URL.
+     */
+    @Exported
+    public String getShortName() {
+<span class="nc" id="L324">        return shortName;</span>
+    }
+
+    /**
+     * Gets the instance of {@link Plugin} contributed by this plugin.
+     */
+    public @CheckForNull Plugin getPlugin() {
+<span class="nc" id="L331">        PluginInstanceStore pis = Jenkins.lookup(PluginInstanceStore.class);</span>
+<span class="nc bnc" id="L332" title="All 2 branches missed.">        return pis != null ? pis.store.get(this) : null;</span>
+    }
+
+    /**
+     * Gets the URL that shows more information about this plugin.
+     * @return
+     *      null if this information is unavailable.
+     * @since 1.283
+     */
+    @Exported
+    public String getUrl() {
+        // first look for the manifest entry. This is new in maven-hpi-plugin 1.30
+<span class="nc" id="L344">        String url = manifest.getMainAttributes().getValue(&quot;Url&quot;);</span>
+<span class="nc bnc" id="L345" title="All 2 branches missed.">        if(url!=null)      return url;</span>
+
+        // fallback to update center metadata
+<span class="nc" id="L348">        UpdateSite.Plugin ui = getInfo();</span>
+<span class="nc bnc" id="L349" title="All 2 branches missed.">        if(ui!=null)    return ui.wiki;</span>
+
+<span class="nc" id="L351">        return null;</span>
+    }
+    
+    
+
+    @Override
+    public String toString() {
+<span class="nc" id="L358">        return &quot;Plugin:&quot; + getShortName();</span>
+    }
+
+    /**
+     * Returns a one-line descriptive name of this plugin.
+     */
+    @Exported
+    public String getLongName() {
+<span class="nc" id="L366">        String name = manifest.getMainAttributes().getValue(&quot;Long-Name&quot;);</span>
+<span class="nc bnc" id="L367" title="All 2 branches missed.">        if(name!=null)      return name;</span>
+<span class="nc" id="L368">        return shortName;</span>
+    }
+
+    /**
+     * Does this plugin supports dynamic loading?
+     */
+    @Exported
+    public YesNoMaybe supportsDynamicLoad() {
+<span class="nc" id="L376">        String v = manifest.getMainAttributes().getValue(&quot;Support-Dynamic-Loading&quot;);</span>
+<span class="nc bnc" id="L377" title="All 2 branches missed.">        if (v==null) return YesNoMaybe.MAYBE;</span>
+<span class="nc bnc" id="L378" title="All 2 branches missed.">        return Boolean.parseBoolean(v) ? YesNoMaybe.YES : YesNoMaybe.NO;</span>
+    }
+
+    /**
+     * Returns the version number of this plugin
+     */
+    @Exported
+    public String getVersion() {
+<span class="nc" id="L386">        return getVersionOf(manifest);</span>
+    }
+
+    private String getVersionOf(Manifest manifest) {
+<span class="nc" id="L390">        String v = manifest.getMainAttributes().getValue(&quot;Plugin-Version&quot;);</span>
+<span class="nc bnc" id="L391" title="All 2 branches missed.">        if(v!=null)      return v;</span>
+
+        // plugins generated before maven-hpi-plugin 1.3 should still have this attribute
+<span class="nc" id="L394">        v = manifest.getMainAttributes().getValue(&quot;Implementation-Version&quot;);</span>
+<span class="nc bnc" id="L395" title="All 2 branches missed.">        if(v!=null)      return v;</span>
+
+<span class="nc" id="L397">        return &quot;???&quot;;</span>
+    }
+
+    /**
+     * Returns the version number of this plugin
+     */
+    public VersionNumber getVersionNumber() {
+<span class="nc" id="L404">        return new VersionNumber(getVersion());</span>
+    }
+
+    /**
+     * Returns true if the version of this plugin is older than the given version.
+     */
+    public boolean isOlderThan(VersionNumber v) {
+        try {
+<span class="nc bnc" id="L412" title="All 2 branches missed.">            return getVersionNumber().compareTo(v) &lt; 0;</span>
+<span class="nc" id="L413">        } catch (IllegalArgumentException e) {</span>
+            // if we can't figure out our current version, it probably means it's very old,
+            // since the version information is missing only from the very old plugins 
+<span class="nc" id="L416">            return true;</span>
+        }
+    }
+
+    /**
+     * Terminates the plugin.
+     */
+    public void stop() {
+<span class="nc" id="L424">        Plugin plugin = getPlugin();</span>
+<span class="nc bnc" id="L425" title="All 2 branches missed.">        if (plugin != null) {</span>
+            try {
+<span class="nc" id="L427">                LOGGER.log(Level.FINE, &quot;Stopping {0}&quot;, shortName);</span>
+<span class="nc" id="L428">                plugin.stop();</span>
+<span class="nc" id="L429">            } catch (Throwable t) {</span>
+<span class="nc" id="L430">                LOGGER.log(WARNING, &quot;Failed to shut down &quot; + shortName, t);</span>
+            }
+<span class="nc" id="L432">        } else {</span>
+<span class="nc" id="L433">            LOGGER.log(Level.FINE, &quot;Could not find Plugin instance to stop for {0}&quot;, shortName);</span>
+        }
+        // Work around a bug in commons-logging.
+        // See http://www.szegedi.org/articles/memleak.html
+<span class="nc" id="L437">        LogFactory.release(classLoader);</span>
+<span class="nc" id="L438">    }</span>
+
+    public void releaseClassLoader() {
+<span class="nc bnc" id="L441" title="All 2 branches missed.">        if (classLoader instanceof Closeable)</span>
+            try {
+<span class="nc" id="L443">                ((Closeable) classLoader).close();</span>
+<span class="nc" id="L444">            } catch (IOException e) {</span>
+<span class="nc" id="L445">                LOGGER.log(WARNING, &quot;Failed to shut down classloader&quot;,e);</span>
+            }
+<span class="nc" id="L447">    }</span>
+
+    /**
+     * Enables this plugin next time Jenkins runs.
+     */
+    public void enable() throws IOException {
+<span class="nc bnc" id="L453" title="All 2 branches missed.">        if(!disableFile.delete())</span>
+<span class="nc" id="L454">            throw new IOException(&quot;Failed to delete &quot;+disableFile);</span>
+<span class="nc" id="L455">    }</span>
+
+    /**
+     * Disables this plugin next time Jenkins runs.
+     */
+    public void disable() throws IOException {
+        // creates an empty file
+<span class="nc" id="L462">        OutputStream os = new FileOutputStream(disableFile);</span>
+<span class="nc" id="L463">        os.close();</span>
+<span class="nc" id="L464">    }</span>
+
+    /**
+     * Returns true if this plugin is enabled for this session.
+     */
+    @Exported
+    public boolean isActive() {
+<span class="nc bnc" id="L471" title="All 4 branches missed.">        return active &amp;&amp; !hasCycleDependency();</span>
+    }
+    
+    public boolean hasCycleDependency(){
+<span class="nc" id="L475">        return hasCycleDependency;</span>
+    }
+
+    public void setHasCycleDependency(boolean hasCycle){
+<span class="nc" id="L479">        hasCycleDependency = hasCycle;</span>
+<span class="nc" id="L480">    }</span>
+    
+    @Exported
+    public boolean isBundled() {
+<span class="nc" id="L484">        return isBundled;</span>
+    }
+
+    /**
+     * If true, the plugin is going to be activated next time
+     * Jenkins runs.
+     */
+    @Exported
+    public boolean isEnabled() {
+<span class="nc bnc" id="L493" title="All 2 branches missed.">        return !disableFile.exists();</span>
+    }
+
+    public Manifest getManifest() {
+<span class="nc" id="L497">        return manifest;</span>
+    }
+
+    public void setPlugin(Plugin plugin) {
+<span class="nc" id="L501">        Jenkins.lookup(PluginInstanceStore.class).store.put(this,plugin);</span>
+<span class="nc" id="L502">        plugin.wrapper = this;</span>
+<span class="nc" id="L503">    }</span>
+
+    public String getPluginClass() {
+<span class="nc" id="L506">        return manifest.getMainAttributes().getValue(&quot;Plugin-Class&quot;);</span>
+    }
+
+    public boolean hasLicensesXml() {
+        try {
+<span class="nc" id="L511">            new URL(baseResourceURL,&quot;WEB-INF/licenses.xml&quot;).openStream().close();</span>
+<span class="nc" id="L512">            return true;</span>
+<span class="nc" id="L513">        } catch (IOException e) {</span>
+<span class="nc" id="L514">            return false;</span>
+        }
+    }
+
+    /**
+     * Makes sure that all the dependencies exist, and then accept optional dependencies
+     * as real dependencies.
+     *
+     * @throws IOException
+     *             thrown if one or several mandatory dependencies doesn't exists.
+     */
+    /*package*/ void resolvePluginDependencies() throws IOException {
+<span class="nc" id="L526">        List&lt;String&gt; missingDependencies = new ArrayList&lt;String&gt;();</span>
+        // make sure dependencies exist
+<span class="nc bnc" id="L528" title="All 2 branches missed.">        for (Dependency d : dependencies) {</span>
+<span class="nc bnc" id="L529" title="All 2 branches missed.">            if (parent.getPlugin(d.shortName) == null)</span>
+<span class="nc" id="L530">                missingDependencies.add(d.toString());</span>
+        }
+<span class="nc bnc" id="L532" title="All 2 branches missed.">        if (!missingDependencies.isEmpty())</span>
+<span class="nc" id="L533">            throw new IOException(&quot;Dependency &quot;+Util.join(missingDependencies, &quot;, &quot;)+&quot; doesn't exist&quot;);</span>
+
+        // add the optional dependencies that exists
+<span class="nc bnc" id="L536" title="All 2 branches missed.">        for (Dependency d : optionalDependencies) {</span>
+<span class="nc bnc" id="L537" title="All 2 branches missed.">            if (parent.getPlugin(d.shortName) != null)</span>
+<span class="nc" id="L538">                dependencies.add(d);</span>
+        }
+<span class="nc" id="L540">    }</span>
+
+    /**
+     * If the plugin has {@link #getUpdateInfo() an update},
+     * returns the {@link hudson.model.UpdateSite.Plugin} object.
+     *
+     * @return
+     *      This method may return null &amp;mdash; for example,
+     *      the user may have installed a plugin locally developed.
+     */
+    public UpdateSite.Plugin getUpdateInfo() {
+<span class="nc" id="L551">        UpdateCenter uc = Jenkins.getInstance().getUpdateCenter();</span>
+<span class="nc" id="L552">        UpdateSite.Plugin p = uc.getPlugin(getShortName());</span>
+<span class="nc bnc" id="L553" title="All 4 branches missed.">        if(p!=null &amp;&amp; p.isNewerThan(getVersion())) return p;</span>
+<span class="nc" id="L554">        return null;</span>
+    }
+    
+    /**
+     * returns the {@link hudson.model.UpdateSite.Plugin} object, or null.
+     */
+    public UpdateSite.Plugin getInfo() {
+<span class="nc" id="L561">        UpdateCenter uc = Jenkins.getInstance().getUpdateCenter();</span>
+<span class="nc" id="L562">        return uc.getPlugin(getShortName());</span>
+    }
+
+    /**
+     * Returns true if this plugin has update in the update center.
+     *
+     * &lt;p&gt;
+     * This method is conservative in the sense that if the version number is incomprehensible,
+     * it always returns false.
+     */
+    @Exported
+    public boolean hasUpdate() {
+<span class="nc bnc" id="L574" title="All 2 branches missed.">        return getUpdateInfo()!=null;</span>
+    }
+    
+    @Exported
+    public boolean isPinned() {
+<span class="nc" id="L579">        return pinFile.exists();</span>
+    }
+
+    /**
+     * Returns true if this plugin is deleted.
+     *
+     * The plugin continues to function in this session, but in the next session it'll disappear.
+     */
+    @Exported
+    public boolean isDeleted() {
+<span class="nc bnc" id="L589" title="All 2 branches missed.">        return !archive.exists();</span>
+    }
+
+    /**
+     * Sort by short name.
+     */
+    public int compareTo(PluginWrapper pw) {
+<span class="nc" id="L596">        return shortName.compareToIgnoreCase(pw.shortName);</span>
+    }
+
+    /**
+     * returns true if backup of previous version of plugin exists
+     */
+    @Exported
+    public boolean isDowngradable() {
+<span class="nc" id="L604">        return getBackupFile().exists();</span>
+    }
+
+    /**
+     * Where is the backup file?
+     */
+    public File getBackupFile() {
+<span class="nc" id="L611">        return new File(Jenkins.getInstance().getRootDir(),&quot;plugins/&quot;+getShortName() + &quot;.bak&quot;);</span>
+    }
+
+    /**
+     * returns the version of the backed up plugin,
+     * or null if there's no back up.
+     */
+    @Exported
+    public String getBackupVersion() {
+<span class="nc" id="L620">        File backup = getBackupFile();</span>
+<span class="nc bnc" id="L621" title="All 2 branches missed.">        if (backup.exists()) {</span>
+            try {
+<span class="nc" id="L623">                JarFile backupPlugin = new JarFile(backup);</span>
+                try {
+<span class="nc" id="L625">                    return backupPlugin.getManifest().getMainAttributes().getValue(&quot;Plugin-Version&quot;);</span>
+<span class="nc" id="L626">                } finally {</span>
+<span class="nc" id="L627">                    backupPlugin.close();</span>
+<span class="nc" id="L628">                }</span>
+<span class="nc" id="L629">            } catch (IOException e) {</span>
+<span class="nc" id="L630">                LOGGER.log(WARNING, &quot;Failed to get backup version from &quot; + backup, e);</span>
+<span class="nc" id="L631">                return null;</span>
+            }
+        } else {
+<span class="nc" id="L634">            return null;</span>
+        }
+    }
+
+    /**
+     * Checks if this plugin is pinned and that's forcing us to use an older version than the bundled one.
+     */
+    public boolean isPinningForcingOldVersion() {
+<span class="nc bnc" id="L642" title="All 2 branches missed.">        if (!isPinned())    return false;</span>
+
+<span class="nc" id="L644">        Manifest bundled = Jenkins.getInstance().pluginManager.getBundledPluginManifest(getShortName());</span>
+<span class="nc bnc" id="L645" title="All 2 branches missed.">        if (bundled==null)  return false;</span>
+
+<span class="nc" id="L647">        VersionNumber you = new VersionNumber(getVersionOf(bundled));</span>
+<span class="nc" id="L648">        VersionNumber me = getVersionNumber();</span>
+
+<span class="nc" id="L650">        return me.isOlderThan(you);</span>
+    }
+
+//
+//
+// Action methods
+//
+//
+    @RequirePOST
+    public HttpResponse doMakeEnabled() throws IOException {
+<span class="nc" id="L660">        Jenkins.getInstance().checkPermission(Jenkins.ADMINISTER);</span>
+<span class="nc" id="L661">        enable();</span>
+<span class="nc" id="L662">        return HttpResponses.ok();</span>
+    }
+
+    @RequirePOST
+    public HttpResponse doMakeDisabled() throws IOException {
+<span class="nc" id="L667">        Jenkins.getInstance().checkPermission(Jenkins.ADMINISTER);</span>
+<span class="nc" id="L668">        disable();</span>
+<span class="nc" id="L669">        return HttpResponses.ok();</span>
+    }
+
+    @RequirePOST
+    public HttpResponse doPin() throws IOException {
+<span class="nc" id="L674">        Jenkins.getInstance().checkPermission(Jenkins.ADMINISTER);</span>
+<span class="nc" id="L675">        new FileOutputStream(pinFile).close();</span>
+<span class="nc" id="L676">        return HttpResponses.ok();</span>
+    }
+
+    @RequirePOST
+    public HttpResponse doUnpin() throws IOException {
+<span class="nc" id="L681">        Jenkins.getInstance().checkPermission(Jenkins.ADMINISTER);</span>
+<span class="nc" id="L682">        pinFile.delete();</span>
+<span class="nc" id="L683">        return HttpResponses.ok();</span>
+    }
+
+    @RequirePOST
+    public HttpResponse doDoUninstall() throws IOException {
+<span class="nc" id="L688">        Jenkins jenkins = Jenkins.getActiveInstance();</span>
+        
+<span class="nc" id="L690">        jenkins.checkPermission(Jenkins.ADMINISTER);</span>
+<span class="nc" id="L691">        archive.delete();</span>
+
+        // Redo who depends on who.
+<span class="nc" id="L694">        jenkins.getPluginManager().resolveDependantPlugins();</span>
+
+<span class="nc" id="L696">        return HttpResponses.redirectViaContextPath(&quot;/pluginManager/installed&quot;);   // send back to plugin manager</span>
+    }
+
+
+<span class="nc" id="L700">    private static final Logger LOGGER = Logger.getLogger(PluginWrapper.class.getName());</span>
+
+    /**
+     * Name of the plugin manifest file (to help find where we parse them.)
+     */
+<span class="nc" id="L705">    public static final String MANIFEST_FILENAME = &quot;META-INF/MANIFEST.MF&quot;;</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

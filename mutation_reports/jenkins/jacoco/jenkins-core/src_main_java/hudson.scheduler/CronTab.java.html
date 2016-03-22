@@ -1,0 +1,517 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>CronTab.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.scheduler</a> &gt; <span class="el_source">CronTab.java</span></div><h1>CronTab.java</h1><pre class="source lang-java linenums"><span class="fc" id="L1">/*</span>
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc., Kohsuke Kawaguchi, InfraDNA, Inc.
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.scheduler;
+
+import antlr.ANTLRException;
+
+import java.io.StringReader;
+import java.util.Calendar;
+import java.util.TimeZone;
+import java.util.GregorianCalendar;
+import java.util.Locale;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import static java.util.Calendar.*;
+import javax.annotation.CheckForNull;
+
+/**
+ * Table for driving scheduled tasks.
+ *
+ * @author Kohsuke Kawaguchi
+ */
+public final class CronTab {
+    /**
+     * bits[0]: minutes
+     * bits[1]: hours
+     * bits[2]: days
+     * bits[3]: months
+     *
+     * false:not scheduled &amp;lt;-&gt; true scheduled
+     */
+<span class="pc" id="L53">    final long[] bits = new long[4];</span>
+
+    int dayOfWeek;
+
+    /**
+     * Textual representation.
+     */
+    private String spec;
+
+    /**
+     * Optional timezone string for calendar 
+     */
+    private @CheckForNull String specTimezone;
+
+    public CronTab(String format) throws ANTLRException {
+<span class="fc" id="L68">        this(format,null);</span>
+<span class="fc" id="L69">    }</span>
+
+    public CronTab(String format, Hash hash) throws ANTLRException {
+<span class="fc" id="L72">        this(format,1,hash);</span>
+<span class="fc" id="L73">    }</span>
+    
+    /**
+     * @deprecated as of 1.448
+     *      Use {@link #CronTab(String, int, Hash)}
+     */
+    @Deprecated
+<span class="nc" id="L80">    public CronTab(String format, int line) throws ANTLRException {</span>
+<span class="nc" id="L81">        set(format, line, null);</span>
+<span class="nc" id="L82">    }</span>
+
+    /**
+     * @param hash
+     *      Used to spread out token like &quot;@daily&quot;. Null to preserve the legacy behaviour
+     *      of not spreading it out at all.
+     */
+    public CronTab(String format, int line, Hash hash) throws ANTLRException {
+<span class="fc" id="L90">        this(format, line, hash, null);</span>
+<span class="fc" id="L91">    }</span>
+
+    /**
+     * @param timezone
+     *      Used to schedule cron in a different timezone. Null to use the default system 
+     *      timezone
+     * @since 1.615
+     */
+<span class="fc" id="L99">    public CronTab(String format, int line, Hash hash, @CheckForNull String timezone) throws ANTLRException {</span>
+<span class="fc" id="L100">        set(format, line, hash, timezone);</span>
+<span class="fc" id="L101">    }</span>
+    
+    private void set(String format, int line, Hash hash) throws ANTLRException {
+<span class="fc" id="L104">        set(format, line, hash, null);</span>
+<span class="fc" id="L105">    }</span>
+
+    /**
+     * @since 1.615
+     */
+    private void set(String format, int line, Hash hash, String timezone) throws ANTLRException {
+<span class="fc" id="L111">        CrontabLexer lexer = new CrontabLexer(new StringReader(format));</span>
+<span class="fc" id="L112">        lexer.setLine(line);</span>
+<span class="fc" id="L113">        CrontabParser parser = new CrontabParser(lexer);</span>
+<span class="fc" id="L114">        parser.setHash(hash);</span>
+<span class="fc" id="L115">        spec = format;</span>
+<span class="fc" id="L116">        specTimezone = timezone;</span>
+
+<span class="fc" id="L118">        parser.startRule(this);</span>
+<span class="fc bfc" id="L119" title="All 2 branches covered.">        if((dayOfWeek&amp;(1&lt;&lt;7))!=0) {</span>
+<span class="fc" id="L120">            dayOfWeek |= 1; // copy bit 7 over to bit 0</span>
+<span class="fc" id="L121">            dayOfWeek &amp;= ~(1&lt;&lt;7); // clear bit 7 or CalendarField#ceil will return an invalid value 7</span>
+        }
+<span class="fc" id="L123">    }</span>
+
+
+    /**
+     * Returns true if the given calendar matches
+     */
+    boolean check(Calendar cal) {
+
+<span class="fc" id="L131">        Calendar checkCal = cal;</span>
+
+<span class="pc bpc" id="L133" title="1 of 4 branches missed.">        if(specTimezone != null &amp;&amp; !specTimezone.isEmpty()) {</span>
+<span class="fc" id="L134">            Calendar tzCal = Calendar.getInstance(TimeZone.getTimeZone(specTimezone));</span>
+<span class="fc" id="L135">            tzCal.setTime(cal.getTime());</span>
+<span class="fc" id="L136">            checkCal = tzCal;</span>
+        }
+
+<span class="fc bfc" id="L139" title="All 2 branches covered.">        if(!checkBits(bits[0],checkCal.get(MINUTE)))</span>
+<span class="fc" id="L140">            return false;</span>
+<span class="pc bpc" id="L141" title="1 of 2 branches missed.">        if(!checkBits(bits[1],checkCal.get(HOUR_OF_DAY)))</span>
+<span class="nc" id="L142">            return false;</span>
+<span class="pc bpc" id="L143" title="1 of 2 branches missed.">        if(!checkBits(bits[2],checkCal.get(DAY_OF_MONTH)))</span>
+<span class="nc" id="L144">            return false;</span>
+<span class="pc bpc" id="L145" title="1 of 2 branches missed.">        if(!checkBits(bits[3],checkCal.get(MONTH)+1))</span>
+<span class="nc" id="L146">            return false;</span>
+<span class="pc bpc" id="L147" title="1 of 2 branches missed.">        if(!checkBits(dayOfWeek,checkCal.get(Calendar.DAY_OF_WEEK)-1))</span>
+<span class="nc" id="L148">            return false;</span>
+
+<span class="fc" id="L150">        return true;</span>
+    }
+
+    private static abstract class CalendarField {
+        /**
+         * {@link Calendar} field ID.
+         */
+        final int field;
+        /**
+         * Lower field is a calendar field whose value needs to be reset when we change the value in this field.
+         * For example, if we modify the value in HOUR, MINUTES must be reset.
+         */
+        final CalendarField lowerField;
+        /**
+         * Whether this field is 0-origin or 1-origin differs between Crontab and {@link Calendar},
+         * so this field adjusts that. If crontab is 1 origin and calendar is 0 origin,  this field is 1
+         * that is the value is {@code (cronOrigin-calendarOrigin)}
+         */
+        final int offset;
+        /**
+         * When we reset this field, we set the field to this value.
+         * For example, resetting {@link Calendar#DAY_OF_MONTH} means setting it to 1.
+         */
+        final int min;
+        /**
+         * If this calendar field has other aliases such that a change in this field
+         * modifies other field values, then true.
+         */
+        final boolean redoAdjustmentIfModified;
+
+        /**
+         * What is this field? Useful for debugging
+         */
+        @SuppressWarnings(&quot;unused&quot;)
+        private final String displayName;
+
+<span class="fc" id="L186">        private CalendarField(String displayName, int field, int min, int offset, boolean redoAdjustmentIfModified, CalendarField lowerField) {</span>
+<span class="fc" id="L187">            this.displayName = displayName;</span>
+<span class="fc" id="L188">            this.field = field;</span>
+<span class="fc" id="L189">            this.min = min;</span>
+<span class="fc" id="L190">            this.redoAdjustmentIfModified= redoAdjustmentIfModified;</span>
+<span class="fc" id="L191">            this.lowerField = lowerField;</span>
+<span class="fc" id="L192">            this.offset = offset;</span>
+<span class="fc" id="L193">        }</span>
+
+        /**
+         * Gets the current value of this field in the given calendar.
+         */
+        int valueOf(Calendar c) {
+<span class="fc" id="L199">            return c.get(field)+offset;</span>
+        }
+
+        void addTo(Calendar c, int i) {
+<span class="fc" id="L203">            c.add(field,i);</span>
+<span class="fc" id="L204">        }</span>
+
+        void setTo(Calendar c, int i) {
+<span class="fc" id="L207">            c.set(field,i-offset);</span>
+<span class="fc" id="L208">        }</span>
+
+        void clear(Calendar c) {
+<span class="fc" id="L211">            setTo(c, min);</span>
+<span class="fc" id="L212">        }</span>
+
+        /**
+         * Given the value 'n' (which represents the current value), finds the smallest x such that:
+         *  1) x matches the specified {@link CronTab} (as far as this field is concerned.)
+         *  2) x&gt;=n   (inclusive)
+         *
+         * If there's no such bit, return -1. Note that if 'n' already matches the crontab, the same n will be returned.
+         */
+        private int ceil(CronTab c, int n) {
+<span class="fc" id="L222">            long bits = bits(c);</span>
+<span class="fc bfc" id="L223" title="All 2 branches covered.">            while ((bits|(1L&lt;&lt;n))!=bits) {</span>
+<span class="fc bfc" id="L224" title="All 2 branches covered.">                if (n&gt;60)   return -1;</span>
+<span class="fc" id="L225">                n++;</span>
+            }
+<span class="fc" id="L227">            return n;</span>
+        }
+
+        /**
+         * Given a bit mask, finds the first bit that's on, and return its index.
+         */
+        private int first(CronTab c) {
+<span class="fc" id="L234">            return ceil(c,0);</span>
+        }
+
+        private int floor(CronTab c, int n) {
+<span class="fc" id="L238">            long bits = bits(c);</span>
+<span class="fc bfc" id="L239" title="All 2 branches covered.">            while ((bits|(1L&lt;&lt;n))!=bits) {</span>
+<span class="fc bfc" id="L240" title="All 2 branches covered.">                if (n==0)   return -1;</span>
+<span class="fc" id="L241">                n--;</span>
+            }
+<span class="fc" id="L243">            return n;</span>
+        }
+
+        private int last(CronTab c) {
+<span class="fc" id="L247">            return floor(c,63);</span>
+        }
+
+        /**
+         * Extracts the bit masks from the given {@link CronTab} that matches this field.
+         */
+        abstract long bits(CronTab c);
+
+        /**
+         * Increment the next field.
+         */
+        abstract void rollUp(Calendar cal, int i);
+
+<span class="fc" id="L260">        private static final CalendarField MINUTE       = new CalendarField(&quot;minute&quot;, Calendar.MINUTE,        0, 0, false, null) {</span>
+<span class="fc" id="L261">            long bits(CronTab c) { return c.bits[0]; }</span>
+<span class="fc" id="L262">            void rollUp(Calendar cal, int i) { cal.add(Calendar.HOUR_OF_DAY,i); }</span>
+        };
+<span class="fc" id="L264">        private static final CalendarField HOUR         = new CalendarField(&quot;hour&quot;, Calendar.HOUR_OF_DAY,   0, 0, false, MINUTE) {</span>
+<span class="fc" id="L265">            long bits(CronTab c) { return c.bits[1]; }</span>
+<span class="fc" id="L266">            void rollUp(Calendar cal, int i) { cal.add(Calendar.DAY_OF_MONTH,i); }</span>
+        };
+<span class="fc" id="L268">        private static final CalendarField DAY_OF_MONTH = new CalendarField(&quot;day&quot;, Calendar.DAY_OF_MONTH,  1, 0, true,  HOUR) {</span>
+<span class="fc" id="L269">            long bits(CronTab c) { return c.bits[2]; }</span>
+<span class="fc" id="L270">            void rollUp(Calendar cal, int i) { cal.add(Calendar.MONTH,i); }</span>
+        };
+<span class="fc" id="L272">        private static final CalendarField MONTH        = new CalendarField(&quot;month&quot;, Calendar.MONTH,         1, 1, false, DAY_OF_MONTH) {</span>
+<span class="fc" id="L273">            long bits(CronTab c) { return c.bits[3]; }</span>
+<span class="fc" id="L274">            void rollUp(Calendar cal, int i) { cal.add(Calendar.YEAR,i); }</span>
+        };
+<span class="fc" id="L276">        private static final CalendarField DAY_OF_WEEK  = new CalendarField(&quot;dow&quot;, Calendar.DAY_OF_WEEK,   1,-1, true,  HOUR) {</span>
+<span class="fc" id="L277">            long bits(CronTab c) { return c.dayOfWeek; }</span>
+            void rollUp(Calendar cal, int i) {
+<span class="fc" id="L279">                cal.add(Calendar.DAY_OF_WEEK, 7 * i);</span>
+<span class="fc" id="L280">            }</span>
+
+            @Override
+            void setTo(Calendar c, int i) {
+<span class="fc" id="L284">                int v = i-offset;</span>
+<span class="fc" id="L285">                int was = c.get(field);</span>
+<span class="fc" id="L286">                c.set(field,v);</span>
+<span class="fc" id="L287">                final int firstDayOfWeek = c.getFirstDayOfWeek();</span>
+<span class="fc bfc" id="L288" title="All 4 branches covered.">                if (v &lt; firstDayOfWeek &amp;&amp; was &gt;= firstDayOfWeek) {</span>
+                    // in crontab, the first DoW is always Sunday, but in Java, it can be Monday or in theory arbitrary other days.
+                    // When first DoW is 1/2 Monday, calendar points to 1/2 Monday, setting the DoW to Sunday makes
+                    // the calendar moves forward to 1/8 Sunday, instead of 1/1 Sunday. So we need to compensate that effect here.
+<span class="fc" id="L292">                    addTo(c,-7);</span>
+<span class="fc bfc" id="L293" title="All 4 branches covered.">                } else if (was &lt; firstDayOfWeek &amp;&amp; firstDayOfWeek &lt;= v) {</span>
+                    // If we wrap the other way around, we need to adjust in the opposite direction of above.
+<span class="fc" id="L295">                    addTo(c, 7);</span>
+                }
+<span class="fc" id="L297">            }</span>
+        };
+
+<span class="fc" id="L300">        private static final CalendarField[] ADJUST_ORDER = {</span>
+<span class="fc" id="L301">            MONTH, DAY_OF_MONTH, DAY_OF_WEEK, HOUR, MINUTE</span>
+<span class="fc" id="L302">        };</span>
+    }
+
+
+    /**
+     * Computes the nearest future timestamp that matches this cron tab.
+     * &lt;p&gt;
+     * More precisely, given the time 't', computes another smallest time x such that:
+     *
+     * &lt;ul&gt;
+     * &lt;li&gt;x &gt;= t (inclusive)
+     * &lt;li&gt;x matches this crontab
+     * &lt;/ul&gt;
+     *
+     * &lt;p&gt;
+     * Note that if t already matches this cron, it's returned as is.
+     */
+    public Calendar ceil(long t) {
+<span class="fc" id="L320">        Calendar cal = new GregorianCalendar(Locale.US);</span>
+<span class="fc" id="L321">        cal.setTimeInMillis(t);</span>
+<span class="fc" id="L322">        return ceil(cal);</span>
+    }
+
+    /**
+     * See {@link #ceil(long)}.
+     *
+     * This method modifies the given calendar and returns the same object.
+     */
+    public Calendar ceil(Calendar cal) {
+        OUTER:
+        while (true) {
+<span class="fc bfc" id="L333" title="All 2 branches covered.">            for (CalendarField f : CalendarField.ADJUST_ORDER) {</span>
+<span class="fc" id="L334">                int cur = f.valueOf(cal);</span>
+<span class="fc" id="L335">                int next = f.ceil(this,cur);</span>
+<span class="fc bfc" id="L336" title="All 2 branches covered.">                if (cur==next)  continue;   // this field is already in a good shape. move on to next</span>
+
+                // we are modifying this field, so clear all the lower level fields
+<span class="fc bfc" id="L339" title="All 2 branches covered.">                for (CalendarField l=f.lowerField; l!=null; l=l.lowerField)</span>
+<span class="fc" id="L340">                    l.clear(cal);</span>
+
+<span class="fc bfc" id="L342" title="All 2 branches covered.">                if (next&lt;0) {</span>
+                    // we need to roll over to the next field.
+<span class="fc" id="L344">                    f.rollUp(cal, 1);</span>
+<span class="fc" id="L345">                    f.setTo(cal,f.first(this));</span>
+                    // since higher order field is affected by this, we need to restart from all over
+<span class="fc" id="L347">                    continue OUTER;</span>
+                } else {
+<span class="fc" id="L349">                    f.setTo(cal,next);</span>
+<span class="fc bfc" id="L350" title="All 2 branches covered.">                    if (f.redoAdjustmentIfModified)</span>
+<span class="fc" id="L351">                        continue OUTER; // when we modify DAY_OF_MONTH and DAY_OF_WEEK, do it all over from the top</span>
+                }
+            }
+<span class="fc" id="L354">            return cal; // all fields adjusted</span>
+        }
+    }
+
+    /**
+     * Computes the nearest past timestamp that matched this cron tab.
+     * &lt;p&gt;
+     * More precisely, given the time 't', computes another smallest time x such that:
+     *
+     * &lt;ul&gt;
+     * &lt;li&gt;x &amp;lt;= t (inclusive)
+     * &lt;li&gt;x matches this crontab
+     * &lt;/ul&gt;
+     *
+     * &lt;p&gt;
+     * Note that if t already matches this cron, it's returned as is.
+     */
+    public Calendar floor(long t) {
+<span class="nc" id="L372">        Calendar cal = new GregorianCalendar(Locale.US);</span>
+<span class="nc" id="L373">        cal.setTimeInMillis(t);</span>
+<span class="nc" id="L374">        return floor(cal);</span>
+    }
+
+    /**
+     * See {@link #floor(long)}
+     *
+     * This method modifies the given calendar and returns the same object.
+     */
+    public Calendar floor(Calendar cal) {
+        OUTER:
+        while (true) {
+<span class="fc bfc" id="L385" title="All 2 branches covered.">            for (CalendarField f : CalendarField.ADJUST_ORDER) {</span>
+<span class="fc" id="L386">                int cur = f.valueOf(cal);</span>
+<span class="fc" id="L387">                int next = f.floor(this,cur);</span>
+<span class="fc bfc" id="L388" title="All 2 branches covered.">                if (cur==next)  continue;   // this field is already in a good shape. move on to next</span>
+
+                // we are modifying this field, so clear all the lower level fields
+<span class="fc bfc" id="L391" title="All 2 branches covered.">                for (CalendarField l=f.lowerField; l!=null; l=l.lowerField)</span>
+<span class="fc" id="L392">                    l.clear(cal);</span>
+
+<span class="fc bfc" id="L394" title="All 2 branches covered.">                if (next&lt;0) {</span>
+                    // we need to borrow from the next field.
+<span class="fc" id="L396">                    f.rollUp(cal,-1);</span>
+                    // the problem here, in contrast with the ceil method, is that
+                    // the maximum value of the field is not always a fixed value (that is, day of month)
+                    // so we zero-clear all the lower fields, set the desired value +1,
+<span class="fc" id="L400">                    f.setTo(cal,f.last(this));</span>
+<span class="fc" id="L401">                    f.addTo(cal,1);</span>
+                    // then subtract a minute to achieve maximum values on all the lower fields,
+                    // with the desired value in 'f'
+<span class="fc" id="L404">                    CalendarField.MINUTE.addTo(cal,-1);</span>
+                    // since higher order field is affected by this, we need to restart from all over
+<span class="fc" id="L406">                    continue OUTER;</span>
+                } else {
+<span class="fc" id="L408">                    f.setTo(cal,next);</span>
+<span class="fc" id="L409">                    f.addTo(cal,1);</span>
+<span class="fc" id="L410">                    CalendarField.MINUTE.addTo(cal,-1);</span>
+<span class="fc bfc" id="L411" title="All 2 branches covered.">                    if (f.redoAdjustmentIfModified)</span>
+<span class="fc" id="L412">                        continue OUTER; // when we modify DAY_OF_MONTH and DAY_OF_WEEK, do it all over from the top</span>
+                }
+            }
+<span class="fc" id="L415">            return cal; // all fields adjusted</span>
+        }
+    }
+
+    void set(String format, Hash hash) throws ANTLRException {
+<span class="fc" id="L420">        set(format,1,hash);</span>
+<span class="fc" id="L421">    }</span>
+
+    /**
+     * Returns true if n-th bit is on.
+     */
+    private boolean checkBits(long bitMask, int n) {
+<span class="fc bfc" id="L427" title="All 2 branches covered.">        return (bitMask|(1L&lt;&lt;n))==bitMask;</span>
+    }
+
+    public String toString() {
+<span class="nc" id="L431">        return super.toString()+&quot;[&quot;+</span>
+<span class="nc" id="L432">            toString(&quot;minute&quot;,bits[0])+','+</span>
+<span class="nc" id="L433">            toString(&quot;hour&quot;,bits[1])+','+</span>
+<span class="nc" id="L434">            toString(&quot;dayOfMonth&quot;,bits[2])+','+</span>
+<span class="nc" id="L435">            toString(&quot;month&quot;,bits[3])+','+</span>
+<span class="nc" id="L436">            toString(&quot;dayOfWeek&quot;,dayOfWeek)+']';</span>
+    }
+
+    private String toString(String key, long bit) {
+<span class="nc" id="L440">        return key+'='+Long.toHexString(bit);</span>
+    }
+
+    /**
+     * Checks if this crontab entry looks reasonable,
+     * and if not, return an warning message.
+     *
+     * &lt;p&gt;
+     * The point of this method is to catch syntactically correct
+     * but semantically suspicious combinations, like
+     * &quot;* 0 * * *&quot;
+     */
+    public @CheckForNull String checkSanity() {
+<span class="pc bpc" id="L453" title="1 of 2 branches missed.">        OUTER: for (int i = 0; i &lt; 5; i++) {</span>
+<span class="fc bfc" id="L454" title="All 2 branches covered.">            long bitMask = (i&lt;4)?bits[i]:(long)dayOfWeek;</span>
+<span class="fc bfc" id="L455" title="All 2 branches covered.">            for( int j=BaseParser.LOWER_BOUNDS[i]; j&lt;=BaseParser.UPPER_BOUNDS[i]; j++ ) {</span>
+<span class="fc bfc" id="L456" title="All 2 branches covered.">                if(!checkBits(bitMask,j)) {</span>
+                    // this rank has a sparse entry.
+                    // if we have a sparse rank, one of them better be the left-most.
+<span class="fc bfc" id="L459" title="All 2 branches covered.">                    if(i&gt;0)</span>
+<span class="fc" id="L460">                        return Messages.CronTab_do_you_really_mean_every_minute_when_you(spec, &quot;H &quot; + spec.substring(spec.indexOf(' ') + 1));</span>
+                    // once we find a sparse rank, upper ranks don't matter
+                    break OUTER;
+                }
+            }
+        }
+
+<span class="fc" id="L467">        int daysOfMonth = 0;</span>
+<span class="fc bfc" id="L468" title="All 2 branches covered.">        for (int i = 1; i &lt; 31; i++) {</span>
+<span class="fc bfc" id="L469" title="All 2 branches covered.">            if (checkBits(bits[2], i)) {</span>
+<span class="fc" id="L470">                daysOfMonth++;</span>
+            }
+        }
+<span class="fc bfc" id="L473" title="All 4 branches covered.">        if (daysOfMonth &gt; 5 &amp;&amp; daysOfMonth &lt; 28) { // a bit arbitrary</span>
+<span class="fc" id="L474">            return Messages.CronTab_short_cycles_in_the_day_of_month_field_w();</span>
+        }
+
+<span class="fc" id="L477">        String hashified = hashify(spec);</span>
+<span class="fc bfc" id="L478" title="All 2 branches covered.">        if (hashified != null) {</span>
+<span class="fc" id="L479">            return Messages.CronTab_spread_load_evenly_by_using_rather_than_(hashified, spec);</span>
+        }
+
+<span class="fc" id="L482">        return null;</span>
+    }
+
+    /**
+     * Checks a prospective crontab specification to see if it could benefit from balanced hashes.
+     * @param spec a (legal) spec
+     * @return a similar spec that uses a hash, if such a transformation is necessary; null if it is OK as is
+     * @since 1.510
+     */
+    public static @CheckForNull String hashify(String spec) {
+<span class="fc bfc" id="L492" title="All 2 branches covered.">        if (spec.contains(&quot;H&quot;)) {</span>
+            // if someone is already using H, presumably he knows what it is, so a warning is likely false positive
+<span class="fc" id="L494">            return null;</span>
+<span class="fc bfc" id="L495" title="All 2 branches covered.">        } else if (spec.startsWith(&quot;*/&quot;)) {// &quot;*/15 ....&quot; (every N minutes) to hash</span>
+<span class="fc" id="L496">            return &quot;H&quot; + spec.substring(1);</span>
+<span class="fc bfc" id="L497" title="All 2 branches covered.">        } else if (spec.matches(&quot;\\d+ .+&quot;)) {// &quot;0 ...&quot; (certain minute) to hash</span>
+<span class="fc" id="L498">            return &quot;H &quot; + spec.substring(spec.indexOf(' ') + 1);</span>
+        } else {
+<span class="fc" id="L500">            Matcher m = Pattern.compile(&quot;0(,(\\d+)(,\\d+)*)( .+)&quot;).matcher(spec);</span>
+<span class="pc bpc" id="L501" title="1 of 2 branches missed.">            if (m.matches()) { // 0,15,30,45 to H/15</span>
+<span class="fc" id="L502">                int period = Integer.parseInt(m.group(2));</span>
+<span class="pc bpc" id="L503" title="1 of 2 branches missed.">                if (period &gt; 0) {</span>
+<span class="fc" id="L504">                    StringBuilder b = new StringBuilder();</span>
+<span class="fc bfc" id="L505" title="All 2 branches covered.">                    for (int i = period; i &lt; 60; i += period) {</span>
+<span class="fc" id="L506">                        b.append(',').append(i);</span>
+                    }
+<span class="pc bpc" id="L508" title="1 of 2 branches missed.">                    if (b.toString().equals(m.group(1))) {</span>
+<span class="fc" id="L509">                        return &quot;H/&quot; + period + m.group(4);</span>
+                    }
+                }
+            }
+<span class="nc" id="L513">            return null;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

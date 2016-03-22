@@ -1,0 +1,197 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>TaskMethodFinder.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.init</a> &gt; <span class="el_source">TaskMethodFinder.java</span></div><h1>TaskMethodFinder.java</h1><pre class="source lang-java linenums">package hudson.init;
+
+import com.google.inject.Injector;
+import hudson.model.Hudson;
+import jenkins.model.Jenkins;
+import org.jvnet.hudson.annotation_indexer.Index;
+import org.jvnet.hudson.reactor.Milestone;
+import org.jvnet.hudson.reactor.MilestoneImpl;
+import org.jvnet.hudson.reactor.Reactor;
+import org.jvnet.hudson.reactor.Task;
+import org.jvnet.hudson.reactor.TaskBuilder;
+import org.jvnet.localizer.ResourceBundleHolder;
+
+import java.io.IOException;
+import java.lang.annotation.Annotation;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.List;
+import java.util.MissingResourceException;
+import java.util.Set;
+import java.util.logging.Logger;
+
+import static java.util.logging.Level.WARNING;
+
+/**
+ * @author Kohsuke Kawaguchi
+ */
+abstract class TaskMethodFinder&lt;T extends Annotation&gt; extends TaskBuilder {
+<span class="nc" id="L33">    private static final Logger LOGGER = Logger.getLogger(TaskMethodFinder.class.getName());</span>
+    protected final ClassLoader cl;
+<span class="nc" id="L35">    private final Set&lt;Method&gt; discovered = new HashSet&lt;Method&gt;();</span>
+
+    private final Class&lt;T&gt; type;
+    private final Class&lt;? extends Enum&gt; milestoneType;
+
+<span class="nc" id="L40">    public TaskMethodFinder(Class&lt;T&gt; type, Class&lt;? extends Enum&gt; milestoneType, ClassLoader cl) {</span>
+<span class="nc" id="L41">        this.type = type;</span>
+<span class="nc" id="L42">        this.milestoneType = milestoneType;</span>
+<span class="nc" id="L43">        this.cl = cl;</span>
+<span class="nc" id="L44">    }</span>
+
+    // working around the restriction that Java doesn't allow annotation types to extend interfaces
+    protected abstract String displayNameOf(T i);
+    protected abstract String[] requiresOf(T i);
+    protected abstract String[] attainsOf(T i);
+    protected abstract Milestone afterOf(T i);
+    protected abstract Milestone beforeOf(T i);
+    protected abstract boolean fatalOf(T i);
+
+    public Collection&lt;Task&gt; discoverTasks(Reactor session) throws IOException {
+<span class="nc" id="L55">        List&lt;Task&gt; result = new ArrayList&lt;Task&gt;();</span>
+<span class="nc bnc" id="L56" title="All 2 branches missed.">        for (Method e : Index.list(type, cl, Method.class)) {</span>
+<span class="nc bnc" id="L57" title="All 2 branches missed.">            if (filter(e)) continue;   // already reported once</span>
+
+<span class="nc bnc" id="L59" title="All 2 branches missed.">            if (!Modifier.isStatic(e.getModifiers()))</span>
+<span class="nc" id="L60">                throw new IOException(e+&quot; is not a static method&quot;);</span>
+
+<span class="nc" id="L62">            T i = e.getAnnotation(type);</span>
+<span class="nc bnc" id="L63" title="All 2 branches missed.">            if (i==null)        continue; // stale index</span>
+
+<span class="nc" id="L65">            result.add(new TaskImpl(i, e));</span>
+        }
+<span class="nc" id="L67">        return result;</span>
+    }
+
+    /**
+     * Return true to ignore this method.
+     */
+    protected boolean filter(Method e) {
+<span class="nc bnc" id="L74" title="All 2 branches missed.">        return !discovered.add(e);</span>
+    }
+
+    /**
+     * Obtains the display name of the given initialization task
+     */
+    protected String getDisplayNameOf(Method e, T i) {
+<span class="nc" id="L81">        Class&lt;?&gt; c = e.getDeclaringClass();</span>
+<span class="nc" id="L82">        String key = displayNameOf(i);</span>
+<span class="nc bnc" id="L83" title="All 2 branches missed.">        if (key.length()==0)  return c.getSimpleName()+&quot;.&quot;+e.getName();</span>
+        try {
+<span class="nc" id="L85">            ResourceBundleHolder rb = ResourceBundleHolder.get(</span>
+<span class="nc" id="L86">                    c.getClassLoader().loadClass(c.getPackage().getName() + &quot;.Messages&quot;));</span>
+<span class="nc" id="L87">            return rb.format(key);</span>
+<span class="nc" id="L88">        } catch (ClassNotFoundException x) {</span>
+<span class="nc" id="L89">            LOGGER.log(WARNING, &quot;Failed to load &quot;+x.getMessage()+&quot; for &quot;+e.toString(),x);</span>
+<span class="nc" id="L90">            return key;</span>
+<span class="nc" id="L91">        } catch (MissingResourceException x) {</span>
+<span class="nc" id="L92">            LOGGER.log(WARNING, &quot;Could not find key '&quot; + key + &quot;' in &quot; + c.getPackage().getName() + &quot;.Messages&quot;, x);</span>
+<span class="nc" id="L93">            return key;</span>
+        }
+    }
+
+    /**
+     * Invokes the given initialization method.
+     */
+    protected void invoke(Method e) {
+        try {
+<span class="nc" id="L102">            Class&lt;?&gt;[] pt = e.getParameterTypes();</span>
+<span class="nc" id="L103">            Object[] args = new Object[pt.length];</span>
+<span class="nc bnc" id="L104" title="All 2 branches missed.">            for (int i=0; i&lt;args.length; i++)</span>
+<span class="nc" id="L105">                args[i] = lookUp(pt[i]);</span>
+<span class="nc" id="L106">            e.invoke(null,args);</span>
+<span class="nc" id="L107">        } catch (IllegalAccessException x) {</span>
+<span class="nc" id="L108">            throw (Error)new IllegalAccessError().initCause(x);</span>
+<span class="nc" id="L109">        } catch (InvocationTargetException x) {</span>
+<span class="nc" id="L110">            throw new Error(x);</span>
+        }
+<span class="nc" id="L112">    }</span>
+
+    /**
+     * Determines the parameter injection of the initialization method.
+     */
+    private Object lookUp(Class&lt;?&gt; type) {
+<span class="nc bnc" id="L118" title="All 4 branches missed.">        if (type==Jenkins.class || type==Hudson.class)</span>
+<span class="nc" id="L119">            return Jenkins.getInstance();</span>
+<span class="nc" id="L120">        Jenkins j = Jenkins.getInstance();</span>
+<span class="nc bnc" id="L121" title="All 2 branches missed.">        if (j!=null) {</span>
+<span class="nc" id="L122">            Injector i = j.getInjector();</span>
+<span class="nc bnc" id="L123" title="All 2 branches missed.">            if (i!=null)</span>
+<span class="nc" id="L124">                return i.getInstance(type);</span>
+        }
+<span class="nc" id="L126">        throw new IllegalArgumentException(&quot;Unable to inject &quot;+type);</span>
+    }
+
+    /**
+     * Task implementation.
+     */
+    public class TaskImpl implements Task {
+        final Collection&lt;Milestone&gt; requires;
+        final Collection&lt;Milestone&gt; attains;
+        private final T i;
+        private final Method e;
+
+<span class="nc" id="L138">        private TaskImpl(T i, Method e) {</span>
+<span class="nc" id="L139">            this.i = i;</span>
+<span class="nc" id="L140">            this.e = e;</span>
+<span class="nc" id="L141">            requires = toMilestones(requiresOf(i), afterOf(i));</span>
+<span class="nc" id="L142">            attains = toMilestones(attainsOf(i), beforeOf(i));</span>
+<span class="nc" id="L143">        }</span>
+
+        /**
+         * The annotation on the {@linkplain #getMethod() method}
+         */
+        public T getAnnotation() {
+<span class="nc" id="L149">            return i;</span>
+        }
+
+        /**
+         * Static method that runs the initialization, that this task wraps.
+         */
+        public Method getMethod() {
+<span class="nc" id="L156">            return e;</span>
+        }
+
+        public Collection&lt;Milestone&gt; requires() {
+<span class="nc" id="L160">            return requires;</span>
+        }
+
+        public Collection&lt;Milestone&gt; attains() {
+<span class="nc" id="L164">            return attains;</span>
+        }
+
+        public String getDisplayName() {
+<span class="nc" id="L168">            return getDisplayNameOf(e, i);</span>
+        }
+
+        public boolean failureIsFatal() {
+<span class="nc" id="L172">            return fatalOf(i);</span>
+        }
+
+        public void run(Reactor session) {
+<span class="nc" id="L176">            invoke(e);</span>
+<span class="nc" id="L177">        }</span>
+
+        public String toString() {
+<span class="nc" id="L180">            return e.toString();</span>
+        }
+
+        private Collection&lt;Milestone&gt; toMilestones(String[] tokens, Milestone m) {
+<span class="nc" id="L184">            List&lt;Milestone&gt; r = new ArrayList&lt;Milestone&gt;();</span>
+<span class="nc bnc" id="L185" title="All 2 branches missed.">            for (String s : tokens) {</span>
+                try {
+<span class="nc" id="L187">                    r.add((Milestone)Enum.valueOf(milestoneType,s));</span>
+<span class="nc" id="L188">                } catch (IllegalArgumentException x) {</span>
+<span class="nc" id="L189">                    r.add(new MilestoneImpl(s));</span>
+                }
+            }
+<span class="nc" id="L192">            r.add(m);</span>
+<span class="nc" id="L193">            return r;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

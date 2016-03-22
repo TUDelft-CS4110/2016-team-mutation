@@ -1,0 +1,663 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>FormFieldValidator.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.util</a> &gt; <span class="el_source">FormFieldValidator.java</span></div><h1>FormFieldValidator.java</h1><pre class="source lang-java linenums">/*
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc., Kohsuke Kawaguchi, Jene Jasper, Tom Huybrechts
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.util;
+
+import static hudson.Util.fixEmpty;
+import hudson.EnvVars;
+import hudson.FilePath;
+import hudson.ProxyConfiguration;
+import hudson.Util;
+import hudson.model.AbstractProject;
+import jenkins.model.Jenkins;
+import hudson.model.Item;
+import hudson.security.Permission;
+import hudson.security.AccessControlled;
+
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.net.URLConnection;
+import java.util.Locale;
+
+import javax.servlet.ServletException;
+
+import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.StaplerResponse;
+import org.acegisecurity.AccessDeniedException;
+import org.kohsuke.stapler.Stapler;
+
+/**
+ * Base class that provides the framework for doing on-the-fly form field validation.
+ *
+ * &lt;p&gt;
+ * The {@link #check()} method is to be implemented by derived classes to perform
+ * the validation. See hudson-behavior.js 'validated' CSS class and 'checkUrl' attribute.
+ *
+ * @author Kohsuke Kawaguchi
+ * @deprecated as of 1.294
+ *      Use {@link FormValidation} as a return value in your check method.
+ */
+@Deprecated
+public abstract class FormFieldValidator {
+<span class="nc" id="L66">    public static final Permission CHECK = Jenkins.ADMINISTER;</span>
+
+    protected final StaplerRequest request;
+    protected final StaplerResponse response;
+    /**
+     * Permission to check, or null if this check doesn't require any permission.
+     */
+    protected final Permission permission;
+
+    /**
+     * The object to which the permission is checked against.
+     * If {@link #permission} is non-null, must be non-null.
+     */
+    protected final AccessControlled subject;
+
+    /**
+     * @param adminOnly
+     *      Pass true to only let admin users to run the check. This is necessary
+     *      for security reason, so that unauthenticated user cannot obtain sensitive
+     *      information or run a process that may have side-effect.
+     */
+    protected FormFieldValidator(StaplerRequest request, StaplerResponse response, boolean adminOnly) {
+<span class="nc bnc" id="L88" title="All 4 branches missed.">        this(request, response, adminOnly? Jenkins.getInstance():null, adminOnly?CHECK:null);</span>
+<span class="nc" id="L89">    }</span>
+
+    /**
+     * @deprecated
+     *      Use {@link #FormFieldValidator(Permission)} and remove {@link StaplerRequest} and {@link StaplerResponse}
+     *      from your &quot;doCheck...&quot; method parameter
+     */
+    @Deprecated
+    protected FormFieldValidator(StaplerRequest request, StaplerResponse response, Permission permission) {
+<span class="nc" id="L98">        this(request,response, Jenkins.getInstance(),permission);</span>
+<span class="nc" id="L99">    }</span>
+
+    /**
+     * @param permission
+     *      Permission needed to perform this validation, or null if no permission is necessary.
+     */
+    protected FormFieldValidator(Permission permission) {
+<span class="nc" id="L106">        this(Stapler.getCurrentRequest(),Stapler.getCurrentResponse(),permission);</span>
+<span class="nc" id="L107">    }</span>
+
+    /**
+     * @deprecated
+     *      Use {@link #FormFieldValidator(AccessControlled,Permission)} and remove {@link StaplerRequest} and {@link StaplerResponse}
+     *      from your &quot;doCheck...&quot; method parameter
+     */
+    @Deprecated
+<span class="nc" id="L115">    protected FormFieldValidator(StaplerRequest request, StaplerResponse response, AccessControlled subject, Permission permission) {</span>
+<span class="nc" id="L116">        this.request = request;</span>
+<span class="nc" id="L117">        this.response = response;</span>
+<span class="nc" id="L118">        this.subject = subject;</span>
+<span class="nc" id="L119">        this.permission = permission;</span>
+<span class="nc" id="L120">    }</span>
+
+    protected FormFieldValidator(AccessControlled subject, Permission permission) {
+<span class="nc" id="L123">        this(Stapler.getCurrentRequest(),Stapler.getCurrentResponse(),subject,permission);</span>
+<span class="nc" id="L124">    }</span>
+
+    /**
+     * Runs the validation code.
+     */
+    public final void process() throws IOException, ServletException {
+<span class="nc bnc" id="L130" title="All 2 branches missed.">        if(permission!=null)</span>
+            try {
+<span class="nc bnc" id="L132" title="All 2 branches missed.">                if(subject==null)</span>
+<span class="nc" id="L133">                    throw new AccessDeniedException(&quot;No subject&quot;);</span>
+<span class="nc" id="L134">                subject.checkPermission(permission);</span>
+<span class="nc" id="L135">            } catch (AccessDeniedException e) {</span>
+                // if the user has hudson-wisde admin permission, all checks are allowed
+                // this is to protect Hudson administrator from broken ACL/SecurityRealm implementation/configuration.
+<span class="nc bnc" id="L138" title="All 2 branches missed.">                if(!Jenkins.getInstance().hasPermission(Jenkins.ADMINISTER))</span>
+<span class="nc" id="L139">                    throw e;</span>
+            }
+
+<span class="nc" id="L142">        check();</span>
+<span class="nc" id="L143">    }</span>
+
+    protected abstract void check() throws IOException, ServletException;
+
+    /**
+     * Gets the parameter as a file.
+     */
+    protected final File getFileParameter(String paramName) {
+<span class="nc" id="L151">        return new File(Util.fixNull(request.getParameter(paramName)));</span>
+    }
+
+    /**
+     * Sends out an HTML fragment that indicates a success.
+     */
+    public void ok() throws IOException, ServletException {
+<span class="nc" id="L158">        respond(&quot;&lt;div/&gt;&quot;);</span>
+<span class="nc" id="L159">    }</span>
+
+    /**
+     * Sends out an arbitrary HTML fragment.
+     */
+    public void respond(String html) throws IOException, ServletException {
+<span class="nc" id="L165">        response.setContentType(&quot;text/html&quot;);</span>
+<span class="nc" id="L166">        response.getWriter().print(html);</span>
+<span class="nc" id="L167">    }</span>
+
+    /**
+     * Sends out a string error message that indicates an error.
+     *
+     * @param message
+     *      Human readable message to be sent. &lt;tt&gt;error(null)&lt;/tt&gt;
+     *      can be used as &lt;tt&gt;ok()&lt;/tt&gt;.
+     */
+    public void error(String message) throws IOException, ServletException {
+<span class="nc bnc" id="L177" title="All 2 branches missed.">        errorWithMarkup(message==null?null:Util.escape(message));</span>
+<span class="nc" id="L178">    }</span>
+
+    public void warning(String message) throws IOException, ServletException {
+<span class="nc bnc" id="L181" title="All 2 branches missed.">        warningWithMarkup(message==null?null:Util.escape(message));</span>
+<span class="nc" id="L182">    }</span>
+
+    public void ok(String message) throws IOException, ServletException {
+<span class="nc bnc" id="L185" title="All 2 branches missed.">        okWithMarkup(message==null?null:Util.escape(message));</span>
+<span class="nc" id="L186">    }</span>
+
+    /**
+     * Sends out a string error message that indicates an error,
+     * by formatting it with {@link String#format(String, Object[])}
+     */
+    public void error(String format, Object... args) throws IOException, ServletException {
+<span class="nc" id="L193">        error(String.format(format,args));</span>
+<span class="nc" id="L194">    }</span>
+
+    public void warning(String format, Object... args) throws IOException, ServletException {
+<span class="nc" id="L197">        warning(String.format(format,args));</span>
+<span class="nc" id="L198">    }</span>
+
+    public void ok(String format, Object... args) throws IOException, ServletException {
+<span class="nc" id="L201">        ok(String.format(format,args));</span>
+<span class="nc" id="L202">    }</span>
+
+    /**
+     * Sends out an HTML fragment that indicates an error.
+     *
+     * &lt;p&gt;
+     * This method must be used with care to avoid cross-site scripting
+     * attack.
+     *
+     * @param message
+     *      Human readable message to be sent. &lt;tt&gt;error(null)&lt;/tt&gt;
+     *      can be used as &lt;tt&gt;ok()&lt;/tt&gt;.
+     */
+    public void errorWithMarkup(String message) throws IOException, ServletException {
+<span class="nc" id="L216">        _errorWithMarkup(message,&quot;error&quot;);</span>
+<span class="nc" id="L217">    }</span>
+
+    public void warningWithMarkup(String message) throws IOException, ServletException {
+<span class="nc" id="L220">        _errorWithMarkup(message,&quot;warning&quot;);</span>
+<span class="nc" id="L221">    }</span>
+
+    public void okWithMarkup(String message) throws IOException, ServletException {
+<span class="nc" id="L224">        _errorWithMarkup(message,&quot;ok&quot;);</span>
+<span class="nc" id="L225">    }</span>
+
+    private void _errorWithMarkup(String message, String cssClass) throws IOException, ServletException {
+<span class="nc bnc" id="L228" title="All 2 branches missed.">        if(message==null) {</span>
+<span class="nc" id="L229">            ok();</span>
+<span class="nc" id="L230">        } else {</span>
+<span class="nc" id="L231">            response.setContentType(&quot;text/html;charset=UTF-8&quot;);</span>
+            // 1x16 spacer needed for IE since it doesn't support min-height
+<span class="nc" id="L233">            response.getWriter().print(&quot;&lt;div class=&quot;+ cssClass +&quot;&gt;&lt;img src='&quot;+</span>
+<span class="nc" id="L234">                    request.getContextPath()+ Jenkins.RESOURCE_PATH+&quot;/images/none.gif' height=16 width=1&gt;&quot;+</span>
+<span class="nc" id="L235">                    message+&quot;&lt;/div&gt;&quot;);</span>
+        }
+<span class="nc" id="L237">    }</span>
+
+    /**
+     * Convenient base class for checking the validity of URLs
+     *
+     * @deprecated as of 1.294
+     *      Use {@link FormValidation.URLCheck}
+     */
+    @Deprecated
+    public static abstract class URLCheck extends FormFieldValidator {
+
+        public URLCheck(StaplerRequest request, StaplerResponse response) {
+            // can be used to check the existence of any file in file system
+            // or other HTTP URLs inside firewall, so limit this to the admin.
+<span class="nc" id="L251">            super(request, response, true);</span>
+<span class="nc" id="L252">        }</span>
+
+        /**
+         * Opens the given URL and reads text content from it.
+         * This method honors Content-type header.
+         */
+        protected BufferedReader open(URL url) throws IOException {
+            // use HTTP content type to find out the charset.
+<span class="nc" id="L260">            URLConnection con = ProxyConfiguration.open(url);</span>
+<span class="nc bnc" id="L261" title="All 2 branches missed.">            if (con == null) { // TODO is this even permitted by URL.openConnection?</span>
+<span class="nc" id="L262">                throw new IOException(url.toExternalForm());</span>
+            }
+<span class="nc" id="L264">            return new BufferedReader(</span>
+<span class="nc" id="L265">                new InputStreamReader(con.getInputStream(),getCharset(con)));</span>
+        }
+
+        /**
+         * Finds the string literal from the given reader.
+         * @return
+         *      true if found, false otherwise.
+         */
+        protected boolean findText(BufferedReader in, String literal) throws IOException {
+            String line;
+<span class="nc bnc" id="L275" title="All 2 branches missed.">            while((line=in.readLine())!=null)</span>
+<span class="nc bnc" id="L276" title="All 2 branches missed.">                if(line.indexOf(literal)!=-1)</span>
+<span class="nc" id="L277">                    return true;</span>
+<span class="nc" id="L278">            return false;</span>
+        }
+
+        /**
+         * Calls the {@link #error(String)} method with a reasonable error message.
+         * Use this method when the {@link #open(URL)} or {@link #findText(BufferedReader, String)} fails.
+         *
+         * @param url
+         *      Pass in the URL that was connected. Used for error diagnosis.
+         */
+        protected void handleIOException(String url, IOException e) throws IOException, ServletException {
+            // any invalid URL comes here
+<span class="nc bnc" id="L290" title="All 2 branches missed.">            if(e.getMessage().equals(url))</span>
+                // Sun JRE (and probably others too) often return just the URL in the error.
+<span class="nc" id="L292">                error(&quot;Unable to connect &quot;+url);</span>
+            else
+<span class="nc" id="L294">                error(e.getMessage());</span>
+<span class="nc" id="L295">        }</span>
+
+        /**
+         * Figures out the charset from the content-type header.
+         */
+        private String getCharset(URLConnection con) {
+<span class="nc bnc" id="L301" title="All 2 branches missed.">            for( String t : con.getContentType().split(&quot;;&quot;) ) {</span>
+<span class="nc" id="L302">                t = t.trim().toLowerCase(Locale.ENGLISH);</span>
+<span class="nc bnc" id="L303" title="All 2 branches missed.">                if(t.startsWith(&quot;charset=&quot;))</span>
+<span class="nc" id="L304">                    return t.substring(8);</span>
+            }
+            // couldn't find it. HTML spec says default is US-ASCII,
+            // but UTF-8 is a better choice since
+            // (1) it's compatible with US-ASCII
+            // (2) a well-written web applications tend to use UTF-8
+<span class="nc" id="L310">            return &quot;UTF-8&quot;;</span>
+        }
+    }
+
+    /**
+     * Checks if the given value is an URL to some Hudson's top page.
+     * @since 1.192
+     */
+    public static class HudsonURL extends URLCheck {
+        public HudsonURL(StaplerRequest request, StaplerResponse response) {
+<span class="nc" id="L320">            super(request, response);</span>
+<span class="nc" id="L321">        }</span>
+
+        protected void check() throws IOException, ServletException {
+<span class="nc" id="L324">            String value = fixEmpty(request.getParameter(&quot;value&quot;));</span>
+<span class="nc bnc" id="L325" title="All 2 branches missed.">            if(value==null) {// nothing entered yet</span>
+<span class="nc" id="L326">                ok();</span>
+<span class="nc" id="L327">                return;</span>
+            }
+
+<span class="nc bnc" id="L330" title="All 2 branches missed.">            if(!value.endsWith(&quot;/&quot;)) value+='/';</span>
+
+            try {
+<span class="nc" id="L333">                URL url = new URL(value);</span>
+<span class="nc" id="L334">                HttpURLConnection con = (HttpURLConnection)url.openConnection();</span>
+<span class="nc" id="L335">                con.connect();</span>
+<span class="nc bnc" id="L336" title="All 2 branches missed.">                if(con.getResponseCode()!=200</span>
+<span class="nc bnc" id="L337" title="All 2 branches missed.">                || con.getHeaderField(&quot;X-Hudson&quot;)==null) {</span>
+<span class="nc" id="L338">                    error(value+&quot; is not Hudson (&quot;+con.getResponseMessage()+&quot;)&quot;);</span>
+<span class="nc" id="L339">                    return;</span>
+                }
+
+<span class="nc" id="L342">                ok();</span>
+<span class="nc" id="L343">            } catch (IOException e) {</span>
+<span class="nc" id="L344">                handleIOException(value,e);</span>
+            }
+<span class="nc" id="L346">        }</span>
+    }
+
+    /**
+     * Checks the file mask (specified in the 'value' query parameter) against
+     * the current workspace.
+     * @since 1.90.
+     * @deprecated as of 1.294. Use {@link FilePath#validateFileMask(String, boolean, boolean)} 
+     */
+    @Deprecated
+    public static class WorkspaceFileMask extends FormFieldValidator {
+        private final boolean errorIfNotExist;
+
+        public WorkspaceFileMask(StaplerRequest request, StaplerResponse response) {
+<span class="nc" id="L360">            this(request, response, true);</span>
+<span class="nc" id="L361">        }</span>
+
+        public WorkspaceFileMask(StaplerRequest request, StaplerResponse response, boolean errorIfNotExist) {
+            // Require CONFIGURE permission on the job
+<span class="nc" id="L365">            super(request, response, request.findAncestorObject(AbstractProject.class), Item.CONFIGURE);</span>
+<span class="nc" id="L366">            this.errorIfNotExist = errorIfNotExist;</span>
+<span class="nc" id="L367">        }</span>
+
+        protected void check() throws IOException, ServletException {
+<span class="nc" id="L370">            String value = fixEmpty(request.getParameter(&quot;value&quot;));</span>
+<span class="nc" id="L371">            AbstractProject&lt;?,?&gt; p = (AbstractProject&lt;?,?&gt;)subject;</span>
+
+<span class="nc bnc" id="L373" title="All 4 branches missed.">            if(value==null || p==null) {</span>
+<span class="nc" id="L374">                ok(); // none entered yet, or something is seriously wrong</span>
+<span class="nc" id="L375">                return;</span>
+            }
+
+            try {
+<span class="nc" id="L379">                FilePath ws = getBaseDirectory(p);</span>
+
+<span class="nc bnc" id="L381" title="All 4 branches missed.">                if(ws==null || !ws.exists()) {// no workspace. can't check</span>
+<span class="nc" id="L382">                    ok();</span>
+<span class="nc" id="L383">                    return;</span>
+                }
+
+<span class="nc" id="L386">                String msg = ws.validateAntFileMask(value, FilePath.VALIDATE_ANT_FILE_MASK_BOUND);</span>
+<span class="nc bnc" id="L387" title="All 2 branches missed.">                if(errorIfNotExist)     error(msg);</span>
+<span class="nc" id="L388">                else                    warning(msg);</span>
+<span class="nc" id="L389">            } catch (InterruptedException e) {</span>
+<span class="nc" id="L390">                ok(Messages.FormFieldValidator_did_not_manage_to_validate_may_be_too_sl(value));</span>
+            }
+<span class="nc" id="L392">        }</span>
+
+        /**
+         * The base directory from which the path name is resolved.
+         */
+        protected FilePath getBaseDirectory(AbstractProject&lt;?,?&gt; p) {
+<span class="nc" id="L398">            return p.getSomeWorkspace();</span>
+        }
+    }
+
+    /**
+     * Checks a valid directory name (specified in the 'value' query parameter) against
+     * the current workspace.
+     * @since 1.116
+     * @deprecated as of 1.294. Use {@link FilePath#validateRelativeDirectory(String, boolean)}
+     *      (see javadoc plugin for the example)
+     */
+    @Deprecated
+    public static class WorkspaceDirectory extends WorkspaceFilePath {
+        public WorkspaceDirectory(StaplerRequest request, StaplerResponse response, boolean errorIfNotExist) {
+<span class="nc" id="L412">            super(request, response, errorIfNotExist, false);</span>
+<span class="nc" id="L413">        }</span>
+
+        public WorkspaceDirectory(StaplerRequest request, StaplerResponse response) {
+<span class="nc" id="L416">            this(request, response, true);</span>
+<span class="nc" id="L417">        }</span>
+    }
+
+    /**
+     * Checks a valid file name or directory (specified in the 'value' query parameter) against
+     * the current workspace.
+     * @since 1.160
+     * @deprecated as of 1.294. Use {@link FilePath#validateRelativePath(String, boolean, boolean)}
+     */
+    @Deprecated
+    public static class WorkspaceFilePath extends FormFieldValidator {
+        private final boolean errorIfNotExist;
+        private final boolean expectingFile;
+
+        public WorkspaceFilePath(StaplerRequest request, StaplerResponse response, boolean errorIfNotExist, boolean expectingFile) {
+            // Require CONFIGURE permission on this job
+<span class="nc" id="L433">            super(request, response, request.findAncestorObject(AbstractProject.class), Item.CONFIGURE);</span>
+<span class="nc" id="L434">            this.errorIfNotExist = errorIfNotExist;</span>
+<span class="nc" id="L435">            this.expectingFile = expectingFile;</span>
+<span class="nc" id="L436">        }</span>
+
+        protected void check() throws IOException, ServletException {
+<span class="nc" id="L439">            String value = fixEmpty(request.getParameter(&quot;value&quot;));</span>
+<span class="nc" id="L440">            AbstractProject&lt;?,?&gt; p = (AbstractProject&lt;?,?&gt;)subject;</span>
+
+<span class="nc bnc" id="L442" title="All 4 branches missed.">            if(value==null || p==null) {</span>
+<span class="nc" id="L443">                ok(); // none entered yet, or something is seriously wrong</span>
+<span class="nc" id="L444">                return;</span>
+            }
+
+<span class="nc bnc" id="L447" title="All 2 branches missed.">            if(value.contains(&quot;*&quot;)) {</span>
+                // a common mistake is to use wildcard
+<span class="nc" id="L449">                error(&quot;Wildcard is not allowed here&quot;);</span>
+<span class="nc" id="L450">                return;</span>
+            }
+
+            try {
+<span class="nc" id="L454">                FilePath ws = getBaseDirectory(p);</span>
+
+<span class="nc bnc" id="L456" title="All 2 branches missed.">                if(ws==null) {// can't check</span>
+<span class="nc" id="L457">                    ok();</span>
+<span class="nc" id="L458">                    return;</span>
+                }
+
+<span class="nc bnc" id="L461" title="All 2 branches missed.">                if(!ws.exists()) {// no workspace. can't check</span>
+<span class="nc" id="L462">                    ok();</span>
+<span class="nc" id="L463">                    return;</span>
+                }
+
+<span class="nc bnc" id="L466" title="All 2 branches missed.">                if(ws.child(value).exists()) {</span>
+<span class="nc bnc" id="L467" title="All 2 branches missed.">                    if (expectingFile) {</span>
+<span class="nc bnc" id="L468" title="All 2 branches missed.">                        if(!ws.child(value).isDirectory())</span>
+<span class="nc" id="L469">                            ok();</span>
+                        else
+<span class="nc" id="L471">                            error(value+&quot; is not a file&quot;);</span>
+<span class="nc" id="L472">                    } else {</span>
+<span class="nc bnc" id="L473" title="All 2 branches missed.">                        if(ws.child(value).isDirectory())</span>
+<span class="nc" id="L474">                            ok();</span>
+                        else
+<span class="nc" id="L476">                            error(value+&quot; is not a directory&quot;);</span>
+                    }
+<span class="nc" id="L478">                } else {</span>
+<span class="nc bnc" id="L479" title="All 2 branches missed.">                    String msg = &quot;No such &quot;+(expectingFile?&quot;file&quot;:&quot;directory&quot;)+&quot;: &quot; + value;</span>
+<span class="nc bnc" id="L480" title="All 2 branches missed.">                    if(errorIfNotExist)     error(msg);</span>
+<span class="nc" id="L481">                    else                    warning(msg);</span>
+                }
+<span class="nc" id="L483">            } catch (InterruptedException e) {</span>
+<span class="nc" id="L484">                ok(); // coundn't check</span>
+            }
+<span class="nc" id="L486">        }</span>
+
+        /**
+         * The base directory from which the path name is resolved.
+         */
+        protected FilePath getBaseDirectory(AbstractProject&lt;?,?&gt; p) {
+<span class="nc" id="L492">            return p.getSomeWorkspace();</span>
+        }
+    }
+
+    /**
+     * Checks a valid executable binary (specified in the 'value' query parameter).
+     * It has to be either given as a full path to the executable, or else
+     * it will be searched in PATH.
+     *
+     * &lt;p&gt;
+     * This file also handles &quot;.exe&quot; omission in Windows --- I thought Windows
+     * has actually more generic mechanism for the executable extension omission,
+     * so perhaps this needs to be extended to handle that correctly. More info
+     * needed.
+     *
+     * @since 1.124
+     * @deprecated as of 1.294. Use {@link FormValidation#validateExecutable(String)}
+     */
+    @Deprecated
+    public static class Executable extends FormFieldValidator {
+
+        public Executable(StaplerRequest request, StaplerResponse response) {
+            // Require admin permission
+<span class="nc" id="L515">            super(request, response, true);</span>
+<span class="nc" id="L516">        }</span>
+
+        protected void check() throws IOException, ServletException {
+<span class="nc" id="L519">            String exe = fixEmpty(request.getParameter(&quot;value&quot;));</span>
+<span class="nc bnc" id="L520" title="All 2 branches missed.">            if(exe==null) {</span>
+<span class="nc" id="L521">                ok(); // nothing entered yet</span>
+<span class="nc" id="L522">                return;</span>
+            }
+
+<span class="nc bnc" id="L525" title="All 2 branches missed.">            if(exe.indexOf(File.separatorChar)&gt;=0) {</span>
+                // this is full path
+<span class="nc" id="L527">                File f = new File(exe);</span>
+<span class="nc bnc" id="L528" title="All 2 branches missed.">                if(f.exists()) {</span>
+<span class="nc" id="L529">                    checkExecutable(f);</span>
+<span class="nc" id="L530">                    return;</span>
+                }
+
+<span class="nc" id="L533">                File fexe = new File(exe+&quot;.exe&quot;);</span>
+<span class="nc bnc" id="L534" title="All 2 branches missed.">                if(fexe.exists()) {</span>
+<span class="nc" id="L535">                    checkExecutable(fexe);</span>
+<span class="nc" id="L536">                    return;</span>
+                }
+
+<span class="nc" id="L539">                error(&quot;There's no such file: &quot;+exe);</span>
+<span class="nc" id="L540">            } else {</span>
+                // look in PATH
+<span class="nc" id="L542">                String path = EnvVars.masterEnvVars.get(&quot;PATH&quot;);</span>
+<span class="nc" id="L543">                String tokenizedPath = &quot;&quot;;</span>
+<span class="nc" id="L544">                String delimiter = null;</span>
+<span class="nc bnc" id="L545" title="All 2 branches missed.">                if(path!=null) {</span>
+<span class="nc bnc" id="L546" title="All 2 branches missed.">                    for (String _dir : Util.tokenize(path.replace(&quot;\\&quot;, &quot;\\\\&quot;),File.pathSeparator)) {</span>
+<span class="nc bnc" id="L547" title="All 2 branches missed.">                        if (delimiter == null) {</span>
+<span class="nc" id="L548">                          delimiter = &quot;, &quot;;</span>
+<span class="nc" id="L549">                        }</span>
+                        else {
+<span class="nc" id="L551">                          tokenizedPath += delimiter;</span>
+                        }
+
+<span class="nc" id="L554">                        tokenizedPath += _dir.replace('\\', '/');</span>
+                        
+<span class="nc" id="L556">                        File dir = new File(_dir);</span>
+
+<span class="nc" id="L558">                        File f = new File(dir,exe);</span>
+<span class="nc bnc" id="L559" title="All 2 branches missed.">                        if(f.exists()) {</span>
+<span class="nc" id="L560">                            checkExecutable(f);</span>
+<span class="nc" id="L561">                            return;</span>
+                        }
+
+<span class="nc" id="L564">                        File fexe = new File(dir,exe+&quot;.exe&quot;);</span>
+<span class="nc bnc" id="L565" title="All 2 branches missed.">                        if(fexe.exists()) {</span>
+<span class="nc" id="L566">                            checkExecutable(fexe);</span>
+<span class="nc" id="L567">                            return;</span>
+                        }
+                    }
+                    
+<span class="nc" id="L571">                    tokenizedPath += &quot;.&quot;;</span>
+<span class="nc" id="L572">                }</span>
+                else {
+<span class="nc" id="L574">                  tokenizedPath = &quot;unavailable.&quot;;</span>
+                }
+
+                // didn't find it
+<span class="nc" id="L578">                error(&quot;There's no such executable &quot;+exe+&quot; in PATH: &quot;+tokenizedPath);</span>
+            }
+<span class="nc" id="L580">        }</span>
+
+        /**
+         * Provides an opportunity for derived classes to do additional checks on the executable.
+         */
+        protected void checkExecutable(File exe) throws IOException, ServletException {
+<span class="nc" id="L586">            ok();</span>
+<span class="nc" id="L587">        }</span>
+    }
+
+    /**
+     * Verifies that the 'value' parameter is correct base64 encoded text.
+     *
+     * @since 1.257
+     * @deprecated as of 1.305
+     *      Use {@link FormValidation#validateBase64(String, boolean, boolean, String)} instead.
+     */
+    @Deprecated
+    public static class Base64 extends FormFieldValidator {
+        private final boolean allowWhitespace;
+        private final boolean allowEmpty;
+        private final String errorMessage;
+
+        public Base64(StaplerRequest request, StaplerResponse response, boolean allowWhitespace, boolean allowEmpty, String errorMessage) {
+<span class="nc" id="L604">            super(request, response, false);</span>
+<span class="nc" id="L605">            this.allowWhitespace = allowWhitespace;</span>
+<span class="nc" id="L606">            this.allowEmpty = allowEmpty;</span>
+<span class="nc" id="L607">            this.errorMessage = errorMessage;</span>
+<span class="nc" id="L608">        }</span>
+
+        protected void check() throws IOException, ServletException {
+            try {
+<span class="nc" id="L612">                String v = request.getParameter(&quot;value&quot;);</span>
+<span class="nc bnc" id="L613" title="All 2 branches missed.">                if(!allowWhitespace) {</span>
+<span class="nc bnc" id="L614" title="All 4 branches missed.">                    if(v.indexOf(' ')&gt;=0 || v.indexOf('\n')&gt;=0) {</span>
+<span class="nc" id="L615">                        fail();</span>
+<span class="nc" id="L616">                        return;</span>
+                    }
+                }
+<span class="nc" id="L619">                v=v.trim();</span>
+<span class="nc bnc" id="L620" title="All 4 branches missed.">                if(!allowEmpty &amp;&amp; v.length()==0) {</span>
+<span class="nc" id="L621">                    fail();</span>
+<span class="nc" id="L622">                    return;</span>
+                }
+                
+<span class="nc" id="L625">                com.trilead.ssh2.crypto.Base64.decode(v.toCharArray());</span>
+<span class="nc" id="L626">                ok();</span>
+<span class="nc" id="L627">            } catch (IOException e) {</span>
+<span class="nc" id="L628">                fail();</span>
+            }
+<span class="nc" id="L630">        }</span>
+
+        protected void fail() throws IOException, ServletException {
+<span class="nc" id="L633">            error(errorMessage);</span>
+<span class="nc" id="L634">        }</span>
+    }
+
+    /**
+     * Verifies that the 'value' parameter is an integer &gt;= 0.
+     *
+     * @since 1.282
+     * @deprecated as of 1.294
+     *      Use {@link FormValidation#validateNonNegativeInteger(String)}
+     */
+    @Deprecated
+    public static class NonNegativeInteger extends FormFieldValidator {
+        public NonNegativeInteger() {
+<span class="nc" id="L647">            super(null);</span>
+<span class="nc" id="L648">        }</span>
+
+        protected void check() throws IOException, ServletException {
+            try {
+<span class="nc" id="L652">                String value = request.getParameter(&quot;value&quot;);</span>
+<span class="nc bnc" id="L653" title="All 2 branches missed.">                if(Integer.parseInt(value)&lt;0)</span>
+<span class="nc" id="L654">                    error(hudson.model.Messages.Hudson_NotAPositiveNumber());</span>
+                else
+<span class="nc" id="L656">                    ok();</span>
+<span class="nc" id="L657">            } catch (NumberFormatException e) {</span>
+<span class="nc" id="L658">                error(hudson.model.Messages.Hudson_NotANumber());</span>
+            }
+<span class="nc" id="L660">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

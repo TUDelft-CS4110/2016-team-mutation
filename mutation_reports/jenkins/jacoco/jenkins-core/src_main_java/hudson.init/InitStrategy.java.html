@@ -1,0 +1,151 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>InitStrategy.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.init</a> &gt; <span class="el_source">InitStrategy.java</span></div><h1>InitStrategy.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">package hudson.init;</span>
+
+import org.kohsuke.MetaInfServices;
+import org.jvnet.hudson.reactor.Task;
+
+import java.io.File;
+import java.io.FilenameFilter;
+import java.io.IOException;
+import java.util.Collection;
+import java.util.List;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Iterator;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+import hudson.PluginManager;
+import hudson.util.DirScanner;
+import hudson.util.FileVisitor;
+import hudson.util.Service;
+
+/**
+ * Strategy pattern of the various key decision making during the Jenkins initialization.
+ *
+ * &lt;p&gt;
+ * Because the act of initializing plugins is a part of the Jenkins initialization,
+ * this extension point cannot be implemented in a plugin. You need to place your jar
+ * inside {@code WEB-INF/lib} instead.
+ *
+ * &lt;p&gt;
+ * To register, put {@link MetaInfServices} on your implementation.
+ * 
+ * @author Kohsuke Kawaguchi
+ */
+<span class="nc" id="L35">public class InitStrategy {</span>
+    /**
+     * Returns the list of *.jpi, *.hpi and *.hpl to expand and load.
+     *
+     * &lt;p&gt;
+     * Normally we look at {@code $JENKINS_HOME/plugins/*.jpi} and *.hpi and *.hpl.
+     *
+     * @return
+     *      never null but can be empty. The list can contain different versions of the same plugin,
+     *      and when that happens, Jenkins will ignore all but the first one in the list.
+     */
+    public List&lt;File&gt; listPluginArchives(PluginManager pm) throws IOException {
+<span class="nc" id="L47">        List&lt;File&gt; r = new ArrayList&lt;File&gt;();</span>
+
+        // the ordering makes sure that during the debugging we get proper precedence among duplicates.
+        // for example, while doing &quot;mvn jpi:run&quot; or &quot;mvn hpi:run&quot; on a plugin that's bundled with Jenkins, we want to the
+        // *.jpl file to override the bundled jpi/hpi file.
+<span class="nc" id="L52">        getBundledPluginsFromProperty(r);</span>
+<span class="nc" id="L53">        Iterator&lt;File&gt; it = r.iterator();</span>
+<span class="nc bnc" id="L54" title="All 2 branches missed.">        while (it.hasNext()) {</span>
+<span class="nc" id="L55">            File f = it.next();</span>
+<span class="nc bnc" id="L56" title="All 2 branches missed.">            if (new File(pm.rootDir, f.getName().replace(&quot;.hpi&quot;, &quot;.jpi&quot;) + &quot;.pinned&quot;).isFile()) {</span>
+                // Cf. PluginManager.copyBundledPlugin, which is not called in this case.
+<span class="nc" id="L58">                LOGGER.log(Level.INFO, &quot;ignoring {0} since this plugin is pinned&quot;, f);</span>
+<span class="nc" id="L59">                it.remove();</span>
+            }
+        }
+
+        // similarly, we prefer *.jpi over *.hpi
+<span class="nc" id="L64">        listPluginFiles(pm, &quot;.jpl&quot;, r); // linked plugin. for debugging.</span>
+<span class="nc" id="L65">        listPluginFiles(pm, &quot;.hpl&quot;, r); // linked plugin. for debugging. (for backward compatibility)</span>
+<span class="nc" id="L66">        listPluginFiles(pm, &quot;.jpi&quot;, r); // plugin jar file</span>
+<span class="nc" id="L67">        listPluginFiles(pm, &quot;.hpi&quot;, r); // plugin jar file (for backward compatibility)</span>
+
+<span class="nc" id="L69">        return r;</span>
+    }
+    
+    private void listPluginFiles(PluginManager pm, String extension, Collection&lt;File&gt; all) throws IOException {
+<span class="nc" id="L73">        File[] files = pm.rootDir.listFiles(new FilterByExtension(extension));</span>
+<span class="nc bnc" id="L74" title="All 2 branches missed.">        if (files==null)</span>
+<span class="nc" id="L75">            throw new IOException(&quot;Jenkins is unable to create &quot; + pm.rootDir + &quot;\nPerhaps its security privilege is insufficient&quot;);</span>
+
+<span class="nc" id="L77">        all.addAll(Arrays.asList(files));</span>
+<span class="nc" id="L78">    }</span>
+
+    /**
+     * Lists up additional bundled plugins from the system property {@code hudson.bundled.plugins}.
+     * Since 1.480 glob syntax is supported.
+     * For use in the &quot;mvn hudson-dev:run&quot;.
+     * TODO: maven-hpi-plugin should inject its own InitStrategy instead of having this in the core.
+     */
+    protected void getBundledPluginsFromProperty(final List&lt;File&gt; r) {
+<span class="nc" id="L87">        String hplProperty = System.getProperty(&quot;hudson.bundled.plugins&quot;);</span>
+<span class="nc bnc" id="L88" title="All 2 branches missed.">        if (hplProperty != null) {</span>
+<span class="nc bnc" id="L89" title="All 2 branches missed.">            for (String hplLocation : hplProperty.split(&quot;,&quot;)) {</span>
+<span class="nc" id="L90">                File hpl = new File(hplLocation.trim());</span>
+<span class="nc bnc" id="L91" title="All 2 branches missed.">                if (hpl.exists()) {</span>
+<span class="nc" id="L92">                    r.add(hpl);</span>
+<span class="nc bnc" id="L93" title="All 2 branches missed.">                } else if (hpl.getName().contains(&quot;*&quot;)) {</span>
+                    try {
+<span class="nc" id="L95">                        new DirScanner.Glob(hpl.getName(), null).scan(hpl.getParentFile(), new FileVisitor() {</span>
+                            @Override public void visit(File f, String relativePath) throws IOException {
+<span class="nc" id="L97">                                r.add(f);</span>
+<span class="nc" id="L98">                            }</span>
+                        });
+<span class="nc" id="L100">                    } catch (IOException x) {</span>
+<span class="nc" id="L101">                        LOGGER.log(Level.WARNING, &quot;could not expand &quot; + hplLocation, x);</span>
+                    }
+<span class="nc" id="L103">                } else {</span>
+<span class="nc" id="L104">                    LOGGER.warning(&quot;bundled plugin &quot; + hplLocation + &quot; does not exist&quot;);</span>
+                }
+            }
+        }
+<span class="nc" id="L108">    }</span>
+
+    /**
+     * Selectively skip some of the initialization tasks.
+     * 
+     * @return
+     *      true to skip the execution.
+     */
+    public boolean skipInitTask(Task task) {
+<span class="nc" id="L117">        return false;</span>
+    }
+
+
+    /**
+     * Obtains the instance to be used.
+     */
+    public static InitStrategy get(ClassLoader cl) throws IOException {
+<span class="nc" id="L125">        List&lt;InitStrategy&gt; r = Service.loadInstances(cl, InitStrategy.class);</span>
+<span class="nc bnc" id="L126" title="All 2 branches missed.">        if (r.isEmpty())    return new InitStrategy();      // default</span>
+
+<span class="nc" id="L128">        InitStrategy s = r.get(0);</span>
+<span class="nc" id="L129">        LOGGER.fine(&quot;Using &quot;+s+&quot; as InitStrategy&quot;);</span>
+<span class="nc" id="L130">        return s;</span>
+    }
+
+<span class="nc" id="L133">    private static final Logger LOGGER = Logger.getLogger(InitStrategy.class.getName());</span>
+
+    private static class FilterByExtension implements FilenameFilter {
+        private final List&lt;String&gt; extensions;
+
+<span class="nc" id="L138">        public FilterByExtension(String... extensions) {</span>
+<span class="nc" id="L139">            this.extensions = Arrays.asList(extensions);</span>
+<span class="nc" id="L140">        }</span>
+
+        public boolean accept(File dir, String name) {
+<span class="nc bnc" id="L143" title="All 2 branches missed.">            for (String extension : extensions) {</span>
+<span class="nc bnc" id="L144" title="All 2 branches missed.">                if (name.endsWith(extension))</span>
+<span class="nc" id="L145">                    return true;</span>
+            }
+<span class="nc" id="L147">            return false;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

@@ -1,0 +1,115 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>ConnectionActivityMonitor.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.slaves</a> &gt; <span class="el_source">ConnectionActivityMonitor.java</span></div><h1>ConnectionActivityMonitor.java</h1><pre class="source lang-java linenums">/*
+ * The MIT License
+ *
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.slaves;
+
+import hudson.model.AsyncPeriodicWork;
+import hudson.model.TaskListener;
+import jenkins.model.Jenkins;
+import hudson.model.Computer;
+import hudson.util.TimeUnit2;
+import hudson.remoting.VirtualChannel;
+import hudson.remoting.Channel;
+import hudson.Extension;
+import jenkins.security.SlaveToMasterCallable;
+
+import java.io.IOException;
+import java.util.logging.Logger;
+
+/**
+ * Makes sure that connections to slaves are alive, and if they are not, cut them off.
+ *
+ * &lt;p&gt;
+ * If we only rely on TCP retransmission time out for this, the time it takes to detect a bad connection
+ * is in the order of 10s of minutes, so we take the matters to our own hands.
+ *
+ * @author Kohsuke Kawaguchi
+ * @since 1.325
+ */
+@Extension
+public class ConnectionActivityMonitor extends AsyncPeriodicWork {
+    public ConnectionActivityMonitor() {
+<span class="nc" id="L52">        super(&quot;Connection Activity monitoring to slaves&quot;);</span>
+<span class="nc" id="L53">    }</span>
+
+    protected void execute(TaskListener listener) throws IOException, InterruptedException {
+<span class="nc bnc" id="L56" title="All 2 branches missed.">        if (!enabled)   return;</span>
+
+<span class="nc" id="L58">        long now = System.currentTimeMillis();</span>
+<span class="nc bnc" id="L59" title="All 2 branches missed.">        for (Computer c: Jenkins.getInstance().getComputers()) {</span>
+<span class="nc" id="L60">            VirtualChannel ch = c.getChannel();</span>
+<span class="nc bnc" id="L61" title="All 2 branches missed.">            if (ch instanceof Channel) {</span>
+<span class="nc" id="L62">                Channel channel = (Channel) ch;</span>
+<span class="nc bnc" id="L63" title="All 2 branches missed.">                if (now-channel.getLastHeard() &gt; TIME_TILL_PING) {</span>
+                    // haven't heard from this slave for a while.
+<span class="nc" id="L65">                    Long lastPing = (Long)channel.getProperty(ConnectionActivityMonitor.class);</span>
+
+<span class="nc bnc" id="L67" title="All 4 branches missed.">                    if (lastPing!=null &amp;&amp; now-lastPing &gt; TIMEOUT) {</span>
+<span class="nc" id="L68">                        LOGGER.info(&quot;Repeated ping attempts failed on &quot;+c.getName()+&quot;. Disconnecting&quot;);</span>
+<span class="nc" id="L69">                        c.disconnect(OfflineCause.create(Messages._ConnectionActivityMonitor_OfflineCause()));</span>
+<span class="nc" id="L70">                    } else {</span>
+                        // send a ping. if we receive a reply, it will be reflected in the next getLastHeard() call.
+<span class="nc" id="L72">                        channel.callAsync(PING_COMMAND);</span>
+<span class="nc bnc" id="L73" title="All 2 branches missed.">                        if (lastPing==null)</span>
+<span class="nc" id="L74">                            channel.setProperty(ConnectionActivityMonitor.class,now);</span>
+                    }
+<span class="nc" id="L76">                } else {</span>
+                    // we are receiving data nicely
+<span class="nc" id="L78">                    channel.setProperty(ConnectionActivityMonitor.class,null);</span>
+                }
+            }
+        }
+<span class="nc" id="L82">    }</span>
+
+    public long getRecurrencePeriod() {
+<span class="nc bnc" id="L85" title="All 2 branches missed.">        return enabled ? FREQUENCY : TimeUnit2.DAYS.toMillis(30);</span>
+    }
+
+    /**
+     * Time till initial ping
+     */
+<span class="nc" id="L91">    private static final long TIME_TILL_PING = Long.getLong(ConnectionActivityMonitor.class.getName()+&quot;.timeToPing&quot;,TimeUnit2.MINUTES.toMillis(3));</span>
+
+<span class="nc" id="L93">    private static final long FREQUENCY = Long.getLong(ConnectionActivityMonitor.class.getName()+&quot;.frequency&quot;,TimeUnit2.SECONDS.toMillis(10));</span>
+
+    /**
+     * When do we abandon the effort and cut off?
+     */
+<span class="nc" id="L98">    private static final long TIMEOUT = Long.getLong(ConnectionActivityMonitor.class.getName()+&quot;.timeToPing&quot;,TimeUnit2.MINUTES.toMillis(4));</span>
+
+
+    // disabled by default until proven in the production
+<span class="nc" id="L102">    public boolean enabled = Boolean.getBoolean(ConnectionActivityMonitor.class.getName()+&quot;.enabled&quot;);</span>
+
+<span class="nc" id="L104">    private static final PingCommand PING_COMMAND = new PingCommand();</span>
+<span class="nc" id="L105">    private static final class PingCommand extends SlaveToMasterCallable&lt;Void,RuntimeException&gt; {</span>
+        public Void call() throws RuntimeException {
+<span class="nc" id="L107">            return null;</span>
+        }
+
+        private static final long serialVersionUID = 1L;
+    }
+
+<span class="nc" id="L113">    private static final Logger LOGGER = Logger.getLogger(ConnectionActivityMonitor.class.getName());</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

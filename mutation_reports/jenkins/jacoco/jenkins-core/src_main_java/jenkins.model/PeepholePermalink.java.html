@@ -1,0 +1,248 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>PeepholePermalink.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">jenkins.model</a> &gt; <span class="el_source">PeepholePermalink.java</span></div><h1>PeepholePermalink.java</h1><pre class="source lang-java linenums">package jenkins.model;
+
+import com.google.common.base.Predicate;
+import hudson.Extension;
+import hudson.Util;
+import hudson.model.Job;
+import hudson.model.PermalinkProjectAction.Permalink;
+import hudson.model.Run;
+import hudson.model.TaskListener;
+import hudson.model.listeners.RunListener;
+import hudson.util.AtomicFileWriter;
+import hudson.util.StreamTaskListener;
+import java.io.File;
+import java.io.IOException;
+import java.io.StringWriter;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+import org.apache.commons.io.FileUtils;
+
+/**
+ * Convenient base implementation for {@link Permalink}s that satisfy
+ * certain properties.
+ *
+ * &lt;p&gt;
+ * For a permalink to be able to use this, it has to satisfy the following:
+ *
+ * &lt;blockquote&gt;
+ *     Given a job J, permalink is a function F that computes a build B.
+ *     A peephole permalink is a subset of this function that can be
+ *     deduced to the &quot;peep-hole&quot; function G(B)-&gt;bool:
+ *
+ *     &lt;pre&gt;
+ *         F(J) = { newest B | G(B)==true }
+ *     &lt;/pre&gt;
+ * &lt;/blockquote&gt;
+ *
+ * &lt;p&gt;
+ * Intuitively speaking, a peep-hole permalink resolves to the latest build that
+ * satisfies a certain characteristics that can be determined solely by looking
+ * at the build and nothing else (most commonly its build result.)
+ *
+ * &lt;p&gt;
+ * This base class provides a file-based caching mechanism that avoids
+ * walking the long build history. The cache is a symlink to the build directory
+ * where symlinks are supported, and text file that contains the build number otherwise.
+ *
+ * &lt;p&gt;
+ * The implementation transparently tolerates G(B) that goes from true to false over time
+ * (it simply scans the history till find the new matching build.) To tolerate G(B)
+ * that goes from false to true, you need to be able to intercept whenever G(B) changes
+ * from false to true, then call {@link #resolve(Job)} to check the current permalink target
+ * is up to date, then call {@link #updateCache(Job, Run)} if it needs updating.
+ *
+ * @author Kohsuke Kawaguchi
+ * @since 1.507
+ */
+<span class="fc" id="L62">public abstract class PeepholePermalink extends Permalink implements Predicate&lt;Run&lt;?,?&gt;&gt; {</span>
+
+    /** JENKINS-22822: avoids rereading symlinks */
+<span class="fc" id="L65">    static final Map&lt;File,String&gt; symlinks = new HashMap&lt;File,String&gt;();</span>
+
+    /**
+     * Checks if the given build satisfies the peep-hole criteria.
+     *
+     * This is the &quot;G(B)&quot; as described in the class javadoc.
+     */
+    public abstract boolean apply(Run&lt;?,?&gt; run);
+
+    /**
+     * The file in which the permalink target gets recorded.
+     */
+    protected File getPermalinkFile(Job&lt;?,?&gt; job) {
+<span class="nc" id="L78">        return new File(job.getBuildDir(),getId());</span>
+    }
+
+    /**
+     * Resolves the permalink by using the cache if possible.
+     */
+    @Override
+    public Run&lt;?, ?&gt; resolve(Job&lt;?, ?&gt; job) {
+<span class="nc" id="L86">        File f = getPermalinkFile(job);</span>
+<span class="nc" id="L87">        Run&lt;?,?&gt; b=null;</span>
+
+        try {
+<span class="nc" id="L90">            String target = readSymlink(f);</span>
+<span class="nc bnc" id="L91" title="All 2 branches missed.">            if (target!=null) {</span>
+<span class="nc" id="L92">                int n = Integer.parseInt(Util.getFileName(target));</span>
+<span class="nc bnc" id="L93" title="All 2 branches missed.">                if (n==RESOLVES_TO_NONE)  return null;</span>
+
+<span class="nc" id="L95">                b = job.getBuildByNumber(n);</span>
+<span class="nc bnc" id="L96" title="All 4 branches missed.">                if (b!=null &amp;&amp; apply(b))</span>
+<span class="nc" id="L97">                    return b;   // found it (in the most efficient way possible)</span>
+
+                // the cache is stale. start the search
+<span class="nc bnc" id="L100" title="All 2 branches missed.">                if (b==null)</span>
+<span class="nc" id="L101">                     b=job.getNearestOldBuild(n);</span>
+            }
+<span class="nc" id="L103">        } catch (InterruptedException e) {</span>
+<span class="nc" id="L104">            LOGGER.log(Level.WARNING, &quot;Failed to read permalink cache:&quot; + f, e);</span>
+            // if we fail to read the cache, fall back to the re-computation
+<span class="nc" id="L106">        } catch (NumberFormatException e) { </span>
+<span class="nc" id="L107">            LOGGER.log(Level.WARNING, &quot;Failed to parse the build number in the permalink cache:&quot; + f, e);</span>
+            // if we fail to read the cache, fall back to the re-computation
+<span class="nc" id="L109">        } catch (IOException e) {</span>
+            // this happens when the symlink doesn't exist
+            // (and it cannot be distinguished from the case when the actual I/O error happened
+        }
+
+<span class="nc bnc" id="L114" title="All 2 branches missed.">        if (b==null) {</span>
+            // no cache
+<span class="nc" id="L116">            b = job.getLastBuild();</span>
+        }
+
+        // start from the build 'b' and locate the build that matches the criteria going back in time
+<span class="nc" id="L120">        b = find(b);</span>
+
+<span class="nc" id="L122">        updateCache(job,b);</span>
+<span class="nc" id="L123">        return b;</span>
+    }
+
+    /**
+     * Start from the build 'b' and locate the build that matches the criteria going back in time
+     */
+    private Run&lt;?,?&gt; find(Run&lt;?,?&gt; b) {
+<span class="nc bnc" id="L130" title="All 4 branches missed.">        for ( ; b!=null &amp;&amp; !apply(b); b=b.getPreviousBuild())</span>
+            ;
+<span class="nc" id="L132">        return b;</span>
+    }
+
+    /**
+     * Remembers the value 'n' in the cache for future {@link #resolve(Job)}.
+     */
+    protected void updateCache(@Nonnull Job&lt;?,?&gt; job, @Nullable Run&lt;?,?&gt; b) {
+<span class="nc bnc" id="L139" title="All 2 branches missed.">        final int n = b==null ? RESOLVES_TO_NONE : b.getNumber();</span>
+
+<span class="nc" id="L141">        File cache = getPermalinkFile(job);</span>
+<span class="nc" id="L142">        cache.getParentFile().mkdirs();</span>
+
+        try {
+<span class="nc" id="L145">            String target = String.valueOf(n);</span>
+<span class="nc bnc" id="L146" title="All 4 branches missed.">            if (b != null &amp;&amp; !new File(job.getBuildDir(), target).exists()) {</span>
+                // (re)create the build Number-&gt;Id symlink
+<span class="nc" id="L148">                Util.createSymlink(job.getBuildDir(),b.getId(),target,TaskListener.NULL);</span>
+            }
+<span class="nc" id="L150">            writeSymlink(cache, target);</span>
+<span class="nc" id="L151">        } catch (IOException e) {</span>
+<span class="nc" id="L152">            LOGGER.log(Level.WARNING, &quot;Failed to update &quot;+job+&quot; &quot;+getId()+&quot; permalink for &quot; + b, e);</span>
+<span class="nc" id="L153">            cache.delete();</span>
+<span class="nc" id="L154">        } catch (InterruptedException e) {</span>
+<span class="nc" id="L155">            LOGGER.log(Level.WARNING, &quot;Failed to update &quot;+job+&quot; &quot;+getId()+&quot; permalink for &quot; + b, e);</span>
+<span class="nc" id="L156">            cache.delete();</span>
+        }
+<span class="nc" id="L158">    }</span>
+
+    // File.exists returns false for a link with a missing target, so for Java 6 compatibility we have to use this circuitous method to see if it was created.
+    private static boolean exists(File link) {
+<span class="fc" id="L162">        File[] kids = link.getParentFile().listFiles();</span>
+<span class="pc bpc" id="L163" title="2 of 4 branches missed.">        return kids != null &amp;&amp; Arrays.asList(kids).contains(link);</span>
+    }
+
+    static String readSymlink(File cache) throws IOException, InterruptedException {
+<span class="pc" id="L167">        synchronized (symlinks) {</span>
+<span class="fc" id="L168">            String target = symlinks.get(cache);</span>
+<span class="pc bpc" id="L169" title="1 of 2 branches missed.">            if (target != null) {</span>
+<span class="nc" id="L170">                LOGGER.log(Level.FINE, &quot;readSymlink cached {0} → {1}&quot;, new Object[] {cache, target});</span>
+<span class="nc" id="L171">                return target;</span>
+            }
+        }
+<span class="fc" id="L174">        String target = Util.resolveSymlink(cache);</span>
+<span class="pc bpc" id="L175" title="2 of 4 branches missed.">        if (target==null &amp;&amp; cache.exists()) {</span>
+            // if this file isn't a symlink, it must be a regular file
+<span class="fc" id="L177">            target = FileUtils.readFileToString(cache,&quot;UTF-8&quot;).trim();</span>
+        }
+<span class="fc" id="L179">        LOGGER.log(Level.FINE, &quot;readSymlink {0} → {1}&quot;, new Object[] {cache, target});</span>
+<span class="pc" id="L180">        synchronized (symlinks) {</span>
+<span class="fc" id="L181">            symlinks.put(cache, target);</span>
+        }
+<span class="fc" id="L183">        return target;</span>
+    }
+
+    static void writeSymlink(File cache, String target) throws IOException, InterruptedException {
+<span class="fc" id="L187">        LOGGER.log(Level.FINE, &quot;writeSymlink {0} → {1}&quot;, new Object[] {cache, target});</span>
+<span class="pc" id="L188">        synchronized (symlinks) {</span>
+<span class="fc" id="L189">            symlinks.put(cache, target);</span>
+        }
+<span class="fc" id="L191">        StringWriter w = new StringWriter();</span>
+<span class="fc" id="L192">        StreamTaskListener listener = new StreamTaskListener(w);</span>
+<span class="fc" id="L193">        Util.createSymlink(cache.getParentFile(),target,cache.getName(),listener);</span>
+        // Avoid calling resolveSymlink on a nonexistent file as it will probably throw an IOException:
+<span class="pc bpc" id="L195" title="3 of 4 branches missed.">        if (!exists(cache) || Util.resolveSymlink(cache)==null) {</span>
+          // symlink not supported. use a regular file
+<span class="fc" id="L197">          AtomicFileWriter cw = new AtomicFileWriter(cache);</span>
+          try {
+<span class="fc" id="L199">              cw.write(target);</span>
+<span class="fc" id="L200">              cw.commit();</span>
+<span class="pc" id="L201">          } finally {</span>
+<span class="pc" id="L202">              cw.abort();</span>
+<span class="nc" id="L203">          }</span>
+        }
+<span class="fc" id="L205">    }</span>
+
+    @Extension
+<span class="nc" id="L208">    public static class RunListenerImpl extends RunListener&lt;Run&lt;?,?&gt;&gt; {</span>
+        /**
+         * If any of the peephole permalink points to the build to be deleted, update it to point to the new location.
+         */
+        @Override
+        public void onDeleted(Run run) {
+<span class="nc" id="L214">            Job&lt;?, ?&gt; j = run.getParent();</span>
+<span class="nc bnc" id="L215" title="All 2 branches missed.">            for (PeepholePermalink pp : Util.filter(j.getPermalinks(), PeepholePermalink.class)) {</span>
+<span class="nc bnc" id="L216" title="All 2 branches missed.">                if (pp.resolve(j)==run) {</span>
+<span class="nc" id="L217">                    Run&lt;?,?&gt; r = pp.find(run.getPreviousBuild());</span>
+<span class="nc bnc" id="L218" title="All 2 branches missed.">                    if (LOGGER.isLoggable(Level.FINE))</span>
+<span class="nc bnc" id="L219" title="All 2 branches missed.">                        LOGGER.fine(&quot;Updating &quot;+pp.getPermalinkFile(j).getName()+&quot; permalink from deleted &quot;+run.getNumber()+&quot; to &quot;+(r == null ? -1 : r.getNumber()));</span>
+<span class="nc" id="L220">                    pp.updateCache(j,r);</span>
+                }
+            }
+<span class="nc" id="L223">        }</span>
+
+        /**
+         * See if the new build matches any of the peephole permalink.
+         */
+        @Override
+        public void onCompleted(Run&lt;?,?&gt; run, @Nonnull TaskListener listener) {
+<span class="nc" id="L230">            Job&lt;?, ?&gt; j = run.getParent();</span>
+<span class="nc bnc" id="L231" title="All 2 branches missed.">            for (PeepholePermalink pp : Util.filter(j.getPermalinks(), PeepholePermalink.class)) {</span>
+<span class="nc bnc" id="L232" title="All 2 branches missed.">                if (pp.apply(run)) {</span>
+<span class="nc" id="L233">                    Run&lt;?, ?&gt; cur = pp.resolve(j);</span>
+<span class="nc bnc" id="L234" title="All 4 branches missed.">                    if (cur==null || cur.getNumber()&lt;run.getNumber()) {</span>
+<span class="nc bnc" id="L235" title="All 2 branches missed.">                        if (LOGGER.isLoggable(Level.FINE))</span>
+<span class="nc" id="L236">                            LOGGER.fine(&quot;Updating &quot;+pp.getPermalinkFile(j).getName()+&quot; permalink to completed &quot;+run.getNumber());</span>
+<span class="nc" id="L237">                        pp.updateCache(j,run);</span>
+                    }
+                }
+            }
+<span class="nc" id="L241">        }</span>
+    }
+
+    private static final int RESOLVES_TO_NONE = -1;
+
+<span class="fc" id="L246">    private static final Logger LOGGER = Logger.getLogger(PeepholePermalink.class.getName());</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

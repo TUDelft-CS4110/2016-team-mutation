@@ -1,0 +1,810 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>ClassicPluginStrategy.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson</a> &gt; <span class="el_source">ClassicPluginStrategy.java</span></div><h1>ClassicPluginStrategy.java</h1><pre class="source lang-java linenums"><span class="pc" id="L1">/*</span>
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc., Kohsuke Kawaguchi, Jean-Baptiste Quenot, Tom Huybrechts
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson;
+
+import com.google.common.collect.Lists;
+import hudson.Plugin.DummyImpl;
+import hudson.PluginWrapper.Dependency;
+import hudson.model.Hudson;
+import jenkins.util.AntClassLoader;
+import hudson.util.CyclicGraphDetector;
+import hudson.util.CyclicGraphDetector.CycleDetectedException;
+import hudson.util.IOUtils;
+import hudson.util.MaskingClassLoader;
+import hudson.util.VersionNumber;
+import jenkins.ClassLoaderReflectionToolkit;
+import jenkins.ExtensionFilter;
+import org.apache.commons.io.output.NullOutputStream;
+import org.apache.tools.ant.BuildException;
+import org.apache.tools.ant.Project;
+import org.apache.tools.ant.taskdefs.Expand;
+import org.apache.tools.ant.taskdefs.Zip;
+import org.apache.tools.ant.types.FileSet;
+import org.apache.tools.ant.types.PatternSet;
+import org.apache.tools.ant.types.Resource;
+import org.apache.tools.ant.types.ZipFileSet;
+import org.apache.tools.ant.types.resources.MappedResourceCollection;
+import org.apache.tools.ant.util.GlobPatternMapper;
+import org.apache.tools.zip.ZipEntry;
+import org.apache.tools.zip.ZipExtraField;
+import org.apache.tools.zip.ZipOutputStream;
+
+import java.io.Closeable;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FilenameFilter;
+import java.io.IOException;
+import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
+import java.net.URI;
+import java.net.URL;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Enumeration;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.Vector;
+import java.util.jar.Attributes;
+import java.util.jar.JarFile;
+import java.util.jar.Manifest;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import org.jenkinsci.bytecode.Transformer;
+
+import static org.apache.commons.io.FilenameUtils.getBaseName;
+
+public class ClassicPluginStrategy implements PluginStrategy {
+
+    /**
+     * Filter for jar files.
+     */
+<span class="fc" id="L85">    private static final FilenameFilter JAR_FILTER = new FilenameFilter() {</span>
+        public boolean accept(File dir,String name) {
+<span class="nc" id="L87">            return name.endsWith(&quot;.jar&quot;);</span>
+        }
+    };
+
+    private PluginManager pluginManager;
+
+    /**
+     * All the plugins eventually delegate this classloader to load core, servlet APIs, and SE runtime.
+     */
+<span class="fc" id="L96">    private final MaskingClassLoader coreClassLoader = new MaskingClassLoader(getClass().getClassLoader());</span>
+
+<span class="fc" id="L98">    public ClassicPluginStrategy(PluginManager pluginManager) {</span>
+<span class="fc" id="L99">        this.pluginManager = pluginManager;</span>
+<span class="fc" id="L100">    }</span>
+
+    @Override public String getShortName(File archive) throws IOException {
+        Manifest manifest;
+<span class="nc bnc" id="L104" title="All 2 branches missed.">        if (isLinked(archive)) {</span>
+<span class="nc" id="L105">            manifest = loadLinkedManifest(archive);</span>
+<span class="nc" id="L106">        } else {</span>
+<span class="nc" id="L107">            JarFile jf = new JarFile(archive, false);</span>
+            try {
+<span class="nc" id="L109">                manifest = jf.getManifest();</span>
+<span class="nc" id="L110">            } finally {</span>
+<span class="nc" id="L111">                jf.close();</span>
+<span class="nc" id="L112">            }</span>
+        }
+<span class="nc" id="L114">        return PluginWrapper.computeShortName(manifest, archive.getName());</span>
+    }
+
+    private static boolean isLinked(File archive) {
+<span class="nc bnc" id="L118" title="All 4 branches missed.">        return archive.getName().endsWith(&quot;.hpl&quot;) || archive.getName().endsWith(&quot;.jpl&quot;);</span>
+    }
+
+    private static Manifest loadLinkedManifest(File archive) throws IOException {
+            // resolve the .hpl file to the location of the manifest file        
+            try {
+                // Locate the manifest
+                String firstLine;
+<span class="nc" id="L126">                FileInputStream manifestHeaderInput = new FileInputStream(archive);</span>
+                try {
+<span class="nc" id="L128">                    firstLine = IOUtils.readFirstLine(manifestHeaderInput, &quot;UTF-8&quot;);</span>
+<span class="nc" id="L129">                } finally {</span>
+<span class="nc" id="L130">                    manifestHeaderInput.close();</span>
+<span class="nc" id="L131">                }</span>
+<span class="nc bnc" id="L132" title="All 2 branches missed.">                if (firstLine.startsWith(&quot;Manifest-Version:&quot;)) {</span>
+                    // this is the manifest already
+                } else {
+                    // indirection
+<span class="nc" id="L136">                    archive = resolve(archive, firstLine);</span>
+                }
+                
+                // Read the manifest
+<span class="nc" id="L140">                FileInputStream manifestInput = new FileInputStream(archive);</span>
+                try {
+<span class="nc" id="L142">                    return new Manifest(manifestInput);</span>
+<span class="nc" id="L143">                } finally {</span>
+<span class="nc" id="L144">                    manifestInput.close();</span>
+<span class="nc" id="L145">                }</span>
+<span class="nc" id="L146">            } catch (IOException e) {</span>
+<span class="nc" id="L147">                throw new IOException(&quot;Failed to load &quot; + archive, e);</span>
+            }
+    }
+
+    @Override public PluginWrapper createPluginWrapper(File archive) throws IOException {
+        final Manifest manifest;
+
+<span class="nc" id="L154">        URL baseResourceURL = null;</span>
+<span class="nc" id="L155">        File expandDir = null;</span>
+        // if .hpi, this is the directory where war is expanded
+
+<span class="nc" id="L158">        boolean isLinked = isLinked(archive);</span>
+<span class="nc bnc" id="L159" title="All 2 branches missed.">        if (isLinked) {</span>
+<span class="nc" id="L160">            manifest = loadLinkedManifest(archive);</span>
+<span class="nc" id="L161">        } else {</span>
+<span class="nc bnc" id="L162" title="All 2 branches missed.">            if (archive.isDirectory()) {// already expanded</span>
+<span class="nc" id="L163">                expandDir = archive;</span>
+<span class="nc" id="L164">            } else {</span>
+<span class="nc" id="L165">                File f = pluginManager.getWorkDir();</span>
+<span class="nc bnc" id="L166" title="All 2 branches missed.">                expandDir =  new File(f == null ? archive.getParentFile() : f, getBaseName(archive.getName()));</span>
+<span class="nc" id="L167">                explode(archive, expandDir);</span>
+            }
+
+<span class="nc" id="L170">            File manifestFile = new File(expandDir, PluginWrapper.MANIFEST_FILENAME);</span>
+<span class="nc bnc" id="L171" title="All 2 branches missed.">            if (!manifestFile.exists()) {</span>
+<span class="nc" id="L172">                throw new IOException(</span>
+<span class="nc" id="L173">                        &quot;Plugin installation failed. No manifest at &quot;</span>
+<span class="nc" id="L174">                                + manifestFile);</span>
+            }
+<span class="nc" id="L176">            FileInputStream fin = new FileInputStream(manifestFile);</span>
+            try {
+<span class="nc" id="L178">                manifest = new Manifest(fin);</span>
+<span class="nc" id="L179">            } finally {</span>
+<span class="nc" id="L180">                fin.close();</span>
+<span class="nc" id="L181">            }</span>
+        }
+
+<span class="nc" id="L184">        final Attributes atts = manifest.getMainAttributes();</span>
+
+        // TODO: define a mechanism to hide classes
+        // String export = manifest.getMainAttributes().getValue(&quot;Export&quot;);
+
+<span class="nc" id="L189">        List&lt;File&gt; paths = new ArrayList&lt;File&gt;();</span>
+<span class="nc bnc" id="L190" title="All 2 branches missed.">        if (isLinked) {</span>
+<span class="nc" id="L191">            parseClassPath(manifest, archive, paths, &quot;Libraries&quot;, &quot;,&quot;);</span>
+<span class="nc" id="L192">            parseClassPath(manifest, archive, paths, &quot;Class-Path&quot;, &quot; +&quot;); // backward compatibility</span>
+
+<span class="nc" id="L194">            baseResourceURL = resolve(archive,atts.getValue(&quot;Resource-Path&quot;)).toURI().toURL();</span>
+<span class="nc" id="L195">        } else {</span>
+<span class="nc" id="L196">            File classes = new File(expandDir, &quot;WEB-INF/classes&quot;);</span>
+<span class="nc bnc" id="L197" title="All 2 branches missed.">            if (classes.exists())</span>
+<span class="nc" id="L198">                paths.add(classes);</span>
+<span class="nc" id="L199">            File lib = new File(expandDir, &quot;WEB-INF/lib&quot;);</span>
+<span class="nc" id="L200">            File[] libs = lib.listFiles(JAR_FILTER);</span>
+<span class="nc bnc" id="L201" title="All 2 branches missed.">            if (libs != null)</span>
+<span class="nc" id="L202">                paths.addAll(Arrays.asList(libs));</span>
+
+            try {
+<span class="nc" id="L205">                Class pathJDK7 = Class.forName(&quot;java.nio.file.Path&quot;);</span>
+<span class="nc" id="L206">                Object toPath = File.class.getMethod(&quot;toPath&quot;).invoke(expandDir);</span>
+<span class="nc" id="L207">                URI uri = (URI) pathJDK7.getMethod(&quot;toUri&quot;).invoke(toPath);</span>
+
+<span class="nc" id="L209">                baseResourceURL = uri.toURL();</span>
+<span class="nc" id="L210">            } catch (NoSuchMethodException e) {</span>
+<span class="nc" id="L211">                throw new Error(e);</span>
+<span class="nc" id="L212">            } catch (ClassNotFoundException e) {</span>
+<span class="nc" id="L213">                baseResourceURL = expandDir.toURI().toURL();</span>
+<span class="nc" id="L214">            } catch (InvocationTargetException e) {</span>
+<span class="nc" id="L215">                throw new Error(e);</span>
+<span class="nc" id="L216">            } catch (IllegalAccessException e) {</span>
+<span class="nc" id="L217">                throw new Error(e);</span>
+            }
+        }
+<span class="nc" id="L220">        File disableFile = new File(archive.getPath() + &quot;.disabled&quot;);</span>
+<span class="nc bnc" id="L221" title="All 2 branches missed.">        if (disableFile.exists()) {</span>
+<span class="nc" id="L222">            LOGGER.info(&quot;Plugin &quot; + archive.getName() + &quot; is disabled&quot;);</span>
+        }
+
+        // compute dependencies
+<span class="nc" id="L226">        List&lt;PluginWrapper.Dependency&gt; dependencies = new ArrayList&lt;PluginWrapper.Dependency&gt;();</span>
+<span class="nc" id="L227">        List&lt;PluginWrapper.Dependency&gt; optionalDependencies = new ArrayList&lt;PluginWrapper.Dependency&gt;();</span>
+<span class="nc" id="L228">        String v = atts.getValue(&quot;Plugin-Dependencies&quot;);</span>
+<span class="nc bnc" id="L229" title="All 2 branches missed.">        if (v != null) {</span>
+<span class="nc bnc" id="L230" title="All 2 branches missed.">            for (String s : v.split(&quot;,&quot;)) {</span>
+<span class="nc" id="L231">                PluginWrapper.Dependency d = new PluginWrapper.Dependency(s);</span>
+<span class="nc bnc" id="L232" title="All 2 branches missed.">                if (d.optional) {</span>
+<span class="nc" id="L233">                    optionalDependencies.add(d);</span>
+<span class="nc" id="L234">                } else {</span>
+<span class="nc" id="L235">                    dependencies.add(d);</span>
+                }
+            }
+        }
+<span class="nc bnc" id="L239" title="All 2 branches missed.">        for (DetachedPlugin detached : DETACHED_LIST)</span>
+<span class="nc" id="L240">            detached.fix(atts,optionalDependencies);</span>
+
+        // Register global classpath mask. This is useful for hiding JavaEE APIs that you might see from the container,
+        // such as database plugin for JPA support. The Mask-Classes attribute is insufficient because those classes
+        // also need to be masked by all the other plugins that depend on the database plugin.
+<span class="nc" id="L245">        String masked = atts.getValue(&quot;Global-Mask-Classes&quot;);</span>
+<span class="nc bnc" id="L246" title="All 2 branches missed.">        if(masked!=null) {</span>
+<span class="nc bnc" id="L247" title="All 2 branches missed.">            for (String pkg : masked.trim().split(&quot;[ \t\r\n]+&quot;))</span>
+<span class="nc" id="L248">                coreClassLoader.add(pkg);</span>
+        }
+
+<span class="nc" id="L251">        ClassLoader dependencyLoader = new DependencyClassLoader(coreClassLoader, archive, Util.join(dependencies,optionalDependencies));</span>
+<span class="nc" id="L252">        dependencyLoader = getBaseClassLoader(atts, dependencyLoader);</span>
+
+<span class="nc" id="L254">        return new PluginWrapper(pluginManager, archive, manifest, baseResourceURL,</span>
+<span class="nc" id="L255">                createClassLoader(paths, dependencyLoader, atts), disableFile, dependencies, optionalDependencies);</span>
+    }
+
+    @Deprecated
+    protected ClassLoader createClassLoader(List&lt;File&gt; paths, ClassLoader parent) throws IOException {
+<span class="nc" id="L260">        return createClassLoader( paths, parent, null );</span>
+    }
+
+    /**
+     * Creates the classloader that can load all the specified jar files and delegate to the given parent.
+     */
+    protected ClassLoader createClassLoader(List&lt;File&gt; paths, ClassLoader parent, Attributes atts) throws IOException {
+<span class="nc bnc" id="L267" title="All 2 branches missed.">        if (atts != null) {</span>
+<span class="nc" id="L268">            String usePluginFirstClassLoader = atts.getValue( &quot;PluginFirstClassLoader&quot; );</span>
+<span class="nc bnc" id="L269" title="All 2 branches missed.">            if (Boolean.valueOf( usePluginFirstClassLoader )) {</span>
+<span class="nc" id="L270">                PluginFirstClassLoader classLoader = new PluginFirstClassLoader();</span>
+<span class="nc" id="L271">                classLoader.setParentFirst( false );</span>
+<span class="nc" id="L272">                classLoader.setParent( parent );</span>
+<span class="nc" id="L273">                classLoader.addPathFiles( paths );</span>
+<span class="nc" id="L274">                return classLoader;</span>
+            }
+        }
+
+<span class="nc" id="L278">        AntClassLoader2 classLoader = new AntClassLoader2(parent);</span>
+<span class="nc" id="L279">        classLoader.addPathFiles(paths);</span>
+<span class="nc" id="L280">        return classLoader;</span>
+    }
+
+    /**
+     * Information about plugins that were originally in the core.
+     */
+    private static final class DetachedPlugin {
+        private final String shortName;
+        /**
+         * Plugins built for this Jenkins version (and earlier) will automatically be assumed to have
+         * this plugin in its dependency.
+         *
+         * When core/pom.xml version is 1.123-SNAPSHOT when the code is removed, then this value should
+         * be &quot;1.123.*&quot; (because 1.124 will be the first version that doesn't include the removed code.)
+         */
+        private final VersionNumber splitWhen;
+        private final String requireVersion;
+
+<span class="fc" id="L298">        private DetachedPlugin(String shortName, String splitWhen, String requireVersion) {</span>
+<span class="fc" id="L299">            this.shortName = shortName;</span>
+<span class="fc" id="L300">            this.splitWhen = new VersionNumber(splitWhen);</span>
+<span class="fc" id="L301">            this.requireVersion = requireVersion;</span>
+<span class="fc" id="L302">        }</span>
+
+        private void fix(Attributes atts, List&lt;PluginWrapper.Dependency&gt; optionalDependencies) {
+            // don't fix the dependency for yourself, or else we'll have a cycle
+<span class="nc" id="L306">            String yourName = atts.getValue(&quot;Short-Name&quot;);</span>
+<span class="nc bnc" id="L307" title="All 2 branches missed.">            if (shortName.equals(yourName))   return;</span>
+<span class="nc bnc" id="L308" title="All 2 branches missed.">            if (BREAK_CYCLES.contains(yourName + '/' + shortName)) {</span>
+<span class="nc" id="L309">                LOGGER.log(Level.FINE, &quot;skipping implicit dependency {0} → {1}&quot;, new Object[] {yourName, shortName});</span>
+<span class="nc" id="L310">                return;</span>
+            }
+
+            // some earlier versions of maven-hpi-plugin apparently puts &quot;null&quot; as a literal in Hudson-Version. watch out for them.
+<span class="nc" id="L314">            String jenkinsVersion = atts.getValue(&quot;Jenkins-Version&quot;);</span>
+<span class="nc bnc" id="L315" title="All 2 branches missed.">            if (jenkinsVersion==null)</span>
+<span class="nc" id="L316">                jenkinsVersion = atts.getValue(&quot;Hudson-Version&quot;);</span>
+<span class="nc bnc" id="L317" title="All 6 branches missed.">            if (jenkinsVersion == null || jenkinsVersion.equals(&quot;null&quot;) || new VersionNumber(jenkinsVersion).compareTo(splitWhen) &lt;= 0) {</span>
+<span class="nc" id="L318">                optionalDependencies.add(new PluginWrapper.Dependency(shortName + ':' + requireVersion));</span>
+<span class="nc" id="L319">                LOGGER.log(Level.FINE, &quot;adding implicit dependency {0} → {1} because of {2}&quot;, new Object[] {yourName, shortName, jenkinsVersion});</span>
+            }
+<span class="nc" id="L321">        }</span>
+    }
+
+<span class="fc" id="L324">    private static final List&lt;DetachedPlugin&gt; DETACHED_LIST = Arrays.asList(</span>
+<span class="fc" id="L325">        new DetachedPlugin(&quot;maven-plugin&quot;,&quot;1.296&quot;,&quot;1.296&quot;),</span>
+<span class="fc" id="L326">        new DetachedPlugin(&quot;subversion&quot;,&quot;1.310&quot;,&quot;1.0&quot;),</span>
+<span class="fc" id="L327">        new DetachedPlugin(&quot;cvs&quot;,&quot;1.340&quot;,&quot;0.1&quot;),</span>
+<span class="fc" id="L328">        new DetachedPlugin(&quot;ant&quot;,&quot;1.430.*&quot;,&quot;1.0&quot;),</span>
+<span class="fc" id="L329">        new DetachedPlugin(&quot;javadoc&quot;,&quot;1.430.*&quot;,&quot;1.0&quot;),</span>
+<span class="fc" id="L330">        new DetachedPlugin(&quot;external-monitor-job&quot;,&quot;1.467.*&quot;,&quot;1.0&quot;),</span>
+<span class="fc" id="L331">        new DetachedPlugin(&quot;ldap&quot;,&quot;1.467.*&quot;,&quot;1.0&quot;),</span>
+<span class="fc" id="L332">        new DetachedPlugin(&quot;pam-auth&quot;,&quot;1.467.*&quot;,&quot;1.0&quot;),</span>
+<span class="fc" id="L333">        new DetachedPlugin(&quot;mailer&quot;,&quot;1.493.*&quot;,&quot;1.2&quot;),</span>
+<span class="fc" id="L334">        new DetachedPlugin(&quot;matrix-auth&quot;,&quot;1.535.*&quot;,&quot;1.0.2&quot;),</span>
+<span class="fc" id="L335">        new DetachedPlugin(&quot;windows-slaves&quot;,&quot;1.547.*&quot;,&quot;1.0&quot;),</span>
+<span class="fc" id="L336">        new DetachedPlugin(&quot;antisamy-markup-formatter&quot;,&quot;1.553.*&quot;,&quot;1.0&quot;),</span>
+<span class="fc" id="L337">        new DetachedPlugin(&quot;matrix-project&quot;,&quot;1.561.*&quot;,&quot;1.0&quot;),</span>
+<span class="fc" id="L338">        new DetachedPlugin(&quot;junit&quot;,&quot;1.577.*&quot;,&quot;1.0&quot;)</span>
+    );
+
+    /** Implicit dependencies that are known to be unnecessary and which must be cut out to prevent a dependency cycle among bundled plugins. */
+<span class="fc" id="L342">    private static final Set&lt;String&gt; BREAK_CYCLES = new HashSet&lt;String&gt;(Arrays.asList(</span>
+<span class="fc" id="L343">            &quot;script-security/matrix-auth&quot;,</span>
+<span class="fc" id="L344">            &quot;script-security/windows-slaves&quot;,</span>
+<span class="fc" id="L345">            &quot;script-security/antisamy-markup-formatter&quot;,</span>
+<span class="fc" id="L346">            &quot;script-security/matrix-project&quot;,</span>
+<span class="fc" id="L347">            &quot;credentials/matrix-auth&quot;,</span>
+<span class="fc" id="L348">            &quot;credentials/windows-slaves&quot;</span>
+    ));
+
+    /**
+     * Computes the classloader that takes the class masking into account.
+     *
+     * &lt;p&gt;
+     * This mechanism allows plugins to have their own versions for libraries that core bundles.
+     */
+    private ClassLoader getBaseClassLoader(Attributes atts, ClassLoader base) {
+<span class="nc" id="L358">        String masked = atts.getValue(&quot;Mask-Classes&quot;);</span>
+<span class="nc bnc" id="L359" title="All 2 branches missed.">        if(masked!=null)</span>
+<span class="nc" id="L360">            base = new MaskingClassLoader(base, masked.trim().split(&quot;[ \t\r\n]+&quot;));</span>
+<span class="nc" id="L361">        return base;</span>
+    }
+
+    public void initializeComponents(PluginWrapper plugin) {
+<span class="nc" id="L365">    }</span>
+
+    public &lt;T&gt; List&lt;ExtensionComponent&lt;T&gt;&gt; findComponents(Class&lt;T&gt; type, Hudson hudson) {
+
+        List&lt;ExtensionFinder&gt; finders;
+<span class="nc bnc" id="L370" title="All 2 branches missed.">        if (type==ExtensionFinder.class) {</span>
+            // Avoid infinite recursion of using ExtensionFinders to find ExtensionFinders
+<span class="nc" id="L372">            finders = Collections.&lt;ExtensionFinder&gt;singletonList(new ExtensionFinder.Sezpoz());</span>
+<span class="nc" id="L373">        } else {</span>
+<span class="nc" id="L374">            finders = hudson.getExtensionList(ExtensionFinder.class);</span>
+        }
+
+        /**
+         * See {@link ExtensionFinder#scout(Class, Hudson)} for the dead lock issue and what this does.
+         */
+<span class="nc bnc" id="L380" title="All 2 branches missed.">        if (LOGGER.isLoggable(Level.FINER))</span>
+<span class="nc" id="L381">            LOGGER.log(Level.FINER,&quot;Scout-loading ExtensionList: &quot;+type, new Throwable());</span>
+<span class="nc bnc" id="L382" title="All 2 branches missed.">        for (ExtensionFinder finder : finders) {</span>
+<span class="nc" id="L383">            finder.scout(type, hudson);</span>
+        }
+
+<span class="nc" id="L386">        List&lt;ExtensionComponent&lt;T&gt;&gt; r = Lists.newArrayList();</span>
+<span class="nc bnc" id="L387" title="All 2 branches missed.">        for (ExtensionFinder finder : finders) {</span>
+            try {
+<span class="nc" id="L389">                r.addAll(finder.find(type, hudson));</span>
+<span class="nc" id="L390">            } catch (AbstractMethodError e) {</span>
+                // backward compatibility
+<span class="nc bnc" id="L392" title="All 2 branches missed.">                for (T t : finder.findExtensions(type, hudson))</span>
+<span class="nc" id="L393">                    r.add(new ExtensionComponent&lt;T&gt;(t));</span>
+            }
+        }
+
+<span class="nc" id="L397">        List&lt;ExtensionComponent&lt;T&gt;&gt; filtered = Lists.newArrayList();</span>
+<span class="nc bnc" id="L398" title="All 2 branches missed.">        for (ExtensionComponent&lt;T&gt; e : r) {</span>
+<span class="nc bnc" id="L399" title="All 2 branches missed.">            if (ExtensionFilter.isAllowed(type,e))</span>
+<span class="nc" id="L400">                filtered.add(e);</span>
+        }
+
+<span class="nc" id="L403">        return filtered;</span>
+    }
+
+    public void load(PluginWrapper wrapper) throws IOException {
+        // override the context classloader. This no longer makes sense,
+        // but it is left for the backward compatibility
+<span class="nc" id="L409">        ClassLoader old = Thread.currentThread().getContextClassLoader();</span>
+<span class="nc" id="L410">        Thread.currentThread().setContextClassLoader(wrapper.classLoader);</span>
+        try {
+<span class="nc" id="L412">            String className = wrapper.getPluginClass();</span>
+<span class="nc bnc" id="L413" title="All 2 branches missed.">            if(className==null) {</span>
+                // use the default dummy instance
+<span class="nc" id="L415">                wrapper.setPlugin(new DummyImpl());</span>
+<span class="nc" id="L416">            } else {</span>
+                try {
+<span class="nc" id="L418">                    Class&lt;?&gt; clazz = wrapper.classLoader.loadClass(className);</span>
+<span class="nc" id="L419">                    Object o = clazz.newInstance();</span>
+<span class="nc bnc" id="L420" title="All 2 branches missed.">                    if(!(o instanceof Plugin)) {</span>
+<span class="nc" id="L421">                        throw new IOException(className+&quot; doesn't extend from hudson.Plugin&quot;);</span>
+                    }
+<span class="nc" id="L423">                    wrapper.setPlugin((Plugin) o);</span>
+<span class="nc" id="L424">                } catch (LinkageError e) {</span>
+<span class="nc" id="L425">                    throw new IOException(&quot;Unable to load &quot; + className + &quot; from &quot; + wrapper.getShortName(),e);</span>
+<span class="nc" id="L426">                } catch (ClassNotFoundException e) {</span>
+<span class="nc" id="L427">                    throw new IOException(&quot;Unable to load &quot; + className + &quot; from &quot; + wrapper.getShortName(),e);</span>
+<span class="nc" id="L428">                } catch (IllegalAccessException e) {</span>
+<span class="nc" id="L429">                    throw new IOException(&quot;Unable to create instance of &quot; + className + &quot; from &quot; + wrapper.getShortName(),e);</span>
+<span class="nc" id="L430">                } catch (InstantiationException e) {</span>
+<span class="nc" id="L431">                    throw new IOException(&quot;Unable to create instance of &quot; + className + &quot; from &quot; + wrapper.getShortName(),e);</span>
+                }
+            }
+
+            // initialize plugin
+            try {
+<span class="nc" id="L437">                Plugin plugin = wrapper.getPlugin();</span>
+<span class="nc" id="L438">                plugin.setServletContext(pluginManager.context);</span>
+<span class="nc" id="L439">                startPlugin(wrapper);</span>
+<span class="nc" id="L440">            } catch(Throwable t) {</span>
+                // gracefully handle any error in plugin.
+<span class="nc" id="L442">                throw new IOException(&quot;Failed to initialize&quot;,t);</span>
+            }
+<span class="nc" id="L444">        } finally {</span>
+<span class="nc" id="L445">            Thread.currentThread().setContextClassLoader(old);</span>
+<span class="nc" id="L446">        }</span>
+<span class="nc" id="L447">    }</span>
+
+    public void startPlugin(PluginWrapper plugin) throws Exception {
+<span class="nc" id="L450">        plugin.getPlugin().start();</span>
+<span class="nc" id="L451">    }</span>
+
+    @Override
+    public void updateDependency(PluginWrapper depender, PluginWrapper dependee) {
+<span class="nc" id="L455">        DependencyClassLoader classLoader = findAncestorDependencyClassLoader(depender.classLoader);</span>
+<span class="nc bnc" id="L456" title="All 2 branches missed.">        if (classLoader != null) {</span>
+<span class="nc" id="L457">            classLoader.updateTransientDependencies();</span>
+<span class="nc" id="L458">            LOGGER.log(Level.INFO, &quot;Updated dependency of {0}&quot;, depender.getShortName());</span>
+        }
+<span class="nc" id="L460">    }</span>
+
+    private DependencyClassLoader findAncestorDependencyClassLoader(ClassLoader classLoader)
+    {
+<span class="nc bnc" id="L464" title="All 2 branches missed.">        for (; classLoader != null; classLoader = classLoader.getParent()) {</span>
+<span class="nc bnc" id="L465" title="All 2 branches missed.">            if (classLoader instanceof DependencyClassLoader) {</span>
+<span class="nc" id="L466">                return (DependencyClassLoader)classLoader;</span>
+            }
+            
+<span class="nc bnc" id="L469" title="All 2 branches missed.">            if (classLoader instanceof AntClassLoader) {</span>
+                // AntClassLoaders hold parents not only as AntClassLoader#getParent()
+                // but also as AntClassLoader#getConfiguredParent()
+<span class="nc" id="L472">                DependencyClassLoader ret = findAncestorDependencyClassLoader(</span>
+<span class="nc" id="L473">                        ((AntClassLoader)classLoader).getConfiguredParent()</span>
+                );
+<span class="nc bnc" id="L475" title="All 2 branches missed.">                if (ret != null) {</span>
+<span class="nc" id="L476">                    return ret;</span>
+                }
+            }
+        }
+<span class="nc" id="L480">        return null;</span>
+    }
+
+    private static File resolve(File base, String relative) {
+<span class="nc" id="L484">        File rel = new File(relative);</span>
+<span class="nc bnc" id="L485" title="All 2 branches missed.">        if(rel.isAbsolute())</span>
+<span class="nc" id="L486">            return rel;</span>
+        else
+<span class="nc" id="L488">            return new File(base.getParentFile(),relative);</span>
+    }
+
+    private static void parseClassPath(Manifest manifest, File archive, List&lt;File&gt; paths, String attributeName, String separator) throws IOException {
+<span class="nc" id="L492">        String classPath = manifest.getMainAttributes().getValue(attributeName);</span>
+<span class="nc bnc" id="L493" title="All 2 branches missed.">        if(classPath==null) return; // attribute not found</span>
+<span class="nc bnc" id="L494" title="All 2 branches missed.">        for (String s : classPath.split(separator)) {</span>
+<span class="nc" id="L495">            File file = resolve(archive, s);</span>
+<span class="nc bnc" id="L496" title="All 2 branches missed.">            if(file.getName().contains(&quot;*&quot;)) {</span>
+                // handle wildcard
+<span class="nc" id="L498">                FileSet fs = new FileSet();</span>
+<span class="nc" id="L499">                File dir = file.getParentFile();</span>
+<span class="nc" id="L500">                fs.setDir(dir);</span>
+<span class="nc" id="L501">                fs.setIncludes(file.getName());</span>
+<span class="nc bnc" id="L502" title="All 2 branches missed.">                for( String included : fs.getDirectoryScanner(new Project()).getIncludedFiles() ) {</span>
+<span class="nc" id="L503">                    paths.add(new File(dir,included));</span>
+                }
+<span class="nc" id="L505">            } else {</span>
+<span class="nc bnc" id="L506" title="All 2 branches missed.">                if(!file.exists())</span>
+<span class="nc" id="L507">                    throw new IOException(&quot;No such file: &quot;+file);</span>
+<span class="nc" id="L508">                paths.add(file);</span>
+            }
+        }
+<span class="nc" id="L511">    }</span>
+
+    /**
+     * Explodes the plugin into a directory, if necessary.
+     */
+    private static void explode(File archive, File destDir) throws IOException {
+<span class="nc" id="L517">        destDir.mkdirs();</span>
+
+        // timestamp check
+<span class="nc" id="L520">        File explodeTime = new File(destDir,&quot;.timestamp2&quot;);</span>
+<span class="nc bnc" id="L521" title="All 4 branches missed.">        if(explodeTime.exists() &amp;&amp; explodeTime.lastModified()==archive.lastModified())</span>
+<span class="nc" id="L522">            return; // no need to expand</span>
+
+        // delete the contents so that old files won't interfere with new files
+<span class="nc" id="L525">        Util.deleteRecursive(destDir);</span>
+
+        try {
+<span class="nc" id="L528">            Project prj = new Project();</span>
+<span class="nc" id="L529">            unzipExceptClasses(archive, destDir, prj);</span>
+<span class="nc" id="L530">            createClassJarFromWebInfClasses(archive, destDir, prj);</span>
+<span class="nc" id="L531">        } catch (BuildException x) {</span>
+<span class="nc" id="L532">            throw new IOException(&quot;Failed to expand &quot; + archive,x);</span>
+        }
+
+        try {
+<span class="nc" id="L536">            new FilePath(explodeTime).touch(archive.lastModified());</span>
+<span class="nc" id="L537">        } catch (InterruptedException e) {</span>
+<span class="nc" id="L538">            throw new AssertionError(e); // impossible</span>
+        }
+<span class="nc" id="L540">    }</span>
+
+    /**
+     * Repackage classes directory into a jar file to make it remoting friendly.
+     * The remoting layer can cache jar files but not class files.
+     */
+    private static void createClassJarFromWebInfClasses(File archive, File destDir, Project prj) throws IOException {
+<span class="nc" id="L547">        File classesJar = new File(destDir, &quot;WEB-INF/lib/classes.jar&quot;);</span>
+
+<span class="nc" id="L549">        ZipFileSet zfs = new ZipFileSet();</span>
+<span class="nc" id="L550">        zfs.setProject(prj);</span>
+<span class="nc" id="L551">        zfs.setSrc(archive);</span>
+<span class="nc" id="L552">        zfs.setIncludes(&quot;WEB-INF/classes/&quot;);</span>
+
+<span class="nc" id="L554">        MappedResourceCollection mapper = new MappedResourceCollection();</span>
+<span class="nc" id="L555">        mapper.add(zfs);</span>
+
+<span class="nc" id="L557">        GlobPatternMapper gm = new GlobPatternMapper();</span>
+<span class="nc" id="L558">        gm.setFrom(&quot;WEB-INF/classes/*&quot;);</span>
+<span class="nc" id="L559">        gm.setTo(&quot;*&quot;);</span>
+<span class="nc" id="L560">        mapper.add(gm);</span>
+
+<span class="nc" id="L562">        final long dirTime = archive.lastModified();</span>
+        // this ZipOutputStream is reused and not created for each directory
+<span class="nc" id="L564">        final ZipOutputStream wrappedZOut = new ZipOutputStream(new NullOutputStream()) {</span>
+            @Override
+            public void putNextEntry(ZipEntry ze) throws IOException {
+<span class="nc" id="L567">                ze.setTime(dirTime+1999);   // roundup</span>
+<span class="nc" id="L568">                super.putNextEntry(ze);</span>
+<span class="nc" id="L569">            }</span>
+        };
+        try {
+<span class="nc" id="L572">            Zip z = new Zip() {</span>
+                /**
+                 * Forces the fixed timestamp for directories to make sure
+                 * classes.jar always get a consistent checksum.
+                 */
+                protected void zipDir(Resource dir, ZipOutputStream zOut, String vPath,
+                                      int mode, ZipExtraField[] extra)
+                    throws IOException {
+                    // use wrappedZOut instead of zOut
+<span class="nc" id="L581">                    super.zipDir(dir,wrappedZOut,vPath,mode,extra);</span>
+<span class="nc" id="L582">                }</span>
+            };
+<span class="nc" id="L584">            z.setProject(prj);</span>
+<span class="nc" id="L585">            z.setTaskType(&quot;zip&quot;);</span>
+<span class="nc" id="L586">            classesJar.getParentFile().mkdirs();</span>
+<span class="nc" id="L587">            z.setDestFile(classesJar);</span>
+<span class="nc" id="L588">            z.add(mapper);</span>
+<span class="nc" id="L589">            z.execute();</span>
+<span class="nc" id="L590">        } finally {</span>
+<span class="nc" id="L591">            wrappedZOut.close();</span>
+<span class="nc" id="L592">        }</span>
+<span class="nc" id="L593">    }</span>
+
+    private static void unzipExceptClasses(File archive, File destDir, Project prj) {
+<span class="nc" id="L596">        Expand e = new Expand();</span>
+<span class="nc" id="L597">        e.setProject(prj);</span>
+<span class="nc" id="L598">        e.setTaskType(&quot;unzip&quot;);</span>
+<span class="nc" id="L599">        e.setSrc(archive);</span>
+<span class="nc" id="L600">        e.setDest(destDir);</span>
+<span class="nc" id="L601">        PatternSet p = new PatternSet();</span>
+<span class="nc" id="L602">        p.setExcludes(&quot;WEB-INF/classes/&quot;);</span>
+<span class="nc" id="L603">        e.addPatternset(p);</span>
+<span class="nc" id="L604">        e.execute();</span>
+<span class="nc" id="L605">    }</span>
+
+    /**
+     * Used to load classes from dependency plugins.
+     */
+    final class DependencyClassLoader extends ClassLoader {
+        /**
+         * This classloader is created for this plugin. Useful during debugging.
+         */
+        private final File _for;
+
+        private List&lt;Dependency&gt; dependencies;
+
+        /**
+         * Topologically sorted list of transient dependencies.
+         */
+        private volatile List&lt;PluginWrapper&gt; transientDependencies;
+
+<span class="nc" id="L623">        public DependencyClassLoader(ClassLoader parent, File archive, List&lt;Dependency&gt; dependencies) {</span>
+<span class="nc" id="L624">            super(parent);</span>
+<span class="nc" id="L625">            this._for = archive;</span>
+<span class="nc" id="L626">            this.dependencies = dependencies;</span>
+<span class="nc" id="L627">        }</span>
+
+        private void updateTransientDependencies() {
+            // This will be recalculated at the next time.
+<span class="nc" id="L631">            transientDependencies = null;</span>
+<span class="nc" id="L632">        }</span>
+
+        private List&lt;PluginWrapper&gt; getTransitiveDependencies() {
+<span class="nc bnc" id="L635" title="All 2 branches missed.">            if (transientDependencies==null) {</span>
+<span class="nc" id="L636">                CyclicGraphDetector&lt;PluginWrapper&gt; cgd = new CyclicGraphDetector&lt;PluginWrapper&gt;() {</span>
+                    @Override
+                    protected List&lt;PluginWrapper&gt; getEdges(PluginWrapper pw) {
+<span class="nc" id="L639">                        List&lt;PluginWrapper&gt; dep = new ArrayList&lt;PluginWrapper&gt;();</span>
+<span class="nc bnc" id="L640" title="All 2 branches missed.">                        for (Dependency d : pw.getDependencies()) {</span>
+<span class="nc" id="L641">                            PluginWrapper p = pluginManager.getPlugin(d.shortName);</span>
+<span class="nc bnc" id="L642" title="All 4 branches missed.">                            if (p!=null &amp;&amp; p.isActive())</span>
+<span class="nc" id="L643">                                dep.add(p);</span>
+                        }
+<span class="nc" id="L645">                        return dep;</span>
+                    }
+                };
+
+                try {
+<span class="nc bnc" id="L650" title="All 2 branches missed.">                    for (Dependency d : dependencies) {</span>
+<span class="nc" id="L651">                        PluginWrapper p = pluginManager.getPlugin(d.shortName);</span>
+<span class="nc bnc" id="L652" title="All 4 branches missed.">                        if (p!=null &amp;&amp; p.isActive())</span>
+<span class="nc" id="L653">                            cgd.run(Collections.singleton(p));</span>
+                    }
+<span class="nc" id="L655">                } catch (CycleDetectedException e) {</span>
+<span class="nc" id="L656">                    throw new AssertionError(e);    // such error should have been reported earlier</span>
+                }
+
+<span class="nc" id="L659">                transientDependencies = cgd.getSorted();</span>
+            }
+<span class="nc" id="L661">            return transientDependencies;</span>
+        }
+
+//        public List&lt;PluginWrapper&gt; getDependencyPluginWrappers() {
+//            List&lt;PluginWrapper&gt; r = new ArrayList&lt;PluginWrapper&gt;();
+//            for (Dependency d : dependencies) {
+//                PluginWrapper w = pluginManager.getPlugin(d.shortName);
+//                if (w!=null)    r.add(w);
+//            }
+//            return r;
+//        }
+
+        @Override
+        protected Class&lt;?&gt; findClass(String name) throws ClassNotFoundException {
+<span class="nc bnc" id="L675" title="All 2 branches missed.">            if (PluginManager.FAST_LOOKUP) {</span>
+<span class="nc bnc" id="L676" title="All 2 branches missed.">                for (PluginWrapper pw : getTransitiveDependencies()) {</span>
+                    try {
+<span class="nc" id="L678">                        Class&lt;?&gt; c = ClassLoaderReflectionToolkit._findLoadedClass(pw.classLoader, name);</span>
+<span class="nc bnc" id="L679" title="All 2 branches missed.">                        if (c!=null)    return c;</span>
+<span class="nc" id="L680">                        return ClassLoaderReflectionToolkit._findClass(pw.classLoader, name);</span>
+<span class="nc" id="L681">                    } catch (ClassNotFoundException e) {</span>
+                        //not found. try next
+                    }
+                }
+<span class="nc" id="L685">            } else {</span>
+<span class="nc bnc" id="L686" title="All 2 branches missed.">                for (Dependency dep : dependencies) {</span>
+<span class="nc" id="L687">                    PluginWrapper p = pluginManager.getPlugin(dep.shortName);</span>
+<span class="nc bnc" id="L688" title="All 2 branches missed.">                    if(p!=null)</span>
+                        try {
+<span class="nc" id="L690">                            return p.classLoader.loadClass(name);</span>
+<span class="nc" id="L691">                        } catch (ClassNotFoundException _) {</span>
+                            // try next
+                        }
+                }
+            }
+
+<span class="nc" id="L697">            throw new ClassNotFoundException(name);</span>
+        }
+
+        @Override
+        protected Enumeration&lt;URL&gt; findResources(String name) throws IOException {
+<span class="nc" id="L702">            HashSet&lt;URL&gt; result = new HashSet&lt;URL&gt;();</span>
+
+<span class="nc bnc" id="L704" title="All 2 branches missed.">            if (PluginManager.FAST_LOOKUP) {</span>
+<span class="nc bnc" id="L705" title="All 2 branches missed.">                    for (PluginWrapper pw : getTransitiveDependencies()) {</span>
+<span class="nc" id="L706">                        Enumeration&lt;URL&gt; urls = ClassLoaderReflectionToolkit._findResources(pw.classLoader, name);</span>
+<span class="nc bnc" id="L707" title="All 4 branches missed.">                        while (urls != null &amp;&amp; urls.hasMoreElements())</span>
+<span class="nc" id="L708">                            result.add(urls.nextElement());</span>
+                    }
+<span class="nc" id="L710">            } else {</span>
+<span class="nc bnc" id="L711" title="All 2 branches missed.">                for (Dependency dep : dependencies) {</span>
+<span class="nc" id="L712">                    PluginWrapper p = pluginManager.getPlugin(dep.shortName);</span>
+<span class="nc bnc" id="L713" title="All 2 branches missed.">                    if (p!=null) {</span>
+<span class="nc" id="L714">                        Enumeration&lt;URL&gt; urls = p.classLoader.getResources(name);</span>
+<span class="nc bnc" id="L715" title="All 4 branches missed.">                        while (urls != null &amp;&amp; urls.hasMoreElements())</span>
+<span class="nc" id="L716">                            result.add(urls.nextElement());</span>
+                    }
+                }
+            }
+
+<span class="nc" id="L721">            return Collections.enumeration(result);</span>
+        }
+
+        @Override
+        protected URL findResource(String name) {
+<span class="nc bnc" id="L726" title="All 2 branches missed.">            if (PluginManager.FAST_LOOKUP) {</span>
+<span class="nc bnc" id="L727" title="All 2 branches missed.">                    for (PluginWrapper pw : getTransitiveDependencies()) {</span>
+<span class="nc" id="L728">                        URL url = ClassLoaderReflectionToolkit._findResource(pw.classLoader, name);</span>
+<span class="nc bnc" id="L729" title="All 2 branches missed.">                        if (url!=null)    return url;</span>
+                    }
+<span class="nc" id="L731">            } else {</span>
+<span class="nc bnc" id="L732" title="All 2 branches missed.">                for (Dependency dep : dependencies) {</span>
+<span class="nc" id="L733">                    PluginWrapper p = pluginManager.getPlugin(dep.shortName);</span>
+<span class="nc bnc" id="L734" title="All 2 branches missed.">                    if(p!=null) {</span>
+<span class="nc" id="L735">                        URL url = p.classLoader.getResource(name);</span>
+<span class="nc bnc" id="L736" title="All 2 branches missed.">                        if (url!=null)</span>
+<span class="nc" id="L737">                            return url;</span>
+                    }
+                }
+            }
+
+<span class="nc" id="L742">            return null;</span>
+        }
+    }
+
+    /**
+     * {@link AntClassLoader} with a few methods exposed, {@link Closeable} support, and {@link Transformer} support.
+     */
+    private final class AntClassLoader2 extends AntClassLoader implements Closeable {
+        private final Vector pathComponents;
+
+<span class="nc" id="L752">        private AntClassLoader2(ClassLoader parent) {</span>
+<span class="nc" id="L753">            super(parent,true);</span>
+
+            try {
+<span class="nc" id="L756">                Field $pathComponents = AntClassLoader.class.getDeclaredField(&quot;pathComponents&quot;);</span>
+<span class="nc" id="L757">                $pathComponents.setAccessible(true);</span>
+<span class="nc" id="L758">                pathComponents = (Vector)$pathComponents.get(this);</span>
+<span class="nc" id="L759">            } catch (NoSuchFieldException e) {</span>
+<span class="nc" id="L760">                throw new Error(e);</span>
+<span class="nc" id="L761">            } catch (IllegalAccessException e) {</span>
+<span class="nc" id="L762">                throw new Error(e);</span>
+            }
+<span class="nc" id="L764">        }</span>
+
+
+        public void addPathFiles(Collection&lt;File&gt; paths) throws IOException {
+<span class="nc bnc" id="L768" title="All 2 branches missed.">            for (File f : paths)</span>
+<span class="nc" id="L769">                addPathFile(f);</span>
+<span class="nc" id="L770">        }</span>
+
+        public void close() throws IOException {
+<span class="nc" id="L773">            cleanup();</span>
+<span class="nc" id="L774">        }</span>
+
+        /**
+         * As of 1.8.0, {@link AntClassLoader} doesn't implement {@link #findResource(String)}
+         * in any meaningful way, which breaks fast lookup. Implement it properly.
+         */
+        @Override
+        protected URL findResource(String name) {
+<span class="nc" id="L782">            URL url = null;</span>
+
+            // try and load from this loader if the parent either didn't find
+            // it or wasn't consulted.
+<span class="nc" id="L786">            Enumeration e = pathComponents.elements();</span>
+<span class="nc bnc" id="L787" title="All 4 branches missed.">            while (e.hasMoreElements() &amp;&amp; url == null) {</span>
+<span class="nc" id="L788">                File pathComponent = (File) e.nextElement();</span>
+<span class="nc" id="L789">                url = getResourceURL(pathComponent, name);</span>
+<span class="nc bnc" id="L790" title="All 2 branches missed.">                if (url != null) {</span>
+<span class="nc" id="L791">                    log(&quot;Resource &quot; + name + &quot; loaded from ant loader&quot;, Project.MSG_DEBUG);</span>
+                }
+            }
+
+<span class="nc" id="L795">            return url;</span>
+        }
+
+        @Override
+        protected Class defineClassFromData(File container, byte[] classData, String classname) throws IOException {
+<span class="nc bnc" id="L800" title="All 2 branches missed.">            if (!DISABLE_TRANSFORMER)</span>
+<span class="nc" id="L801">                classData = pluginManager.getCompatibilityTransformer().transform(classname, classData, this);</span>
+<span class="nc" id="L802">            return super.defineClassFromData(container, classData, classname);</span>
+        }
+    }
+
+<span class="fc" id="L806">    public static boolean useAntClassLoader = Boolean.getBoolean(ClassicPluginStrategy.class.getName()+&quot;.useAntClassLoader&quot;);</span>
+<span class="fc" id="L807">    private static final Logger LOGGER = Logger.getLogger(ClassicPluginStrategy.class.getName());</span>
+<span class="fc" id="L808">    public static boolean DISABLE_TRANSFORMER = Boolean.getBoolean(ClassicPluginStrategy.class.getName()+&quot;.noBytecodeTransformer&quot;);</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

@@ -1,0 +1,668 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>SCMTrigger.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.triggers</a> &gt; <span class="el_source">SCMTrigger.java</span></div><h1>SCMTrigger.java</h1><pre class="source lang-java linenums">/*
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc., Kohsuke Kawaguchi, Brian Westrich, Jean-Baptiste Quenot, id:cactusman
+ *               2015 Kanstantsin Shautsou
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.triggers;
+
+import antlr.ANTLRException;
+import com.google.common.base.Preconditions;
+import hudson.Extension;
+import hudson.Util;
+import hudson.console.AnnotatedLargeText;
+import hudson.model.AbstractBuild;
+import hudson.model.AbstractProject;
+import hudson.model.Action;
+import hudson.model.AdministrativeMonitor;
+import hudson.model.Cause;
+import hudson.model.CauseAction;
+import hudson.model.Item;
+import hudson.model.Run;
+import hudson.scm.SCM;
+import hudson.scm.SCMDescriptor;
+import hudson.util.FlushProofOutputStream;
+import hudson.util.FormValidation;
+import hudson.util.IOUtils;
+import hudson.util.NamingThreadFactory;
+import hudson.util.SequentialExecutionQueue;
+import hudson.util.StreamTaskListener;
+import hudson.util.TimeUnit2;
+import org.apache.commons.io.FileUtils;
+import org.apache.commons.jelly.XMLOutput;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.DoNotUse;
+import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.DataBoundConstructor;
+
+import java.io.File;
+import java.io.IOException;
+import java.io.PrintStream;
+import java.nio.charset.Charset;
+import java.text.DateFormat;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Date;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import jenkins.model.Jenkins;
+import jenkins.triggers.SCMTriggerItem;
+import net.sf.json.JSONObject;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
+import org.kohsuke.stapler.QueryParameter;
+import org.kohsuke.stapler.StaplerResponse;
+
+import static java.util.logging.Level.*;
+import jenkins.model.RunAction2;
+
+
+/**
+ * {@link Trigger} that checks for SCM updates periodically.
+ *
+ * You can add UI elements under the SCM section by creating a
+ * config.jelly or config.groovy in the resources area for
+ * your class that inherits from SCMTrigger and has the 
+ * @{@link hudson.model.Extension} annotation. The UI should 
+ * be wrapped in an f:section element to denote it.
+ *
+ * @author Kohsuke Kawaguchi
+ */
+public class SCMTrigger extends Trigger&lt;Item&gt; {
+    
+    private boolean ignorePostCommitHooks;
+    
+    public SCMTrigger(String scmpoll_spec) throws ANTLRException {
+<span class="fc" id="L100">        this(scmpoll_spec, false);</span>
+<span class="fc" id="L101">    }</span>
+    
+    @DataBoundConstructor
+    public SCMTrigger(String scmpoll_spec, boolean ignorePostCommitHooks) throws ANTLRException {
+<span class="fc" id="L105">        super(scmpoll_spec);</span>
+<span class="fc" id="L106">        this.ignorePostCommitHooks = ignorePostCommitHooks;</span>
+<span class="fc" id="L107">    }</span>
+    
+    /**
+     * This trigger wants to ignore post-commit hooks.
+     * &lt;p&gt;
+     * SCM plugins must respect this and not run this trigger for post-commit notifications.
+     * 
+     * @since 1.493
+     */
+    public boolean isIgnorePostCommitHooks() {
+<span class="nc" id="L117">        return this.ignorePostCommitHooks;</span>
+    }
+
+    @Override
+    public void run() {
+<span class="pc bpc" id="L122" title="1 of 2 branches missed.">        if (job == null) {</span>
+<span class="fc" id="L123">            return;</span>
+        }
+
+<span class="nc" id="L126">        run(null);</span>
+<span class="nc" id="L127">    }</span>
+
+    /**
+     * Run the SCM trigger with additional build actions. Used by SubversionRepositoryStatus
+     * to trigger a build at a specific revisionn number.
+     * 
+     * @param additionalActions
+     * @since 1.375
+     */
+    public void run(Action[] additionalActions) {
+<span class="pc bpc" id="L137" title="1 of 2 branches missed.">        if (job == null) {</span>
+<span class="fc" id="L138">            return;</span>
+        }
+
+<span class="nc" id="L141">        DescriptorImpl d = getDescriptor();</span>
+
+<span class="nc" id="L143">        LOGGER.fine(&quot;Scheduling a polling for &quot;+job);</span>
+<span class="nc bnc" id="L144" title="All 2 branches missed.">        if (d.synchronousPolling) {</span>
+<span class="nc" id="L145">        	LOGGER.fine(&quot;Running the trigger directly without threading, &quot; +</span>
+        			&quot;as it's already taken care of by Trigger.Cron&quot;);
+<span class="nc" id="L147">            new Runner(additionalActions).run();</span>
+<span class="nc" id="L148">        } else {</span>
+            // schedule the polling.
+            // even if we end up submitting this too many times, that's OK.
+            // the real exclusion control happens inside Runner.
+<span class="nc" id="L152">        	LOGGER.fine(&quot;scheduling the trigger to (asynchronously) run&quot;);</span>
+<span class="nc" id="L153">            d.queue.execute(new Runner(additionalActions));</span>
+<span class="nc" id="L154">            d.clogCheck();</span>
+        }
+<span class="nc" id="L156">    }</span>
+
+    @Override
+    public DescriptorImpl getDescriptor() {
+<span class="nc" id="L160">        return (DescriptorImpl)super.getDescriptor();</span>
+    }
+
+    @Override
+    public Collection&lt;? extends Action&gt; getProjectActions() {
+<span class="pc bpc" id="L165" title="1 of 2 branches missed.">        if (job == null) {</span>
+<span class="fc" id="L166">            return Collections.emptyList();</span>
+        }
+
+<span class="nc" id="L169">        return Collections.singleton(new SCMAction());</span>
+    }
+
+    /**
+     * Returns the file that records the last/current polling activity.
+     */
+    public File getLogFile() {
+<span class="nc" id="L176">        return new File(job.getRootDir(),&quot;scm-polling.log&quot;);</span>
+    }
+
+    @Extension
+    public static class DescriptorImpl extends TriggerDescriptor {
+
+        private static ThreadFactory threadFactory() {
+<span class="nc" id="L183">            return new NamingThreadFactory(Executors.defaultThreadFactory(), &quot;SCMTrigger&quot;);</span>
+        }
+
+        /**
+         * Used to control the execution of the polling tasks.
+         * &lt;p&gt;
+         * This executor implementation has a semantics suitable for polling. Namely, no two threads will try to poll the same project
+         * at once, and multiple polling requests to the same job will be combined into one. Note that because executor isn't aware
+         * of a potential workspace lock between a build and a polling, we may end up using executor threads unwisely --- they
+         * may block.
+         */
+<span class="nc" id="L194">        private transient final SequentialExecutionQueue queue = new SequentialExecutionQueue(Executors.newSingleThreadExecutor(threadFactory()));</span>
+
+        /**
+         * Whether the projects should be polled all in one go in the order of dependencies. The default behavior is
+         * that each project polls for changes independently.
+         */
+<span class="nc" id="L200">        public boolean synchronousPolling = false;</span>
+
+        /**
+         * Max number of threads for SCM polling.
+         * 0 for unbounded.
+         */
+        private int maximumThreads;
+
+<span class="nc" id="L208">        public DescriptorImpl() {</span>
+<span class="nc" id="L209">            load();</span>
+<span class="nc" id="L210">            resizeThreadPool();</span>
+<span class="nc" id="L211">        }</span>
+
+        public boolean isApplicable(Item item) {
+<span class="nc bnc" id="L214" title="All 2 branches missed.">            return SCMTriggerItem.SCMTriggerItems.asSCMTriggerItem(item) != null;</span>
+        }
+
+        public ExecutorService getExecutor() {
+<span class="nc" id="L218">            return queue.getExecutors();</span>
+        }
+
+        /**
+         * Returns true if the SCM polling thread queue has too many jobs
+         * than it can handle.
+         */
+        public boolean isClogged() {
+<span class="nc" id="L226">            return queue.isStarving(STARVATION_THRESHOLD);</span>
+        }
+
+        /**
+         * Checks if the queue is clogged, and if so,
+         * activate {@link AdministrativeMonitorImpl}.
+         */
+        public void clogCheck() {
+<span class="nc" id="L234">            AdministrativeMonitor.all().get(AdministrativeMonitorImpl.class).on = isClogged();</span>
+<span class="nc" id="L235">        }</span>
+
+        /**
+         * Gets the snapshot of {@link Runner}s that are performing polling.
+         */
+        public List&lt;Runner&gt; getRunners() {
+<span class="nc" id="L241">            return Util.filter(queue.getInProgress(),Runner.class);</span>
+        }
+
+         // originally List&lt;SCMedItem&gt; but known to be used only for logging, in which case the instances are not actually cast to SCMedItem anyway
+        public List&lt;SCMTriggerItem&gt; getItemsBeingPolled() {
+<span class="nc" id="L246">            List&lt;SCMTriggerItem&gt; r = new ArrayList&lt;SCMTriggerItem&gt;();</span>
+<span class="nc bnc" id="L247" title="All 2 branches missed.">            for (Runner i : getRunners())</span>
+<span class="nc" id="L248">                r.add(i.getTarget());</span>
+<span class="nc" id="L249">            return r;</span>
+        }
+
+        public String getDisplayName() {
+<span class="nc" id="L253">            return Messages.SCMTrigger_DisplayName();</span>
+        }
+
+        /**
+         * Gets the number of concurrent threads used for polling.
+         *
+         * @return
+         *      0 if unlimited.
+         */
+        public int getPollingThreadCount() {
+<span class="nc" id="L263">            return maximumThreads;</span>
+        }
+
+        /**
+         * Sets the number of concurrent threads used for SCM polling and resizes the thread pool accordingly
+         * @param n number of concurrent threads, zero or less means unlimited, maximum is 100
+         */
+        public void setPollingThreadCount(int n) {
+            // fool proof
+<span class="nc bnc" id="L272" title="All 2 branches missed.">            if(n&lt;0)     n=0;</span>
+<span class="nc bnc" id="L273" title="All 2 branches missed.">            if(n&gt;100)   n=100;</span>
+
+<span class="nc" id="L275">            maximumThreads = n;</span>
+
+<span class="nc" id="L277">            resizeThreadPool();</span>
+<span class="nc" id="L278">        }</span>
+
+        @Restricted(NoExternalUse.class)
+        public boolean isPollingThreadCountOptionVisible() {
+            // unless you have a fair number of projects, this option is likely pointless.
+            // so let's hide this option for new users to avoid confusing them
+            // unless it was already changed
+            // TODO switch to check for SCMTriggerItem
+<span class="nc bnc" id="L286" title="All 2 branches missed.">            return Jenkins.getInstance().getAllItems(AbstractProject.class).size() &gt; 10</span>
+<span class="nc bnc" id="L287" title="All 2 branches missed.">                    || getPollingThreadCount() != 0;</span>
+        }
+
+        /**
+         * Update the {@link ExecutorService} instance.
+         */
+        /*package*/ synchronized void resizeThreadPool() {
+<span class="nc" id="L294">            queue.setExecutors(</span>
+<span class="nc bnc" id="L295" title="All 2 branches missed.">                    (maximumThreads==0 ? Executors.newCachedThreadPool(threadFactory()) : Executors.newFixedThreadPool(maximumThreads, threadFactory())));</span>
+<span class="nc" id="L296">        }</span>
+
+        @Override
+        public boolean configure(StaplerRequest req, JSONObject json) throws FormException {
+<span class="nc" id="L300">            String t = json.optString(&quot;pollingThreadCount&quot;,null);</span>
+<span class="nc bnc" id="L301" title="All 4 branches missed.">            if(t==null || t.length()==0)</span>
+<span class="nc" id="L302">                setPollingThreadCount(0);</span>
+            else
+<span class="nc" id="L304">                setPollingThreadCount(Integer.parseInt(t));</span>
+
+            // Save configuration
+<span class="nc" id="L307">            save();</span>
+
+<span class="nc" id="L309">            return true;</span>
+        }
+
+        public FormValidation doCheckPollingThreadCount(@QueryParameter String value) {
+<span class="nc bnc" id="L313" title="All 4 branches missed.">            if (value != null &amp;&amp; &quot;&quot;.equals(value.trim()))</span>
+<span class="nc" id="L314">                return FormValidation.ok();</span>
+<span class="nc" id="L315">            return FormValidation.validateNonNegativeInteger(value);</span>
+        }
+    }
+
+    @Extension
+<span class="nc" id="L320">    public static final class AdministrativeMonitorImpl extends AdministrativeMonitor {</span>
+        private boolean on;
+
+        public boolean isActivated() {
+<span class="nc" id="L324">            return on;</span>
+        }
+    }
+
+    /**
+     * Associated with {@link Run} to show the polling log
+     * that triggered that build.
+     *
+     * @since 1.376
+     */
+    public static class BuildAction implements RunAction2 {
+        private transient /*final*/ Run&lt;?,?&gt; run;
+        @Deprecated
+        public transient /*final*/ AbstractBuild build;
+
+        /**
+         * @since 1.568
+         */
+<span class="nc" id="L342">        public BuildAction(Run&lt;?,?&gt; run) {</span>
+<span class="nc" id="L343">            this.run = run;</span>
+<span class="nc bnc" id="L344" title="All 2 branches missed.">            build = run instanceof AbstractBuild ? (AbstractBuild) run : null;</span>
+<span class="nc" id="L345">        }</span>
+        
+        @Deprecated
+        public BuildAction(AbstractBuild build) {
+<span class="nc" id="L349">            this((Run) build);</span>
+<span class="nc" id="L350">        }</span>
+
+        /**
+         * @since 1.568
+         */
+        public Run&lt;?,?&gt; getRun() {
+<span class="nc" id="L356">            return run;</span>
+        }
+
+        /**
+         * Polling log that triggered the build.
+         */
+        public File getPollingLogFile() {
+<span class="nc" id="L363">            return new File(run.getRootDir(),&quot;polling.log&quot;);</span>
+        }
+
+        public String getIconFileName() {
+<span class="nc" id="L367">            return &quot;clipboard.png&quot;;</span>
+        }
+
+        public String getDisplayName() {
+<span class="nc" id="L371">            return Messages.SCMTrigger_BuildAction_DisplayName();</span>
+        }
+
+        public String getUrlName() {
+<span class="nc" id="L375">            return &quot;pollingLog&quot;;</span>
+        }
+
+        /**
+         * Sends out the raw polling log output.
+         */
+        public void doPollingLog(StaplerRequest req, StaplerResponse rsp) throws IOException {
+<span class="nc" id="L382">            rsp.setContentType(&quot;text/plain;charset=UTF-8&quot;);</span>
+            // Prevent jelly from flushing stream so Content-Length header can be added afterwards
+<span class="nc" id="L384">            FlushProofOutputStream out = new FlushProofOutputStream(rsp.getCompressedOutputStream(req));</span>
+            try {
+<span class="nc" id="L386">                getPollingLogText().writeLogTo(0, out);</span>
+<span class="nc" id="L387">            } finally {</span>
+<span class="nc" id="L388">                IOUtils.closeQuietly(out);</span>
+<span class="nc" id="L389">            }</span>
+<span class="nc" id="L390">        }</span>
+
+        public AnnotatedLargeText getPollingLogText() {
+<span class="nc" id="L393">            return new AnnotatedLargeText&lt;BuildAction&gt;(getPollingLogFile(), Charset.defaultCharset(), true, this);</span>
+        }
+        
+        /**
+         * Used from &lt;tt&gt;polling.jelly&lt;/tt&gt; to write annotated polling log to the given output.
+         */
+        public void writePollingLogTo(long offset, XMLOutput out) throws IOException {
+            // TODO: resurrect compressed log file support
+<span class="nc" id="L401">            getPollingLogText().writeHtmlTo(offset, out.asWriter());</span>
+<span class="nc" id="L402">        }</span>
+
+        @Override public void onAttached(Run&lt;?, ?&gt; r) {
+            // unnecessary, existing constructor does this
+<span class="nc" id="L406">        }</span>
+
+        @Override public void onLoad(Run&lt;?, ?&gt; r) {
+<span class="nc" id="L409">            run = r;</span>
+<span class="nc bnc" id="L410" title="All 2 branches missed.">            build = run instanceof AbstractBuild ? (AbstractBuild) run : null;</span>
+<span class="nc" id="L411">        }</span>
+    }
+
+    /**
+     * Action object for job. Used to display the last polling log.
+     */
+<span class="nc" id="L417">    public final class SCMAction implements Action {</span>
+        public AbstractProject&lt;?,?&gt; getOwner() {
+<span class="nc" id="L419">            Item item = getItem();</span>
+<span class="nc bnc" id="L420" title="All 2 branches missed.">            return item instanceof AbstractProject ? ((AbstractProject) item) : null;</span>
+        }
+
+        /**
+         * @since 1.568
+         */
+        public Item getItem() {
+<span class="nc" id="L427">            return job().asItem();</span>
+        }
+
+        public String getIconFileName() {
+<span class="nc" id="L431">            return &quot;clipboard.png&quot;;</span>
+        }
+
+        public String getDisplayName() {
+<span class="nc" id="L435">            Set&lt;SCMDescriptor&lt;?&gt;&gt; descriptors = new HashSet&lt;SCMDescriptor&lt;?&gt;&gt;();</span>
+<span class="nc bnc" id="L436" title="All 2 branches missed.">            for (SCM scm : job().getSCMs()) {</span>
+<span class="nc" id="L437">                descriptors.add(scm.getDescriptor());</span>
+            }
+<span class="nc bnc" id="L439" title="All 2 branches missed.">            return descriptors.size() == 1 ? Messages.SCMTrigger_getDisplayName(descriptors.iterator().next().getDisplayName()) : Messages.SCMTrigger_BuildAction_DisplayName();</span>
+        }
+
+        public String getUrlName() {
+<span class="nc" id="L443">            return &quot;scmPollLog&quot;;</span>
+        }
+
+        public String getLog() throws IOException {
+<span class="nc" id="L447">            return Util.loadFile(getLogFile());</span>
+        }
+
+        /**
+         * Writes the annotated log to the given output.
+         * @since 1.350
+         */
+        public void writeLogTo(XMLOutput out) throws IOException {
+<span class="nc" id="L455">            new AnnotatedLargeText&lt;SCMAction&gt;(getLogFile(),Charset.defaultCharset(),true,this).writeHtmlTo(0,out.asWriter());</span>
+<span class="nc" id="L456">        }</span>
+    }
+
+<span class="fc" id="L459">    private static final Logger LOGGER = Logger.getLogger(SCMTrigger.class.getName());</span>
+
+    /**
+     * {@link Runnable} that actually performs polling.
+     */
+    public class Runner implements Runnable {
+
+        /**
+         * When did the polling start?
+         */
+        private volatile long startTime;
+
+        private Action[] additionalActions;
+
+        public Runner() {
+<span class="nc" id="L474">            this(null);</span>
+<span class="nc" id="L475">        }</span>
+        
+<span class="nc" id="L477">        public Runner(Action[] actions) {</span>
+<span class="nc" id="L478">            Preconditions.checkNotNull(job, &quot;Runner can't be instantiated when job is null&quot;);</span>
+
+<span class="nc bnc" id="L480" title="All 2 branches missed.">            if (actions == null) {</span>
+<span class="nc" id="L481">                additionalActions = new Action[0];</span>
+<span class="nc" id="L482">            } else {</span>
+<span class="nc" id="L483">                additionalActions = actions;</span>
+            }
+<span class="nc" id="L485">        }</span>
+        
+        /**
+         * Where the log file is written.
+         */
+        public File getLogFile() {
+<span class="nc" id="L491">            return SCMTrigger.this.getLogFile();</span>
+        }
+
+        /**
+         * For which {@link Item} are we polling?
+         * @since 1.568
+         */
+        public SCMTriggerItem getTarget() {
+<span class="nc" id="L499">            return job();</span>
+        }
+
+        /**
+         * When was this polling started?
+         */
+        public long getStartTime() {
+<span class="nc" id="L506">            return startTime;</span>
+        }
+
+        /**
+         * Human readable string of when this polling is started.
+         */
+        public String getDuration() {
+<span class="nc" id="L513">            return Util.getTimeSpanString(System.currentTimeMillis()-startTime);</span>
+        }
+
+        private boolean runPolling() {
+            try {
+                // to make sure that the log file contains up-to-date text,
+                // don't do buffering.
+<span class="nc" id="L520">                StreamTaskListener listener = new StreamTaskListener(getLogFile());</span>
+
+                try {
+<span class="nc" id="L523">                    PrintStream logger = listener.getLogger();</span>
+<span class="nc" id="L524">                    long start = System.currentTimeMillis();</span>
+<span class="nc" id="L525">                    logger.println(&quot;Started on &quot;+ DateFormat.getDateTimeInstance().format(new Date()));</span>
+<span class="nc" id="L526">                    boolean result = job().poll(listener).hasChanges();</span>
+<span class="nc" id="L527">                    logger.println(&quot;Done. Took &quot;+ Util.getTimeSpanString(System.currentTimeMillis()-start));</span>
+<span class="nc bnc" id="L528" title="All 2 branches missed.">                    if(result)</span>
+<span class="nc" id="L529">                        logger.println(&quot;Changes found&quot;);</span>
+                    else
+<span class="nc" id="L531">                        logger.println(&quot;No changes&quot;);</span>
+<span class="nc" id="L532">                    return result;</span>
+<span class="nc" id="L533">                } catch (Error | RuntimeException e) {</span>
+<span class="nc" id="L534">                    e.printStackTrace(listener.error(&quot;Failed to record SCM polling for &quot;+job));</span>
+<span class="nc" id="L535">                    LOGGER.log(Level.SEVERE,&quot;Failed to record SCM polling for &quot;+job,e);</span>
+<span class="nc" id="L536">                    throw e;</span>
+<span class="nc" id="L537">                } finally {</span>
+<span class="nc" id="L538">                    listener.close();</span>
+<span class="nc" id="L539">                }</span>
+<span class="nc" id="L540">            } catch (IOException e) {</span>
+<span class="nc" id="L541">                LOGGER.log(Level.SEVERE,&quot;Failed to record SCM polling for &quot;+job,e);</span>
+<span class="nc" id="L542">                return false;</span>
+            }
+        }
+
+        public void run() {
+<span class="nc bnc" id="L547" title="All 2 branches missed.">            if (job == null) {</span>
+<span class="nc" id="L548">                return;</span>
+            }
+
+<span class="nc" id="L551">            String threadName = Thread.currentThread().getName();</span>
+<span class="nc" id="L552">            Thread.currentThread().setName(&quot;SCM polling for &quot;+job);</span>
+            try {
+<span class="nc" id="L554">                startTime = System.currentTimeMillis();</span>
+<span class="nc bnc" id="L555" title="All 2 branches missed.">                if(runPolling()) {</span>
+<span class="nc" id="L556">                    SCMTriggerItem p = job();</span>
+<span class="nc" id="L557">                    String name = &quot; #&quot;+p.getNextBuildNumber();</span>
+                    SCMTriggerCause cause;
+                    try {
+<span class="nc" id="L560">                        cause = new SCMTriggerCause(getLogFile());</span>
+<span class="nc" id="L561">                    } catch (IOException e) {</span>
+<span class="nc" id="L562">                        LOGGER.log(WARNING, &quot;Failed to parse the polling log&quot;,e);</span>
+<span class="nc" id="L563">                        cause = new SCMTriggerCause();</span>
+                    }
+<span class="nc" id="L565">                    Action[] queueActions = new Action[additionalActions.length + 1];</span>
+<span class="nc" id="L566">                    queueActions[0] = new CauseAction(cause);</span>
+<span class="nc" id="L567">                    System.arraycopy(additionalActions, 0, queueActions, 1, additionalActions.length);</span>
+<span class="nc bnc" id="L568" title="All 2 branches missed.">                    if (p.scheduleBuild2(p.getQuietPeriod(), queueActions) != null) {</span>
+<span class="nc" id="L569">                        LOGGER.info(&quot;SCM changes detected in &quot;+ job.getFullDisplayName()+&quot;. Triggering &quot;+name);</span>
+<span class="nc" id="L570">                    } else {</span>
+<span class="nc" id="L571">                        LOGGER.info(&quot;SCM changes detected in &quot;+ job.getFullDisplayName()+&quot;. Job is already in the queue&quot;);</span>
+                    }
+                }
+<span class="nc" id="L574">            } finally {</span>
+<span class="nc" id="L575">                Thread.currentThread().setName(threadName);</span>
+<span class="nc" id="L576">            }</span>
+<span class="nc" id="L577">        }</span>
+
+        // as per the requirement of SequentialExecutionQueue, value equality is necessary
+        @Override
+        public boolean equals(Object that) {
+<span class="nc bnc" id="L582" title="All 4 branches missed.">            return that instanceof Runner &amp;&amp; job == ((Runner) that)._job();</span>
+        }
+<span class="nc" id="L584">        private Item _job() {return job;}</span>
+
+        @Override
+        public int hashCode() {
+<span class="nc" id="L588">            return job.hashCode();</span>
+        }
+    }
+
+    @SuppressWarnings(&quot;deprecation&quot;)
+    private SCMTriggerItem job() {
+<span class="nc" id="L594">        return SCMTriggerItem.SCMTriggerItems.asSCMTriggerItem(job);</span>
+    }
+
+    public static class SCMTriggerCause extends Cause {
+        /**
+         * Only used while ths cause is in the queue.
+         * Once attached to the build, we'll move this into a file to reduce the memory footprint.
+         */
+        private String pollingLog;
+
+        private transient Run run;
+
+        public SCMTriggerCause(File logFile) throws IOException {
+            // TODO: charset of this log file?
+<span class="nc" id="L608">            this(FileUtils.readFileToString(logFile));</span>
+<span class="nc" id="L609">        }</span>
+
+<span class="nc" id="L611">        public SCMTriggerCause(String pollingLog) {</span>
+<span class="nc" id="L612">            this.pollingLog = pollingLog;</span>
+<span class="nc" id="L613">        }</span>
+
+        /**
+         * @deprecated
+         *      Use {@link #SCMTrigger.SCMTriggerCause(String)}.
+         */
+        @Deprecated
+        public SCMTriggerCause() {
+<span class="nc" id="L621">            this(&quot;&quot;);</span>
+<span class="nc" id="L622">        }</span>
+
+        @Override
+        public void onLoad(Run run) {
+<span class="nc" id="L626">            this.run = run;</span>
+<span class="nc" id="L627">        }</span>
+
+        @Override
+        public void onAddedTo(Run build) {
+<span class="nc" id="L631">            this.run = build;</span>
+            try {
+<span class="nc" id="L633">                BuildAction a = new BuildAction(build);</span>
+<span class="nc" id="L634">                FileUtils.writeStringToFile(a.getPollingLogFile(),pollingLog);</span>
+<span class="nc" id="L635">                build.replaceAction(a);</span>
+<span class="nc" id="L636">            } catch (IOException e) {</span>
+<span class="nc" id="L637">                LOGGER.log(WARNING,&quot;Failed to persist the polling log&quot;,e);</span>
+            }
+<span class="nc" id="L639">            pollingLog = null;</span>
+<span class="nc" id="L640">        }</span>
+
+        @Override
+        public String getShortDescription() {
+<span class="nc" id="L644">            return Messages.SCMTrigger_SCMTriggerCause_ShortDescription();</span>
+        }
+
+        @Restricted(DoNotUse.class)
+        public Run getRun() {
+<span class="nc" id="L649">            return this.run;</span>
+        }
+
+        @Override
+        public boolean equals(Object o) {
+<span class="nc" id="L654">            return o instanceof SCMTriggerCause;</span>
+        }
+
+        @Override
+        public int hashCode() {
+<span class="nc" id="L659">            return 3;</span>
+        }
+    }
+
+    /**
+     * How long is too long for a polling activity to be in the queue?
+     */
+<span class="fc" id="L666">    public static long STARVATION_THRESHOLD =Long.getLong(SCMTrigger.class.getName()+&quot;.starvationThreshold&quot;, TimeUnit2.HOURS.toMillis(1));</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

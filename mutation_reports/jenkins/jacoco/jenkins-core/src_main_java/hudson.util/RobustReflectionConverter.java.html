@@ -1,0 +1,452 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>RobustReflectionConverter.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.util</a> &gt; <span class="el_source">RobustReflectionConverter.java</span></div><h1>RobustReflectionConverter.java</h1><pre class="source lang-java linenums"><span class="fc" id="L1">/*</span>
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2010, Sun Microsystems, Inc., Kohsuke Kawaguchi
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.util;
+
+import com.thoughtworks.xstream.XStreamException;
+import com.thoughtworks.xstream.converters.ConversionException;
+import com.thoughtworks.xstream.converters.Converter;
+import com.thoughtworks.xstream.converters.MarshallingContext;
+import com.thoughtworks.xstream.converters.SingleValueConverter;
+import com.thoughtworks.xstream.converters.UnmarshallingContext;
+import com.thoughtworks.xstream.converters.reflection.ObjectAccessException;
+import com.thoughtworks.xstream.converters.reflection.PureJavaReflectionProvider;
+import com.thoughtworks.xstream.converters.reflection.ReflectionConverter;
+import com.thoughtworks.xstream.converters.reflection.ReflectionProvider;
+import com.thoughtworks.xstream.converters.reflection.SerializationMethodInvoker;
+import com.thoughtworks.xstream.core.util.Primitives;
+import com.thoughtworks.xstream.io.ExtendedHierarchicalStreamWriterHelper;
+import com.thoughtworks.xstream.io.HierarchicalStreamReader;
+import com.thoughtworks.xstream.io.HierarchicalStreamWriter;
+import com.thoughtworks.xstream.mapper.Mapper;
+import hudson.diagnosis.OldDataMonitor;
+import hudson.model.Saveable;
+import java.lang.reflect.Field;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedList;
+import java.util.Map;
+import java.util.Set;
+import static java.util.logging.Level.FINE;
+import java.util.logging.Logger;
+import javax.annotation.Nonnull;
+import jenkins.util.xstream.CriticalXStreamException;
+
+/**
+ * Custom {@link ReflectionConverter} that handle errors more gracefully.
+ *
+ * &lt;ul&gt;
+ * &lt;li&gt;If the field is missing, the value is ignored instead of causing an error.
+ *     This makes evolution easy.
+ * &lt;li&gt;If the type found in XML is no longer available, the element is skipped
+ *     instead of causing an error.
+ * &lt;/ul&gt;
+ *
+ */
+<span class="pc bpc" id="L70" title="1 of 2 branches missed.">public class RobustReflectionConverter implements Converter {</span>
+
+    protected final ReflectionProvider reflectionProvider;
+    protected final Mapper mapper;
+    protected transient SerializationMethodInvoker serializationMethodInvoker;
+    private transient ReflectionProvider pureJavaReflectionProvider;
+    private final @Nonnull XStream2.ClassOwnership classOwnership;
+    /** {@code pkg.Clazz#fieldName} */
+<span class="fc" id="L78">    private final Set&lt;String&gt; criticalFields = Collections.synchronizedSet(new HashSet&lt;String&gt;());</span>
+
+    public RobustReflectionConverter(Mapper mapper, ReflectionProvider reflectionProvider) {
+<span class="nc" id="L81">        this(mapper, reflectionProvider, new XStream2().new PluginClassOwnership());</span>
+<span class="nc" id="L82">    }</span>
+<span class="fc" id="L83">    RobustReflectionConverter(Mapper mapper, ReflectionProvider reflectionProvider, XStream2.ClassOwnership classOwnership) {</span>
+<span class="fc" id="L84">        this.mapper = mapper;</span>
+<span class="fc" id="L85">        this.reflectionProvider = reflectionProvider;</span>
+<span class="pc bpc" id="L86" title="3 of 4 branches missed.">        assert classOwnership != null;</span>
+<span class="fc" id="L87">        this.classOwnership = classOwnership;</span>
+<span class="fc" id="L88">        serializationMethodInvoker = new SerializationMethodInvoker();</span>
+<span class="fc" id="L89">    }</span>
+
+    void addCriticalField(Class&lt;?&gt; clazz, String field) {
+<span class="fc" id="L92">        criticalFields.add(clazz.getName() + '#' + field);</span>
+<span class="fc" id="L93">    }</span>
+
+    public boolean canConvert(Class type) {
+<span class="fc" id="L96">        return true;</span>
+    }
+
+    public void marshal(Object original, final HierarchicalStreamWriter writer, final MarshallingContext context) {
+<span class="fc" id="L100">        final Object source = serializationMethodInvoker.callWriteReplace(original);</span>
+
+<span class="fc bfc" id="L102" title="All 2 branches covered.">        if (source.getClass() != original.getClass()) {</span>
+<span class="fc" id="L103">            writer.addAttribute(mapper.aliasForAttribute(&quot;resolves-to&quot;), mapper.serializedClass(source.getClass()));</span>
+        }
+
+<span class="fc" id="L106">        OwnerContext oc = OwnerContext.find(context);</span>
+<span class="fc" id="L107">        oc.startVisiting(writer, classOwnership.ownerOf(original.getClass()));</span>
+        try {
+<span class="fc" id="L109">            doMarshal(source, writer, context);</span>
+<span class="pc" id="L110">        } finally {</span>
+<span class="pc" id="L111">            oc.stopVisiting();</span>
+<span class="nc" id="L112">        }</span>
+<span class="fc" id="L113">    }</span>
+
+    /** Marks {@code plugin=&quot;...&quot;} on elements where the owner is known and distinct from the closest owned ancestor. */
+<span class="fc" id="L116">    private static class OwnerContext extends LinkedList&lt;String&gt; {</span>
+        static OwnerContext find(MarshallingContext context) {
+<span class="fc" id="L118">            OwnerContext c = (OwnerContext) context.get(OwnerContext.class);</span>
+<span class="fc bfc" id="L119" title="All 2 branches covered.">            if (c == null) {</span>
+<span class="fc" id="L120">                c = new OwnerContext();</span>
+<span class="fc" id="L121">                context.put(OwnerContext.class, c);</span>
+            }
+<span class="fc" id="L123">            return c;</span>
+        }
+        private void startVisiting(HierarchicalStreamWriter writer, String owner) {
+<span class="fc bfc" id="L126" title="All 2 branches covered.">            if (owner != null) {</span>
+<span class="fc" id="L127">                boolean redundant = false;</span>
+<span class="fc bfc" id="L128" title="All 2 branches covered.">                for (String parentOwner : this) {</span>
+<span class="fc bfc" id="L129" title="All 2 branches covered.">                    if (parentOwner != null) {</span>
+<span class="fc" id="L130">                        redundant = parentOwner.equals(owner);</span>
+<span class="fc" id="L131">                        break;</span>
+                    }
+                }
+<span class="fc bfc" id="L134" title="All 2 branches covered.">                if (!redundant) {</span>
+<span class="fc" id="L135">                    writer.addAttribute(&quot;plugin&quot;, owner);</span>
+                }
+            }
+<span class="fc" id="L138">            addFirst(owner);</span>
+<span class="fc" id="L139">        }</span>
+        private void stopVisiting() {
+<span class="fc" id="L141">            removeFirst();</span>
+<span class="fc" id="L142">        }</span>
+    }
+
+    protected void doMarshal(final Object source, final HierarchicalStreamWriter writer, final MarshallingContext context) {
+<span class="fc" id="L146">        final Set seenFields = new HashSet();</span>
+<span class="fc" id="L147">        final Set seenAsAttributes = new HashSet();</span>
+
+        // Attributes might be preferred to child elements ...
+<span class="fc" id="L150">         reflectionProvider.visitSerializableFields(source, new ReflectionProvider.Visitor() {</span>
+            public void visit(String fieldName, Class type, Class definedIn, Object value) {
+<span class="fc" id="L152">                SingleValueConverter converter = mapper.getConverterFromItemType(fieldName, type, definedIn);</span>
+<span class="pc bpc" id="L153" title="1 of 2 branches missed.">                if (converter == null) converter = mapper.getConverterFromItemType(fieldName, type);</span>
+<span class="pc bpc" id="L154" title="1 of 2 branches missed.">                if (converter == null) converter = mapper.getConverterFromItemType(type);</span>
+<span class="pc bpc" id="L155" title="1 of 2 branches missed.">                if (converter != null) {</span>
+<span class="nc bnc" id="L156" title="All 2 branches missed.">                    if (value != null) {</span>
+<span class="nc" id="L157">                        final String str = converter.toString(value);</span>
+<span class="nc bnc" id="L158" title="All 2 branches missed.">                        if (str != null) {</span>
+<span class="nc" id="L159">                            writer.addAttribute(mapper.aliasForAttribute(fieldName), str);</span>
+                        }
+                    }
+<span class="nc" id="L162">                    seenAsAttributes.add(fieldName);</span>
+                }
+<span class="fc" id="L164">            }</span>
+        });
+
+        // Child elements not covered already processed as attributes ...
+<span class="fc" id="L168">        reflectionProvider.visitSerializableFields(source, new ReflectionProvider.Visitor() {</span>
+            public void visit(String fieldName, Class fieldType, Class definedIn, Object newObj) {
+<span class="pc bpc" id="L170" title="1 of 4 branches missed.">                if (!seenAsAttributes.contains(fieldName) &amp;&amp; newObj != null) {</span>
+<span class="fc" id="L171">                    Mapper.ImplicitCollectionMapping mapping = mapper.getImplicitCollectionDefForFieldName(source.getClass(), fieldName);</span>
+<span class="pc bpc" id="L172" title="1 of 2 branches missed.">                    if (mapping != null) {</span>
+<span class="nc bnc" id="L173" title="All 2 branches missed.">                        if (mapping.getItemFieldName() != null) {</span>
+<span class="nc" id="L174">                            Collection list = (Collection) newObj;</span>
+<span class="nc bnc" id="L175" title="All 2 branches missed.">                            for (Iterator iter = list.iterator(); iter.hasNext();) {</span>
+<span class="nc" id="L176">                                Object obj = iter.next();</span>
+<span class="nc" id="L177">                                writeField(fieldName, mapping.getItemFieldName(), mapping.getItemType(), definedIn, obj);</span>
+                            }
+<span class="nc" id="L179">                        } else {</span>
+<span class="nc" id="L180">                            context.convertAnother(newObj);</span>
+                        }
+<span class="nc" id="L182">                    } else {</span>
+<span class="fc" id="L183">                        writeField(fieldName, fieldName, fieldType, definedIn, newObj);</span>
+<span class="fc" id="L184">                        seenFields.add(fieldName);</span>
+                    }
+                }
+<span class="fc" id="L187">            }</span>
+
+            private void writeField(String fieldName, String aliasName, Class fieldType, Class definedIn, Object newObj) {
+                try {
+<span class="pc bpc" id="L191" title="1 of 2 branches missed.">                    if (!mapper.shouldSerializeMember(definedIn, aliasName)) {</span>
+<span class="nc" id="L192">                        return;</span>
+                    }
+<span class="fc" id="L194">                    ExtendedHierarchicalStreamWriterHelper.startNode(writer, mapper.serializedMember(definedIn, aliasName), fieldType);</span>
+
+<span class="fc" id="L196">                    Class actualType = newObj.getClass();</span>
+
+<span class="fc" id="L198">                    Class defaultType = mapper.defaultImplementationOf(fieldType);</span>
+<span class="fc bfc" id="L199" title="All 2 branches covered.">                    if (!actualType.equals(defaultType)) {</span>
+<span class="fc" id="L200">                        String serializedClassName = mapper.serializedClass(actualType);</span>
+<span class="fc bfc" id="L201" title="All 2 branches covered.">                        if (!serializedClassName.equals(mapper.serializedClass(defaultType))) {</span>
+<span class="fc" id="L202">                            writer.addAttribute(mapper.aliasForSystemAttribute(&quot;class&quot;), serializedClassName);</span>
+                        }
+                    }
+
+<span class="pc bpc" id="L206" title="1 of 2 branches missed.">                    if (seenFields.contains(aliasName)) {</span>
+<span class="nc" id="L207">                        writer.addAttribute(mapper.aliasForAttribute(&quot;defined-in&quot;), mapper.serializedClass(definedIn));</span>
+                    }
+
+<span class="fc" id="L210">                    Field field = reflectionProvider.getField(definedIn,fieldName);</span>
+<span class="fc" id="L211">                    marshallField(context, newObj, field);</span>
+<span class="fc" id="L212">                    writer.endNode();</span>
+<span class="pc" id="L213">                } catch (RuntimeException e) {</span>
+                    // intercept an exception so that the stack trace shows how we end up marshalling the object in question
+<span class="nc" id="L215">                    throw new RuntimeException(&quot;Failed to serialize &quot;+definedIn.getName()+&quot;#&quot;+fieldName+&quot; for &quot;+source.getClass(),e);</span>
+                }
+<span class="fc" id="L217">            }</span>
+
+        });
+<span class="fc" id="L220">    }</span>
+
+    protected void marshallField(final MarshallingContext context, Object newObj, Field field) {
+<span class="fc" id="L223">        Converter converter = mapper.getLocalConverter(field.getDeclaringClass(), field.getName());</span>
+<span class="fc" id="L224">        context.convertAnother(newObj, converter);</span>
+<span class="fc" id="L225">    }</span>
+
+    public Object unmarshal(final HierarchicalStreamReader reader, final UnmarshallingContext context) {
+<span class="fc" id="L228">        Object result = instantiateNewInstance(reader, context);</span>
+<span class="fc" id="L229">        result = doUnmarshal(result, reader, context);</span>
+<span class="fc" id="L230">        return serializationMethodInvoker.callReadResolve(result);</span>
+    }
+
+    public Object doUnmarshal(final Object result, final HierarchicalStreamReader reader, final UnmarshallingContext context) {
+<span class="fc" id="L234">        final SeenFields seenFields = new SeenFields();</span>
+<span class="fc" id="L235">        Iterator it = reader.getAttributeNames();</span>
+        // Remember outermost Saveable encountered, for reporting below
+<span class="pc bpc" id="L237" title="1 of 4 branches missed.">        if (result instanceof Saveable &amp;&amp; context.get(&quot;Saveable&quot;) == null)</span>
+<span class="fc" id="L238">            context.put(&quot;Saveable&quot;, result);</span>
+
+        // Process attributes before recursing into child elements.
+<span class="fc bfc" id="L241" title="All 2 branches covered.">        while (it.hasNext()) {</span>
+<span class="fc" id="L242">            String attrAlias = (String) it.next();</span>
+<span class="fc" id="L243">            String attrName = mapper.attributeForAlias(attrAlias);</span>
+<span class="fc" id="L244">            Class classDefiningField = determineWhichClassDefinesField(reader);</span>
+<span class="fc" id="L245">            boolean fieldExistsInClass = fieldDefinedInClass(result, attrName);</span>
+<span class="pc bpc" id="L246" title="1 of 2 branches missed.">            if (fieldExistsInClass) {</span>
+<span class="nc" id="L247">                Field field = reflectionProvider.getField(result.getClass(), attrName);</span>
+<span class="nc" id="L248">                SingleValueConverter converter = mapper.getConverterFromAttribute(field.getDeclaringClass(),attrName,field.getType());</span>
+<span class="nc" id="L249">                Class type = field.getType();</span>
+<span class="nc bnc" id="L250" title="All 2 branches missed.">                if (converter == null) {</span>
+<span class="nc" id="L251">                    converter = mapper.getConverterFromItemType(type);</span>
+                }
+<span class="nc bnc" id="L253" title="All 2 branches missed.">                if (converter != null) {</span>
+<span class="nc" id="L254">                    Object value = converter.fromString(reader.getAttribute(attrAlias));</span>
+<span class="nc bnc" id="L255" title="All 2 branches missed.">                    if (type.isPrimitive()) {</span>
+<span class="nc" id="L256">                        type = Primitives.box(type);</span>
+                    }
+<span class="nc bnc" id="L258" title="All 4 branches missed.">                    if (value != null &amp;&amp; !type.isAssignableFrom(value.getClass())) {</span>
+<span class="nc" id="L259">                        throw new ConversionException(&quot;Cannot convert type &quot; + value.getClass().getName() + &quot; to type &quot; + type.getName());</span>
+                    }
+<span class="nc" id="L261">                    reflectionProvider.writeField(result, attrName, value, classDefiningField);</span>
+<span class="nc" id="L262">                    seenFields.add(classDefiningField, attrName);</span>
+                }
+            }
+        }
+
+<span class="fc" id="L267">        Map implicitCollectionsForCurrentObject = null;</span>
+<span class="fc bfc" id="L268" title="All 2 branches covered.">        while (reader.hasMoreChildren()) {</span>
+<span class="fc" id="L269">            reader.moveDown();</span>
+
+<span class="fc" id="L271">            boolean critical = false;</span>
+            try {
+<span class="fc" id="L273">                String fieldName = mapper.realMember(result.getClass(), reader.getNodeName());</span>
+<span class="fc bfc" id="L274" title="All 2 branches covered.">                for (Class&lt;?&gt; concrete = result.getClass(); concrete != null; concrete = concrete.getSuperclass()) {</span>
+                    // Not quite right since a subclass could shadow a field, but probably suffices:
+<span class="pc bpc" id="L276" title="1 of 2 branches missed.">                    if (criticalFields.contains(concrete.getName() + '#' + fieldName)) {</span>
+<span class="nc" id="L277">                        critical = true;</span>
+<span class="nc" id="L278">                        break;</span>
+                    }
+                }
+<span class="pc bpc" id="L281" title="1 of 2 branches missed.">                boolean implicitCollectionHasSameName = mapper.getImplicitCollectionDefForFieldName(result.getClass(), reader.getNodeName()) != null;</span>
+
+<span class="fc" id="L283">                Class classDefiningField = determineWhichClassDefinesField(reader);</span>
+<span class="pc bpc" id="L284" title="1 of 4 branches missed.">                boolean fieldExistsInClass = !implicitCollectionHasSameName &amp;&amp; fieldDefinedInClass(result,fieldName);</span>
+
+<span class="fc" id="L286">                Class type = determineType(reader, fieldExistsInClass, result, fieldName, classDefiningField);</span>
+                final Object value;
+<span class="pc bpc" id="L288" title="1 of 2 branches missed.">                if (fieldExistsInClass) {</span>
+<span class="fc" id="L289">                    Field field = reflectionProvider.getField(result.getClass(),fieldName);</span>
+<span class="fc" id="L290">                    value = unmarshalField(context, result, type, field);</span>
+                    // TODO the reflection provider should have returned the proper field in first place ....
+<span class="fc" id="L292">                    Class definedType = reflectionProvider.getFieldType(result, fieldName, classDefiningField);</span>
+<span class="fc bfc" id="L293" title="All 2 branches covered.">                    if (!definedType.isPrimitive()) {</span>
+<span class="fc" id="L294">                        type = definedType;</span>
+                    }
+<span class="fc" id="L296">                } else {</span>
+<span class="nc" id="L297">                    value = context.convertAnother(result, type);</span>
+                }
+
+<span class="pc bpc" id="L300" title="2 of 4 branches missed.">                if (value != null &amp;&amp; !type.isAssignableFrom(value.getClass())) {</span>
+<span class="nc" id="L301">                    LOGGER.warning(&quot;Cannot convert type &quot; + value.getClass().getName() + &quot; to type &quot; + type.getName());</span>
+                    // behave as if we didn't see this element
+<span class="nc" id="L303">                } else {</span>
+<span class="pc bpc" id="L304" title="1 of 2 branches missed.">                    if (fieldExistsInClass) {</span>
+<span class="fc" id="L305">                        reflectionProvider.writeField(result, fieldName, value, classDefiningField);</span>
+<span class="fc" id="L306">                        seenFields.add(classDefiningField, fieldName);</span>
+<span class="fc" id="L307">                    } else {</span>
+<span class="nc" id="L308">                        implicitCollectionsForCurrentObject = writeValueToImplicitCollection(context, value, implicitCollectionsForCurrentObject, result, fieldName);</span>
+                    }
+                }
+<span class="nc" id="L311">            } catch (CriticalXStreamException e) {</span>
+<span class="nc" id="L312">                throw e;</span>
+<span class="fc" id="L313">            } catch (XStreamException e) {</span>
+<span class="pc bpc" id="L314" title="1 of 2 branches missed.">                if (critical) {</span>
+<span class="nc" id="L315">                    throw new CriticalXStreamException(e);</span>
+                }
+<span class="fc" id="L317">                addErrorInContext(context, e);</span>
+<span class="nc" id="L318">            } catch (LinkageError e) {</span>
+<span class="nc bnc" id="L319" title="All 2 branches missed.">                if (critical) {</span>
+<span class="nc" id="L320">                    throw e;</span>
+                }
+<span class="nc" id="L322">                addErrorInContext(context, e);</span>
+            }
+
+<span class="fc" id="L325">            reader.moveUp();</span>
+        }
+
+        // Report any class/field errors in Saveable objects
+<span class="pc bpc" id="L329" title="1 of 4 branches missed.">        if (context.get(&quot;ReadError&quot;) != null &amp;&amp; context.get(&quot;Saveable&quot;) == result) {</span>
+<span class="nc" id="L330">            OldDataMonitor.report((Saveable)result, (ArrayList&lt;Throwable&gt;)context.get(&quot;ReadError&quot;));</span>
+<span class="nc" id="L331">            context.put(&quot;ReadError&quot;, null);</span>
+        }
+<span class="fc" id="L333">        return result;</span>
+    }
+
+    public static void addErrorInContext(UnmarshallingContext context, Throwable e) {
+<span class="fc" id="L337">        LOGGER.log(FINE, &quot;Failed to load&quot;, e);</span>
+<span class="fc" id="L338">        ArrayList&lt;Throwable&gt; list = (ArrayList&lt;Throwable&gt;)context.get(&quot;ReadError&quot;);</span>
+<span class="fc bfc" id="L339" title="All 2 branches covered.">        if (list == null)</span>
+<span class="fc" id="L340">            context.put(&quot;ReadError&quot;, list = new ArrayList&lt;Throwable&gt;());</span>
+<span class="fc" id="L341">        list.add(e);</span>
+<span class="fc" id="L342">    }</span>
+
+    private boolean fieldDefinedInClass(Object result, String attrName) {
+        // during unmarshalling, unmarshal into transient fields like XStream 1.1.3
+        //boolean fieldExistsInClass = reflectionProvider.fieldDefinedInClass(attrName, result.getClass());
+<span class="fc bfc" id="L347" title="All 2 branches covered.">        return reflectionProvider.getFieldOrNull(result.getClass(),attrName)!=null;</span>
+    }
+
+    protected Object unmarshalField(final UnmarshallingContext context, final Object result, Class type, Field field) {
+<span class="fc" id="L351">        Converter converter = mapper.getLocalConverter(field.getDeclaringClass(), field.getName());</span>
+<span class="fc" id="L352">        return context.convertAnother(result, type, converter);</span>
+    }
+
+    private Map writeValueToImplicitCollection(UnmarshallingContext context, Object value, Map implicitCollections, Object result, String itemFieldName) {
+<span class="nc" id="L356">        String fieldName = mapper.getFieldNameForItemTypeAndName(context.getRequiredType(), value.getClass(), itemFieldName);</span>
+<span class="nc bnc" id="L357" title="All 2 branches missed.">        if (fieldName != null) {</span>
+<span class="nc bnc" id="L358" title="All 2 branches missed.">            if (implicitCollections == null) {</span>
+<span class="nc" id="L359">                implicitCollections = new HashMap(); // lazy instantiation</span>
+            }
+<span class="nc" id="L361">            Collection collection = (Collection) implicitCollections.get(fieldName);</span>
+<span class="nc bnc" id="L362" title="All 2 branches missed.">            if (collection == null) {</span>
+<span class="nc" id="L363">                Class fieldType = mapper.defaultImplementationOf(reflectionProvider.getFieldType(result, fieldName, null));</span>
+<span class="nc bnc" id="L364" title="All 2 branches missed.">                if (!Collection.class.isAssignableFrom(fieldType)) {</span>
+<span class="nc" id="L365">                    throw new ObjectAccessException(&quot;Field &quot; + fieldName + &quot; of &quot; + result.getClass().getName() +</span>
+<span class="nc" id="L366">                            &quot; is configured for an implicit Collection, but field is of type &quot; + fieldType.getName());</span>
+                }
+<span class="nc bnc" id="L368" title="All 2 branches missed.">                if (pureJavaReflectionProvider == null) {</span>
+<span class="nc" id="L369">                    pureJavaReflectionProvider = new PureJavaReflectionProvider();</span>
+                }
+<span class="nc" id="L371">                collection = (Collection)pureJavaReflectionProvider.newInstance(fieldType);</span>
+<span class="nc" id="L372">                reflectionProvider.writeField(result, fieldName, collection, null);</span>
+<span class="nc" id="L373">                implicitCollections.put(fieldName, collection);</span>
+            }
+<span class="nc" id="L375">            collection.add(value);</span>
+        }
+<span class="nc" id="L377">        return implicitCollections;</span>
+    }
+
+    private Class determineWhichClassDefinesField(HierarchicalStreamReader reader) {
+<span class="fc" id="L381">        String definedIn = reader.getAttribute(mapper.aliasForAttribute(&quot;defined-in&quot;));</span>
+<span class="pc bpc" id="L382" title="1 of 2 branches missed.">        return definedIn == null ? null : mapper.realClass(definedIn);</span>
+    }
+
+    protected Object instantiateNewInstance(HierarchicalStreamReader reader, UnmarshallingContext context) {
+<span class="fc" id="L386">        String readResolveValue = reader.getAttribute(mapper.aliasForAttribute(&quot;resolves-to&quot;));</span>
+
+<span class="fc bfc" id="L388" title="All 2 branches covered.">        Class type = readResolveValue != null ? mapper.realClass(readResolveValue) : context.getRequiredType();</span>
+
+<span class="fc" id="L390">        Object currentObject = context.currentObject();</span>
+<span class="pc bpc" id="L391" title="1 of 2 branches missed.">        if (currentObject != null) {</span>
+<span class="nc bnc" id="L392" title="All 2 branches missed.">            if (type.isInstance(currentObject))</span>
+<span class="nc" id="L393">                return currentObject;</span>
+        }
+<span class="fc" id="L395">        return reflectionProvider.newInstance(type);</span>
+    }
+
+<span class="fc" id="L398">    private static class SeenFields {</span>
+
+<span class="fc" id="L400">        private Set seen = new HashSet();</span>
+
+        public void add(Class definedInCls, String fieldName) {
+<span class="fc" id="L403">            String uniqueKey = fieldName;</span>
+<span class="pc bpc" id="L404" title="1 of 2 branches missed.">            if (definedInCls != null) {</span>
+<span class="nc" id="L405">                uniqueKey += &quot; [&quot; + definedInCls.getName() + &quot;]&quot;;</span>
+            }
+<span class="pc bpc" id="L407" title="1 of 2 branches missed.">            if (seen.contains(uniqueKey)) {</span>
+<span class="nc" id="L408">                throw new DuplicateFieldException(uniqueKey);</span>
+            } else {
+<span class="fc" id="L410">                seen.add(uniqueKey);</span>
+            }
+<span class="fc" id="L412">        }</span>
+
+    }
+
+    private Class determineType(HierarchicalStreamReader reader, boolean validField, Object result, String fieldName, Class definedInCls) {
+<span class="fc" id="L417">        String classAttribute = reader.getAttribute(mapper.aliasForAttribute(&quot;class&quot;));</span>
+<span class="fc" id="L418">        Class fieldType = reflectionProvider.getFieldType(result, fieldName, definedInCls);</span>
+<span class="fc bfc" id="L419" title="All 2 branches covered.">        if (classAttribute != null) {</span>
+<span class="fc" id="L420">            Class specifiedType = mapper.realClass(classAttribute);</span>
+<span class="pc bpc" id="L421" title="1 of 2 branches missed.">            if(fieldType.isAssignableFrom(specifiedType))</span>
+                // make sure that the specified type in XML is compatible with the field type.
+                // this allows the code to evolve in more flexible way.
+<span class="fc" id="L424">                return specifiedType;</span>
+        }
+<span class="pc bpc" id="L426" title="1 of 2 branches missed.">        if (!validField) {</span>
+<span class="nc" id="L427">            Class itemType = mapper.getItemTypeForItemFieldName(result.getClass(), fieldName);</span>
+<span class="nc bnc" id="L428" title="All 2 branches missed.">            if (itemType != null) {</span>
+<span class="nc" id="L429">                return itemType;</span>
+            } else {
+<span class="nc" id="L431">                return mapper.realClass(reader.getNodeName());</span>
+            }
+        } else {
+<span class="fc" id="L434">            return mapper.defaultImplementationOf(fieldType);</span>
+        }
+    }
+
+    private Object readResolve() {
+<span class="nc" id="L439">        serializationMethodInvoker = new SerializationMethodInvoker();</span>
+<span class="nc" id="L440">        return this;</span>
+    }
+
+    public static class DuplicateFieldException extends ConversionException {
+        public DuplicateFieldException(String msg) {
+<span class="nc" id="L445">            super(msg);</span>
+<span class="nc" id="L446">            add(&quot;duplicate-field&quot;, msg);</span>
+<span class="nc" id="L447">        }</span>
+    }
+
+<span class="fc" id="L450">    private static final Logger LOGGER = Logger.getLogger(RobustReflectionConverter.class.getName());</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

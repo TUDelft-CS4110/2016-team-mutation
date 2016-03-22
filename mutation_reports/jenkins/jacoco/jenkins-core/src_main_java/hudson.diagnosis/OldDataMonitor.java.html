@@ -1,0 +1,457 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>OldDataMonitor.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.diagnosis</a> &gt; <span class="el_source">OldDataMonitor.java</span></div><h1>OldDataMonitor.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">/*</span>
+ * The MIT License
+ *
+ * Copyright (c) 2004-2010, Sun Microsystems, Inc., Alan Harder
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.diagnosis;
+
+import com.google.common.base.Predicate;
+import com.thoughtworks.xstream.converters.UnmarshallingContext;
+import hudson.Extension;
+import hudson.XmlFile;
+import hudson.model.AdministrativeMonitor;
+import hudson.model.Item;
+import hudson.model.Job;
+import hudson.model.ManagementLink;
+import hudson.model.Run;
+import hudson.model.Saveable;
+import hudson.model.listeners.ItemListener;
+import hudson.model.listeners.RunListener;
+import hudson.model.listeners.SaveableListener;
+import hudson.security.ACL;
+import hudson.util.RobustReflectionConverter;
+import hudson.util.VersionNumber;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.TreeSet;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import javax.annotation.CheckForNull;
+import jenkins.model.Jenkins;
+import org.acegisecurity.context.SecurityContext;
+import org.acegisecurity.context.SecurityContextHolder;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
+import org.kohsuke.stapler.HttpRedirect;
+import org.kohsuke.stapler.HttpResponse;
+import org.kohsuke.stapler.HttpResponses;
+import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.StaplerResponse;
+import org.kohsuke.stapler.interceptor.RequirePOST;
+
+/**
+ * Tracks whether any data structure changes were corrected when loading XML,
+ * that could be resaved to migrate that data to the new format.
+ *
+ * @author Alan.Harder@Sun.Com
+ */
+@Extension
+public class OldDataMonitor extends AdministrativeMonitor {
+<span class="nc" id="L75">    private static final Logger LOGGER = Logger.getLogger(OldDataMonitor.class.getName());</span>
+
+<span class="nc" id="L77">    private ConcurrentMap&lt;SaveableReference,VersionRange&gt; data = new ConcurrentHashMap&lt;SaveableReference,VersionRange&gt;();</span>
+
+    static OldDataMonitor get(Jenkins j) {
+<span class="nc" id="L80">        return (OldDataMonitor) j.getAdministrativeMonitor(&quot;OldData&quot;);</span>
+    }
+
+    public OldDataMonitor() {
+<span class="nc" id="L84">        super(&quot;OldData&quot;);</span>
+<span class="nc" id="L85">    }</span>
+
+    @Override
+    public String getDisplayName() {
+<span class="nc" id="L89">        return Messages.OldDataMonitor_DisplayName();</span>
+    }
+
+    public boolean isActivated() {
+<span class="nc bnc" id="L93" title="All 2 branches missed.">        return !data.isEmpty();</span>
+    }
+
+    public Map&lt;Saveable,VersionRange&gt; getData() {
+<span class="nc" id="L97">        Map&lt;Saveable,VersionRange&gt; r = new HashMap&lt;Saveable,VersionRange&gt;();</span>
+<span class="nc bnc" id="L98" title="All 2 branches missed.">        for (Map.Entry&lt;SaveableReference,VersionRange&gt; entry : this.data.entrySet()) {</span>
+<span class="nc" id="L99">            Saveable s = entry.getKey().get();</span>
+<span class="nc bnc" id="L100" title="All 2 branches missed.">            if (s != null) {</span>
+<span class="nc" id="L101">                r.put(s, entry.getValue());</span>
+            }
+        }
+<span class="nc" id="L104">        return r;</span>
+    }
+
+    private static void remove(Saveable obj, boolean isDelete) {
+<span class="nc" id="L108">        Jenkins j = Jenkins.getInstance();</span>
+<span class="nc bnc" id="L109" title="All 2 branches missed.">        if (j != null) {</span>
+<span class="nc" id="L110">            OldDataMonitor odm = get(j);</span>
+<span class="nc" id="L111">            SecurityContext oldContext = ACL.impersonate(ACL.SYSTEM);</span>
+            try {
+<span class="nc" id="L113">                odm.data.remove(referTo(obj));</span>
+<span class="nc bnc" id="L114" title="All 4 branches missed.">                if (isDelete &amp;&amp; obj instanceof Job&lt;?, ?&gt;) {</span>
+<span class="nc bnc" id="L115" title="All 2 branches missed.">                    for (Run r : ((Job&lt;?, ?&gt;) obj).getBuilds()) {</span>
+<span class="nc" id="L116">                        odm.data.remove(referTo(r));</span>
+                    }
+                }
+<span class="nc" id="L119">            } finally {</span>
+<span class="nc" id="L120">                SecurityContextHolder.setContext(oldContext);</span>
+<span class="nc" id="L121">            }</span>
+        }
+<span class="nc" id="L123">    }</span>
+
+    // Listeners to remove data here if resaved or deleted in regular Hudson usage
+
+    @Extension
+<span class="nc" id="L128">    public static final SaveableListener changeListener = new SaveableListener() {</span>
+        @Override
+        public void onChange(Saveable obj, XmlFile file) {
+<span class="nc" id="L131">            remove(obj, false);</span>
+<span class="nc" id="L132">        }</span>
+    };
+
+    @Extension
+<span class="nc" id="L136">    public static final ItemListener itemDeleteListener = new ItemListener() {</span>
+        @Override
+        public void onDeleted(Item item) {
+<span class="nc" id="L139">            remove(item, true);</span>
+<span class="nc" id="L140">        }</span>
+    };
+
+    @Extension
+<span class="nc" id="L144">    public static final RunListener&lt;Run&gt; runDeleteListener = new RunListener&lt;Run&gt;() {</span>
+        @Override
+        public void onDeleted(Run run) {
+<span class="nc" id="L147">            remove(run, true);</span>
+<span class="nc" id="L148">        }</span>
+<span class="nc" id="L149">    };</span>
+
+    /**
+     * Inform monitor that some data in a deprecated format has been loaded,
+     * and converted in-memory to a new structure.
+     * @param obj Saveable object; calling save() on this object will persist
+     *            the data in its new format to disk.
+     * @param version Hudson release when the data structure changed.
+     */
+    public static void report(Saveable obj, String version) {
+<span class="nc" id="L159">        OldDataMonitor odm = get(Jenkins.getInstance());</span>
+        try {
+<span class="nc" id="L161">            SaveableReference ref = referTo(obj);</span>
+            while (true) {
+<span class="nc" id="L163">                VersionRange vr = odm.data.get(ref);</span>
+<span class="nc bnc" id="L164" title="All 4 branches missed.">                if (vr != null &amp;&amp; odm.data.replace(ref, vr, new VersionRange(vr, version, null))) {</span>
+<span class="nc" id="L165">                    break;</span>
+<span class="nc bnc" id="L166" title="All 2 branches missed.">                } else if (odm.data.putIfAbsent(ref, new VersionRange(null, version, null)) == null) {</span>
+                    break;
+                }
+            }
+<span class="nc" id="L170">        } catch (IllegalArgumentException ex) {</span>
+<span class="nc" id="L171">            LOGGER.log(Level.WARNING, &quot;Bad parameter given to OldDataMonitor&quot;, ex);</span>
+        }
+<span class="nc" id="L173">    }</span>
+
+    /**
+     * Inform monitor that some data in a deprecated format has been loaded, during
+     * XStream unmarshalling when the Saveable containing this object is not available.
+     * @param context XStream unmarshalling context
+     * @param version Hudson release when the data structure changed.
+     */
+    public static void report(UnmarshallingContext context, String version) {
+<span class="nc" id="L182">        RobustReflectionConverter.addErrorInContext(context, new ReportException(version));</span>
+<span class="nc" id="L183">    }</span>
+
+    private static class ReportException extends Exception {
+        private String version;
+<span class="nc" id="L187">        private ReportException(String version) {</span>
+<span class="nc" id="L188">            this.version = version;</span>
+<span class="nc" id="L189">        }</span>
+    }
+
+    /**
+     * Inform monitor that some unreadable data was found while loading.
+     * @param obj Saveable object; calling save() on this object will discard the unreadable data.
+     * @param errors Exception(s) thrown while loading, regarding the unreadable classes/fields.
+     */
+    public static void report(Saveable obj, Collection&lt;Throwable&gt; errors) {
+<span class="nc" id="L198">        StringBuilder buf = new StringBuilder();</span>
+<span class="nc" id="L199">        int i = 0;</span>
+<span class="nc bnc" id="L200" title="All 2 branches missed.">        for (Throwable e : errors) {</span>
+<span class="nc bnc" id="L201" title="All 2 branches missed.">            if (e instanceof ReportException) {</span>
+<span class="nc" id="L202">                report(obj, ((ReportException)e).version);</span>
+<span class="nc" id="L203">            } else {</span>
+<span class="nc bnc" id="L204" title="All 2 branches missed.">                if (++i &gt; 1) buf.append(&quot;, &quot;);</span>
+<span class="nc" id="L205">                buf.append(e.getClass().getSimpleName()).append(&quot;: &quot;).append(e.getMessage());</span>
+            }
+        }
+<span class="nc bnc" id="L208" title="All 2 branches missed.">        if (buf.length() == 0) return;</span>
+<span class="nc" id="L209">        Jenkins j = Jenkins.getInstance();</span>
+<span class="nc bnc" id="L210" title="All 2 branches missed.">        if (j == null) {</span>
+            // Startup failed, something is very broken, so report what we can.
+<span class="nc bnc" id="L212" title="All 2 branches missed.">            for (Throwable t : errors) {</span>
+<span class="nc" id="L213">                LOGGER.log(Level.WARNING, &quot;could not read &quot; + obj + &quot; (and Jenkins did not start up)&quot;, t);</span>
+            }
+<span class="nc" id="L215">            return;</span>
+        }
+<span class="nc" id="L217">        OldDataMonitor odm = get(j);</span>
+<span class="nc" id="L218">        SaveableReference ref = referTo(obj);</span>
+        while (true) {
+<span class="nc" id="L220">            VersionRange vr = odm.data.get(ref);</span>
+<span class="nc bnc" id="L221" title="All 4 branches missed.">            if (vr != null &amp;&amp; odm.data.replace(ref, vr, new VersionRange(vr, null, buf.toString()))) {</span>
+<span class="nc" id="L222">                break;</span>
+<span class="nc bnc" id="L223" title="All 2 branches missed.">            } else if (odm.data.putIfAbsent(ref, new VersionRange(null, null, buf.toString())) == null) {</span>
+                break;
+            }
+        }
+<span class="nc" id="L227">    }</span>
+
+    public static class VersionRange {
+<span class="nc" id="L230">        private static VersionNumber currentVersion = Jenkins.getVersion();</span>
+
+        final VersionNumber min;
+        final VersionNumber max;
+        final boolean single;
+        final public String extra;
+
+<span class="nc" id="L237">        public VersionRange(VersionRange previous, String version, String extra) {</span>
+<span class="nc bnc" id="L238" title="All 2 branches missed.">            if (previous == null) {</span>
+<span class="nc bnc" id="L239" title="All 2 branches missed.">                min = max = version != null ? new VersionNumber(version) : null;</span>
+<span class="nc" id="L240">                this.single = true;</span>
+<span class="nc" id="L241">                this.extra = extra;</span>
+<span class="nc bnc" id="L242" title="All 2 branches missed.">            } else if (version == null) {</span>
+<span class="nc" id="L243">                min = previous.min;</span>
+<span class="nc" id="L244">                max = previous.max;</span>
+<span class="nc" id="L245">                single = previous.single;</span>
+<span class="nc" id="L246">                this.extra = extra;</span>
+<span class="nc" id="L247">            } else {</span>
+<span class="nc" id="L248">                VersionNumber ver = new VersionNumber(version);</span>
+<span class="nc bnc" id="L249" title="All 4 branches missed.">                if (previous.min == null || ver.isOlderThan(previous.min)) {</span>
+<span class="nc" id="L250">                    this.min = ver;</span>
+<span class="nc" id="L251">                } else {</span>
+<span class="nc" id="L252">                    this.min = previous.min;</span>
+                }
+<span class="nc bnc" id="L254" title="All 4 branches missed.">                if (previous.max == null || ver.isNewerThan(previous.max)) {</span>
+<span class="nc" id="L255">                    this.max = ver;</span>
+<span class="nc" id="L256">                } else {</span>
+<span class="nc" id="L257">                    this.max = previous.max;</span>
+                }
+<span class="nc" id="L259">                this.single = this.max.isNewerThan(this.min);</span>
+<span class="nc" id="L260">                this.extra = extra;</span>
+            }
+<span class="nc" id="L262">        }</span>
+
+        @Override
+        public String toString() {
+<span class="nc bnc" id="L266" title="All 4 branches missed.">            return min==null ? &quot;&quot; : min.toString() + (single ? &quot;&quot; : &quot; - &quot; + max.toString());</span>
+        }
+
+        /**
+         * Does this version range contain a version more than the given number of releases ago?
+         * @param threshold Number of releases
+         * @return True if the major version# differs or the minor# differs by &gt;= threshold
+         */
+        public boolean isOld(int threshold) {
+<span class="nc bnc" id="L275" title="All 8 branches missed.">            return currentVersion != null &amp;&amp; min != null &amp;&amp; (currentVersion.digit(0) &gt; min.digit(0)</span>
+<span class="nc bnc" id="L276" title="All 2 branches missed.">                    || (currentVersion.digit(0) == min.digit(0)</span>
+<span class="nc" id="L277">                    &amp;&amp; currentVersion.digit(1) - min.digit(1) &gt;= threshold));</span>
+        }
+
+    }
+
+    /**
+     * Sorted list of unique max-versions in the data set.  For select list in jelly.
+     */
+    @Restricted(NoExternalUse.class)
+    public Iterator&lt;VersionNumber&gt; getVersionList() {
+<span class="nc" id="L287">        TreeSet&lt;VersionNumber&gt; set = new TreeSet&lt;VersionNumber&gt;();</span>
+<span class="nc bnc" id="L288" title="All 2 branches missed.">        for (VersionRange vr : data.values()) {</span>
+<span class="nc bnc" id="L289" title="All 2 branches missed.">            if (vr.max != null) {</span>
+<span class="nc" id="L290">                set.add(vr.max);</span>
+            }
+        }
+<span class="nc" id="L293">        return set.iterator();</span>
+    }
+
+    /**
+     * Depending on whether the user said &quot;yes&quot; or &quot;no&quot;, send him to the right place.
+     */
+    @RequirePOST
+    public HttpResponse doAct(StaplerRequest req, StaplerResponse rsp) throws IOException {
+<span class="nc bnc" id="L301" title="All 2 branches missed.">        if (req.hasParameter(&quot;no&quot;)) {</span>
+<span class="nc" id="L302">            disable(true);</span>
+<span class="nc" id="L303">            return HttpResponses.redirectViaContextPath(&quot;/manage&quot;);</span>
+        } else {
+<span class="nc" id="L305">            return new HttpRedirect(&quot;manage&quot;);</span>
+        }
+    }
+
+    /**
+     * Save all or some of the files to persist data in the new forms.
+     * Remove those items from the data map.
+     */
+    @RequirePOST
+    public HttpResponse doUpgrade(StaplerRequest req, StaplerResponse rsp) {
+<span class="nc" id="L315">        final String thruVerParam = req.getParameter(&quot;thruVer&quot;);</span>
+<span class="nc bnc" id="L316" title="All 2 branches missed.">        final VersionNumber thruVer = thruVerParam.equals(&quot;all&quot;) ? null : new VersionNumber(thruVerParam);</span>
+
+<span class="nc" id="L318">        saveAndRemoveEntries(new Predicate&lt;Map.Entry&lt;SaveableReference, VersionRange&gt;&gt;() {</span>
+            @Override
+            public boolean apply(Map.Entry&lt;SaveableReference, VersionRange&gt; entry) {
+<span class="nc" id="L321">                VersionNumber version = entry.getValue().max;</span>
+<span class="nc bnc" id="L322" title="All 6 branches missed.">                return version != null &amp;&amp; (thruVer == null || !version.isNewerThan(thruVer));</span>
+            }
+        });
+
+<span class="nc" id="L326">        return HttpResponses.forwardToPreviousPage();</span>
+    }
+
+    /**
+     * Save all files containing only unreadable data (no data upgrades), which discards this data.
+     * Remove those items from the data map.
+     */
+    @RequirePOST
+    public HttpResponse doDiscard(StaplerRequest req, StaplerResponse rsp) {
+<span class="nc" id="L335">        saveAndRemoveEntries( new Predicate&lt;Map.Entry&lt;SaveableReference,VersionRange&gt;&gt;() {</span>
+            @Override
+            public boolean apply(Map.Entry&lt;SaveableReference, VersionRange&gt; entry) {
+<span class="nc bnc" id="L338" title="All 2 branches missed.">                return entry.getValue().max == null;</span>
+            }
+        });
+
+<span class="nc" id="L342">        return HttpResponses.forwardToPreviousPage();</span>
+    }
+
+    private void saveAndRemoveEntries(Predicate&lt;Map.Entry&lt;SaveableReference, VersionRange&gt;&gt; matchingPredicate) {
+        /*
+         * Note that there a race condition here: we acquire the lock and get localCopy which includes some
+         * project (say); then we go through our loop and save that project; then someone POSTs a new
+         * config.xml for the project with some old data, causing remove to be called and the project to be
+         * added to data (in the new version); then we hit the end of this method and the project is removed
+         * from data again, even though it again has old data.
+         *
+         * In practice this condition is extremely unlikely, and not a major problem even if it
+         * does occur: just means the user will be prompted to discard less than they should have been (and
+         * would see the warning again after next restart).
+         */
+<span class="nc" id="L357">        List&lt;SaveableReference&gt; removed = new ArrayList&lt;SaveableReference&gt;();</span>
+<span class="nc bnc" id="L358" title="All 2 branches missed.">        for (Map.Entry&lt;SaveableReference,VersionRange&gt; entry : data.entrySet()) {</span>
+<span class="nc bnc" id="L359" title="All 2 branches missed.">            if (matchingPredicate.apply(entry)) {</span>
+<span class="nc" id="L360">                Saveable s = entry.getKey().get();</span>
+<span class="nc bnc" id="L361" title="All 2 branches missed.">                if (s != null) {</span>
+                    try {
+<span class="nc" id="L363">                        s.save();</span>
+<span class="nc" id="L364">                    } catch (Exception x) {</span>
+<span class="nc" id="L365">                        LOGGER.log(Level.WARNING, &quot;failed to save &quot; + s, x);</span>
+                    }
+                }
+<span class="nc" id="L368">                removed.add(entry.getKey());</span>
+            }
+        }
+
+<span class="nc" id="L372">        data.keySet().removeAll(removed);</span>
+<span class="nc" id="L373">    }</span>
+
+    public HttpResponse doIndex(StaplerResponse rsp) throws IOException {
+<span class="nc" id="L376">        return new HttpRedirect(&quot;manage&quot;);</span>
+    }
+
+    /** Reference to a saveable object that need not actually hold it in heap. */
+    private interface SaveableReference {
+        @CheckForNull Saveable get();
+        // must also define equals, hashCode
+    }
+
+    private static SaveableReference referTo(Saveable s) {
+<span class="nc bnc" id="L386" title="All 2 branches missed.">        if (s instanceof Run) {</span>
+<span class="nc" id="L387">            Job parent = ((Run) s).getParent();</span>
+<span class="nc bnc" id="L388" title="All 2 branches missed.">            if (Jenkins.getInstance().getItemByFullName(parent.getFullName()) == parent) {</span>
+<span class="nc" id="L389">                return new RunSaveableReference((Run) s);</span>
+            }
+        }
+<span class="nc" id="L392">        return new SimpleSaveableReference(s);</span>
+    }
+
+    private static final class SimpleSaveableReference implements SaveableReference {
+        private final Saveable instance;
+<span class="nc" id="L397">        SimpleSaveableReference(Saveable instance) {</span>
+<span class="nc" id="L398">            this.instance = instance;</span>
+<span class="nc" id="L399">        }</span>
+        @Override public Saveable get() {
+<span class="nc" id="L401">            return instance;</span>
+        }
+        @Override public int hashCode() {
+<span class="nc" id="L404">            return instance.hashCode();</span>
+        }
+        @Override public boolean equals(Object obj) {
+<span class="nc bnc" id="L407" title="All 4 branches missed.">            return obj instanceof SimpleSaveableReference &amp;&amp; instance.equals(((SimpleSaveableReference) obj).instance);</span>
+        }
+    }
+
+    // could easily make an ItemSaveableReference, but Jenkins holds all these strongly, so why bother
+
+    private static final class RunSaveableReference implements SaveableReference {
+        private final String id;
+<span class="nc" id="L415">        RunSaveableReference(Run&lt;?,?&gt; r) {</span>
+<span class="nc" id="L416">            id = r.getExternalizableId();</span>
+<span class="nc" id="L417">        }</span>
+        @Override public Saveable get() {
+            try {
+<span class="nc" id="L420">                return Run.fromExternalizableId(id);</span>
+<span class="nc" id="L421">            } catch (IllegalArgumentException x) {</span>
+                // Typically meaning the job or build was since deleted.
+<span class="nc" id="L423">                LOGGER.log(Level.FINE, null, x);</span>
+<span class="nc" id="L424">                return null;</span>
+            }
+        }
+        @Override public int hashCode() {
+<span class="nc" id="L428">            return id.hashCode();</span>
+        }
+        @Override public boolean equals(Object obj) {
+<span class="nc bnc" id="L431" title="All 4 branches missed.">            return obj instanceof RunSaveableReference &amp;&amp; id.equals(((RunSaveableReference) obj).id);</span>
+        }
+    }
+
+    @Extension
+<span class="nc" id="L436">    public static class ManagementLinkImpl extends ManagementLink {</span>
+        @Override
+        public String getIconFileName() {
+<span class="nc" id="L439">            return &quot;document.png&quot;;</span>
+        }
+
+        @Override
+        public String getUrlName() {
+<span class="nc" id="L444">            return &quot;administrativeMonitor/OldData/&quot;;</span>
+        }
+
+        @Override
+        public String getDescription() {
+<span class="nc" id="L449">            return Messages.OldDataMonitor_Description();</span>
+        }
+
+        public String getDisplayName() {
+<span class="nc" id="L453">            return Messages.OldDataMonitor_DisplayName();</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

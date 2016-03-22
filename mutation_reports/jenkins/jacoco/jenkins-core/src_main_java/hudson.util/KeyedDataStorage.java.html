@@ -1,0 +1,265 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>KeyedDataStorage.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.util</a> &gt; <span class="el_source">KeyedDataStorage.java</span></div><h1>KeyedDataStorage.java</h1><pre class="source lang-java linenums">/*
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc., Kohsuke Kawaguchi
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.util;
+
+import hudson.model.Fingerprint;
+import hudson.model.FingerprintMap;
+
+import java.io.IOException;
+import java.lang.ref.SoftReference;
+import java.text.MessageFormat;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import javax.annotation.CheckForNull;
+import javax.annotation.Nonnull;
+
+/**
+ * Convenient base class for implementing data storage.
+ *
+ * &lt;p&gt;
+ * One typical pattern of data storage in Hudson is the one that {@link Fingerprint}
+ * uses, where each data is keyed by an unique key (MD5 sum), and that key is used
+ * to determine the file system location of the data.
+ *
+ * On memory, each data is represented by one object ({@link Fingerprint}), and
+ * write access to the same data is coordinated by using synchronization.
+ *
+ * &lt;p&gt;
+ * With such storage, care has to be taken to ensure that there's only one data
+ * object in memory for any given key. That means load and create operation
+ * needs to be synchronized. This class implements this logic in a fairly efficient
+ * way, and thus intends to help plugins that want to use such data storage.
+ *
+ * @since 1.87
+ * @author Kohsuke Kawaguchi
+ * @see FingerprintMap
+ */
+<span class="nc" id="L58">public abstract class KeyedDataStorage&lt;T,P&gt; {</span>
+    /**
+     * The value is either {@code SoftReference&lt;Fingerprint&gt;} or {@link Loading}.
+     *
+     * If it's {@link SoftReference}, that represents the currently available value.
+     * If it's {@link Loading}, then that indicates the fingerprint is being loaded.
+     * The thread can wait on this object to be notified when the loading completes.
+     */
+<span class="nc" id="L66">    private final ConcurrentHashMap&lt;String,Object&gt; core = new ConcurrentHashMap&lt;String,Object&gt;();</span>
+
+    /**
+     * Used in {@link KeyedDataStorage#core} to indicate that the loading of a fingerprint
+     * is in progress, so that we can avoid creating two {@link Fingerprint}s for the same hash code,
+     * but do so without having a single lock.
+     */
+<span class="nc" id="L73">    private static class Loading&lt;T&gt; {</span>
+        private @CheckForNull T value;
+        private boolean set;
+
+        public synchronized void set(@CheckForNull T value) {
+<span class="nc" id="L78">            this.set = true;</span>
+<span class="nc" id="L79">            this.value = value;</span>
+<span class="nc" id="L80">            notifyAll();</span>
+<span class="nc" id="L81">        }</span>
+
+        /**
+         * Blocks until the value is {@link #set(Object)} by another thread
+         * and returns the value.
+         */
+        public synchronized @CheckForNull T get() {
+            try {
+<span class="nc bnc" id="L89" title="All 2 branches missed.">                while(!set)</span>
+<span class="nc" id="L90">                    wait();</span>
+<span class="nc" id="L91">                return value;</span>
+<span class="nc" id="L92">            } catch (InterruptedException e) {</span>
+                // assume the loading failed, but make sure we process interruption properly later
+<span class="nc" id="L94">                Thread.currentThread().interrupt();</span>
+<span class="nc" id="L95">                return null;</span>
+            }
+        }
+    }
+
+    /**
+     * Atomically gets the existing data object if any, or if it doesn't exist
+     * {@link #create(String,Object) create} it and return it.
+     *
+     * @return
+     *      Item with the specified {@code key}.
+     * @param createParams
+     *      Additional parameters needed to create a new data object. Can be null.
+     * @throws IOException Loading error
+     */
+    public @Nonnull T getOrCreate(String key, P createParams) throws IOException {
+<span class="nc" id="L111">        return get(key,true,createParams);</span>
+    }
+
+    /**
+     * Finds the data object that matches the given key if available, or null
+     * if not found.
+     * @return Item with the specified {@code key}
+     * @throws IOException Loading error
+     */
+    public @CheckForNull T get(String key) throws IOException {
+<span class="nc" id="L121">        return get(key,false,null);</span>
+    }
+
+    /**
+     * Implementation of get/getOrCreate.
+     * @return Item with the specified {@code key}
+     * @throws IOException Loading error
+     */
+    protected @CheckForNull T get(@Nonnull String key, boolean createIfNotExist, P createParams) throws IOException {
+        while(true) {
+<span class="nc" id="L131">            totalQuery.incrementAndGet();</span>
+<span class="nc" id="L132">            Object value = core.get(key);</span>
+
+<span class="nc bnc" id="L134" title="All 2 branches missed.">            if(value instanceof SoftReference) {</span>
+<span class="nc" id="L135">                SoftReference&lt;T&gt; wfp = (SoftReference&lt;T&gt;) value;</span>
+<span class="nc" id="L136">                T t = wfp.get();</span>
+<span class="nc bnc" id="L137" title="All 2 branches missed.">                if(t!=null) {</span>
+<span class="nc" id="L138">                    cacheHit.incrementAndGet();</span>
+<span class="nc" id="L139">                    return t;  // found it</span>
+                }
+<span class="nc" id="L141">                weakRefLost.incrementAndGet();</span>
+            }
+<span class="nc bnc" id="L143" title="All 2 branches missed.">            if(value instanceof Loading) {</span>
+                // another thread is loading it. get the value from there.
+<span class="nc" id="L145">                T t = ((Loading&lt;T&gt;)value).get();</span>
+<span class="nc bnc" id="L146" title="All 4 branches missed.">                if(t!=null || !createIfNotExist)</span>
+<span class="nc" id="L147">                    return t;   // found it (t!=null) or we are just 'get' (!createIfNotExist)</span>
+            }
+
+            // the fingerprint doesn't seem to be loaded thus far, so let's load it now.
+            // the care needs to be taken that other threads might be trying to do the same.
+<span class="nc" id="L152">            Loading&lt;T&gt; l = new Loading&lt;T&gt;();</span>
+<span class="nc bnc" id="L153" title="All 6 branches missed.">            if(value==null ? core.putIfAbsent(key,l)!=null : !core.replace(key,value,l)) {</span>
+                // the value has changed since then. another thread is attempting to do the same.
+                // go back to square 1 and try it again.
+<span class="nc" id="L156">                continue;</span>
+            }
+
+<span class="nc" id="L159">            T t = null;</span>
+            try {
+<span class="nc" id="L161">                t = load(key);</span>
+<span class="nc bnc" id="L162" title="All 4 branches missed.">                if(t==null &amp;&amp; createIfNotExist) {</span>
+<span class="nc" id="L163">                    t = create(key,createParams);    // create the new data</span>
+<span class="nc bnc" id="L164" title="All 2 branches missed.">                    if(t==null)</span>
+<span class="nc" id="L165">                        throw new IllegalStateException(&quot;Bug in the derived class&quot;); // bug in the derived classes</span>
+                }
+<span class="nc" id="L167">            } catch(IOException e) {</span>
+<span class="nc" id="L168">                loadFailure.incrementAndGet();</span>
+<span class="nc" id="L169">                throw e;</span>
+<span class="nc" id="L170">            } finally {</span>
+                // let other threads know that the value is available now.
+                // when the original thread failed to load, this should set it to null.
+<span class="nc" id="L173">                l.set(t);</span>
+<span class="nc" id="L174">            }</span>
+
+            // the map needs to be updated to reflect the result of loading
+<span class="nc bnc" id="L177" title="All 2 branches missed.">            if(t!=null)</span>
+<span class="nc" id="L178">                core.put(key,new SoftReference&lt;T&gt;(t));</span>
+            else
+<span class="nc" id="L180">                core.remove(key);</span>
+
+<span class="nc" id="L182">            return t;</span>
+        }
+
+    }
+
+    /**
+     * Attempts to load an existing data object from disk.
+     *
+     * &lt;p&gt;
+     * {@link KeyedDataStorage} class serializes the requests so that
+     * no two threads call the {@link #load(String)} method with the
+     * same parameter concurrently. This ensures that there's only
+     * up to one data object for any key.
+     *
+     * @return
+     *      null if no such data exists.
+     * @throws IOException
+     *      if load operation fails. This exception will be
+     *      propagated to the caller.
+     */
+    protected abstract @CheckForNull T load(String key) throws IOException;
+
+    /**
+     * Creates a new data object.
+     *
+     * &lt;p&gt;
+     * This method is called by {@link #getOrCreate(String,Object)}
+     * if the data that matches the specified key does not exist.
+     * &lt;p&gt;
+     * Because of concurrency, another thread might call {@link #get(String)}
+     * as soon as a new data object is created, so it's important that
+     * this method returns a properly initialized &quot;valid&quot; object.
+     *
+     * @return
+     *      Created item. If construction fails, abort with an exception.
+     * @throws IOException
+     *      if the method fails to create a new data object, it can throw
+     *      {@link IOException} (or any other exception) and that will be
+     *      propagated to the caller.
+     */
+    protected abstract @Nonnull T create(@Nonnull String key, @Nonnull P createParams) throws IOException;
+
+    public void resetPerformanceStats() {
+<span class="nc" id="L225">        totalQuery.set(0);</span>
+<span class="nc" id="L226">        cacheHit.set(0);</span>
+<span class="nc" id="L227">        weakRefLost.set(0);</span>
+<span class="nc" id="L228">        loadFailure.set(0);</span>
+<span class="nc" id="L229">    }</span>
+
+    /**
+     * Gets the short summary of performance statistics.
+     */
+    public String getPerformanceStats() {
+<span class="nc" id="L235">        int total = totalQuery.get();</span>
+<span class="nc" id="L236">        int hit = cacheHit.get();</span>
+<span class="nc" id="L237">        int weakRef = weakRefLost.get();</span>
+<span class="nc" id="L238">        int failure = loadFailure.get();</span>
+<span class="nc" id="L239">        int miss = total-hit-weakRef;</span>
+
+<span class="nc" id="L241">        return MessageFormat.format(&quot;total={0} hit={1}% lostRef={2}% failure={3}% miss={4}%&quot;,</span>
+<span class="nc" id="L242">                total,hit,weakRef,failure,miss);</span>
+    }
+
+    /**
+     * Total number of queries into this storage.
+     */
+<span class="nc" id="L248">    public final AtomicInteger totalQuery = new AtomicInteger();</span>
+    /**
+     * Number of cache hits (of all the total queries.)
+     */
+<span class="nc" id="L252">    public final AtomicInteger cacheHit = new AtomicInteger();</span>
+    /**
+     * Among cache misses, number of times when we had {@link SoftReference}
+     * but lost its value due to GC.
+     *
+     * &lt;tt&gt;totalQuery-cacheHit-weakRefLost&lt;/tt&gt; means cache miss.
+     */
+<span class="nc" id="L259">    public final AtomicInteger weakRefLost = new AtomicInteger();</span>
+    /**
+     * Number of failures in loading data.
+     */
+<span class="nc" id="L263">    public final AtomicInteger loadFailure = new AtomicInteger();</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

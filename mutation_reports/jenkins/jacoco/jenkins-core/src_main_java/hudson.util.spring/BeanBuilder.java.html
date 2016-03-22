@@ -1,0 +1,664 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>BeanBuilder.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.util.spring</a> &gt; <span class="el_source">BeanBuilder.java</span></div><h1>BeanBuilder.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">/*</span>
+ * Copyright 2004-2005 the original author or authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the &quot;License&quot;);
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package hudson.util.spring;
+
+import groovy.lang.Binding;
+import groovy.lang.Closure;
+import groovy.lang.GString;
+import groovy.lang.GroovyObject;
+import groovy.lang.GroovyObjectSupport;
+import groovy.lang.GroovyShell;
+import groovy.lang.MetaClass;
+import groovy.lang.MissingMethodException;
+import org.apache.commons.lang.ArrayUtils;
+import org.codehaus.groovy.control.CompilerConfiguration;
+import org.codehaus.groovy.runtime.DefaultGroovyMethods;
+import org.codehaus.groovy.runtime.InvokerHelper;
+import org.springframework.beans.factory.config.BeanDefinition;
+import org.springframework.beans.factory.config.RuntimeBeanReference;
+import org.springframework.beans.factory.support.ManagedList;
+import org.springframework.beans.factory.support.ManagedMap;
+import org.springframework.context.ApplicationContext;
+import org.springframework.context.support.StaticApplicationContext;
+import org.springframework.core.io.Resource;
+import org.springframework.core.io.support.PathMatchingResourcePatternResolver;
+import org.springframework.web.context.WebApplicationContext;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.ListIterator;
+import java.util.Map;
+import java.util.Map.Entry;
+
+/**
+ * &lt;p&gt;Runtime bean configuration wrapper. Like a Groovy builder, but more of a DSL for
+ * Spring configuration. Allows syntax like:&lt;/p&gt;
+ *
+ * &lt;pre&gt;
+ * import org.hibernate.SessionFactory
+ * import org.apache.commons.dbcp.BasicDataSource
+ *
+ * BeanBuilder builder = new BeanBuilder()
+ * builder.beans {
+ *   dataSource(BasicDataSource) {                  // &lt;--- invokeMethod
+ *      driverClassName = &quot;org.hsqldb.jdbcDriver&quot;
+ *      url = &quot;jdbc:hsqldb:mem:grailsDB&quot;
+ *      username = &quot;sa&quot;                            // &lt;-- setProperty
+ *      password = &quot;&quot;
+ *      settings = [mynew:&quot;setting&quot;]
+ *  }
+ *  sessionFactory(SessionFactory) {
+ *  	   dataSource = dataSource                 // &lt;-- getProperty for retrieving refs
+ *  }
+ *  myService(MyService) {
+ *      nestedBean = { AnotherBean bean-&gt;          // &lt;-- setProperty with closure for nested bean
+ *      		dataSource = dataSource
+ *      }
+ *  }
+ * }
+ * &lt;/pre&gt;
+ * &lt;p&gt;
+ *   You can also use the Spring IO API to load resources containing beans defined as a Groovy
+ *   script using either the constructors or the loadBeans(Resource[] resources) method
+ * &lt;/p&gt;
+ *
+ * @author Graeme Rocher
+ * @since 0.4
+ *
+ */
+public class BeanBuilder extends GroovyObjectSupport {
+    private static final String ANONYMOUS_BEAN = &quot;bean&quot;;
+<span class="nc" id="L87">    private RuntimeSpringConfiguration springConfig = new DefaultRuntimeSpringConfiguration();</span>
+    private BeanConfiguration currentBeanConfig;
+<span class="nc" id="L89">    private Map&lt;String,DeferredProperty&gt; deferredProperties = new HashMap&lt;String,DeferredProperty&gt;();</span>
+    private ApplicationContext parentCtx;
+<span class="nc" id="L91">    private Map binding = new HashMap();</span>
+<span class="nc" id="L92">    private ClassLoader classLoader = null;</span>
+
+
+    public BeanBuilder() {
+<span class="nc" id="L96">		super();</span>
+<span class="nc" id="L97">	}</span>
+
+    public BeanBuilder(ClassLoader classLoader) {
+<span class="nc" id="L100">		super();</span>
+<span class="nc" id="L101">		this.classLoader = classLoader;</span>
+<span class="nc" id="L102">	}</span>
+
+	public BeanBuilder(ApplicationContext parent) {
+<span class="nc" id="L105">		super();</span>
+<span class="nc" id="L106">		this.parentCtx = parent;</span>
+<span class="nc" id="L107">		this.springConfig = new DefaultRuntimeSpringConfiguration(parent);</span>
+<span class="nc" id="L108">	}</span>
+
+	public BeanBuilder(ApplicationContext parent,ClassLoader classLoader) {
+<span class="nc" id="L111">		super();</span>
+<span class="nc" id="L112">		this.parentCtx = parent;</span>
+<span class="nc" id="L113">		this.springConfig = new DefaultRuntimeSpringConfiguration(parent);</span>
+<span class="nc" id="L114">		this.classLoader = classLoader;</span>
+<span class="nc" id="L115">	}</span>
+
+    /**
+     * Parses the bean definition groovy script.
+     */
+    public void parse(InputStream script) {
+<span class="nc" id="L121">        parse(script,new Binding());</span>
+<span class="nc" id="L122">    }</span>
+
+    /**
+     * Parses the bean definition groovy script by first exporting the given {@link Binding}. 
+     */
+    public void parse(InputStream script, Binding binding) {
+<span class="nc bnc" id="L128" title="All 2 branches missed.">        if (script==null)</span>
+<span class="nc" id="L129">            throw new IllegalArgumentException(&quot;No script is provided&quot;);</span>
+<span class="nc" id="L130">        setBinding(binding);</span>
+<span class="nc" id="L131">        CompilerConfiguration cc = new CompilerConfiguration();</span>
+<span class="nc" id="L132">        cc.setScriptBaseClass(ClosureScript.class.getName());</span>
+<span class="nc" id="L133">        GroovyShell shell = new GroovyShell(classLoader,binding,cc);</span>
+
+<span class="nc" id="L135">        ClosureScript s = (ClosureScript)shell.parse(script);</span>
+<span class="nc" id="L136">        s.setDelegate(this);</span>
+<span class="nc" id="L137">        s.run();</span>
+<span class="nc" id="L138">    }</span>
+
+    /**
+	 * Retrieves the parent ApplicationContext
+	 * @return The parent ApplicationContext
+	 */
+	public ApplicationContext getParentCtx() {
+<span class="nc" id="L145">		return parentCtx;</span>
+	}
+
+	/**
+	 * Retrieves the RuntimeSpringConfiguration instance used the the BeanBuilder
+	 * @return The RuntimeSpringConfiguration instance
+	 */
+	public RuntimeSpringConfiguration getSpringConfig() {
+<span class="nc" id="L153">		return springConfig;</span>
+	}
+
+	/**
+	 * Retrieves a BeanDefinition for the given name
+	 * @param name The bean definition
+	 * @return The BeanDefinition instance
+	 */
+	public BeanDefinition getBeanDefinition(String name) {
+<span class="nc bnc" id="L162" title="All 2 branches missed.">		if(!getSpringConfig().containsBean(name))</span>
+<span class="nc" id="L163">			return null;</span>
+<span class="nc" id="L164">		return getSpringConfig().getBeanConfig(name).getBeanDefinition();</span>
+	}
+
+    /**
+     * Retrieves all BeanDefinitions for this BeanBuilder
+     *
+     * @return A map of BeanDefinition instances with the bean id as the key
+     */
+    public Map&lt;String,BeanDefinition&gt; getBeanDefinitions() {
+
+<span class="nc" id="L174">        Map&lt;String,BeanDefinition&gt; beanDefinitions = new HashMap&lt;String,BeanDefinition&gt;();</span>
+<span class="nc bnc" id="L175" title="All 2 branches missed.">        for (String beanName : getSpringConfig().getBeanNames()) {</span>
+<span class="nc" id="L176">            BeanDefinition bd = getSpringConfig()</span>
+<span class="nc" id="L177">                    .getBeanConfig(beanName)</span>
+<span class="nc" id="L178">                    .getBeanDefinition();</span>
+<span class="nc" id="L179">            beanDefinitions.put(beanName, bd);</span>
+        }
+<span class="nc" id="L181">        return beanDefinitions;</span>
+    }
+
+    /**
+	 * Sets the runtime Spring configuration instance to use. This is not necessary to set
+	 * and is configured to default value if not, but is useful for integrating with other
+	 * spring configuration mechanisms @see org.codehaus.groovy.grails.commons.spring.GrailsRuntimeConfigurator
+	 *
+	 * @param springConfig The spring config
+	 */
+	public void setSpringConfig(RuntimeSpringConfiguration springConfig) {
+<span class="nc" id="L192">		this.springConfig = springConfig;</span>
+<span class="nc" id="L193">	}</span>
+
+
+
+	/**
+	 * This class is used to defer the adding of a property to a bean definition until later
+	 * This is for a case where you assign a property to a list that may not contain bean references at
+	 * that point of asignment, but may later hence it would need to be managed
+	 *
+	 * @author Graeme Rocher
+	 */
+	private static class DeferredProperty {
+		private BeanConfiguration config;
+		private String name;
+		private Object value;
+
+<span class="nc" id="L209">		DeferredProperty(BeanConfiguration config, String name, Object value) {</span>
+<span class="nc" id="L210">			this.config = config;</span>
+<span class="nc" id="L211">			this.name = name;</span>
+<span class="nc" id="L212">			this.value = value;</span>
+<span class="nc" id="L213">		}</span>
+
+		public void setInBeanConfig() {
+<span class="nc" id="L216">			this.config.addProperty(name, value);</span>
+<span class="nc" id="L217">		}</span>
+	}
+
+	/**
+	 * A RuntimeBeanReference that takes care of adding new properties to runtime references
+	 *
+	 * @author Graeme Rocher
+	 * @since 0.4
+	 *
+	 */
+	private class ConfigurableRuntimeBeanReference extends RuntimeBeanReference implements GroovyObject {
+
+		private MetaClass metaClass;
+		private BeanConfiguration beanConfig;
+
+		public ConfigurableRuntimeBeanReference(String beanName, BeanConfiguration beanConfig) {
+<span class="nc" id="L233">			this(beanName, beanConfig, false);</span>
+<span class="nc" id="L234">		}</span>
+
+<span class="nc" id="L236">		public ConfigurableRuntimeBeanReference(String beanName, BeanConfiguration beanConfig, boolean toParent) {</span>
+<span class="nc" id="L237">			super(beanName, toParent);</span>
+<span class="nc" id="L238">			this.beanConfig = beanConfig;</span>
+<span class="nc bnc" id="L239" title="All 2 branches missed.">			if(beanConfig == null)</span>
+<span class="nc" id="L240">				throw new IllegalArgumentException(&quot;Argument [beanConfig] cannot be null&quot;);</span>
+<span class="nc" id="L241">			this.metaClass = InvokerHelper.getMetaClass(this);</span>
+<span class="nc" id="L242">		}</span>
+
+		public MetaClass getMetaClass() {
+<span class="nc" id="L245">			return this.metaClass;</span>
+		}
+
+		public Object getProperty(String property) {
+<span class="nc bnc" id="L249" title="All 2 branches missed.">			if(property.equals(&quot;beanName&quot;))</span>
+<span class="nc" id="L250">				return getBeanName();</span>
+<span class="nc bnc" id="L251" title="All 2 branches missed.">			else if(property.equals(&quot;source&quot;))</span>
+<span class="nc" id="L252">				return getSource();</span>
+<span class="nc bnc" id="L253" title="All 2 branches missed.">			else if(this.beanConfig != null) {</span>
+<span class="nc" id="L254">				return new WrappedPropertyValue(property,beanConfig.getPropertyValue(property));</span>
+			}
+			else
+<span class="nc" id="L257">				return this.metaClass.getProperty(this, property);</span>
+		}
+
+
+
+        /**
+		 * Wraps a BeanConfiguration property an ensures that any RuntimeReference additions to it are
+		 * deferred for resolution later
+		 *
+		 * @author Graeme Rocher
+		 * @since 0.4
+		 *
+		 */
+		private class WrappedPropertyValue extends GroovyObjectSupport {
+			private Object propertyValue;
+			private String propertyName;
+<span class="nc" id="L273">			public WrappedPropertyValue(String propertyName, Object propertyValue) {</span>
+<span class="nc" id="L274">				this.propertyValue = propertyValue;</span>
+<span class="nc" id="L275">				this.propertyName = propertyName;</span>
+<span class="nc" id="L276">			}</span>
+
+			public void leftShift(Object value) {
+<span class="nc" id="L279">				InvokerHelper.invokeMethod(propertyValue, &quot;leftShift&quot;, value);</span>
+<span class="nc bnc" id="L280" title="All 2 branches missed.">				if(value instanceof RuntimeBeanReference) {</span>
+<span class="nc" id="L281">					deferredProperties.put(beanConfig.getName(), new DeferredProperty(beanConfig, propertyName, propertyValue));</span>
+				}
+<span class="nc" id="L283">			}</span>
+		}
+		public Object invokeMethod(String name, Object args) {
+<span class="nc" id="L286">			return this.metaClass.invokeMethod(this, name, args);</span>
+		}
+
+		public void setMetaClass(MetaClass metaClass) {
+<span class="nc" id="L290">			this.metaClass = metaClass;</span>
+<span class="nc" id="L291">		}</span>
+
+		public void setProperty(String property, Object newValue) {
+<span class="nc bnc" id="L294" title="All 2 branches missed.">            if(!addToDeferred(beanConfig,property, newValue)) {</span>
+<span class="nc" id="L295">                beanConfig.setPropertyValue(property, newValue);</span>
+            }
+<span class="nc" id="L297">		}</span>
+	}
+	/**
+	 * Takes a resource pattern as (@see org.springframework.core.io.support.PathMatchingResourcePatternResolver)
+	 * This allows you load multiple bean resources in this single builder
+	 *
+	 * eg loadBeans(&quot;classpath:*Beans.groovy&quot;)
+	 *
+	 * @param resourcePattern
+	 * @throws IOException When the path cannot be matched
+	 */
+	public void loadBeans(String resourcePattern) throws IOException {
+<span class="nc" id="L309">		loadBeans(new PathMatchingResourcePatternResolver().getResources(resourcePattern));</span>
+<span class="nc" id="L310">	}</span>
+
+	/**
+	 * Loads a single Resource into the bean builder
+	 *
+	 * @param resource The resource to load
+	 * @throws IOException When an error occurs
+	 */
+	public void loadBeans(Resource resource) throws IOException {
+<span class="nc" id="L319">		loadBeans(new Resource[]{resource});</span>
+<span class="nc" id="L320">	}</span>
+
+	/**
+	 * Loads a set of given beans
+	 * @param resources The resources to load
+	 * @throws IOException
+	 */
+	public void loadBeans(Resource[] resources) throws IOException {
+<span class="nc" id="L328">		Closure beans = new Closure(this){</span>
+			@Override
+			public Object call(Object... args) {
+<span class="nc" id="L331">				return beans((Closure)args[0]);</span>
+			}
+		};
+<span class="nc" id="L334">		Binding b = new Binding();</span>
+<span class="nc" id="L335">		b.setVariable(&quot;beans&quot;, beans);</span>
+
+<span class="nc bnc" id="L337" title="All 2 branches missed.">		GroovyShell shell = classLoader != null ? new GroovyShell(classLoader,b) : new GroovyShell(b);</span>
+<span class="nc bnc" id="L338" title="All 2 branches missed.">        for (Resource resource : resources) {</span>
+<span class="nc" id="L339">            shell.evaluate(resource.getInputStream());</span>
+        }
+<span class="nc" id="L341">	}</span>
+
+    public void registerBeans(StaticApplicationContext ctx) {
+<span class="nc" id="L344">        finalizeDeferredProperties();</span>
+<span class="nc" id="L345">        springConfig.registerBeansWithContext(ctx);</span>
+<span class="nc" id="L346">    }</span>
+
+    public RuntimeBeanReference ref(String refName) {
+<span class="nc" id="L349">        return ref(refName,false);</span>
+    }
+
+    public RuntimeBeanReference parentRef(String refName) {
+<span class="nc" id="L353">        return ref(refName,true);</span>
+    }
+
+    public RuntimeBeanReference ref(String refName, boolean parentRef) {
+<span class="nc" id="L357">        return new RuntimeBeanReference(refName, parentRef);</span>
+    }
+
+    /**
+	 * This method is invoked by Groovy when a method that's not defined in Java is invoked.
+     * We use that as a syntax for bean definition. 
+	 */
+	public Object methodMissing(String name, Object arg) {
+<span class="nc" id="L365">        Object[] args = (Object[])arg;</span>
+
+<span class="nc bnc" id="L367" title="All 2 branches missed.">        if(args.length == 0)</span>
+<span class="nc" id="L368">			throw new MissingMethodException(name,getClass(),args);</span>
+
+<span class="nc bnc" id="L370" title="All 2 branches missed.">		if(args[0] instanceof Closure) {</span>
+            // abstract bean definition
+<span class="nc" id="L372">            return invokeBeanDefiningMethod(name, args);</span>
+		}
+<span class="nc bnc" id="L374" title="All 6 branches missed.">		else if(args[0] instanceof Class || args[0] instanceof RuntimeBeanReference || args[0] instanceof Map) {</span>
+<span class="nc" id="L375">			return invokeBeanDefiningMethod(name, args);</span>
+		}
+<span class="nc bnc" id="L377" title="All 4 branches missed.">		else if (args.length &gt; 1 &amp;&amp; args[args.length -1] instanceof Closure) {</span>
+<span class="nc" id="L378">			return invokeBeanDefiningMethod(name, args);</span>
+		}
+<span class="nc" id="L380">        WebApplicationContext ctx = springConfig.getUnrefreshedApplicationContext();</span>
+<span class="nc" id="L381">        MetaClass mc = DefaultGroovyMethods.getMetaClass(ctx);</span>
+<span class="nc bnc" id="L382" title="All 2 branches missed.">        if(!mc.respondsTo(ctx, name, args).isEmpty()){</span>
+<span class="nc" id="L383">            return mc.invokeMethod(ctx,name, args);</span>
+        }
+<span class="nc" id="L385">        return this;</span>
+	}
+
+    public WebApplicationContext createApplicationContext() {
+<span class="nc" id="L389">        finalizeDeferredProperties();</span>
+<span class="nc" id="L390">        return springConfig.getApplicationContext();</span>
+    }
+
+    private void finalizeDeferredProperties() {
+<span class="nc bnc" id="L394" title="All 2 branches missed.">        for (DeferredProperty dp : deferredProperties.values()) {</span>
+<span class="nc bnc" id="L395" title="All 2 branches missed.">            if (dp.value instanceof List) {</span>
+<span class="nc" id="L396">                dp.value = manageListIfNecessary((List)dp.value);</span>
+<span class="nc bnc" id="L397" title="All 2 branches missed.">            } else if (dp.value instanceof Map) {</span>
+<span class="nc" id="L398">                dp.value = manageMapIfNecessary((Map)dp.value);</span>
+            }
+<span class="nc" id="L400">            dp.setInBeanConfig();</span>
+        }
+<span class="nc" id="L402">		deferredProperties.clear();</span>
+<span class="nc" id="L403">	}</span>
+
+	private boolean addToDeferred(BeanConfiguration beanConfig,String property, Object newValue) {
+<span class="nc bnc" id="L406" title="All 2 branches missed.">		if(newValue instanceof List) {</span>
+<span class="nc" id="L407">			deferredProperties.put(currentBeanConfig.getName()+property,new DeferredProperty(currentBeanConfig, property, newValue));</span>
+<span class="nc" id="L408">			return true;</span>
+		}
+<span class="nc bnc" id="L410" title="All 2 branches missed.">		else if(newValue instanceof Map) {</span>
+<span class="nc" id="L411">			deferredProperties.put(currentBeanConfig.getName()+property,new DeferredProperty(currentBeanConfig, property, newValue));</span>
+<span class="nc" id="L412">			return true;</span>
+		}
+<span class="nc" id="L414">		return false;</span>
+	}
+	/**
+	 * This method is called when a bean definition node is called
+	 *
+	 * @param name The name of the bean to define
+	 * @param args The arguments to the bean. The first argument is the class name, the last argument is sometimes a closure. All
+	 * the arguments in between are constructor arguments
+	 * @return The bean configuration instance
+	 */
+	private BeanConfiguration invokeBeanDefiningMethod(String name, Object[] args) {
+<span class="nc" id="L425">        BeanConfiguration old = currentBeanConfig;</span>
+        try {
+<span class="nc bnc" id="L427" title="All 2 branches missed.">            if(args[0] instanceof Class) {</span>
+<span class="nc bnc" id="L428" title="All 2 branches missed.">                Class beanClass = args[0] instanceof Class ? (Class)args[0] : args[0].getClass();</span>
+
+<span class="nc bnc" id="L430" title="All 2 branches missed.">                if(args.length &gt;= 1) {</span>
+<span class="nc bnc" id="L431" title="All 2 branches missed.">                    if(args[args.length-1] instanceof Closure) {</span>
+<span class="nc bnc" id="L432" title="All 2 branches missed.">                        if(args.length-1 != 1) {</span>
+<span class="nc" id="L433">                            Object[] constructorArgs = ArrayUtils.subarray(args, 1, args.length-1);</span>
+<span class="nc" id="L434">                            filterGStringReferences(constructorArgs);</span>
+<span class="nc bnc" id="L435" title="All 2 branches missed.">                            if(name.equals(ANONYMOUS_BEAN))</span>
+<span class="nc" id="L436">                                currentBeanConfig = springConfig.createSingletonBean(beanClass,Arrays.asList(constructorArgs));</span>
+                            else
+<span class="nc" id="L438">                                currentBeanConfig = springConfig.addSingletonBean(name, beanClass, Arrays.asList(constructorArgs));</span>
+<span class="nc" id="L439">                        }</span>
+                        else {
+<span class="nc bnc" id="L441" title="All 2 branches missed.">                            if(name.equals(ANONYMOUS_BEAN))</span>
+<span class="nc" id="L442">                                currentBeanConfig = springConfig.createSingletonBean(beanClass);</span>
+                            else
+<span class="nc" id="L444">                                currentBeanConfig = springConfig.addSingletonBean(name, beanClass);</span>
+                        }
+<span class="nc" id="L446">                    }</span>
+                    else  {
+<span class="nc" id="L448">                        Object[] constructorArgs = ArrayUtils.subarray(args, 1, args.length);</span>
+<span class="nc" id="L449">                        filterGStringReferences(constructorArgs);</span>
+<span class="nc bnc" id="L450" title="All 2 branches missed.">                        if(name.equals(ANONYMOUS_BEAN))</span>
+<span class="nc" id="L451">                            currentBeanConfig = springConfig.createSingletonBean(beanClass,Arrays.asList(constructorArgs));</span>
+                        else
+<span class="nc" id="L453">                            currentBeanConfig = springConfig.addSingletonBean(name, beanClass, Arrays.asList(constructorArgs));</span>
+                    }
+
+                }
+<span class="nc" id="L457">            }</span>
+<span class="nc bnc" id="L458" title="All 2 branches missed.">            else if(args[0] instanceof RuntimeBeanReference) {</span>
+<span class="nc" id="L459">                currentBeanConfig = springConfig.addSingletonBean(name);</span>
+<span class="nc" id="L460">                currentBeanConfig.setFactoryBean(((RuntimeBeanReference)args[0]).getBeanName());</span>
+<span class="nc" id="L461">            }</span>
+<span class="nc bnc" id="L462" title="All 2 branches missed.">            else if(args[0] instanceof Map) {</span>
+<span class="nc" id="L463">                currentBeanConfig = springConfig.addSingletonBean(name);</span>
+<span class="nc" id="L464">                Map.Entry factoryBeanEntry = (Map.Entry)((Map)args[0]).entrySet().iterator().next();</span>
+<span class="nc" id="L465">                currentBeanConfig.setFactoryBean(factoryBeanEntry.getKey().toString());</span>
+<span class="nc" id="L466">                currentBeanConfig.setFactoryMethod(factoryBeanEntry.getValue().toString());</span>
+<span class="nc" id="L467">            }</span>
+<span class="nc bnc" id="L468" title="All 2 branches missed.">            else if(args[0] instanceof Closure) {</span>
+<span class="nc" id="L469">                currentBeanConfig = springConfig.addAbstractBean(name);</span>
+<span class="nc" id="L470">            }</span>
+            else {
+                Object[] constructorArgs;
+<span class="nc bnc" id="L473" title="All 2 branches missed.">                if(args[args.length-1] instanceof Closure) {</span>
+<span class="nc" id="L474">                    constructorArgs= ArrayUtils.subarray(args, 0, args.length-1);</span>
+<span class="nc" id="L475">                }</span>
+                else {
+<span class="nc" id="L477">                    constructorArgs= ArrayUtils.subarray(args, 0, args.length);</span>
+                }
+<span class="nc" id="L479">                filterGStringReferences(constructorArgs);</span>
+<span class="nc" id="L480">                currentBeanConfig = new DefaultBeanConfiguration(name, null, Arrays.asList(constructorArgs));</span>
+<span class="nc" id="L481">                springConfig.addBeanConfiguration(name,currentBeanConfig);</span>
+            }
+<span class="nc bnc" id="L483" title="All 2 branches missed.">            if(args[args.length-1] instanceof Closure) {</span>
+<span class="nc" id="L484">                Closure callable = (Closure)args[args.length-1];</span>
+<span class="nc" id="L485">                callable.setDelegate(this);</span>
+<span class="nc" id="L486">                callable.setResolveStrategy(Closure.DELEGATE_FIRST);</span>
+<span class="nc" id="L487">                callable.call(new Object[]{currentBeanConfig});</span>
+
+            }
+
+<span class="nc" id="L491">            return currentBeanConfig;</span>
+<span class="nc" id="L492">        } finally {</span>
+<span class="nc" id="L493">            currentBeanConfig = old;</span>
+<span class="nc" id="L494">        }</span>
+    }
+
+    private void filterGStringReferences(Object[] constructorArgs) {
+<span class="nc bnc" id="L498" title="All 2 branches missed.">        for (int i = 0; i &lt; constructorArgs.length; i++) {</span>
+<span class="nc" id="L499">            Object constructorArg = constructorArgs[i];</span>
+<span class="nc bnc" id="L500" title="All 2 branches missed.">            if(constructorArg instanceof GString) constructorArgs[i] = constructorArg.toString();</span>
+        }
+<span class="nc" id="L502">    }</span>
+
+    /**
+	 * When an methods argument is only a closure it is a set of bean definitions
+	 *
+	 * @param callable The closure argument
+	 */
+	public BeanBuilder beans(Closure callable) {
+<span class="nc" id="L510">		callable.setDelegate(this);</span>
+  //      callable.setResolveStrategy(Closure.DELEGATE_FIRST);
+<span class="nc" id="L512">        callable.call();</span>
+<span class="nc" id="L513">		finalizeDeferredProperties();</span>
+
+<span class="nc" id="L515">        return this;</span>
+    }
+
+    /**
+	 * This method overrides property setting in the scope of the BeanBuilder to set
+	 * properties on the current BeanConfiguration
+	 */
+	@Override
+	public void setProperty(String name, Object value) {
+<span class="nc bnc" id="L524" title="All 2 branches missed.">		if(currentBeanConfig != null) {</span>
+<span class="nc bnc" id="L525" title="All 2 branches missed.">			if(value instanceof GString)value = value.toString();</span>
+<span class="nc bnc" id="L526" title="All 2 branches missed.">			if(addToDeferred(currentBeanConfig, name, value)) {</span>
+<span class="nc" id="L527">				return;</span>
+			}
+<span class="nc bnc" id="L529" title="All 2 branches missed.">			else if(value instanceof Closure) {</span>
+<span class="nc" id="L530">				BeanConfiguration current = currentBeanConfig;</span>
+				try {
+<span class="nc" id="L532">					Closure callable = (Closure)value;</span>
+
+<span class="nc" id="L534">					Class parameterType = callable.getParameterTypes()[0];</span>
+<span class="nc bnc" id="L535" title="All 2 branches missed.">					if(parameterType.equals(Object.class)) {</span>
+<span class="nc" id="L536">						currentBeanConfig = springConfig.createSingletonBean(&quot;&quot;);</span>
+<span class="nc" id="L537">						callable.call(new Object[]{currentBeanConfig});</span>
+<span class="nc" id="L538">					}</span>
+					else {
+<span class="nc" id="L540">						currentBeanConfig = springConfig.createSingletonBean(parameterType);</span>
+<span class="nc" id="L541">						callable.call(null);</span>
+					}
+
+<span class="nc" id="L544">					value = currentBeanConfig.getBeanDefinition();</span>
+<span class="nc" id="L545">				}</span>
+<span class="nc" id="L546">				finally {</span>
+<span class="nc" id="L547">					currentBeanConfig = current;</span>
+<span class="nc" id="L548">				}</span>
+			}
+<span class="nc" id="L550">            currentBeanConfig.addProperty(name, value);</span>
+<span class="nc" id="L551">		} else {</span>
+<span class="nc" id="L552">            binding.put(name,value);</span>
+        }
+<span class="nc" id="L554">	}</span>
+
+	/**
+	 * Checks whether there are any runtime refs inside a Map and converts
+	 * it to a ManagedMap if necessary
+	 *
+	 * @param value The current map
+	 * @return A ManagedMap or a normal map
+	 */
+	private Object manageMapIfNecessary(Map&lt;Object, Object&gt; value) {
+<span class="nc" id="L564">		boolean containsRuntimeRefs = false;</span>
+<span class="nc bnc" id="L565" title="All 2 branches missed.">        for (Entry&lt;Object, Object&gt; e : value.entrySet()) {</span>
+<span class="nc" id="L566">            Object v = e.getValue();</span>
+<span class="nc bnc" id="L567" title="All 2 branches missed.">            if (v instanceof RuntimeBeanReference) {</span>
+<span class="nc" id="L568">                containsRuntimeRefs = true;</span>
+            }
+<span class="nc bnc" id="L570" title="All 2 branches missed.">            if (v instanceof BeanConfiguration) {</span>
+<span class="nc" id="L571">                BeanConfiguration c = (BeanConfiguration) v;</span>
+<span class="nc" id="L572">                e.setValue(c.getBeanDefinition());</span>
+<span class="nc" id="L573">                containsRuntimeRefs = true;</span>
+            }
+        }
+<span class="nc bnc" id="L576" title="All 2 branches missed.">		if(containsRuntimeRefs) {</span>
+//			return new ManagedMap(map);
+<span class="nc" id="L578">            ManagedMap m = new ManagedMap();</span>
+<span class="nc" id="L579">            m.putAll(value);</span>
+<span class="nc" id="L580">            return m;</span>
+        }
+<span class="nc" id="L582">		return value;</span>
+	}
+
+	/**
+	 * Checks whether there are any runtime refs inside the list and
+	 * converts it to a ManagedList if necessary
+	 *
+	 * @param value The object that represents the list
+	 * @return Either a new list or a managed one
+	 */
+	private Object manageListIfNecessary(List&lt;Object&gt; value) {
+<span class="nc" id="L593">		boolean containsRuntimeRefs = false;</span>
+<span class="nc bnc" id="L594" title="All 2 branches missed.">		for (ListIterator&lt;Object&gt; i = value.listIterator(); i.hasNext();) {</span>
+<span class="nc" id="L595">			Object e = i.next();</span>
+<span class="nc bnc" id="L596" title="All 2 branches missed.">			if(e instanceof RuntimeBeanReference) {</span>
+<span class="nc" id="L597">				containsRuntimeRefs = true;</span>
+			}
+<span class="nc bnc" id="L599" title="All 2 branches missed.">            if (e instanceof BeanConfiguration) {</span>
+<span class="nc" id="L600">                BeanConfiguration c = (BeanConfiguration) e;</span>
+<span class="nc" id="L601">                i.set(c.getBeanDefinition());</span>
+<span class="nc" id="L602">                containsRuntimeRefs = true;</span>
+            }
+        }
+<span class="nc bnc" id="L605" title="All 2 branches missed.">		if(containsRuntimeRefs) {</span>
+<span class="nc" id="L606">			List tmp = new ManagedList();</span>
+<span class="nc" id="L607">			tmp.addAll(value);</span>
+<span class="nc" id="L608">			value = tmp;</span>
+		}
+<span class="nc" id="L610">		return value;</span>
+	}
+
+	/**
+	 * This method overrides property retrieval in the scope of the BeanBuilder to either:
+	 *
+	 * a) Retrieve a variable from the bean builder's binding if it exits
+	 * b) Retrieve a RuntimeBeanReference for a specific bean if it exists
+	 * c) Otherwise just delegate to super.getProperty which will resolve properties from the BeanBuilder itself
+	 */
+	@Override
+	public Object getProperty(String name) {
+<span class="nc bnc" id="L622" title="All 2 branches missed.">		if(binding.containsKey(name)) {</span>
+<span class="nc" id="L623">			return binding.get(name);</span>
+		}
+		else {
+<span class="nc bnc" id="L626" title="All 2 branches missed.">			if(springConfig.containsBean(name)) {</span>
+<span class="nc" id="L627">				BeanConfiguration beanConfig = springConfig.getBeanConfig(name);</span>
+<span class="nc bnc" id="L628" title="All 2 branches missed.">				if(beanConfig != null) {</span>
+<span class="nc" id="L629">					return new ConfigurableRuntimeBeanReference(name, springConfig.getBeanConfig(name) ,false);</span>
+				}
+				else
+<span class="nc" id="L632">					return new RuntimeBeanReference(name,false);</span>
+			}
+			// this is to deal with the case where the property setter is the last
+			// statement in a closure (hence the return value)
+<span class="nc bnc" id="L636" title="All 2 branches missed.">			else if(currentBeanConfig != null) {</span>
+<span class="nc bnc" id="L637" title="All 2 branches missed.">				if(currentBeanConfig.hasProperty(name))</span>
+<span class="nc" id="L638">					return currentBeanConfig.getPropertyValue(name);</span>
+				else {
+<span class="nc" id="L640">					DeferredProperty dp = deferredProperties.get(currentBeanConfig.getName()+name);</span>
+<span class="nc bnc" id="L641" title="All 2 branches missed.">					if(dp!=null) {</span>
+<span class="nc" id="L642">						return dp.value;</span>
+					}
+					else {
+<span class="nc" id="L645">						return super.getProperty(name);</span>
+					}
+				}
+			}
+			else {
+<span class="nc" id="L650">				return super.getProperty(name);</span>
+			}
+		}
+	}
+
+	/**
+	 * Sets the binding (the variables available in the scope of the BeanBuilder)
+	 * @param b The Binding instance
+	 */
+	public void setBinding(Binding b) {
+<span class="nc" id="L660">		this.binding = b.getVariables();</span>
+<span class="nc" id="L661">	}</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

@@ -1,0 +1,596 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>CLI.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">cli</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.cli</a> &gt; <span class="el_source">CLI.java</span></div><h1>CLI.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">/*</span>
+ * The MIT License
+ *
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.cli;
+
+import hudson.cli.client.Messages;
+import hudson.remoting.Channel;
+import hudson.remoting.PingThread;
+import hudson.remoting.Pipe;
+import hudson.remoting.RemoteInputStream;
+import hudson.remoting.RemoteOutputStream;
+import hudson.remoting.SocketChannelStream;
+import hudson.remoting.SocketOutputStream;
+
+import javax.crypto.SecretKey;
+import javax.crypto.spec.SecretKeySpec;
+import javax.net.ssl.HostnameVerifier;
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLSession;
+import javax.net.ssl.TrustManager;
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.BufferedReader;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.Closeable;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.io.PrintStream;
+import java.io.StringReader;
+import java.net.HttpURLConnection;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.net.URL;
+import java.net.URLConnection;
+import java.security.GeneralSecurityException;
+import java.security.KeyPair;
+import java.security.PublicKey;
+import java.security.SecureRandom;
+import java.security.Signature;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.Locale;
+import java.util.Properties;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import static java.util.logging.Level.*;
+
+/**
+ * CLI entry point to Jenkins.
+ * 
+ * @author Kohsuke Kawaguchi
+ */
+public class CLI {
+    private final ExecutorService pool;
+    private final Channel channel;
+    private final CliEntryPoint entryPoint;
+    private final boolean ownsPool;
+<span class="nc" id="L88">    private final List&lt;Closeable&gt; closables = new ArrayList&lt;Closeable&gt;(); // stuff to close in the close method</span>
+    private final String httpsProxyTunnel;
+    private final String authorization;
+
+    public CLI(URL jenkins) throws IOException, InterruptedException {
+<span class="nc" id="L93">        this(jenkins,null);</span>
+<span class="nc" id="L94">    }</span>
+
+    /**
+     * @deprecated
+     *      Use {@link CLIConnectionFactory} to create {@link CLI}
+     */
+    @Deprecated
+    public CLI(URL jenkins, ExecutorService exec) throws IOException, InterruptedException {
+<span class="nc" id="L102">        this(jenkins,exec,null);</span>
+<span class="nc" id="L103">    }</span>
+
+    /**
+     * @deprecated 
+     *      Use {@link CLIConnectionFactory} to create {@link CLI}
+     */
+    @Deprecated
+    public CLI(URL jenkins, ExecutorService exec, String httpsProxyTunnel) throws IOException, InterruptedException {
+<span class="nc" id="L111">        this(new CLIConnectionFactory().url(jenkins).executorService(exec).httpsProxyTunnel(httpsProxyTunnel));</span>
+<span class="nc" id="L112">    }</span>
+    
+<span class="nc" id="L114">    /*package*/ CLI(CLIConnectionFactory factory) throws IOException, InterruptedException {</span>
+<span class="nc" id="L115">        URL jenkins = factory.jenkins;</span>
+<span class="nc" id="L116">        this.httpsProxyTunnel = factory.httpsProxyTunnel;</span>
+<span class="nc" id="L117">        this.authorization = factory.authorization;</span>
+<span class="nc" id="L118">        ExecutorService exec = factory.exec;</span>
+        
+<span class="nc" id="L120">        String url = jenkins.toExternalForm();</span>
+<span class="nc bnc" id="L121" title="All 2 branches missed.">        if(!url.endsWith(&quot;/&quot;))  url+='/';</span>
+
+<span class="nc bnc" id="L123" title="All 2 branches missed.">        ownsPool = exec==null;</span>
+<span class="nc bnc" id="L124" title="All 2 branches missed.">        pool = exec!=null ? exec : Executors.newCachedThreadPool();</span>
+
+        Channel _channel;
+        try {
+<span class="nc" id="L128">            _channel = connectViaCliPort(jenkins, getCliTcpPort(url));</span>
+<span class="nc" id="L129">        } catch (IOException e) {</span>
+<span class="nc" id="L130">            LOGGER.log(Level.FINE,&quot;Failed to connect via CLI port. Falling back to HTTP&quot;,e);</span>
+            try {
+<span class="nc" id="L132">                _channel = connectViaHttp(url);</span>
+<span class="nc" id="L133">            } catch (IOException e2) {</span>
+                try { // Java 7: e.addSuppressed(e2);
+<span class="nc" id="L135">                    Throwable.class.getMethod(&quot;addSuppressed&quot;, Throwable.class).invoke(e, e2);</span>
+<span class="nc" id="L136">                } catch (NoSuchMethodException _ignore) {</span>
+                    // Java 6
+<span class="nc" id="L138">                } catch (Exception _huh) {</span>
+<span class="nc" id="L139">                    LOGGER.log(Level.SEVERE, null, _huh);</span>
+                }
+<span class="nc" id="L141">                throw e;</span>
+            }
+        }
+<span class="nc" id="L144">        this.channel = _channel;</span>
+
+        // execute the command
+<span class="nc" id="L147">        entryPoint = (CliEntryPoint)_channel.waitForRemoteProperty(CliEntryPoint.class.getName());</span>
+
+<span class="nc bnc" id="L149" title="All 2 branches missed.">        if(entryPoint.protocolVersion()!=CliEntryPoint.VERSION)</span>
+<span class="nc" id="L150">            throw new IOException(Messages.CLI_VersionMismatch());</span>
+<span class="nc" id="L151">    }</span>
+
+    private Channel connectViaHttp(String url) throws IOException {
+<span class="nc" id="L154">        LOGGER.log(FINE, &quot;Trying to connect to {0} via HTTP&quot;, url);</span>
+<span class="nc" id="L155">        url+=&quot;cli&quot;;</span>
+<span class="nc" id="L156">        URL jenkins = new URL(url);</span>
+
+<span class="nc" id="L158">        FullDuplexHttpStream con = new FullDuplexHttpStream(jenkins,authorization);</span>
+<span class="nc" id="L159">        Channel ch = new Channel(&quot;Chunked connection to &quot;+jenkins,</span>
+<span class="nc" id="L160">                pool,con.getInputStream(),con.getOutputStream());</span>
+<span class="nc" id="L161">        final long interval = 15*1000;</span>
+<span class="nc" id="L162">        final long timeout = (interval * 3) / 4;</span>
+<span class="nc" id="L163">        new PingThread(ch,timeout,interval) {</span>
+            protected void onDead() {
+                // noop. the point of ping is to keep the connection alive
+                // as most HTTP servers have a rather short read time out
+<span class="nc" id="L167">            }</span>
+<span class="nc" id="L168">        }.start();</span>
+<span class="nc" id="L169">        return ch;</span>
+    }
+
+    private Channel connectViaCliPort(URL jenkins, CliPort clip) throws IOException {
+<span class="nc" id="L173">        LOGGER.log(FINE, &quot;Trying to connect directly via TCP/IP to {0}&quot;, clip.endpoint);</span>
+<span class="nc" id="L174">        final Socket s = new Socket();</span>
+        // this prevents a connection from silently terminated by the router in between or the other peer
+        // and that goes without unnoticed. However, the time out is often very long (for example 2 hours
+        // by default in Linux) that this alone is enough to prevent that.
+<span class="nc" id="L178">        s.setKeepAlive(true);</span>
+        // we take care of buffering on our own
+<span class="nc" id="L180">        s.setTcpNoDelay(true);</span>
+        OutputStream out;
+
+<span class="nc bnc" id="L183" title="All 2 branches missed.">        if (httpsProxyTunnel!=null) {</span>
+<span class="nc" id="L184">            String[] tokens = httpsProxyTunnel.split(&quot;:&quot;);</span>
+<span class="nc" id="L185">            s.connect(new InetSocketAddress(tokens[0], Integer.parseInt(tokens[1])));</span>
+<span class="nc" id="L186">            PrintStream o = new PrintStream(s.getOutputStream());</span>
+<span class="nc" id="L187">            o.print(&quot;CONNECT &quot; + clip.endpoint.getHostName() + &quot;:&quot; + clip.endpoint.getPort() + &quot; HTTP/1.0\r\n\r\n&quot;);</span>
+
+            // read the response from the proxy
+<span class="nc" id="L190">            ByteArrayOutputStream rsp = new ByteArrayOutputStream();</span>
+<span class="nc bnc" id="L191" title="All 2 branches missed.">            while (!rsp.toString(&quot;ISO-8859-1&quot;).endsWith(&quot;\r\n\r\n&quot;)) {</span>
+<span class="nc" id="L192">                int ch = s.getInputStream().read();</span>
+<span class="nc bnc" id="L193" title="All 2 branches missed.">                if (ch&lt;0)   throw new IOException(&quot;Failed to read the HTTP proxy response: &quot;+rsp);</span>
+<span class="nc" id="L194">                rsp.write(ch);</span>
+            }
+<span class="nc" id="L196">            String head = new BufferedReader(new StringReader(rsp.toString(&quot;ISO-8859-1&quot;))).readLine();</span>
+<span class="nc bnc" id="L197" title="All 2 branches missed.">            if (!head.startsWith(&quot;HTTP/1.0 200 &quot;))</span>
+<span class="nc" id="L198">                throw new IOException(&quot;Failed to establish a connection through HTTP proxy: &quot;+rsp);</span>
+
+            // HTTP proxies (at least the one I tried --- squid) doesn't seem to do half-close very well.
+            // So instead of relying on it, we'll just send the close command and then let the server
+            // cut their side, then close the socket after the join.
+<span class="nc" id="L203">            out = new SocketOutputStream(s) {</span>
+                @Override
+                public void close() throws IOException {
+                    // ignore
+<span class="nc" id="L207">                }</span>
+            };
+<span class="nc" id="L209">        } else {</span>
+<span class="nc" id="L210">            s.connect(clip.endpoint,3000);</span>
+<span class="nc" id="L211">            out = SocketChannelStream.out(s);</span>
+        }
+
+<span class="nc" id="L214">        closables.add(new Closeable() {</span>
+            public void close() throws IOException {
+<span class="nc" id="L216">                s.close();</span>
+<span class="nc" id="L217">            }</span>
+        });
+
+<span class="nc" id="L220">        Connection c = new Connection(SocketChannelStream.in(s),out);</span>
+
+<span class="nc bnc" id="L222" title="All 3 branches missed.">        switch (clip.version) {</span>
+        case 1:
+<span class="nc" id="L224">            DataOutputStream dos = new DataOutputStream(s.getOutputStream());</span>
+<span class="nc" id="L225">            dos.writeUTF(&quot;Protocol:CLI-connect&quot;);</span>
+            // we aren't checking greeting from the server here because I'm too lazy. It gets ignored by Channel constructor.
+<span class="nc" id="L227">            break;</span>
+        case 2:
+<span class="nc" id="L229">            DataInputStream dis = new DataInputStream(s.getInputStream());</span>
+<span class="nc" id="L230">            dos = new DataOutputStream(s.getOutputStream());</span>
+<span class="nc" id="L231">            dos.writeUTF(&quot;Protocol:CLI2-connect&quot;);</span>
+<span class="nc" id="L232">            String greeting = dis.readUTF();</span>
+<span class="nc bnc" id="L233" title="All 2 branches missed.">            if (!greeting.equals(&quot;Welcome&quot;))</span>
+<span class="nc" id="L234">                throw new IOException(&quot;Handshaking failed: &quot;+greeting);</span>
+            try {
+<span class="nc" id="L236">                byte[] secret = c.diffieHellman(false).generateSecret();</span>
+<span class="nc" id="L237">                SecretKey sessionKey = new SecretKeySpec(Connection.fold(secret,128/8),&quot;AES&quot;);</span>
+<span class="nc" id="L238">                c = c.encryptConnection(sessionKey,&quot;AES/CFB8/NoPadding&quot;);</span>
+
+                // validate the instance identity, so that we can be sure that we are talking to the same server
+                // and there's no one in the middle.
+<span class="nc" id="L242">                byte[] signature = c.readByteArray();</span>
+
+<span class="nc bnc" id="L244" title="All 2 branches missed.">                if (clip.identity!=null) {</span>
+<span class="nc" id="L245">                    Signature verifier = Signature.getInstance(&quot;SHA1withRSA&quot;);</span>
+<span class="nc" id="L246">                    verifier.initVerify(clip.getIdentity());</span>
+<span class="nc" id="L247">                    verifier.update(secret);</span>
+<span class="nc bnc" id="L248" title="All 2 branches missed.">                    if (!verifier.verify(signature))</span>
+<span class="nc" id="L249">                        throw new IOException(&quot;Server identity signature validation failed.&quot;);</span>
+                }
+
+<span class="nc" id="L252">            } catch (GeneralSecurityException e) {</span>
+<span class="nc" id="L253">                throw (IOException)new IOException(&quot;Failed to negotiate transport security&quot;).initCause(e);</span>
+            }
+        }
+
+<span class="nc" id="L257">        return new Channel(&quot;CLI connection to &quot;+jenkins, pool,</span>
+<span class="nc" id="L258">                new BufferedInputStream(c.in), new BufferedOutputStream(c.out));</span>
+    }
+
+    /**
+     * If the server advertises CLI endpoint, returns its location.
+     */
+    protected CliPort getCliTcpPort(String url) throws IOException {
+<span class="nc" id="L265">        URL _url = new URL(url);</span>
+<span class="nc bnc" id="L266" title="All 4 branches missed.">        if (_url.getHost()==null || _url.getHost().length()==0) {</span>
+<span class="nc" id="L267">            throw new IOException(&quot;Invalid URL: &quot;+url);</span>
+        }
+<span class="nc" id="L269">        URLConnection head = _url.openConnection();</span>
+        try {
+<span class="nc" id="L271">            head.connect();</span>
+<span class="nc" id="L272">        } catch (IOException e) {</span>
+<span class="nc" id="L273">            throw (IOException)new IOException(&quot;Failed to connect to &quot;+url).initCause(e);</span>
+        }
+
+<span class="nc" id="L276">        String h = head.getHeaderField(&quot;X-Jenkins-CLI-Host&quot;);</span>
+<span class="nc bnc" id="L277" title="All 2 branches missed.">        if (h==null)    h = head.getURL().getHost();</span>
+<span class="nc" id="L278">        String p1 = head.getHeaderField(&quot;X-Jenkins-CLI-Port&quot;);</span>
+<span class="nc bnc" id="L279" title="All 2 branches missed.">        if (p1==null)    p1 = head.getHeaderField(&quot;X-Hudson-CLI-Port&quot;);   // backward compatibility</span>
+<span class="nc" id="L280">        String p2 = head.getHeaderField(&quot;X-Jenkins-CLI2-Port&quot;);</span>
+
+<span class="nc" id="L282">        String identity = head.getHeaderField(&quot;X-Instance-Identity&quot;);</span>
+
+<span class="nc" id="L284">        flushURLConnection(head);</span>
+<span class="nc bnc" id="L285" title="All 4 branches missed.">        if (p1==null &amp;&amp; p2==null) {</span>
+            // we aren't finding headers we are expecting. Is this even running Jenkins?
+<span class="nc bnc" id="L287" title="All 4 branches missed.">            if (head.getHeaderField(&quot;X-Hudson&quot;)==null &amp;&amp; head.getHeaderField(&quot;X-Jenkins&quot;)==null)</span>
+<span class="nc" id="L288">                throw new IOException(&quot;There's no Jenkins running at &quot;+url);</span>
+
+<span class="nc" id="L290">            throw new IOException(&quot;No X-Jenkins-CLI2-Port among &quot; + head.getHeaderFields().keySet());</span>
+        }
+
+<span class="nc bnc" id="L293" title="All 2 branches missed.">        if (p2!=null)   return new CliPort(new InetSocketAddress(h,Integer.parseInt(p2)),identity,2);</span>
+<span class="nc" id="L294">        else            return new CliPort(new InetSocketAddress(h,Integer.parseInt(p1)),identity,1);</span>
+    }
+
+    /**
+     * Flush the supplied {@link URLConnection} input and close the
+     * connection nicely.
+     * @param conn the connection to flush/close
+     */
+    private void flushURLConnection(URLConnection conn) {
+<span class="nc" id="L303">        byte[] buf = new byte[1024];</span>
+        try {
+<span class="nc" id="L305">            InputStream is = conn.getInputStream();</span>
+<span class="nc bnc" id="L306" title="All 2 branches missed.">            while (is.read(buf) &gt;= 0) {</span>
+                // Ignore
+            }
+<span class="nc" id="L309">            is.close();</span>
+<span class="nc" id="L310">        } catch (IOException e) {</span>
+            try {
+<span class="nc" id="L312">                InputStream es = ((HttpURLConnection)conn).getErrorStream();</span>
+<span class="nc bnc" id="L313" title="All 2 branches missed.">                if (es!=null) {</span>
+<span class="nc bnc" id="L314" title="All 2 branches missed.">                    while (es.read(buf) &gt;= 0) {</span>
+                        // Ignore
+                    }
+<span class="nc" id="L317">                    es.close();</span>
+                }
+<span class="nc" id="L319">            } catch (IOException ex) {</span>
+                // Ignore
+            }
+        }
+<span class="nc" id="L323">    }</span>
+
+    /**
+     * Shuts down the channel and closes the underlying connection.
+     */
+    public void close() throws IOException, InterruptedException {
+<span class="nc" id="L329">        channel.close();</span>
+<span class="nc" id="L330">        channel.join();</span>
+<span class="nc bnc" id="L331" title="All 2 branches missed.">        if(ownsPool)</span>
+<span class="nc" id="L332">            pool.shutdown();</span>
+<span class="nc bnc" id="L333" title="All 2 branches missed.">        for (Closeable c : closables)</span>
+<span class="nc" id="L334">            c.close();</span>
+<span class="nc" id="L335">    }</span>
+
+    public int execute(List&lt;String&gt; args, InputStream stdin, OutputStream stdout, OutputStream stderr) {
+<span class="nc" id="L338">        return entryPoint.main(args, Locale.getDefault(),</span>
+<span class="nc" id="L339">                new RemoteInputStream(stdin),</span>
+<span class="nc" id="L340">                new RemoteOutputStream(stdout),</span>
+<span class="nc" id="L341">                new RemoteOutputStream(stderr));</span>
+    }
+
+    public int execute(List&lt;String&gt; args) {
+<span class="nc" id="L345">        return execute(args, System.in, System.out, System.err);</span>
+    }
+
+    public int execute(String... args) {
+<span class="nc" id="L349">        return execute(Arrays.asList(args));</span>
+    }
+
+    /**
+     * Returns true if the named command exists.
+     */
+    public boolean hasCommand(String name) {
+<span class="nc" id="L356">        return entryPoint.hasCommand(name);</span>
+    }
+
+    /**
+     * Accesses the underlying communication channel.
+     * @since 1.419
+     */
+    public Channel getChannel() {
+<span class="nc" id="L364">        return channel;</span>
+    }
+
+    /**
+     * Attempts to lift the security restriction on the underlying channel.
+     * This requires the administer privilege on the server.
+     *
+     * @throws SecurityException
+     *      If we fail to upgrade the connection.
+     */
+    public void upgrade() {
+<span class="nc" id="L375">        ByteArrayOutputStream out = new ByteArrayOutputStream();</span>
+<span class="nc bnc" id="L376" title="All 2 branches missed.">        if (execute(Arrays.asList(&quot;groovy&quot;, &quot;=&quot;),</span>
+<span class="nc" id="L377">                new ByteArrayInputStream(&quot;hudson.remoting.Channel.current().setRestricted(false)&quot;.getBytes()),</span>
+<span class="nc" id="L378">                out,out)!=0)</span>
+<span class="nc" id="L379">            throw new SecurityException(out.toString()); // failed to upgrade</span>
+<span class="nc" id="L380">    }</span>
+
+    public static void main(final String[] _args) throws Exception {
+//        Logger l = Logger.getLogger(Channel.class.getName());
+//        l.setLevel(ALL);
+//        ConsoleHandler h = new ConsoleHandler();
+//        h.setLevel(ALL);
+//        l.addHandler(h);
+//
+        try {
+<span class="nc" id="L390">            System.exit(_main(_args));</span>
+<span class="nc" id="L391">        } catch (Throwable t) {</span>
+            // if the CLI main thread die, make sure to kill the JVM.
+<span class="nc" id="L393">            t.printStackTrace();</span>
+<span class="nc" id="L394">            System.exit(-1);</span>
+        }
+<span class="nc" id="L396">    }</span>
+
+    public static int _main(String[] _args) throws Exception {
+<span class="nc" id="L399">        List&lt;String&gt; args = Arrays.asList(_args);</span>
+<span class="nc" id="L400">        PrivateKeyProvider provider = new PrivateKeyProvider();</span>
+<span class="nc" id="L401">        boolean sshAuthRequestedExplicitly = false;</span>
+<span class="nc" id="L402">        String httpProxy=null;</span>
+
+<span class="nc" id="L404">        String url = System.getenv(&quot;JENKINS_URL&quot;);</span>
+
+<span class="nc bnc" id="L406" title="All 2 branches missed.">        if (url==null)</span>
+<span class="nc" id="L407">            url = System.getenv(&quot;HUDSON_URL&quot;);</span>
+        
+<span class="nc" id="L409">        boolean tryLoadPKey = true;</span>
+
+<span class="nc bnc" id="L411" title="All 2 branches missed.">        while(!args.isEmpty()) {</span>
+<span class="nc" id="L412">            String head = args.get(0);</span>
+<span class="nc bnc" id="L413" title="All 2 branches missed.">            if (head.equals(&quot;-version&quot;)) {</span>
+<span class="nc" id="L414">                System.out.println(&quot;Version: &quot;+computeVersion());</span>
+<span class="nc" id="L415">                return 0;</span>
+            }
+<span class="nc bnc" id="L417" title="All 4 branches missed.">            if(head.equals(&quot;-s&quot;) &amp;&amp; args.size()&gt;=2) {</span>
+<span class="nc" id="L418">                url = args.get(1);</span>
+<span class="nc" id="L419">                args = args.subList(2,args.size());</span>
+<span class="nc" id="L420">                continue;</span>
+            }
+<span class="nc bnc" id="L422" title="All 2 branches missed.">            if (head.equals(&quot;-noCertificateCheck&quot;)) {</span>
+<span class="nc" id="L423">                System.out.println(&quot;Skipping HTTPS certificate checks altogether. Note that this is not secure at all.&quot;);</span>
+<span class="nc" id="L424">                SSLContext context = SSLContext.getInstance(&quot;TLS&quot;);</span>
+<span class="nc" id="L425">                context.init(null, new TrustManager[]{new NoCheckTrustManager()}, new SecureRandom());</span>
+<span class="nc" id="L426">                HttpsURLConnection.setDefaultSSLSocketFactory(context.getSocketFactory());</span>
+                // bypass host name check, too.
+<span class="nc" id="L428">                HttpsURLConnection.setDefaultHostnameVerifier(new HostnameVerifier() {</span>
+                    public boolean verify(String s, SSLSession sslSession) {
+<span class="nc" id="L430">                        return true;</span>
+                    }
+                });
+<span class="nc" id="L433">                args = args.subList(1,args.size());</span>
+<span class="nc" id="L434">                continue;</span>
+            }
+<span class="nc bnc" id="L436" title="All 2 branches missed.">            if (head.equals(&quot;-noKeyAuth&quot;)) {</span>
+<span class="nc" id="L437">            	tryLoadPKey = false;</span>
+<span class="nc" id="L438">            	args = args.subList(1,args.size());</span>
+<span class="nc" id="L439">            	continue;</span>
+            }
+<span class="nc bnc" id="L441" title="All 4 branches missed.">            if(head.equals(&quot;-i&quot;) &amp;&amp; args.size()&gt;=2) {</span>
+<span class="nc" id="L442">                File f = new File(args.get(1));</span>
+<span class="nc bnc" id="L443" title="All 2 branches missed.">                if (!f.exists()) {</span>
+<span class="nc" id="L444">                    printUsage(Messages.CLI_NoSuchFileExists(f));</span>
+<span class="nc" id="L445">                    return -1;</span>
+                }
+
+<span class="nc" id="L448">                provider.readFrom(f);</span>
+
+<span class="nc" id="L450">                args = args.subList(2,args.size());</span>
+<span class="nc" id="L451">                sshAuthRequestedExplicitly = true;</span>
+<span class="nc" id="L452">                continue;</span>
+            }
+<span class="nc bnc" id="L454" title="All 4 branches missed.">            if(head.equals(&quot;-p&quot;) &amp;&amp; args.size()&gt;=2) {</span>
+<span class="nc" id="L455">                httpProxy = args.get(1);</span>
+<span class="nc" id="L456">                args = args.subList(2,args.size());</span>
+                continue;
+            }
+            break;
+        }
+
+<span class="nc bnc" id="L462" title="All 2 branches missed.">        if(url==null) {</span>
+<span class="nc" id="L463">            printUsage(Messages.CLI_NoURL());</span>
+<span class="nc" id="L464">            return -1;</span>
+        }
+
+<span class="nc bnc" id="L467" title="All 2 branches missed.">        if(args.isEmpty())</span>
+<span class="nc" id="L468">            args = Arrays.asList(&quot;help&quot;); // default to help</span>
+
+<span class="nc bnc" id="L470" title="All 4 branches missed.">        if (tryLoadPKey &amp;&amp; !provider.hasKeys())</span>
+<span class="nc" id="L471">            provider.readFromDefaultLocations();</span>
+
+<span class="nc" id="L473">        CLIConnectionFactory factory = new CLIConnectionFactory().url(url).httpsProxyTunnel(httpProxy);</span>
+<span class="nc" id="L474">        String userInfo = new URL(url).getUserInfo();</span>
+<span class="nc bnc" id="L475" title="All 2 branches missed.">        if (userInfo != null) {</span>
+<span class="nc" id="L476">            factory = factory.basicAuth(userInfo);</span>
+        }
+
+<span class="nc" id="L479">        CLI cli = factory.connect();</span>
+        try {
+<span class="nc bnc" id="L481" title="All 2 branches missed.">            if (provider.hasKeys()) {</span>
+                try {
+                    // TODO: server verification
+<span class="nc" id="L484">                    cli.authenticate(provider.getKeys());</span>
+<span class="nc" id="L485">                } catch (IllegalStateException e) {</span>
+<span class="nc bnc" id="L486" title="All 2 branches missed.">                    if (sshAuthRequestedExplicitly) {</span>
+<span class="nc" id="L487">                        System.err.println(&quot;The server doesn't support public key authentication&quot;);</span>
+<span class="nc" id="L488">                        return -1;</span>
+                    }
+<span class="nc" id="L490">                } catch (UnsupportedOperationException e) {</span>
+<span class="nc bnc" id="L491" title="All 2 branches missed.">                    if (sshAuthRequestedExplicitly) {</span>
+<span class="nc" id="L492">                        System.err.println(&quot;The server doesn't support public key authentication&quot;);</span>
+<span class="nc" id="L493">                        return -1;</span>
+                    }
+<span class="nc" id="L495">                } catch (GeneralSecurityException e) {</span>
+<span class="nc bnc" id="L496" title="All 2 branches missed.">                    if (sshAuthRequestedExplicitly) {</span>
+<span class="nc" id="L497">                        System.err.println(e.getMessage());</span>
+<span class="nc" id="L498">                        LOGGER.log(FINE,e.getMessage(),e);</span>
+<span class="nc" id="L499">                        return -1;</span>
+                    }
+<span class="nc" id="L501">                    System.err.println(&quot;[WARN] Failed to authenticate with your SSH keys. Proceeding as anonymous&quot;);</span>
+<span class="nc" id="L502">                    LOGGER.log(FINE,&quot;Failed to authenticate with your SSH keys.&quot;,e);</span>
+                }
+            }
+
+            // execute the command
+            // Arrays.asList is not serializable --- see 6835580
+<span class="nc" id="L508">            args = new ArrayList&lt;String&gt;(args);</span>
+<span class="nc" id="L509">            return cli.execute(args, System.in, System.out, System.err);</span>
+<span class="nc" id="L510">        } finally {</span>
+<span class="nc" id="L511">            cli.close();</span>
+<span class="nc" id="L512">        }</span>
+    }
+
+    private static String computeVersion() {
+<span class="nc" id="L516">        Properties props = new Properties();</span>
+        try {
+<span class="nc" id="L518">            InputStream is = CLI.class.getResourceAsStream(&quot;/jenkins/cli/jenkins-cli-version.properties&quot;);</span>
+<span class="nc bnc" id="L519" title="All 2 branches missed.">            if(is!=null) {</span>
+                try {
+<span class="nc" id="L521">                    props.load(is);</span>
+<span class="nc" id="L522">                } finally {</span>
+<span class="nc" id="L523">                    is.close();</span>
+<span class="nc" id="L524">                }</span>
+            }
+<span class="nc" id="L526">        } catch (IOException e) {</span>
+<span class="nc" id="L527">            e.printStackTrace(); // if the version properties is missing, that's OK.</span>
+        }
+<span class="nc" id="L529">        return props.getProperty(&quot;version&quot;,&quot;?&quot;);</span>
+    }
+
+    /**
+     * Loads RSA/DSA private key in a PEM format into {@link KeyPair}.
+     */
+    public static KeyPair loadKey(File f, String passwd) throws IOException, GeneralSecurityException {
+<span class="nc" id="L536">        return PrivateKeyProvider.loadKey(f, passwd);</span>
+    }
+
+    public static KeyPair loadKey(File f) throws IOException, GeneralSecurityException {
+<span class="nc" id="L540">        return loadKey(f, null);</span>
+    }
+
+    /**
+     * Loads RSA/DSA private key in a PEM format into {@link KeyPair}.
+     */
+    public static KeyPair loadKey(String pemString, String passwd) throws IOException, GeneralSecurityException {
+<span class="nc" id="L547">        return PrivateKeyProvider.loadKey(pemString, passwd);</span>
+    }
+
+    public static KeyPair loadKey(String pemString) throws IOException, GeneralSecurityException {
+<span class="nc" id="L551">        return loadKey(pemString, null);</span>
+    }
+
+    /**
+     * Authenticate ourselves against the server.
+     *
+     * @return
+     *      identity of the server represented as a public key.
+     */
+    public PublicKey authenticate(Iterable&lt;KeyPair&gt; privateKeys) throws IOException, GeneralSecurityException {
+<span class="nc" id="L561">        Pipe c2s = Pipe.createLocalToRemote();</span>
+<span class="nc" id="L562">        Pipe s2c = Pipe.createRemoteToLocal();</span>
+<span class="nc" id="L563">        entryPoint.authenticate(&quot;ssh&quot;,c2s, s2c);</span>
+<span class="nc" id="L564">        Connection c = new Connection(s2c.getIn(), c2s.getOut());</span>
+
+        try {
+<span class="nc" id="L567">            byte[] sharedSecret = c.diffieHellman(false).generateSecret();</span>
+<span class="nc" id="L568">            PublicKey serverIdentity = c.verifyIdentity(sharedSecret);</span>
+
+            // try all the public keys
+<span class="nc bnc" id="L571" title="All 2 branches missed.">            for (KeyPair key : privateKeys) {</span>
+<span class="nc" id="L572">                c.proveIdentity(sharedSecret,key);</span>
+<span class="nc bnc" id="L573" title="All 2 branches missed.">                if (c.readBoolean())</span>
+<span class="nc" id="L574">                    return serverIdentity;  // succeeded</span>
+            }
+<span class="nc bnc" id="L576" title="All 2 branches missed.">            if (privateKeys.iterator().hasNext())</span>
+<span class="nc" id="L577">                throw new GeneralSecurityException(&quot;Authentication failed. No private key accepted.&quot;);</span>
+            else
+<span class="nc" id="L579">                throw new GeneralSecurityException(&quot;No private key is available for use in authentication&quot;);</span>
+<span class="nc" id="L580">        } finally {</span>
+<span class="nc" id="L581">            c.close();</span>
+<span class="nc" id="L582">        }</span>
+    }
+
+    public PublicKey authenticate(KeyPair key) throws IOException, GeneralSecurityException {
+<span class="nc" id="L586">        return authenticate(Collections.singleton(key));</span>
+    }
+
+    private static void printUsage(String msg) {
+<span class="nc bnc" id="L590" title="All 2 branches missed.">        if(msg!=null)   System.out.println(msg);</span>
+<span class="nc" id="L591">        System.err.println(Messages.CLI_Usage());</span>
+<span class="nc" id="L592">    }</span>
+
+<span class="nc" id="L594">    private static final Logger LOGGER = Logger.getLogger(CLI.class.getName());</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

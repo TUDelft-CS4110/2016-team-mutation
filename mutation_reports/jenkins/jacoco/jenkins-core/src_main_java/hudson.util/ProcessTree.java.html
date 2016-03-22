@@ -1,0 +1,1290 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>ProcessTree.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.util</a> &gt; <span class="el_source">ProcessTree.java</span></div><h1>ProcessTree.java</h1><pre class="source lang-java linenums"><span class="pc" id="L1">/*</span>
+ * The MIT License
+ *
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc., Kohsuke Kawaguchi
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.util;
+
+import com.sun.jna.Memory;
+import com.sun.jna.Native;
+import com.sun.jna.ptr.IntByReference;
+import hudson.EnvVars;
+import hudson.FilePath;
+import hudson.Util;
+import hudson.remoting.Channel;
+import hudson.remoting.VirtualChannel;
+import hudson.slaves.SlaveComputer;
+import hudson.util.ProcessKillingVeto.VetoCause;
+import hudson.util.ProcessTree.OSProcess;
+import hudson.util.ProcessTreeRemoting.IOSProcess;
+import hudson.util.ProcessTreeRemoting.IProcessTree;
+import jenkins.security.SlaveToMasterCallable;
+import org.jvnet.winp.WinProcess;
+import org.jvnet.winp.WinpException;
+
+import java.io.*;
+import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.SortedMap;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+import javax.annotation.CheckForNull;
+import static com.sun.jna.Pointer.NULL;
+import static hudson.util.jna.GNUCLibrary.LIBC;
+import static java.util.logging.Level.FINE;
+import static java.util.logging.Level.FINER;
+import static java.util.logging.Level.FINEST;
+
+/**
+ * Represents a snapshot of the process tree of the current system.
+ *
+ * &lt;p&gt;
+ * A {@link ProcessTree} is really conceptually a map from process ID to a {@link OSProcess} object.
+ * When Hudson runs on platforms that support process introspection, this allows you to introspect
+ * and do some useful things on processes. On other platforms, the implementation falls back to
+ * &quot;do nothing&quot; behavior.
+ *
+ * &lt;p&gt;
+ * {@link ProcessTree} is remotable.
+ *
+ * @author Kohsuke Kawaguchi
+ * @since 1.315
+ */
+public abstract class ProcessTree implements Iterable&lt;OSProcess&gt;, IProcessTree, Serializable {
+    /**
+     * To be filled in the constructor of the derived type.
+     */
+<span class="fc" id="L86">    protected final Map&lt;Integer/*pid*/, OSProcess&gt; processes = new HashMap&lt;Integer, OSProcess&gt;();</span>
+
+    /**
+     * Lazily obtained {@link ProcessKiller}s to be applied on this process tree.
+     */
+    private transient volatile List&lt;ProcessKiller&gt; killers;
+
+    // instantiation only allowed for subtypes in this class
+<span class="fc" id="L94">    private ProcessTree() {}</span>
+
+    /**
+     * Gets the process given a specific ID, or null if no such process exists.
+     */
+    public final OSProcess get(int pid) {
+<span class="fc" id="L100">        return processes.get(pid);</span>
+    }
+
+    /**
+     * Lists all the processes in the system.
+     */
+    public final Iterator&lt;OSProcess&gt; iterator() {
+<span class="fc" id="L107">        return processes.values().iterator();</span>
+    }
+
+    /**
+     * Try to convert {@link Process} into this process object
+     * or null if it fails (for example, maybe the snapshot is taken after
+     * this process has already finished.)
+     */
+    public abstract OSProcess get(Process proc);
+
+    /**
+     * Kills all the processes that have matching environment variables.
+     *
+     * &lt;p&gt;
+     * In this method, the method is given a
+     * &quot;model environment variables&quot;, which is a list of environment variables
+     * and their values that are characteristic to the launched process.
+     * The implementation is expected to find processes
+     * in the system that inherit these environment variables, and kill
+     * them all. This is suitable for locating daemon processes
+     * that cannot be tracked by the regular ancestor/descendant relationship.
+     */
+    public abstract void killAll(Map&lt;String, String&gt; modelEnvVars) throws InterruptedException;
+
+    /**
+     * Convenience method that does {@link #killAll(Map)} and {@link OSProcess#killRecursively()}.
+     * This is necessary to reliably kill the process and its descendants, as some OS
+     * may not implement {@link #killAll(Map)}.
+     *
+     * Either of the parameter can be null.
+     */
+    public void killAll(Process proc, Map&lt;String, String&gt; modelEnvVars) throws InterruptedException {
+<span class="nc" id="L139">        LOGGER.fine(&quot;killAll: process=&quot;+proc+&quot; and envs=&quot;+modelEnvVars);</span>
+<span class="nc" id="L140">        OSProcess p = get(proc);</span>
+<span class="nc bnc" id="L141" title="All 2 branches missed.">        if(p!=null) p.killRecursively();</span>
+<span class="nc bnc" id="L142" title="All 2 branches missed.">        if(modelEnvVars!=null)</span>
+<span class="nc" id="L143">            killAll(modelEnvVars);</span>
+<span class="nc" id="L144">    }</span>
+
+    /**
+     * Obtains the list of killers.
+     */
+    /*package*/ final List&lt;ProcessKiller&gt; getKillers() throws InterruptedException {
+<span class="nc bnc" id="L150" title="All 2 branches missed.">        if (killers==null)</span>
+            try {
+<span class="nc" id="L152">                VirtualChannel channelToMaster = SlaveComputer.getChannelToMaster();</span>
+<span class="nc bnc" id="L153" title="All 2 branches missed.">                if (channelToMaster!=null) {</span>
+<span class="nc" id="L154">                    killers = channelToMaster.call(new SlaveToMasterCallable&lt;List&lt;ProcessKiller&gt;, IOException&gt;() {</span>
+                        public List&lt;ProcessKiller&gt; call() throws IOException {
+<span class="nc" id="L156">                            return new ArrayList&lt;ProcessKiller&gt;(ProcessKiller.all());</span>
+                        }
+                    });
+<span class="nc" id="L159">                } else {</span>
+                    // used in an environment that doesn't support talk-back to the master.
+                    // let's do with what we have.
+<span class="nc" id="L162">                    killers = Collections.emptyList();</span>
+                }
+<span class="nc" id="L164">            } catch (IOException e) {</span>
+<span class="nc" id="L165">                LOGGER.log(Level.WARNING, &quot;Failed to obtain killers&quot;,e);</span>
+<span class="nc" id="L166">                killers = Collections.emptyList();</span>
+            }
+<span class="nc" id="L168">        return killers;</span>
+    }
+
+    /**
+     * Represents a process.
+     */
+    public abstract class OSProcess implements IOSProcess, Serializable {
+        final int pid;
+
+        // instantiation only allowed for subtypes in this class
+<span class="fc" id="L178">        private OSProcess(int pid) {</span>
+<span class="fc" id="L179">            this.pid = pid;</span>
+<span class="fc" id="L180">        }</span>
+
+        public final int getPid() {
+<span class="fc" id="L183">            return pid;</span>
+        }
+        /**
+         * Gets the parent process. This method may return null, because
+         * there's no guarantee that we are getting a consistent snapshot
+         * of the whole system state.
+         */
+        public abstract OSProcess getParent();
+
+        /*package*/ final ProcessTree getTree() {
+<span class="fc" id="L193">            return ProcessTree.this;</span>
+        }
+
+        /**
+         * Immediate child processes.
+         */
+        public final List&lt;OSProcess&gt; getChildren() {
+<span class="nc" id="L200">            List&lt;OSProcess&gt; r = new ArrayList&lt;OSProcess&gt;();</span>
+<span class="nc bnc" id="L201" title="All 2 branches missed.">            for (OSProcess p : ProcessTree.this)</span>
+<span class="nc bnc" id="L202" title="All 2 branches missed.">                if(p.getParent()==this)</span>
+<span class="nc" id="L203">                    r.add(p);</span>
+<span class="nc" id="L204">            return r;</span>
+        }
+
+        /**
+         * Kills this process.
+         */
+        public abstract void kill() throws InterruptedException;
+
+        void killByKiller() throws InterruptedException {
+<span class="nc bnc" id="L213" title="All 2 branches missed.">            for (ProcessKiller killer : getKillers())</span>
+                try {
+<span class="nc bnc" id="L215" title="All 2 branches missed.">                    if (killer.kill(this))</span>
+<span class="nc" id="L216">                        break;</span>
+<span class="nc" id="L217">                } catch (IOException e) {</span>
+<span class="nc" id="L218">                    LOGGER.log(Level.WARNING, &quot;Failed to kill pid=&quot;+getPid(),e);</span>
+                }
+<span class="nc" id="L220">        }</span>
+
+        /**
+         * Kills this process and all the descendants.
+         * &lt;p&gt;
+         * Note that the notion of &quot;descendants&quot; is somewhat vague,
+         * in the presence of such things like daemons. On platforms
+         * where the recursive operation is not supported, this just kills
+         * the current process.
+         */
+        public abstract void killRecursively() throws InterruptedException;
+
+        /**
+         * @return The first non-null {@link VetoCause} provided by a process killing veto extension for this OSProcess. 
+         * null if no one objects killing the process.
+         */
+        protected @CheckForNull VetoCause getVeto() {
+<span class="nc bnc" id="L237" title="All 2 branches missed.">            for (ProcessKillingVeto vetoExtension : ProcessKillingVeto.all()) {</span>
+<span class="nc" id="L238">                VetoCause cause = vetoExtension.vetoProcessKilling(this);</span>
+<span class="nc bnc" id="L239" title="All 2 branches missed.">                if (cause != null) {</span>
+<span class="nc bnc" id="L240" title="All 2 branches missed.">                    if (LOGGER.isLoggable(FINEST))</span>
+<span class="nc" id="L241">                        LOGGER.finest(&quot;Killing of pid &quot; + getPid() + &quot; vetoed by &quot; + vetoExtension.getClass().getName() + &quot;: &quot; + cause.getMessage());</span>
+<span class="nc" id="L242">                    return cause;</span>
+                }
+            }
+<span class="nc" id="L245">            return null;</span>
+        }
+
+        /**
+         * Gets the command-line arguments of this process.
+         *
+         * &lt;p&gt;
+         * On Windows, where the OS models command-line arguments as a single string, this method
+         * computes the approximated tokenization.
+         */
+        public abstract List&lt;String&gt; getArguments();
+
+        /**
+         * Obtains the environment variables of this process.
+         *
+         * @return
+         *      empty map if failed (for example because the process is already dead,
+         *      or the permission was denied.)
+         */
+        public abstract EnvVars getEnvironmentVariables();
+
+        /**
+         * Given the environment variable of a process and the &quot;model environment variable&quot; that Hudson
+         * used for launching the build, returns true if there's a match (which means the process should
+         * be considered a descendant of a build.)
+         */
+        public final boolean hasMatchingEnvVars(Map&lt;String,String&gt; modelEnvVar) {
+<span class="nc bnc" id="L272" title="All 2 branches missed.">            if(modelEnvVar.isEmpty())</span>
+                // sanity check so that we don't start rampage.
+<span class="nc" id="L274">                return false;</span>
+
+<span class="nc" id="L276">            SortedMap&lt;String,String&gt; envs = getEnvironmentVariables();</span>
+<span class="nc bnc" id="L277" title="All 2 branches missed.">            for (Entry&lt;String,String&gt; e : modelEnvVar.entrySet()) {</span>
+<span class="nc" id="L278">                String v = envs.get(e.getKey());</span>
+<span class="nc bnc" id="L279" title="All 4 branches missed.">                if(v==null || !v.equals(e.getValue()))</span>
+<span class="nc" id="L280">                    return false;   // no match</span>
+            }
+
+<span class="nc" id="L283">            return true;</span>
+        }
+
+        /**
+         * Executes a chunk of code at the same machine where this process resides.
+         */
+        public &lt;T&gt; T act(ProcessCallable&lt;T&gt; callable) throws IOException, InterruptedException {
+<span class="fc" id="L290">            return callable.invoke(this, FilePath.localChannel);</span>
+        }
+
+        Object writeReplace() {
+<span class="fc" id="L294">            return new SerializedProcess(pid);</span>
+        }
+    }
+
+    /**
+     * Serialized form of {@link OSProcess} is the PID and {@link ProcessTree}
+     */
+    private final class SerializedProcess implements Serializable {
+        private final int pid;
+        private static final long serialVersionUID = 1L;
+
+<span class="fc" id="L305">        private SerializedProcess(int pid) {</span>
+<span class="fc" id="L306">            this.pid = pid;</span>
+<span class="fc" id="L307">        }</span>
+
+        Object readResolve() {
+<span class="fc" id="L310">            return get(pid);</span>
+        }
+    }
+
+    /**
+     * Code that gets executed on the machine where the {@link OSProcess} is local.
+     * Used to act on {@link OSProcess}.
+     *
+     * @see ProcessTree.OSProcess#act(ProcessTree.ProcessCallable)
+     */
+    public interface ProcessCallable&lt;T&gt; extends Serializable {
+        /**
+         * Performs the computational task on the node where the data is located.
+         *
+         * @param process
+         *      {@link OSProcess} that represents the local process.
+         * @param channel
+         *      The &quot;back pointer&quot; of the {@link Channel} that represents the communication
+         *      with the node from where the code was sent.
+         */
+        T invoke(OSProcess process, VirtualChannel channel) throws IOException;
+    }
+
+
+    /**
+     * Gets the {@link ProcessTree} of the current system
+     * that JVM runs in, or in the worst case return the default one
+     * that's not capable of killing descendants at all.
+     */
+    public static ProcessTree get() {
+<span class="pc bpc" id="L340" title="1 of 2 branches missed.">        if(!enabled)</span>
+<span class="nc" id="L341">            return DEFAULT;</span>
+
+        try {
+<span class="pc bpc" id="L344" title="1 of 2 branches missed.">            if(File.pathSeparatorChar==';')</span>
+<span class="fc" id="L345">                return new Windows();</span>
+
+<span class="nc" id="L347">            String os = Util.fixNull(System.getProperty(&quot;os.name&quot;));</span>
+<span class="nc bnc" id="L348" title="All 2 branches missed.">            if(os.equals(&quot;Linux&quot;))</span>
+<span class="nc" id="L349">                return new Linux();</span>
+<span class="nc bnc" id="L350" title="All 2 branches missed.">            if(os.equals(&quot;SunOS&quot;))</span>
+<span class="nc" id="L351">                return new Solaris();</span>
+<span class="nc bnc" id="L352" title="All 2 branches missed.">            if(os.equals(&quot;Mac OS X&quot;))</span>
+<span class="nc" id="L353">                return new Darwin();</span>
+<span class="nc" id="L354">        } catch (LinkageError e) {</span>
+<span class="nc" id="L355">            LOGGER.log(Level.WARNING,&quot;Failed to load winp. Reverting to the default&quot;,e);</span>
+<span class="nc" id="L356">            enabled = false;</span>
+        }
+
+<span class="nc" id="L359">        return DEFAULT;</span>
+    }
+
+//
+//
+// implementation follows
+//-------------------------------------------
+//
+
+    /**
+     * Empty process list as a default value if the platform doesn't support it.
+     */
+<span class="fc" id="L371">    /*package*/ static final ProcessTree DEFAULT = new Local() {</span>
+        public OSProcess get(final Process proc) {
+<span class="nc" id="L373">            return new OSProcess(-1) {</span>
+                public OSProcess getParent() {
+<span class="nc" id="L375">                    return null;</span>
+                }
+
+                public void killRecursively() {
+                    // fall back to a single process killer
+<span class="nc" id="L380">                    proc.destroy();</span>
+<span class="nc" id="L381">                }</span>
+
+                public void kill() throws InterruptedException {
+<span class="nc bnc" id="L384" title="All 2 branches missed.">                    if (getVeto() != null) </span>
+<span class="nc" id="L385">                        return;</span>
+<span class="nc" id="L386">                    proc.destroy();</span>
+<span class="nc" id="L387">                    killByKiller();</span>
+<span class="nc" id="L388">                }</span>
+
+                public List&lt;String&gt; getArguments() {
+<span class="nc" id="L391">                    return Collections.emptyList();</span>
+                }
+
+                public EnvVars getEnvironmentVariables() {
+<span class="nc" id="L395">                    return new EnvVars();</span>
+                }
+            };
+        }
+
+        public void killAll(Map&lt;String, String&gt; modelEnvVars) {
+            // no-op
+<span class="nc" id="L402">        }</span>
+    };
+
+
+    private static final class Windows extends Local {
+<span class="fc" id="L407">        Windows() {</span>
+<span class="fc bfc" id="L408" title="All 2 branches covered.">            for (final WinProcess p : WinProcess.all()) {</span>
+<span class="fc" id="L409">                int pid = p.getPid();</span>
+<span class="fc bfc" id="L410" title="All 4 branches covered.">                if(pid == 0 || pid == 4) continue; // skip the System Idle and System processes</span>
+<span class="fc" id="L411">                super.processes.put(pid,new OSProcess(pid) {</span>
+                    private EnvVars env;
+                    private List&lt;String&gt; args;
+
+                    public OSProcess getParent() {
+                        // windows process doesn't have parent/child relationship
+<span class="nc" id="L417">                        return null;</span>
+                    }
+
+                    public void killRecursively() throws InterruptedException {
+<span class="nc bnc" id="L421" title="All 2 branches missed.">                        if (getVeto() != null) </span>
+<span class="nc" id="L422">                            return;</span>
+                        
+<span class="nc" id="L424">                        LOGGER.finer(&quot;Killing recursively &quot;+getPid());</span>
+<span class="nc" id="L425">                        p.killRecursively();</span>
+<span class="nc" id="L426">                        killByKiller();</span>
+<span class="nc" id="L427">                    }</span>
+
+                    public void kill() throws InterruptedException {
+<span class="nc bnc" id="L430" title="All 2 branches missed.">                        if (getVeto() != null) </span>
+<span class="nc" id="L431">                            return;</span>
+
+<span class="nc" id="L433">                        LOGGER.finer(&quot;Killing &quot;+getPid());</span>
+<span class="nc" id="L434">                        p.kill();</span>
+<span class="nc" id="L435">                        killByKiller();</span>
+<span class="nc" id="L436">                    }</span>
+
+                    @Override
+                    public synchronized List&lt;String&gt; getArguments() {
+<span class="nc bnc" id="L440" title="All 2 branches missed.">                        if(args==null)  args = Arrays.asList(QuotedStringTokenizer.tokenize(p.getCommandLine()));</span>
+<span class="nc" id="L441">                        return args;</span>
+                    }
+
+                    @Override
+                    public synchronized EnvVars getEnvironmentVariables() {
+<span class="pc bpc" id="L446" title="1 of 2 branches missed.">                        if(env !=null)</span>
+<span class="nc" id="L447">                          return env;</span>
+<span class="fc" id="L448">                        env = new EnvVars();</span>
+
+                        try
+                        {
+<span class="nc" id="L452">                           env.putAll(p.getEnvironmentVariables());</span>
+<span class="pc" id="L453">                        } catch (WinpException e)</span>
+                        {
+<span class="fc" id="L455">                           LOGGER.log(FINE, &quot;Failed to get environment variable &quot;, e);</span>
+                        }
+<span class="fc" id="L457">                        return env;</span>
+                    }
+                });
+
+            }
+<span class="fc" id="L462">        }</span>
+
+        @Override
+        public OSProcess get(Process proc) {
+<span class="nc" id="L466">            return get(new WinProcess(proc).getPid());</span>
+        }
+
+        public void killAll(Map&lt;String, String&gt; modelEnvVars) throws InterruptedException {
+<span class="nc bnc" id="L470" title="All 2 branches missed.">            for( OSProcess p : this) {</span>
+<span class="nc bnc" id="L471" title="All 2 branches missed.">                if(p.getPid()&lt;10)</span>
+<span class="nc" id="L472">                    continue;   // ignore system processes like &quot;idle process&quot;</span>
+
+<span class="nc" id="L474">                LOGGER.finest(&quot;Considering to kill &quot;+p.getPid());</span>
+
+                boolean matched;
+                try {
+<span class="nc" id="L478">                    matched = p.hasMatchingEnvVars(modelEnvVars);</span>
+<span class="nc" id="L479">                } catch (WinpException e) {</span>
+                    // likely a missing privilege
+<span class="nc" id="L481">                    LOGGER.log(FINEST,&quot;  Failed to check environment variable match&quot;,e);</span>
+<span class="nc" id="L482">                    continue;</span>
+                }
+
+<span class="nc bnc" id="L485" title="All 2 branches missed.">                if(matched)</span>
+<span class="nc" id="L486">                    p.killRecursively();</span>
+                else
+<span class="nc" id="L488">                    LOGGER.finest(&quot;Environment variable didn't match&quot;);</span>
+
+            }
+<span class="nc" id="L491">        }</span>
+
+        static {
+<span class="fc" id="L494">            WinProcess.enableDebugPrivilege();</span>
+<span class="fc" id="L495">        }</span>
+    }
+
+<span class="nc" id="L498">    static abstract class Unix extends Local {</span>
+        @Override
+        public OSProcess get(Process proc) {
+            try {
+<span class="nc" id="L502">                return get((Integer) UnixReflection.PID_FIELD.get(proc));</span>
+<span class="nc" id="L503">            } catch (IllegalAccessException e) { // impossible</span>
+<span class="nc" id="L504">                IllegalAccessError x = new IllegalAccessError();</span>
+<span class="nc" id="L505">                x.initCause(e);</span>
+<span class="nc" id="L506">                throw x;</span>
+            }
+        }
+
+        public void killAll(Map&lt;String, String&gt; modelEnvVars) throws InterruptedException {
+<span class="nc bnc" id="L511" title="All 2 branches missed.">            for (OSProcess p : this)</span>
+<span class="nc bnc" id="L512" title="All 2 branches missed.">                if(p.hasMatchingEnvVars(modelEnvVars))</span>
+<span class="nc" id="L513">                    p.killRecursively();</span>
+<span class="nc" id="L514">        }</span>
+    }
+    /**
+     * {@link ProcessTree} based on /proc.
+     */
+    static abstract class ProcfsUnix extends Unix {
+<span class="nc" id="L520">        ProcfsUnix() {</span>
+<span class="nc" id="L521">            File[] processes = new File(&quot;/proc&quot;).listFiles(new FileFilter() {</span>
+                public boolean accept(File f) {
+<span class="nc" id="L523">                    return f.isDirectory();</span>
+                }
+            });
+<span class="nc bnc" id="L526" title="All 2 branches missed.">            if(processes==null) {</span>
+<span class="nc" id="L527">                LOGGER.info(&quot;No /proc&quot;);</span>
+<span class="nc" id="L528">                return;</span>
+            }
+
+<span class="nc bnc" id="L531" title="All 2 branches missed.">            for (File p : processes) {</span>
+                int pid;
+                try {
+<span class="nc" id="L534">                    pid = Integer.parseInt(p.getName());</span>
+<span class="nc" id="L535">                } catch (NumberFormatException e) {</span>
+                    // other sub-directories
+<span class="nc" id="L537">                    continue;</span>
+                }
+                try {
+<span class="nc" id="L540">                    this.processes.put(pid,createProcess(pid));</span>
+<span class="nc" id="L541">                } catch (IOException e) {</span>
+                    // perhaps the process status has changed since we obtained a directory listing
+                }
+            }
+<span class="nc" id="L545">        }</span>
+
+        protected abstract OSProcess createProcess(int pid) throws IOException;
+    }
+
+    /**
+     * A process.
+     */
+    public abstract class UnixProcess extends OSProcess {
+<span class="nc" id="L554">        protected UnixProcess(int pid) {</span>
+<span class="nc" id="L555">            super(pid);</span>
+<span class="nc" id="L556">        }</span>
+
+        protected final File getFile(String relativePath) {
+<span class="nc" id="L559">            return new File(new File(&quot;/proc/&quot;+getPid()),relativePath);</span>
+        }
+
+        /**
+         * Tries to kill this process.
+         */
+        public void kill() throws InterruptedException {
+<span class="nc bnc" id="L566" title="All 2 branches missed.">            if (getVeto() != null) </span>
+<span class="nc" id="L567">                return;</span>
+            try {
+<span class="nc" id="L569">                int pid = getPid();</span>
+<span class="nc" id="L570">                LOGGER.fine(&quot;Killing pid=&quot;+pid);</span>
+<span class="nc" id="L571">                UnixReflection.destroy(pid);</span>
+<span class="nc" id="L572">            } catch (IllegalAccessException e) {</span>
+                // this is impossible
+<span class="nc" id="L574">                IllegalAccessError x = new IllegalAccessError();</span>
+<span class="nc" id="L575">                x.initCause(e);</span>
+<span class="nc" id="L576">                throw x;</span>
+<span class="nc" id="L577">            } catch (InvocationTargetException e) {</span>
+                // tunnel serious errors
+<span class="nc bnc" id="L579" title="All 2 branches missed.">                if(e.getTargetException() instanceof Error)</span>
+<span class="nc" id="L580">                    throw (Error)e.getTargetException();</span>
+                // otherwise log and let go. I need to see when this happens
+<span class="nc" id="L582">                LOGGER.log(Level.INFO, &quot;Failed to terminate pid=&quot;+getPid(),e);</span>
+            }
+<span class="nc" id="L584">            killByKiller();</span>
+<span class="nc" id="L585">        }</span>
+
+        public void killRecursively() throws InterruptedException {
+            // We kill individual processes of a tree, so handling vetoes inside #kill() is enough for UnixProcess es
+<span class="nc" id="L589">            LOGGER.fine(&quot;Recursively killing pid=&quot;+getPid());</span>
+<span class="nc bnc" id="L590" title="All 2 branches missed.">            for (OSProcess p : getChildren())</span>
+<span class="nc" id="L591">                p.killRecursively();</span>
+<span class="nc" id="L592">            kill();</span>
+<span class="nc" id="L593">        }</span>
+
+        /**
+         * Obtains the argument list of this process.
+         *
+         * @return
+         *      empty list if failed (for example because the process is already dead,
+         *      or the permission was denied.)
+         */
+        public abstract List&lt;String&gt; getArguments();
+    }
+
+    /**
+     * Reflection used in the Unix support.
+     */
+<span class="nc" id="L608">    private static final class UnixReflection {</span>
+        /**
+         * Field to access the PID of the process.
+         */
+        private static final Field PID_FIELD;
+
+        /**
+         * Method to destroy a process, given pid.
+         *
+         * Looking at the JavaSE source code, this is using SIGTERM (15)
+         */
+        private static final Method DESTROY_PROCESS;
+
+        static {
+            try {
+<span class="nc" id="L623">                Class&lt;?&gt; clazz = Class.forName(&quot;java.lang.UNIXProcess&quot;);</span>
+<span class="nc" id="L624">                PID_FIELD = clazz.getDeclaredField(&quot;pid&quot;);</span>
+<span class="nc" id="L625">                PID_FIELD.setAccessible(true);</span>
+
+<span class="nc bnc" id="L627" title="All 2 branches missed.">                if (isPreJava8()) {</span>
+<span class="nc" id="L628">                    DESTROY_PROCESS = clazz.getDeclaredMethod(&quot;destroyProcess&quot;,int.class);</span>
+<span class="nc" id="L629">                } else {</span>
+<span class="nc" id="L630">                    DESTROY_PROCESS = clazz.getDeclaredMethod(&quot;destroyProcess&quot;,int.class, boolean.class);</span>
+                }
+<span class="nc" id="L632">                DESTROY_PROCESS.setAccessible(true);</span>
+<span class="nc" id="L633">            } catch (ClassNotFoundException e) {</span>
+<span class="nc" id="L634">                LinkageError x = new LinkageError();</span>
+<span class="nc" id="L635">                x.initCause(e);</span>
+<span class="nc" id="L636">                throw x;</span>
+<span class="nc" id="L637">            } catch (NoSuchFieldException e) {</span>
+<span class="nc" id="L638">                LinkageError x = new LinkageError();</span>
+<span class="nc" id="L639">                x.initCause(e);</span>
+<span class="nc" id="L640">                throw x;</span>
+<span class="nc" id="L641">            } catch (NoSuchMethodException e) {</span>
+<span class="nc" id="L642">                LinkageError x = new LinkageError();</span>
+<span class="nc" id="L643">                x.initCause(e);</span>
+<span class="nc" id="L644">                throw x;</span>
+            }
+<span class="nc" id="L646">        }</span>
+
+        public static void destroy(int pid) throws IllegalAccessException, InvocationTargetException {
+<span class="nc bnc" id="L649" title="All 2 branches missed.">            if (isPreJava8()) {</span>
+<span class="nc" id="L650">                DESTROY_PROCESS.invoke(null, pid);</span>
+<span class="nc" id="L651">            } else {</span>
+<span class="nc" id="L652">                DESTROY_PROCESS.invoke(null, pid, false);</span>
+            }
+<span class="nc" id="L654">        }</span>
+
+        private static boolean isPreJava8() {
+<span class="nc" id="L657">            int javaVersionAsAnInteger = Integer.parseInt(System.getProperty(&quot;java.version&quot;).replaceAll(&quot;\\.&quot;, &quot;&quot;).replaceAll(&quot;_&quot;, &quot;&quot;).substring(0, 2));</span>
+<span class="nc bnc" id="L658" title="All 2 branches missed.">            return javaVersionAsAnInteger &lt; 18;</span>
+        }
+    }
+
+
+<span class="nc" id="L663">    static class Linux extends ProcfsUnix {</span>
+        protected LinuxProcess createProcess(int pid) throws IOException {
+<span class="nc" id="L665">            return new LinuxProcess(pid);</span>
+        }
+
+        class LinuxProcess extends UnixProcess {
+<span class="nc" id="L669">            private int ppid = -1;</span>
+            private EnvVars envVars;
+            private List&lt;String&gt; arguments;
+
+<span class="nc" id="L673">            LinuxProcess(int pid) throws IOException {</span>
+<span class="nc" id="L674">                super(pid);</span>
+
+<span class="nc" id="L676">                BufferedReader r = new BufferedReader(new FileReader(getFile(&quot;status&quot;)));</span>
+                try {
+                    String line;
+<span class="nc bnc" id="L679" title="All 2 branches missed.">                    while((line=r.readLine())!=null) {</span>
+<span class="nc" id="L680">                        line=line.toLowerCase(Locale.ENGLISH);</span>
+<span class="nc bnc" id="L681" title="All 2 branches missed.">                        if(line.startsWith(&quot;ppid:&quot;)) {</span>
+<span class="nc" id="L682">                            ppid = Integer.parseInt(line.substring(5).trim());</span>
+<span class="nc" id="L683">                            break;</span>
+                        }
+                    }
+<span class="nc" id="L686">                } finally {</span>
+<span class="nc" id="L687">                    r.close();</span>
+<span class="nc" id="L688">                }</span>
+<span class="nc bnc" id="L689" title="All 2 branches missed.">                if(ppid==-1)</span>
+<span class="nc" id="L690">                    throw new IOException(&quot;Failed to parse PPID from /proc/&quot;+pid+&quot;/status&quot;);</span>
+<span class="nc" id="L691">            }</span>
+
+            public OSProcess getParent() {
+<span class="nc" id="L694">                return get(ppid);</span>
+            }
+
+            public synchronized List&lt;String&gt; getArguments() {
+<span class="nc bnc" id="L698" title="All 2 branches missed.">                if(arguments!=null)</span>
+<span class="nc" id="L699">                    return arguments;</span>
+<span class="nc" id="L700">                arguments = new ArrayList&lt;String&gt;();</span>
+                try {
+<span class="nc" id="L702">                    byte[] cmdline = readFileToByteArray(getFile(&quot;cmdline&quot;));</span>
+<span class="nc" id="L703">                    int pos=0;</span>
+<span class="nc bnc" id="L704" title="All 2 branches missed.">                    for (int i = 0; i &lt; cmdline.length; i++) {</span>
+<span class="nc" id="L705">                        byte b = cmdline[i];</span>
+<span class="nc bnc" id="L706" title="All 2 branches missed.">                        if(b==0) {</span>
+<span class="nc" id="L707">                            arguments.add(new String(cmdline,pos,i-pos));</span>
+<span class="nc" id="L708">                            pos=i+1;</span>
+                        }
+                    }
+<span class="nc" id="L711">                } catch (IOException e) {</span>
+                    // failed to read. this can happen under normal circumstances (most notably permission denied)
+                    // so don't report this as an error.
+                }
+<span class="nc" id="L715">                arguments = Collections.unmodifiableList(arguments);</span>
+<span class="nc" id="L716">                return arguments;</span>
+            }
+
+            public synchronized EnvVars getEnvironmentVariables() {
+<span class="nc bnc" id="L720" title="All 2 branches missed.">                if(envVars !=null)</span>
+<span class="nc" id="L721">                    return envVars;</span>
+<span class="nc" id="L722">                envVars = new EnvVars();</span>
+                try {
+<span class="nc" id="L724">                    byte[] environ = readFileToByteArray(getFile(&quot;environ&quot;));</span>
+<span class="nc" id="L725">                    int pos=0;</span>
+<span class="nc bnc" id="L726" title="All 2 branches missed.">                    for (int i = 0; i &lt; environ.length; i++) {</span>
+<span class="nc" id="L727">                        byte b = environ[i];</span>
+<span class="nc bnc" id="L728" title="All 2 branches missed.">                        if(b==0) {</span>
+<span class="nc" id="L729">                            envVars.addLine(new String(environ,pos,i-pos));</span>
+<span class="nc" id="L730">                            pos=i+1;</span>
+                        }
+                    }
+<span class="nc" id="L733">                } catch (IOException e) {</span>
+                    // failed to read. this can happen under normal circumstances (most notably permission denied)
+                    // so don't report this as an error.
+                }
+<span class="nc" id="L737">                return envVars;</span>
+            }
+        }
+
+        public byte[] readFileToByteArray(File file) throws IOException {
+<span class="nc" id="L742">            InputStream in = org.apache.commons.io.FileUtils.openInputStream(file);</span>
+            try {
+<span class="nc" id="L744">                return org.apache.commons.io.IOUtils.toByteArray(in);</span>
+<span class="nc" id="L745">            } finally {</span>
+<span class="nc" id="L746">                    in.close();</span>
+<span class="nc" id="L747">            }</span>
+        }
+    }
+
+    /**
+     * Implementation for Solaris that uses &lt;tt&gt;/proc&lt;/tt&gt;.
+     *
+     * Amazingly, this single code works for both 32bit and 64bit Solaris, despite the fact
+     * that does a lot of pointer manipulation and what not.
+     */
+<span class="nc" id="L757">    static class Solaris extends ProcfsUnix {</span>
+        protected OSProcess createProcess(final int pid) throws IOException {
+<span class="nc" id="L759">            return new SolarisProcess(pid);</span>
+        }
+
+        private class SolarisProcess extends UnixProcess {
+            private final int ppid;
+            /**
+                 * Address of the environment vector. Even on 64bit Solaris this is still 32bit pointer.
+             */
+            private final int envp;
+            /**
+                 * Similarly, address of the arguments vector.
+             */
+            private final int argp;
+            private final int argc;
+            private EnvVars envVars;
+            private List&lt;String&gt; arguments;
+
+<span class="nc" id="L776">            private SolarisProcess(int pid) throws IOException {</span>
+<span class="nc" id="L777">                super(pid);</span>
+
+<span class="nc" id="L779">                RandomAccessFile psinfo = new RandomAccessFile(getFile(&quot;psinfo&quot;),&quot;r&quot;);</span>
+                try {
+                    // see http://cvs.opensolaris.org/source/xref/onnv/onnv-gate/usr/src/uts/common/sys/procfs.h
+                    //typedef struct psinfo {
+                    //	int	pr_flag;	/* process flags */
+                    //	int	pr_nlwp;	/* number of lwps in the process */
+                    //	pid_t	pr_pid;	/* process id */
+                    //	pid_t	pr_ppid;	/* process id of parent */
+                    //	pid_t	pr_pgid;	/* process id of process group leader */
+                    //	pid_t	pr_sid;	/* session id */
+                    //	uid_t	pr_uid;	/* real user id */
+                    //	uid_t	pr_euid;	/* effective user id */
+                    //	gid_t	pr_gid;	/* real group id */
+                    //	gid_t	pr_egid;	/* effective group id */
+                    //	uintptr_t	pr_addr;	/* address of process */
+                    //	size_t	pr_size;	/* size of process image in Kbytes */
+                    //	size_t	pr_rssize;	/* resident set size in Kbytes */
+                    //	dev_t	pr_ttydev;	/* controlling tty device (or PRNODEV) */
+                    //	ushort_t	pr_pctcpu;	/* % of recent cpu time used by all lwps */
+                    //	ushort_t	pr_pctmem;	/* % of system memory used by process */
+                    //	timestruc_t	pr_start;	/* process start time, from the epoch */
+                    //	timestruc_t	pr_time;	/* cpu time for this process */
+                    //	timestruc_t	pr_ctime;	/* cpu time for reaped children */
+                    //	char	pr_fname[PRFNSZ];	/* name of exec'ed file */
+                    //	char	pr_psargs[PRARGSZ];	/* initial characters of arg list */
+                    //	int	pr_wstat;	/* if zombie, the wait() status */
+                    //	int	pr_argc;	/* initial argument count */
+                    //	uintptr_t	pr_argv;	/* address of initial argument vector */
+                    //	uintptr_t	pr_envp;	/* address of initial environment vector */
+                    //	char	pr_dmodel;	/* data model of the process */
+                    //	lwpsinfo_t	pr_lwp;	/* information for representative lwp */
+                    //} psinfo_t;
+
+                    // see http://cvs.opensolaris.org/source/xref/onnv/onnv-gate/usr/src/uts/common/sys/types.h
+                    // for the size of the various datatype.
+
+                    // see http://cvs.opensolaris.org/source/xref/onnv/onnv-gate/usr/src/cmd/ptools/pargs/pargs.c
+                    // for how to read this information
+
+<span class="nc" id="L818">                    psinfo.seek(8);</span>
+<span class="nc bnc" id="L819" title="All 2 branches missed.">                    if(adjust(psinfo.readInt())!=pid)</span>
+<span class="nc" id="L820">                        throw new IOException(&quot;psinfo PID mismatch&quot;);   // sanity check</span>
+<span class="nc" id="L821">                    ppid = adjust(psinfo.readInt());</span>
+
+<span class="nc" id="L823">                    psinfo.seek(188);  // now jump to pr_argc</span>
+<span class="nc" id="L824">                    argc = adjust(psinfo.readInt());</span>
+<span class="nc" id="L825">                    argp = adjust(psinfo.readInt());</span>
+<span class="nc" id="L826">                    envp = adjust(psinfo.readInt());</span>
+<span class="nc" id="L827">                } finally {</span>
+<span class="nc" id="L828">                    psinfo.close();</span>
+<span class="nc" id="L829">                }</span>
+<span class="nc bnc" id="L830" title="All 2 branches missed.">                if(ppid==-1)</span>
+<span class="nc" id="L831">                    throw new IOException(&quot;Failed to parse PPID from /proc/&quot;+pid+&quot;/status&quot;);</span>
+
+<span class="nc" id="L833">            }</span>
+
+            public OSProcess getParent() {
+<span class="nc" id="L836">                return get(ppid);</span>
+            }
+
+            public synchronized List&lt;String&gt; getArguments() {
+<span class="nc bnc" id="L840" title="All 2 branches missed.">                if(arguments!=null)</span>
+<span class="nc" id="L841">                    return arguments;</span>
+
+<span class="nc" id="L843">                arguments = new ArrayList&lt;String&gt;(argc);</span>
+
+                try {
+<span class="nc" id="L846">                    RandomAccessFile as = new RandomAccessFile(getFile(&quot;as&quot;),&quot;r&quot;);</span>
+<span class="nc bnc" id="L847" title="All 2 branches missed.">                    if(LOGGER.isLoggable(FINER))</span>
+<span class="nc" id="L848">                        LOGGER.finer(&quot;Reading &quot;+getFile(&quot;as&quot;));</span>
+                    try {
+<span class="nc bnc" id="L850" title="All 2 branches missed.">                        for( int n=0; n&lt;argc; n++ ) {</span>
+                            // read a pointer to one entry
+<span class="nc" id="L852">                            as.seek(to64(argp+n*4));</span>
+<span class="nc" id="L853">                            int p = adjust(as.readInt());</span>
+
+<span class="nc" id="L855">                            arguments.add(readLine(as, p, &quot;argv[&quot;+ n +&quot;]&quot;));</span>
+                        }
+<span class="nc" id="L857">                    } finally {</span>
+<span class="nc" id="L858">                        as.close();</span>
+<span class="nc" id="L859">                    }</span>
+<span class="nc" id="L860">                } catch (IOException e) {</span>
+                    // failed to read. this can happen under normal circumstances (most notably permission denied)
+                    // so don't report this as an error.
+                }
+
+<span class="nc" id="L865">                arguments = Collections.unmodifiableList(arguments);</span>
+<span class="nc" id="L866">                return arguments;</span>
+            }
+
+            public synchronized EnvVars getEnvironmentVariables() {
+<span class="nc bnc" id="L870" title="All 2 branches missed.">                if(envVars !=null)</span>
+<span class="nc" id="L871">                    return envVars;</span>
+<span class="nc" id="L872">                envVars = new EnvVars();</span>
+
+                try {
+<span class="nc" id="L875">                    RandomAccessFile as = new RandomAccessFile(getFile(&quot;as&quot;),&quot;r&quot;);</span>
+<span class="nc bnc" id="L876" title="All 2 branches missed.">                    if(LOGGER.isLoggable(FINER))</span>
+<span class="nc" id="L877">                        LOGGER.finer(&quot;Reading &quot;+getFile(&quot;as&quot;));</span>
+                    try {
+<span class="nc" id="L879">                        for( int n=0; ; n++ ) {</span>
+                            // read a pointer to one entry
+<span class="nc" id="L881">                            as.seek(to64(envp+n*4));</span>
+<span class="nc" id="L882">                            int p = adjust(as.readInt());</span>
+<span class="nc bnc" id="L883" title="All 2 branches missed.">                            if(p==0)</span>
+<span class="nc" id="L884">                                break;  // completed the walk</span>
+
+                            // now read the null-terminated string
+<span class="nc" id="L887">                            envVars.addLine(readLine(as, p, &quot;env[&quot;+ n +&quot;]&quot;));</span>
+                        }
+<span class="nc" id="L889">                    } finally {</span>
+<span class="nc" id="L890">                        as.close();</span>
+<span class="nc" id="L891">                    }</span>
+<span class="nc" id="L892">                } catch (IOException e) {</span>
+                    // failed to read. this can happen under normal circumstances (most notably permission denied)
+                    // so don't report this as an error.
+                }
+
+<span class="nc" id="L897">                return envVars;</span>
+            }
+
+            private String readLine(RandomAccessFile as, int p, String prefix) throws IOException {
+<span class="nc bnc" id="L901" title="All 2 branches missed.">                if(LOGGER.isLoggable(FINEST))</span>
+<span class="nc" id="L902">                    LOGGER.finest(&quot;Reading &quot;+prefix+&quot; at &quot;+p);</span>
+
+<span class="nc" id="L904">                as.seek(to64(p));</span>
+<span class="nc" id="L905">                ByteArrayOutputStream buf = new ByteArrayOutputStream();</span>
+<span class="nc" id="L906">                int ch,i=0;</span>
+<span class="nc bnc" id="L907" title="All 2 branches missed.">                while((ch=as.read())&gt;0) {</span>
+<span class="nc bnc" id="L908" title="All 4 branches missed.">                    if((++i)%100==0 &amp;&amp; LOGGER.isLoggable(FINEST))</span>
+<span class="nc" id="L909">                        LOGGER.finest(prefix +&quot; is so far &quot;+buf.toString());</span>
+
+<span class="nc" id="L911">                    buf.write(ch);</span>
+                }
+<span class="nc" id="L913">                String line = buf.toString();</span>
+<span class="nc bnc" id="L914" title="All 2 branches missed.">                if(LOGGER.isLoggable(FINEST))</span>
+<span class="nc" id="L915">                    LOGGER.finest(prefix+&quot; was &quot;+line);</span>
+<span class="nc" id="L916">                return line;</span>
+            }
+        }
+
+        /**
+         * int to long conversion with zero-padding.
+         */
+        private static long to64(int i) {
+<span class="nc" id="L924">            return i&amp;0xFFFFFFFFL;</span>
+        }
+
+        /**
+         * {@link DataInputStream} reads a value in big-endian, so
+         * convert it to the correct value on little-endian systems.
+         */
+        private static int adjust(int i) {
+<span class="nc bnc" id="L932" title="All 2 branches missed.">            if(IS_LITTLE_ENDIAN)</span>
+<span class="nc" id="L933">                return (i&lt;&lt;24) |((i&lt;&lt;8) &amp; 0x00FF0000) | ((i&gt;&gt;8) &amp; 0x0000FF00) | (i&gt;&gt;&gt;24);</span>
+            else
+<span class="nc" id="L935">                return i;</span>
+        }
+
+    }
+
+    /**
+     * Implementation for Mac OS X based on sysctl(3).
+     */
+    private static class Darwin extends Unix {
+<span class="nc" id="L944">        Darwin() {</span>
+<span class="nc" id="L945">            String arch = System.getProperty(&quot;sun.arch.data.model&quot;);</span>
+<span class="nc bnc" id="L946" title="All 2 branches missed.">            if (&quot;64&quot;.equals(arch)) {</span>
+<span class="nc" id="L947">                sizeOf_kinfo_proc = sizeOf_kinfo_proc_64;</span>
+<span class="nc" id="L948">                kinfo_proc_pid_offset = kinfo_proc_pid_offset_64;</span>
+<span class="nc" id="L949">                kinfo_proc_ppid_offset = kinfo_proc_ppid_offset_64;</span>
+<span class="nc" id="L950">            } else {</span>
+<span class="nc" id="L951">                sizeOf_kinfo_proc = sizeOf_kinfo_proc_32;</span>
+<span class="nc" id="L952">                kinfo_proc_pid_offset = kinfo_proc_pid_offset_32;</span>
+<span class="nc" id="L953">                kinfo_proc_ppid_offset = kinfo_proc_ppid_offset_32;</span>
+            }
+            try {
+<span class="nc" id="L956">                IntByReference _ = new IntByReference(sizeOfInt);</span>
+<span class="nc" id="L957">                IntByReference size = new IntByReference(sizeOfInt);</span>
+                Memory m;
+<span class="nc" id="L959">                int nRetry = 0;</span>
+                while(true) {
+                    // find out how much memory we need to do this
+<span class="nc bnc" id="L962" title="All 2 branches missed.">                    if(LIBC.sysctl(MIB_PROC_ALL,3, NULL, size, NULL, _)!=0)</span>
+<span class="nc" id="L963">                        throw new IOException(&quot;Failed to obtain memory requirement: &quot;+LIBC.strerror(Native.getLastError()));</span>
+
+                    // now try the real call
+<span class="nc" id="L966">                    m = new Memory(size.getValue());</span>
+<span class="nc bnc" id="L967" title="All 2 branches missed.">                    if(LIBC.sysctl(MIB_PROC_ALL,3, m, size, NULL, _)!=0) {</span>
+<span class="nc bnc" id="L968" title="All 4 branches missed.">                        if(Native.getLastError()==ENOMEM &amp;&amp; nRetry++&lt;16)</span>
+<span class="nc" id="L969">                            continue; // retry</span>
+<span class="nc" id="L970">                        throw new IOException(&quot;Failed to call kern.proc.all: &quot;+LIBC.strerror(Native.getLastError()));</span>
+                    }
+                    break;
+                }
+
+<span class="nc" id="L975">                int count = size.getValue()/sizeOf_kinfo_proc;</span>
+<span class="nc" id="L976">                LOGGER.fine(&quot;Found &quot;+count+&quot; processes&quot;);</span>
+
+<span class="nc bnc" id="L978" title="All 2 branches missed.">                for( int base=0; base&lt;size.getValue(); base+=sizeOf_kinfo_proc) {</span>
+<span class="nc" id="L979">                    int pid = m.getInt(base+ kinfo_proc_pid_offset);</span>
+<span class="nc" id="L980">                    int ppid = m.getInt(base+ kinfo_proc_ppid_offset);</span>
+//                    int effective_uid = m.getInt(base+304);
+//                    byte[] comm = new byte[16];
+//                    m.read(base+163,comm,0,16);
+
+<span class="nc" id="L985">                    super.processes.put(pid,new DarwinProcess(pid,ppid));</span>
+                }
+<span class="nc" id="L987">            } catch (IOException e) {</span>
+<span class="nc" id="L988">                LOGGER.log(Level.WARNING, &quot;Failed to obtain process list&quot;,e);</span>
+            }
+<span class="nc" id="L990">        }</span>
+
+        private class DarwinProcess extends UnixProcess {
+            private final int ppid;
+            private EnvVars envVars;
+            private List&lt;String&gt; arguments;
+
+<span class="nc" id="L997">            DarwinProcess(int pid, int ppid) {</span>
+<span class="nc" id="L998">                super(pid);</span>
+<span class="nc" id="L999">                this.ppid = ppid;</span>
+<span class="nc" id="L1000">            }</span>
+
+            public OSProcess getParent() {
+<span class="nc" id="L1003">                return get(ppid);</span>
+            }
+
+            public synchronized EnvVars getEnvironmentVariables() {
+<span class="nc bnc" id="L1007" title="All 2 branches missed.">                if(envVars !=null)</span>
+<span class="nc" id="L1008">                    return envVars;</span>
+<span class="nc" id="L1009">                parse();</span>
+<span class="nc" id="L1010">                return envVars;</span>
+            }
+
+            public List&lt;String&gt; getArguments() {
+<span class="nc bnc" id="L1014" title="All 2 branches missed.">                if(arguments !=null)</span>
+<span class="nc" id="L1015">                    return arguments;</span>
+<span class="nc" id="L1016">                parse();</span>
+<span class="nc" id="L1017">                return arguments;</span>
+            }
+
+            private void parse() {
+                try {
+// allocate them first, so that the parse error wil result in empty data
+                    // and avoid retry.
+<span class="nc" id="L1024">                    arguments = new ArrayList&lt;String&gt;();</span>
+<span class="nc" id="L1025">                    envVars = new EnvVars();</span>
+
+<span class="nc" id="L1027">                    IntByReference _ = new IntByReference();</span>
+
+<span class="nc" id="L1029">                    IntByReference argmaxRef = new IntByReference(0);</span>
+<span class="nc" id="L1030">                    IntByReference size = new IntByReference(sizeOfInt);</span>
+
+                    // for some reason, I was never able to get sysctlbyname work.
+//        if(LIBC.sysctlbyname(&quot;kern.argmax&quot;, argmaxRef.getPointer(), size, NULL, _)!=0)
+<span class="nc bnc" id="L1034" title="All 2 branches missed.">                    if(LIBC.sysctl(new int[]{CTL_KERN,KERN_ARGMAX},2, argmaxRef.getPointer(), size, NULL, _)!=0)</span>
+<span class="nc" id="L1035">                        throw new IOException(&quot;Failed to get kernl.argmax: &quot;+LIBC.strerror(Native.getLastError()));</span>
+
+<span class="nc" id="L1037">                    int argmax = argmaxRef.getValue();</span>
+
+                    class StringArrayMemory extends Memory {
+<span class="nc" id="L1040">                        private long offset=0;</span>
+
+<span class="nc" id="L1042">                        StringArrayMemory(long l) {</span>
+<span class="nc" id="L1043">                            super(l);</span>
+<span class="nc" id="L1044">                        }</span>
+
+                        int readInt() {
+<span class="nc" id="L1047">                            int r = getInt(offset);</span>
+<span class="nc" id="L1048">                            offset+=sizeOfInt;</span>
+<span class="nc" id="L1049">                            return r;</span>
+                        }
+
+                        byte peek() {
+<span class="nc" id="L1053">                            return getByte(offset);</span>
+                        }
+
+                        String readString() {
+<span class="nc" id="L1057">                            ByteArrayOutputStream baos = new ByteArrayOutputStream();</span>
+                            byte ch;
+<span class="nc bnc" id="L1059" title="All 2 branches missed.">                            while((ch = getByte(offset++))!='\0')</span>
+<span class="nc" id="L1060">                                baos.write(ch);</span>
+<span class="nc" id="L1061">                            return baos.toString();</span>
+                        }
+
+                        void skip0() {
+                            // skip padding '\0's
+<span class="nc bnc" id="L1066" title="All 2 branches missed.">                            while(getByte(offset)=='\0')</span>
+<span class="nc" id="L1067">                                offset++;</span>
+<span class="nc" id="L1068">                        }</span>
+                    }
+<span class="nc" id="L1070">                    StringArrayMemory m = new StringArrayMemory(argmax);</span>
+<span class="nc" id="L1071">                    size.setValue(argmax);</span>
+<span class="nc bnc" id="L1072" title="All 2 branches missed.">                    if(LIBC.sysctl(new int[]{CTL_KERN,KERN_PROCARGS2,pid},3, m, size, NULL, _)!=0)</span>
+<span class="nc" id="L1073">                        throw new IOException(&quot;Failed to obtain ken.procargs2: &quot;+LIBC.strerror(Native.getLastError()));</span>
+
+
+                    /*
+                    * Make a sysctl() call to get the raw argument space of the
+                        * process.  The layout is documented in start.s, which is part
+                        * of the Csu project.  In summary, it looks like:
+                        *
+                        * /---------------\ 0x00000000
+                        * :               :
+                        * :               :
+                        * |---------------|
+                        * | argc          |
+                        * |---------------|
+                        * | arg[0]        |
+                        * |---------------|
+                        * :               :
+                        * :               :
+                        * |---------------|
+                        * | arg[argc - 1] |
+                        * |---------------|
+                        * | 0             |
+                        * |---------------|
+                        * | env[0]        |
+                        * |---------------|
+                        * :               :
+                        * :               :
+                        * |---------------|
+                        * | env[n]        |
+                        * |---------------|
+                        * | 0             |
+                        * |---------------| &lt;-- Beginning of data returned by sysctl()
+                        * | exec_path     |     is here.
+                        * |:::::::::::::::|
+                        * |               |
+                        * | String area.  |
+                        * |               |
+                        * |---------------| &lt;-- Top of stack.
+                        * :               :
+                        * :               :
+                        * \---------------/ 0xffffffff
+                        */
+
+                    // I find the Darwin source code of the 'ps' command helpful in understanding how it does this:
+                    // see http://www.opensource.apple.com/source/adv_cmds/adv_cmds-147/ps/print.c
+<span class="nc" id="L1118">                    int argc = m.readInt();</span>
+<span class="nc" id="L1119">                    String args0 = m.readString(); // exec path</span>
+<span class="nc" id="L1120">                    m.skip0();</span>
+                    try {
+<span class="nc bnc" id="L1122" title="All 2 branches missed.">                        for( int i=0; i&lt;argc; i++) {</span>
+<span class="nc" id="L1123">                            arguments.add(m.readString());</span>
+                        }
+<span class="nc" id="L1125">                    } catch (IndexOutOfBoundsException e) {</span>
+<span class="nc" id="L1126">                        throw new IllegalStateException(&quot;Failed to parse arguments: pid=&quot;+pid+&quot;, arg0=&quot;+args0+&quot;, arguments=&quot;+arguments+&quot;, nargs=&quot;+argc+&quot;. Please run 'ps e &quot;+pid+&quot;' and report this to https://issues.jenkins-ci.org/browse/JENKINS-9634&quot;,e);</span>
+                    }
+
+                    // read env vars that follow
+<span class="nc bnc" id="L1130" title="All 2 branches missed.">                    while(m.peek()!=0)</span>
+<span class="nc" id="L1131">                        envVars.addLine(m.readString());</span>
+<span class="nc" id="L1132">                } catch (IOException e) {</span>
+                    // this happens with insufficient permissions, so just ignore the problem.
+                }
+<span class="nc" id="L1135">            }</span>
+        }
+
+        // local constants
+        private final int sizeOf_kinfo_proc;
+        private static final int sizeOf_kinfo_proc_32 = 492; // on 32bit Mac OS X.
+        private static final int sizeOf_kinfo_proc_64 = 648; // on 64bit Mac OS X.
+        private final int kinfo_proc_pid_offset;
+        private static final int kinfo_proc_pid_offset_32 = 24;
+        private static final int kinfo_proc_pid_offset_64 = 40;
+        private final int kinfo_proc_ppid_offset;
+        private static final int kinfo_proc_ppid_offset_32 = 416;
+        private static final int kinfo_proc_ppid_offset_64 = 560;
+<span class="nc" id="L1148">        private static final int sizeOfInt = Native.getNativeSize(int.class);</span>
+        private static final int CTL_KERN = 1;
+        private static final int KERN_PROC = 14;
+        private static final int KERN_PROC_ALL = 0;
+        private static final int ENOMEM = 12;
+<span class="nc" id="L1153">        private static int[] MIB_PROC_ALL = {CTL_KERN, KERN_PROC, KERN_PROC_ALL};</span>
+        private static final int KERN_ARGMAX = 8;
+<span class="nc" id="L1155">        private static final int KERN_PROCARGS2 = 49;</span>
+    }
+
+    /**
+     * Represents a local process tree, where this JVM and the process tree run on the same system.
+     * (The opposite of {@link Remote}.)
+     */
+    public static abstract class Local extends ProcessTree {
+<span class="fc" id="L1163">        Local() {</span>
+<span class="fc" id="L1164">        }</span>
+    }
+
+    /**
+     * Represents a process tree over a channel.
+     */
+    public static class Remote extends ProcessTree implements Serializable {
+        private final IProcessTree proxy;
+
+<span class="fc" id="L1173">        public Remote(ProcessTree proxy, Channel ch) {</span>
+<span class="fc" id="L1174">            this.proxy = ch.export(IProcessTree.class,proxy);</span>
+<span class="fc bfc" id="L1175" title="All 2 branches covered.">            for (Entry&lt;Integer,OSProcess&gt; e : proxy.processes.entrySet())</span>
+<span class="fc" id="L1176">                processes.put(e.getKey(),new RemoteProcess(e.getValue(),ch));</span>
+<span class="fc" id="L1177">        }</span>
+
+        @Override
+        public OSProcess get(Process proc) {
+<span class="nc" id="L1181">            return null;</span>
+        }
+
+        @Override
+        public void killAll(Map&lt;String, String&gt; modelEnvVars) throws InterruptedException {
+<span class="nc" id="L1186">            proxy.killAll(modelEnvVars);</span>
+<span class="nc" id="L1187">        }</span>
+
+        Object writeReplace() {
+<span class="fc" id="L1190">            return this; // cancel out super.writeReplace()</span>
+        }
+
+        private static final long serialVersionUID = 1L;
+
+        private class RemoteProcess extends OSProcess implements Serializable {
+            private final IOSProcess proxy;
+
+<span class="fc" id="L1198">            RemoteProcess(OSProcess proxy, Channel ch) {</span>
+<span class="fc" id="L1199">                super(proxy.getPid());</span>
+<span class="fc" id="L1200">                this.proxy = ch.export(IOSProcess.class,proxy);</span>
+<span class="fc" id="L1201">            }</span>
+
+            public OSProcess getParent() {
+<span class="nc" id="L1204">                IOSProcess p = proxy.getParent();</span>
+<span class="nc bnc" id="L1205" title="All 2 branches missed.">                if (p==null)    return null;</span>
+<span class="nc" id="L1206">                return get(p.getPid());</span>
+            }
+
+            public void kill() throws InterruptedException {
+<span class="nc" id="L1210">                proxy.kill();</span>
+<span class="nc" id="L1211">            }</span>
+
+            public void killRecursively() throws InterruptedException {
+<span class="nc" id="L1214">                proxy.killRecursively();</span>
+<span class="nc" id="L1215">            }</span>
+
+            public List&lt;String&gt; getArguments() {
+<span class="nc" id="L1218">                return proxy.getArguments();</span>
+            }
+
+            public EnvVars getEnvironmentVariables() {
+<span class="fc" id="L1222">                return proxy.getEnvironmentVariables();</span>
+            }
+
+            Object writeReplace() {
+<span class="fc" id="L1226">                return this; // cancel out super.writeReplace()</span>
+            }
+
+            public &lt;T&gt; T act(ProcessCallable&lt;T&gt; callable) throws IOException, InterruptedException {
+<span class="fc" id="L1230">                return proxy.act(callable);</span>
+            }
+
+
+            private static final long serialVersionUID = 1L;
+        }
+    }
+
+    /**
+     * Use {@link Remote} as the serialized form.
+     */
+    /*package*/ Object writeReplace() {
+<span class="fc" id="L1242">        return new Remote(this,Channel.current());</span>
+    }
+
+//    public static void main(String[] args) {
+//        // dump everything
+//        LOGGER.setLevel(Level.ALL);
+//        ConsoleHandler h = new ConsoleHandler();
+//        h.setLevel(Level.ALL);
+//        LOGGER.addHandler(h);
+//
+//        Solaris killer = (Solaris)get();
+//        Solaris.SolarisSystem s = killer.createSystem();
+//        Solaris.SolarisProcess p = s.get(Integer.parseInt(args[0]));
+//        System.out.println(p.getEnvVars());
+//
+//        if(args.length==2)
+//            p.kill();
+//    }
+
+    /*
+        On MacOS X, there's no procfs &lt;http://www.osxbook.com/book/bonus/chapter11/procfs/&gt;
+        instead you'd do it with the sysctl &lt;http://search.cpan.org/src/DURIST/Proc-ProcessTable-0.42/os/darwin.c&gt;
+        &lt;http://developer.apple.com/documentation/Darwin/Reference/ManPages/man3/sysctl.3.html&gt;
+
+        There's CLI but that doesn't seem to offer the access to per-process info
+        &lt;http://developer.apple.com/documentation/Darwin/Reference/ManPages/man8/sysctl.8.html&gt;
+
+
+
+        On HP-UX, pstat_getcommandline get you command line, but I'm not seeing any environment variables.
+     */
+
+<span class="fc" id="L1274">    private static final boolean IS_LITTLE_ENDIAN = &quot;little&quot;.equals(System.getProperty(&quot;sun.cpu.endian&quot;));</span>
+<span class="fc" id="L1275">    private static final Logger LOGGER = Logger.getLogger(ProcessTree.class.getName());</span>
+
+    /**
+     * Flag to control this feature.
+     *
+     * &lt;p&gt;
+     * This feature involves some native code, so we are allowing the user to disable this
+     * in case there's a fatal problem.
+     *
+     * &lt;p&gt;
+     * This property supports two names for a compatibility reason.
+     */
+<span class="pc bpc" id="L1287" title="1 of 2 branches missed.">    public static boolean enabled = !Boolean.getBoolean(ProcessTreeKiller.class.getName()+&quot;.disable&quot;)</span>
+<span class="pc bpc" id="L1288" title="1 of 2 branches missed.">                                 &amp;&amp; !Boolean.getBoolean(ProcessTree.class.getName()+&quot;.disable&quot;);</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

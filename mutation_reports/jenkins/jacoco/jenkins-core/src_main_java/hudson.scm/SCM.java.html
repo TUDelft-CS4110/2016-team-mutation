@@ -1,0 +1,747 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>SCM.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.scm</a> &gt; <span class="el_source">SCM.java</span></div><h1>SCM.java</h1><pre class="source lang-java linenums">/*
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc., Kohsuke Kawaguchi, Stephen Connolly, InfraDNA, Inc.
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.scm;
+
+import hudson.AbortException;
+import hudson.DescriptorExtensionList;
+import hudson.Extension;
+import hudson.ExtensionPoint;
+import hudson.FilePath;
+import hudson.Launcher;
+import hudson.Util;
+import hudson.model.AbstractBuild;
+import hudson.model.AbstractProject;
+import hudson.model.Action;
+import hudson.model.Api;
+import hudson.model.BuildListener;
+import hudson.model.Describable;
+import hudson.model.Descriptor;
+import hudson.model.Job;
+import hudson.model.Node;
+import hudson.model.Run;
+import hudson.model.TaskListener;
+import hudson.model.TopLevelItemDescriptor;
+import hudson.model.WorkspaceCleanupThread;
+import hudson.security.Permission;
+import hudson.security.PermissionGroup;
+import hudson.security.PermissionScope;
+import hudson.tasks.Builder;
+import hudson.util.IOUtils;
+import java.io.File;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import javax.annotation.CheckForNull;
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+import jenkins.model.Jenkins;
+import org.kohsuke.stapler.export.Exported;
+import org.kohsuke.stapler.export.ExportedBean;
+
+/**
+ * Captures the configuration information in it.
+ *
+ * &lt;p&gt;
+ * To register a custom {@link SCM} implementation from a plugin,
+ * put {@link Extension} on your {@link SCMDescriptor}.
+ *
+ * &lt;p&gt;
+ * Use the &quot;project-changes&quot; view to render change list to be displayed
+ * at the project level. The default implementation simply aggregates
+ * change lists from builds, but your SCM can provide different views.
+ * The view gets the &quot;builds&quot; variable which is a list of builds that are
+ * selected for the display.
+ *
+ * &lt;p&gt;
+ * If you are interested in writing a subclass in a plugin,
+ * also take a look at &lt;a href=&quot;http://wiki.jenkins-ci.org/display/JENKINS/Writing+an+SCM+plugin&quot;&gt;
+ * &quot;Writing an SCM plugin&quot;&lt;/a&gt; wiki article.
+ *
+ * @author Kohsuke Kawaguchi
+ */
+@ExportedBean
+<span class="nc" id="L86">public abstract class SCM implements Describable&lt;SCM&gt;, ExtensionPoint {</span>
+    /**
+     * Stores {@link AutoBrowserHolder}. Lazily created.
+     */
+    private transient AutoBrowserHolder autoBrowserHolder;
+
+    /**
+     * Expose {@link SCM} to the remote API.
+     */
+    public Api getApi() {
+<span class="nc" id="L96">        return new Api(this);</span>
+    }
+
+    /**
+     * Returns the {@link RepositoryBrowser} for files
+     * controlled by this {@link SCM}.
+     *
+     * @return
+     *      null to indicate that there's no explicitly configured browser
+     *      for this SCM instance.
+     *
+     * @see #getEffectiveBrowser()
+     */
+    public @CheckForNull RepositoryBrowser&lt;?&gt; getBrowser() {
+<span class="nc" id="L110">        return null;</span>
+    }
+
+    /**
+     * Type of this SCM.
+     *
+     * Exposed so that the client of the remote API can tell what SCM this is.
+     */
+    @Exported
+    public String getType() {
+<span class="nc" id="L120">        return getClass().getName();</span>
+    }
+
+    /**
+     * Returns the applicable {@link RepositoryBrowser} for files
+     * controlled by this {@link SCM}.
+     * @see #guessBrowser
+     * @see SCMDescriptor#isBrowserReusable
+     */
+    @Exported(name=&quot;browser&quot;)
+    public final @CheckForNull RepositoryBrowser&lt;?&gt; getEffectiveBrowser() {
+<span class="nc" id="L131">        RepositoryBrowser&lt;?&gt; b = getBrowser();</span>
+<span class="nc bnc" id="L132" title="All 2 branches missed.">        if(b!=null)</span>
+<span class="nc" id="L133">            return b;</span>
+<span class="nc bnc" id="L134" title="All 2 branches missed.">        if(autoBrowserHolder==null)</span>
+<span class="nc" id="L135">            autoBrowserHolder = new AutoBrowserHolder(this);</span>
+<span class="nc" id="L136">        return autoBrowserHolder.get();</span>
+
+    }
+
+    /**
+     * Returns true if this SCM supports
+     * {@link #poll(AbstractProject, Launcher, FilePath, TaskListener, SCMRevisionState) poling}.
+     *
+     * @since 1.105
+     */
+    public boolean supportsPolling() {
+<span class="nc" id="L147">        return true;</span>
+    }
+    
+    /**
+     * Returns true if this SCM requires a checked out workspace for doing polling.
+     *
+     * &lt;p&gt;
+     * This flag affects the behavior of Hudson when a job lost its workspace
+     * (typically due to a slave outage.) If this method returns false and
+     * polling is configured, then that would immediately trigger a new build.
+     *
+     * &lt;p&gt;
+     * This flag also affects the mutual exclusion control between builds and polling.
+     * If this methods returns false, polling will continue asynchronously even
+     * when a build is in progress, but otherwise the polling activity is blocked
+     * if a build is currently using a workspace.
+     *
+     * &lt;p&gt;
+     * The default implementation returns true.
+     *
+     * &lt;p&gt;
+     * See issue #1348 for more discussion of this feature.
+     *
+     * @since 1.196
+     */
+    public boolean requiresWorkspaceForPolling() {
+<span class="nc" id="L173">    	return true;</span>
+    }
+
+    /**
+     * Called before a workspace is deleted on the given node, to provide SCM an opportunity to perform clean up.
+     *
+     * &lt;p&gt;
+     * Hudson periodically scans through all the slaves and removes old workspaces that are deemed unnecessary.
+     * This behavior is implemented in {@link WorkspaceCleanupThread}, and it is necessary to control the
+     * disk consumption on slaves. If we don't do this, in a long run, all the slaves will have workspaces
+     * for all the projects, which will be prohibitive in big Hudson.
+     *
+     * &lt;p&gt;
+     * However, some SCM implementations require that the server be made aware of deletion of the local workspace,
+     * and this method provides an opportunity for SCMs to perform such a clean-up act.
+     *
+     * &lt;p&gt;
+     * This call back is invoked after Hudson determines that a workspace is unnecessary, but before the actual
+     * recursive directory deletion happens.
+     *
+     * &lt;p&gt;
+     * Note that this method does not guarantee that such a clean up will happen. For example, slaves can be
+     * taken offline by being physically removed from the network, and in such a case there's no opportunity
+     * to perform this clean up.
+     *
+     * &lt;p&gt;
+     * This method is also invoked when the project is deleted.
+     *
+     * @param project
+     *      The project that owns this {@link SCM}. This is always the same object for a particular instance
+     *      of {@link SCM}. Just passed in here so that {@link SCM} itself doesn't have to remember the value.
+     * @param workspace
+     *      The workspace which is about to be deleted. This can be a remote file path.
+     * @param node
+     *      The node that hosts the workspace. SCM can use this information to determine the course of action.
+     *
+     * @return
+     *      true if {@link SCM} is OK to let Hudson proceed with deleting the workspace.
+     *      False to veto the workspace deletion.
+     * 
+     * @since 1.568
+     */
+    public boolean processWorkspaceBeforeDeletion(@Nonnull Job&lt;?,?&gt; project, @Nonnull FilePath workspace, @Nonnull Node node) throws IOException, InterruptedException {
+<span class="nc bnc" id="L216" title="All 2 branches missed.">        if (project instanceof AbstractProject) {</span>
+<span class="nc" id="L217">            return processWorkspaceBeforeDeletion((AbstractProject) project, workspace, node);</span>
+        } else {
+<span class="nc" id="L219">            return true;</span>
+        }
+    }
+
+    @Deprecated
+    public boolean processWorkspaceBeforeDeletion(AbstractProject&lt;?,?&gt; project, FilePath workspace, Node node) throws IOException, InterruptedException {
+<span class="nc bnc" id="L225" title="All 2 branches missed.">        if (Util.isOverridden(SCM.class, getClass(), &quot;processWorkspaceBeforeDeletion&quot;, Job.class, FilePath.class, Node.class)) {</span>
+<span class="nc" id="L226">            return processWorkspaceBeforeDeletion((Job) project, workspace, node);</span>
+        } else {
+<span class="nc" id="L228">            return true;</span>
+        }
+    }
+
+    /**
+     * Checks if there has been any changes to this module in the repository.
+     *
+     * TODO: we need to figure out a better way to communicate an error back,
+     * so that we won't keep retrying the same node (for example a slave might be down.)
+     *
+     * &lt;p&gt;
+     * If the SCM doesn't implement polling, have the {@link #supportsPolling()} method
+     * return false.
+     *
+     * @param project
+     *      The project to check for updates
+     * @param launcher
+     *      Abstraction of the machine where the polling will take place. If SCM declares
+     *      that {@linkplain #requiresWorkspaceForPolling() the polling doesn't require a workspace}, this parameter is null.
+     * @param workspace
+     *      The workspace directory that contains baseline files. If SCM declares
+     *      that {@linkplain #requiresWorkspaceForPolling() the polling doesn't require a workspace}, this parameter is null.
+     * @param listener
+     *      Logs during the polling should be sent here.
+     *
+     * @return true
+     *      if the change is detected.
+     *
+     * @throws InterruptedException
+     *      interruption is usually caused by the user aborting the computation.
+     *      this exception should be simply propagated all the way up.
+     *
+     * @see #supportsPolling()
+     *
+     * @deprecated as of 1.345
+     *      Override {@link #calcRevisionsFromBuild(AbstractBuild, Launcher, TaskListener)} and
+     *      {@link #compareRemoteRevisionWith(AbstractProject, Launcher, FilePath, TaskListener, SCMRevisionState)} for implementation.
+     *
+     *      The implementation is now separated in two pieces, one that computes the revision of the current workspace,
+     *      and the other that computes the revision of the remote repository.
+     *
+     *      Call {@link #poll(AbstractProject, Launcher, FilePath, TaskListener, SCMRevisionState)} for use instead.
+     */
+    @Deprecated
+    public boolean pollChanges(AbstractProject&lt;?,?&gt; project, Launcher launcher, FilePath workspace, TaskListener listener) throws IOException, InterruptedException {
+        // up until 1.336, this method was abstract, so everyone should have overridden this method
+        // without calling super.pollChanges. So the compatibility implementation is purely for
+        // new implementations that doesn't override this method.
+<span class="nc" id="L276">        throw new AbstractMethodError(&quot;you must override compareRemoteRevisionWith&quot;);</span>
+    }
+
+    /**
+     * Calculates the {@link SCMRevisionState} that represents the state of the workspace of the given build.
+     *
+     * &lt;p&gt;
+     * The returned object is then fed into the
+     * {@link #compareRemoteRevisionWith(AbstractProject, Launcher, FilePath, TaskListener, SCMRevisionState)} method
+     * as the baseline {@link SCMRevisionState} to determine if the build is necessary.
+     *
+     * &lt;p&gt;
+     * This method is called after source code is checked out for the given build (that is, after
+     * {@link SCM#checkout(Run, Launcher, FilePath, TaskListener, File)} has finished successfully.)
+     *
+     * &lt;p&gt;
+     * The obtained object is added to the build as an {@link Action} for later retrieval. As an optimization,
+     * {@link SCM} implementation can choose to compute {@link SCMRevisionState} and add it as an action
+     * during check out, in which case this method will not called. 
+     *
+     * @param build
+     *      The calculated {@link SCMRevisionState} is for the files checked out in this build.
+     *      If {@link #requiresWorkspaceForPolling()} returns true, Hudson makes sure that the workspace of this
+     *      build is available and accessible by the callee.
+     * @param workspace the location of the checkout; normally not null, since this will normally be called immediately after checkout,
+     *                  though could be null if data is being loaded from a very old version of Jenkins and the SCM declares that it does not require a workspace for polling
+     * @param launcher
+     *      Abstraction of the machine where the polling will take place. Nullness matches that of {@code workspace}.
+     * @param listener
+     *      Logs during the polling should be sent here.
+     *
+     * @throws InterruptedException
+     *      interruption is usually caused by the user aborting the computation.
+     *      this exception should be simply propagated all the way up. 
+     * @since 1.568
+     */
+    public @CheckForNull SCMRevisionState calcRevisionsFromBuild(@Nonnull Run&lt;?,?&gt; build, @Nullable FilePath workspace, @Nullable Launcher launcher, @Nonnull TaskListener listener) throws IOException, InterruptedException {
+<span class="nc bnc" id="L313" title="All 4 branches missed.">        if (build instanceof AbstractBuild &amp;&amp; Util.isOverridden(SCM.class, getClass(), &quot;calcRevisionsFromBuild&quot;, AbstractBuild.class, Launcher.class, TaskListener.class)) {</span>
+<span class="nc" id="L314">            return calcRevisionsFromBuild((AbstractBuild) build, launcher, listener);</span>
+        } else {
+<span class="nc" id="L316">            throw new AbstractMethodError(&quot;you must override the new calcRevisionsFromBuild overload&quot;);</span>
+        }
+    }
+
+    @Deprecated
+    public SCMRevisionState calcRevisionsFromBuild(AbstractBuild&lt;?,?&gt; build, Launcher launcher, TaskListener listener) throws IOException, InterruptedException {
+<span class="nc bnc" id="L322" title="All 2 branches missed.">        return calcRevisionsFromBuild(build, launcher != null ? build.getWorkspace() : null, launcher, listener);</span>
+    }
+
+    @Deprecated
+    public SCMRevisionState _calcRevisionsFromBuild(AbstractBuild&lt;?, ?&gt; build, Launcher launcher, TaskListener listener) throws IOException, InterruptedException {
+<span class="nc" id="L327">        return calcRevisionsFromBuild(build, launcher, listener);</span>
+    }
+    
+    /**
+     * Compares the current state of the remote repository against the given baseline {@link SCMRevisionState}.
+     *
+     * &lt;p&gt;
+     * Conceptually, the act of polling is to take two states of the repository and to compare them to see
+     * if there's any difference. In practice, however, comparing two arbitrary repository states is an expensive
+     * operation, so in this abstraction, we chose to mix (1) the act of building up a repository state and
+     * (2) the act of comparing it with the earlier state, so that SCM implementations can implement this
+     * more easily. 
+     *
+     * &lt;p&gt;
+     * Multiple invocations of this method may happen over time to make sure that the remote repository
+     * is &quot;quiet&quot; before Hudson schedules a new build.
+     *
+     * @param project
+     *      The project to check for updates
+     * @param launcher
+     *      Abstraction of the machine where the polling will take place. If SCM declares
+     *      that {@linkplain #requiresWorkspaceForPolling() the polling doesn't require a workspace}, this parameter is null.
+     * @param workspace
+     *      The workspace directory that contains baseline files. If SCM declares
+     *      that {@linkplain #requiresWorkspaceForPolling() the polling doesn't require a workspace}, this parameter is null.
+     * @param listener
+     *      Logs during the polling should be sent here.
+     * @param baseline
+     *      The baseline of the comparison. This object is the return value from earlier
+     *      {@link #compareRemoteRevisionWith(AbstractProject, Launcher, FilePath, TaskListener, SCMRevisionState)} or
+     *      {@link #calcRevisionsFromBuild(AbstractBuild, Launcher, TaskListener)}.
+     *
+     * @return
+     *      This method returns multiple values that are bundled together into the {@link PollingResult} value type.
+     *      {@link PollingResult#baseline} should be the value of the baseline parameter, {@link PollingResult#remote}
+     *      is the current state of the remote repository (this object only needs to be understandable to the future
+     *      invocations of this method),
+     *      and {@link PollingResult#change} that indicates the degree of changes found during the comparison.
+     *
+     * @throws InterruptedException
+     *      interruption is usually caused by the user aborting the computation.
+     *      this exception should be simply propagated all the way up.
+     * @since 1.568
+     */
+    public PollingResult compareRemoteRevisionWith(@Nonnull Job&lt;?,?&gt; project, @Nullable Launcher launcher, @Nullable FilePath workspace, @Nonnull TaskListener listener, @Nonnull SCMRevisionState baseline) throws IOException, InterruptedException {
+<span class="nc bnc" id="L372" title="All 4 branches missed.">        if (project instanceof AbstractProject &amp;&amp; Util.isOverridden(SCM.class, getClass(), &quot;compareRemoteRevisionWith&quot;, AbstractProject.class, Launcher.class, FilePath.class, TaskListener.class, SCMRevisionState.class)) {</span>
+<span class="nc" id="L373">            return compareRemoteRevisionWith((AbstractProject) project, launcher, workspace, listener, baseline);</span>
+        } else {
+<span class="nc" id="L375">            throw new AbstractMethodError(&quot;you must override the new overload of compareRemoteRevisionWith&quot;);</span>
+        }
+    }
+
+    @Deprecated
+    protected PollingResult compareRemoteRevisionWith(AbstractProject&lt;?,?&gt; project, Launcher launcher, FilePath workspace, TaskListener listener, SCMRevisionState baseline) throws IOException, InterruptedException {
+<span class="nc" id="L381">        return compareRemoteRevisionWith((Job) project, launcher, workspace, listener, baseline);</span>
+    }
+
+    /**
+     * Convenience method for the caller to handle the backward compatibility between pre 1.345 SCMs.
+     */
+    public final PollingResult poll(AbstractProject&lt;?,?&gt; project, Launcher launcher, FilePath workspace, TaskListener listener, SCMRevisionState baseline) throws IOException, InterruptedException {
+<span class="nc bnc" id="L388" title="All 2 branches missed.">        if (is1_346OrLater()) {</span>
+            // This is to work around HUDSON-5827 in a general way.
+            // don't let the SCM.compareRemoteRevisionWith(...) see SCMRevisionState that it didn't produce.
+            SCMRevisionState baseline2;
+<span class="nc bnc" id="L392" title="All 2 branches missed.">            if (baseline!=SCMRevisionState.NONE) {</span>
+<span class="nc" id="L393">                baseline2 = baseline;</span>
+<span class="nc" id="L394">            } else {</span>
+<span class="nc" id="L395">                baseline2 = calcRevisionsFromBuild(project.getLastBuild(), launcher, listener);</span>
+            }
+
+<span class="nc" id="L398">            return compareRemoteRevisionWith(project, launcher, workspace, listener, baseline2);</span>
+        } else {
+<span class="nc bnc" id="L400" title="All 2 branches missed.">            return pollChanges(project,launcher,workspace,listener) ? PollingResult.SIGNIFICANT : PollingResult.NO_CHANGES;</span>
+        }
+    }
+
+    private boolean is1_346OrLater() {
+<span class="nc bnc" id="L405" title="All 2 branches missed.">        for (Class&lt;?&gt; c = getClass(); c != SCM.class; c = c.getSuperclass()) {</span>
+            try {
+<span class="nc" id="L407">                c.getDeclaredMethod(&quot;compareRemoteRevisionWith&quot;, AbstractProject.class, Launcher.class, FilePath.class, TaskListener.class, SCMRevisionState.class);</span>
+<span class="nc" id="L408">                return true;</span>
+<span class="nc" id="L409">            } catch (NoSuchMethodException e) {</span>
+                try {
+<span class="nc" id="L411">                    c.getDeclaredMethod(&quot;compareRemoteRevisionWith&quot;, Job.class, Launcher.class, FilePath.class, TaskListener.class, SCMRevisionState.class);</span>
+<span class="nc" id="L412">                    return true;</span>
+<span class="nc" id="L413">                } catch (NoSuchMethodException e2) {}</span>
+            }
+        }
+<span class="nc" id="L416">        return false;</span>
+    }
+
+    /**
+     * Should create a key by which this SCM configuration might be distinguished from others in the same project.
+     * Should be invariable across builds but otherwise as distinctive as possible.
+     * &lt;p&gt;Could include information such as the relative paths used in {@link #getModuleRoots(FilePath, AbstractBuild)},
+     * and/or configured repository URLs and branch names, and/or labels set for this purpose by the user.
+     * &lt;p&gt;The result may be used for various purposes, but it may be long and/or include URL-unsafe characters,
+     * so to use in a URL path component you may need to first wrap it in {@link Util#getDigestOf(String)} or otherwise encode it.
+     * @return by default, just {@link #getType}
+     * @since 1.568
+     */
+    public @Nonnull String getKey() {
+<span class="nc" id="L430">        return getType();</span>
+    }
+
+    /**
+     * Obtains a fresh workspace of the module(s) into the specified directory
+     * of the specified machine.
+     *
+     * &lt;p&gt;
+     * The &quot;update&quot; operation can be performed instead of a fresh checkout if
+     * feasible.
+     *
+     * &lt;p&gt;
+     * This operation should also capture the information necessary to tag the workspace later.
+     *
+     * @param launcher
+     *      Abstracts away the machine that the files will be checked out.
+     * @param workspace
+     *      a directory to check out the source code. May contain left-over
+     *      from the previous build.
+     * @param changelogFile
+     *      Upon a successful return, this file should capture the changelog.
+     *      When there's no change, this file should contain an empty entry.
+     *      See {@link #createEmptyChangeLog(File, TaskListener, String)}.
+     *      May be null, in which case no changelog was requested.
+     * @param  baseline version from the previous build to use for changelog creation, if requested and available
+     * @throws InterruptedException
+     *      interruption is usually caused by the user aborting the build.
+     *      this exception will cause the build to be aborted.
+     * @throws AbortException in case of a routine failure
+     * @since 1.568
+     */
+    public void checkout(@Nonnull Run&lt;?,?&gt; build, @Nonnull Launcher launcher, @Nonnull FilePath workspace, @Nonnull TaskListener listener, @CheckForNull File changelogFile, @CheckForNull SCMRevisionState baseline) throws IOException, InterruptedException {
+<span class="nc bnc" id="L462" title="All 6 branches missed.">        if (build instanceof AbstractBuild &amp;&amp; listener instanceof BuildListener &amp;&amp; Util.isOverridden(SCM.class, getClass(), &quot;checkout&quot;, AbstractBuild.class, Launcher.class, FilePath.class, BuildListener.class, File.class)) {</span>
+<span class="nc bnc" id="L463" title="All 2 branches missed.">            if (changelogFile == null) {</span>
+<span class="nc" id="L464">                changelogFile = File.createTempFile(&quot;changelog&quot;, &quot;.xml&quot;);</span>
+                try {
+<span class="nc bnc" id="L466" title="All 2 branches missed.">                    if (!checkout((AbstractBuild) build, launcher, workspace, (BuildListener) listener, changelogFile)) {</span>
+<span class="nc" id="L467">                        throw new AbortException();</span>
+                    }
+<span class="nc" id="L469">                } finally {</span>
+<span class="nc" id="L470">                    Util.deleteFile(changelogFile);</span>
+<span class="nc" id="L471">                }</span>
+<span class="nc" id="L472">            } else {</span>
+<span class="nc bnc" id="L473" title="All 2 branches missed.">                if (!checkout((AbstractBuild) build, launcher, workspace, (BuildListener) listener, changelogFile)) {</span>
+<span class="nc" id="L474">                    throw new AbortException();</span>
+                }
+            }
+        } else {
+<span class="nc" id="L478">            throw new AbstractMethodError(&quot;you must override the new overload of checkout&quot;);</span>
+        }
+<span class="nc" id="L480">    }</span>
+
+    @Deprecated
+    public boolean checkout(AbstractBuild&lt;?,?&gt; build, Launcher launcher, FilePath workspace, BuildListener listener, @Nonnull File changelogFile) throws IOException, InterruptedException {
+<span class="nc" id="L484">        AbstractBuild&lt;?,?&gt; prev = build.getPreviousBuild();</span>
+<span class="nc bnc" id="L485" title="All 2 branches missed.">        checkout((Run) build, launcher, workspace, listener, changelogFile, prev != null ? prev.getAction(SCMRevisionState.class) : null);</span>
+<span class="nc" id="L486">        return true;</span>
+    }
+
+    /**
+     * Get a chance to do operations after the workspace i checked out and the changelog is written.
+     * @since 1.568
+     */
+    public void postCheckout(@Nonnull Run&lt;?,?&gt; build, @Nonnull Launcher launcher, @Nonnull FilePath workspace, @Nonnull TaskListener listener) throws IOException, InterruptedException {
+<span class="nc bnc" id="L494" title="All 4 branches missed.">        if (build instanceof AbstractBuild &amp;&amp; listener instanceof BuildListener) {</span>
+<span class="nc" id="L495">            postCheckout((AbstractBuild) build, launcher, workspace, (BuildListener) listener);</span>
+        }
+<span class="nc" id="L497">    }</span>
+
+    @Deprecated
+    public void postCheckout(AbstractBuild&lt;?,?&gt; build, Launcher launcher, FilePath workspace, BuildListener listener) throws IOException, InterruptedException {
+<span class="nc bnc" id="L501" title="All 2 branches missed.">        if (Util.isOverridden(SCM.class, getClass(), &quot;postCheckout&quot;, Run.class, Launcher.class, FilePath.class, TaskListener.class)) {</span>
+<span class="nc" id="L502">            postCheckout((Run) build, launcher, workspace, listener);</span>
+        }
+        /* Default implementation is noop */
+<span class="nc" id="L505">    }</span>
+
+    /**
+     * Adds environmental variables for the builds to the given map.
+     *
+     * &lt;p&gt;
+     * This can be used to propagate information from SCM to builds
+     * (for example, SVN revision number.)
+     *
+     * &lt;p&gt;
+     * This method is invoked whenever someone does {@link AbstractBuild#getEnvironment(TaskListener)}, which
+     * can be before/after your checkout method is invoked. So if you are going to provide information about
+     * check out (like SVN revision number that was checked out), be prepared for the possibility that the
+     * check out hasn't happened yet.
+     */
+    // TODO is an equivalent for Run needed?
+    public void buildEnvVars(AbstractBuild&lt;?,?&gt; build, Map&lt;String, String&gt; env) {
+        // default implementation is noop.
+<span class="nc" id="L523">    }</span>
+
+    /**
+     * Gets the top directory of the checked out module.
+     *
+     * &lt;p&gt;
+     * Often SCMs have to create a directory inside a workspace, which
+     * creates directory layout like this:
+     *
+     * &lt;pre&gt;
+     * workspace  &lt;- workspace root
+     *  +- xyz    &lt;- directory checked out by SCM
+     *      +- CVS
+     *      +- build.xml  &lt;- user file
+     * &lt;/pre&gt;
+     *
+     * &lt;p&gt;
+     * Many builders, like Ant or Maven, works off the specific user file
+     * at the top of the checked out module (in the above case, that would
+     * be &lt;tt&gt;xyz/build.xml&lt;/tt&gt;), yet the builder doesn't know the &quot;xyz&quot;
+     * part; that comes from SCM.
+     *
+     * &lt;p&gt;
+     * Collaboration between {@link Builder} and {@link SCM} allows
+     * Hudson to find build.xml without asking the user to enter &quot;xyz&quot; again.
+     *
+     * &lt;p&gt;
+     * This method is for this purpose. It takes the workspace
+     * root as a parameter, and expected to return the directory
+     * that was checked out from SCM.
+     *
+     * &lt;p&gt;
+     * If this SCM is configured to create a directory, try to
+     * return that directory so that builders can work seamlessly.
+     *
+     * &lt;p&gt;
+     * If SCM doesn't need to create any directory inside workspace,
+     * or in any other tricky cases, it should revert to the default
+     * implementation, which is to just return the parameter.
+     *
+     * @param workspace
+     *      The workspace root directory.
+     * @param build
+     *      The build for which the module root is desired.
+     *      This parameter is null when existing legacy code calls deprecated {@link #getModuleRoot(FilePath)}.
+     *      Handle this situation gracefully if your can, but otherwise you can just fail with an exception, too.
+     *
+     * @since 1.382
+     */
+    // TODO perhaps deprecate all replace with a single getModuleRoots(FilePath, Run)
+    public FilePath getModuleRoot(FilePath workspace, AbstractBuild build) {
+        // For backwards compatibility, call the one argument version of the method.
+<span class="nc" id="L575">        return getModuleRoot(workspace);</span>
+    }
+    
+    /**
+     * @deprecated since 1.382
+     *      Use/override {@link #getModuleRoot(FilePath, AbstractBuild)} instead.
+     */
+    @Deprecated
+    public FilePath getModuleRoot(FilePath workspace) {
+<span class="nc bnc" id="L584" title="All 2 branches missed.">        if (Util.isOverridden(SCM.class,getClass(),&quot;getModuleRoot&quot;, FilePath.class,AbstractBuild.class))</span>
+            // if the subtype already implements newer getModuleRoot(FilePath,AbstractBuild), call that.
+<span class="nc" id="L586">            return getModuleRoot(workspace,null);</span>
+
+<span class="nc" id="L588">        return workspace;</span>
+    }
+
+    /**
+     * Gets the top directories of all the checked out modules.
+     *
+     * &lt;p&gt;
+     * Some SCMs support checking out multiple modules inside a workspace, which
+     * creates directory layout like this:
+     *
+     * &lt;pre&gt;
+     * workspace  &lt;- workspace root
+     *  +- xyz    &lt;- directory checked out by SCM
+     *      +- .svn
+     *      +- build.xml  &lt;- user file
+     *  +- abc    &lt;- second module from different SCM root
+     *      +- .svn
+     *      +- build.xml  &lt;- user file
+     * &lt;/pre&gt;
+     *
+     * This method takes the workspace root as a parameter, and is expected to return
+     * all the module roots that were checked out from SCM.
+     *
+     * &lt;p&gt;
+     * For normal SCMs, the array will be of length &lt;code&gt;1&lt;/code&gt; and it's contents
+     * will be identical to calling {@link #getModuleRoot(FilePath, AbstractBuild)}.
+     *
+     * @param workspace The workspace root directory
+     * @param build
+     *      The build for which the module roots are desired.
+     *      This parameter is null when existing legacy code calls deprecated {@link #getModuleRoot(FilePath)}.
+     *      Handle this situation gracefully if your can, but otherwise you can just fail with an exception, too.
+     *
+     * @return An array of all module roots.
+     * @since 1.382
+     */
+    public FilePath[] getModuleRoots(FilePath workspace, AbstractBuild build) {
+<span class="nc bnc" id="L625" title="All 2 branches missed.">        if (Util.isOverridden(SCM.class,getClass(),&quot;getModuleRoots&quot;, FilePath.class))</span>
+            // if the subtype derives legacy getModuleRoots(FilePath), delegate to it
+<span class="nc" id="L627">            return getModuleRoots(workspace);</span>
+
+        // otherwise the default implementation
+<span class="nc" id="L630">        return new FilePath[]{getModuleRoot(workspace,build)};</span>
+    }
+    
+    /**
+     * @deprecated as of 1.382.
+     *      Use/derive from {@link #getModuleRoots(FilePath, AbstractBuild)} instead.
+     */
+    @Deprecated
+    public FilePath[] getModuleRoots(FilePath workspace) {
+<span class="nc bnc" id="L639" title="All 2 branches missed.">        if (Util.isOverridden(SCM.class,getClass(),&quot;getModuleRoots&quot;, FilePath.class, AbstractBuild.class))</span>
+            // if the subtype already derives newer getModuleRoots(FilePath,AbstractBuild), delegate to it
+<span class="nc" id="L641">            return getModuleRoots(workspace,null);</span>
+
+        // otherwise the default implementation
+<span class="nc" id="L644">        return new FilePath[] { getModuleRoot(workspace), };</span>
+    }
+
+    /**
+     * The returned object will be used to parse &lt;tt&gt;changelog.xml&lt;/tt&gt;.
+     */
+    public abstract ChangeLogParser createChangeLogParser();
+
+    public SCMDescriptor&lt;?&gt; getDescriptor() {
+<span class="nc" id="L653">        return (SCMDescriptor) Jenkins.getInstance().getDescriptorOrDie(getClass());</span>
+    }
+
+//
+// convenience methods
+//
+
+    @Deprecated
+    protected final boolean createEmptyChangeLog(File changelogFile, BuildListener listener, String rootTag) {
+        try {
+<span class="nc" id="L663">            createEmptyChangeLog(changelogFile, (TaskListener) listener, rootTag);</span>
+<span class="nc" id="L664">            return true;</span>
+<span class="nc" id="L665">        } catch (IOException e) {</span>
+<span class="nc" id="L666">            e.printStackTrace(listener.error(e.getMessage()));</span>
+<span class="nc" id="L667">            return false;</span>
+        }
+    }
+
+    /**
+     * @since 1.568
+     */
+    protected final void createEmptyChangeLog(@Nonnull File changelogFile, @Nonnull TaskListener listener, @Nonnull String rootTag) throws IOException {
+<span class="nc" id="L675">        FileWriter w = null;</span>
+        try {
+<span class="nc" id="L677">            w = new FileWriter(changelogFile);</span>
+<span class="nc" id="L678">            w.write(&quot;&lt;&quot;+rootTag +&quot;/&gt;&quot;);</span>
+<span class="nc" id="L679">            w.close();</span>
+<span class="nc" id="L680">        } finally {</span>
+<span class="nc" id="L681">            IOUtils.closeQuietly(w);</span>
+<span class="nc" id="L682">        }</span>
+<span class="nc" id="L683">    }</span>
+
+    protected final String nullify(String s) {
+<span class="nc bnc" id="L686" title="All 2 branches missed.">        if(s==null)     return null;</span>
+<span class="nc bnc" id="L687" title="All 2 branches missed.">        if(s.trim().length()==0)    return null;</span>
+<span class="nc" id="L688">        return s;</span>
+    }
+
+<span class="fc" id="L691">    public static final PermissionGroup PERMISSIONS = new PermissionGroup(SCM.class, Messages._SCM_Permissions_Title());</span>
+    /**
+     * Permission to create new tags.
+     * @since 1.171
+     */
+<span class="fc" id="L696">    public static final Permission TAG = new Permission(PERMISSIONS,&quot;Tag&quot;,Messages._SCM_TagPermission_Description(),Permission.CREATE, PermissionScope.ITEM);</span>
+
+    /**
+     * Returns all the registered {@link SCMDescriptor}s.
+     */
+    public static DescriptorExtensionList&lt;SCM,SCMDescriptor&lt;?&gt;&gt; all() {
+<span class="nc" id="L702">        return Jenkins.getInstance().&lt;SCM,SCMDescriptor&lt;?&gt;&gt;getDescriptorList(SCM.class);</span>
+    }
+
+    /**
+     * Determines which kinds of SCMs are applicable to a given project.
+     * @param project a project on which we might be configuring SCM, or null if unknown
+     * @return all descriptors which {@link SCMDescriptor#isApplicable(Job)} to it, also filtered by {@link TopLevelItemDescriptor#isApplicable};
+     *         or simply {@link #all} if there is no project
+     * @since 1.568
+     */
+    public static List&lt;SCMDescriptor&lt;?&gt;&gt; _for(@CheckForNull final Job project) {
+<span class="nc bnc" id="L713" title="All 2 branches missed.">        if(project==null)   return all();</span>
+        
+<span class="nc" id="L715">        final Descriptor pd = Jenkins.getInstance().getDescriptor((Class) project.getClass());</span>
+<span class="nc" id="L716">        List&lt;SCMDescriptor&lt;?&gt;&gt; r = new ArrayList&lt;SCMDescriptor&lt;?&gt;&gt;();</span>
+<span class="nc bnc" id="L717" title="All 2 branches missed.">        for (SCMDescriptor&lt;?&gt; scmDescriptor : all()) {</span>
+<span class="nc bnc" id="L718" title="All 2 branches missed.">            if(!scmDescriptor.isApplicable(project))    continue;</span>
+
+<span class="nc bnc" id="L720" title="All 2 branches missed.">            if (pd instanceof TopLevelItemDescriptor) {</span>
+<span class="nc" id="L721">                TopLevelItemDescriptor apd = (TopLevelItemDescriptor) pd;</span>
+<span class="nc bnc" id="L722" title="All 2 branches missed.">                if(!apd.isApplicable(scmDescriptor))    continue;</span>
+            }
+
+<span class="nc" id="L725">            r.add(scmDescriptor);</span>
+        }
+
+<span class="nc" id="L728">        return r;</span>
+    }
+
+    @Deprecated
+    public static List&lt;SCMDescriptor&lt;?&gt;&gt; _for(final AbstractProject project) {
+<span class="nc" id="L733">        return _for((Job) project);</span>
+    }
+
+    /**
+     * Try to guess how a repository browser should be configured, based on URLs and the like.
+     * Used when {@link #getBrowser} has not been explicitly configured.
+     * @return a reasonable default value for {@link #getEffectiveBrowser}, or null
+     * @since 1.568
+     */
+    public @CheckForNull RepositoryBrowser&lt;?&gt; guessBrowser() {
+<span class="nc" id="L743">        return null;</span>
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

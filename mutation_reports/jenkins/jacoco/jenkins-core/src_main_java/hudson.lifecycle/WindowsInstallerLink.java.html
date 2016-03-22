@@ -1,0 +1,316 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>WindowsInstallerLink.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.lifecycle</a> &gt; <span class="el_source">WindowsInstallerLink.java</span></div><h1>WindowsInstallerLink.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">/*</span>
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc., Kohsuke Kawaguchi, Seiji Sogabe, CloudBees, Inc.
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.lifecycle;
+
+import com.sun.jna.Native;
+import hudson.Functions;
+import hudson.Launcher.LocalLauncher;
+import hudson.model.ManagementLink;
+import hudson.model.TaskListener;
+import hudson.util.jna.Kernel32Utils;
+import hudson.util.jna.SHELLEXECUTEINFO;
+import hudson.util.jna.Shell32;
+import jenkins.model.Jenkins;
+import hudson.AbortException;
+import hudson.Extension;
+import hudson.util.StreamTaskListener;
+import hudson.util.jna.DotNet;
+import org.apache.commons.io.IOUtils;
+import org.kohsuke.stapler.QueryParameter;
+import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.StaplerResponse;
+import org.apache.commons.io.FileUtils;
+import org.apache.commons.io.output.ByteArrayOutputStream;
+import org.apache.tools.ant.taskdefs.Move;
+import org.apache.tools.ant.Project;
+import org.apache.tools.ant.DefaultLogger;
+import org.apache.tools.ant.types.FileSet;
+
+import javax.servlet.ServletException;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.util.logging.Logger;
+import java.util.logging.Level;
+import java.net.URL;
+
+import static hudson.util.jna.SHELLEXECUTEINFO.*;
+
+/**
+ * {@link ManagementLink} that allows the installation as a Windows service.
+ *
+ * @author Kohsuke Kawaguchi
+ */
+public class WindowsInstallerLink extends ManagementLink {
+
+    /**
+     * Location of the jenkins.war.
+     * In general case, we can't determine this value, yet having this is a requirement for the installer.
+     */
+    private final File hudsonWar;
+
+    /**
+     * If the installation is completed, this value holds the installation directory.
+     */
+    private volatile File installationDir;
+
+<span class="nc" id="L78">    private WindowsInstallerLink(File jenkinsWar) {</span>
+<span class="nc" id="L79">        this.hudsonWar = jenkinsWar;</span>
+<span class="nc" id="L80">    }</span>
+
+    public String getIconFileName() {
+<span class="nc" id="L83">        return &quot;installer.gif&quot;;</span>
+    }
+
+    public String getUrlName() {
+<span class="nc" id="L87">        return &quot;install&quot;;</span>
+    }
+
+    public String getDisplayName() {
+<span class="nc" id="L91">        return Messages.WindowsInstallerLink_DisplayName();</span>
+    }
+
+    public String getDescription() {
+<span class="nc" id="L95">        return Messages.WindowsInstallerLink_Description();</span>
+    }
+
+    /**
+     * Is the installation successful?
+     */
+    public boolean isInstalled() {
+<span class="nc bnc" id="L102" title="All 2 branches missed.">        return installationDir!=null;</span>
+    }
+
+    /**
+     * Performs installation.
+     */
+    public void doDoInstall(StaplerRequest req, StaplerResponse rsp, @QueryParameter(&quot;dir&quot;) String _dir) throws IOException, ServletException {
+<span class="nc bnc" id="L109" title="All 2 branches missed.">        if(installationDir!=null) {</span>
+            // installation already complete
+<span class="nc" id="L111">            sendError(&quot;Installation is already complete&quot;,req,rsp);</span>
+<span class="nc" id="L112">            return;</span>
+        }
+<span class="nc bnc" id="L114" title="All 2 branches missed.">        if(!DotNet.isInstalled(2,0)) {</span>
+<span class="nc" id="L115">            sendError(&quot;.NET Framework 2.0 or later is required for this feature&quot;,req,rsp);</span>
+<span class="nc" id="L116">            return;</span>
+        }
+        
+<span class="nc" id="L119">        Jenkins.getInstance().checkPermission(Jenkins.ADMINISTER);</span>
+
+<span class="nc" id="L121">        File dir = new File(_dir).getAbsoluteFile();</span>
+<span class="nc" id="L122">        dir.mkdirs();</span>
+<span class="nc bnc" id="L123" title="All 2 branches missed.">        if(!dir.exists()) {</span>
+<span class="nc" id="L124">            sendError(&quot;Failed to create installation directory: &quot;+dir,req,rsp);</span>
+<span class="nc" id="L125">            return;</span>
+        }
+
+        try {
+            // copy files over there
+<span class="nc" id="L130">            copy(req, rsp, dir, getClass().getResource(&quot;/windows-service/jenkins.exe&quot;),         &quot;jenkins.exe&quot;);</span>
+<span class="nc" id="L131">            copy(req, rsp, dir, getClass().getResource(&quot;/windows-service/jenkins.exe.config&quot;),  &quot;jenkins.exe.config&quot;);</span>
+<span class="nc" id="L132">            copy(req, rsp, dir, getClass().getResource(&quot;/windows-service/jenkins.xml&quot;),         &quot;jenkins.xml&quot;);</span>
+<span class="nc bnc" id="L133" title="All 2 branches missed.">            if(!hudsonWar.getCanonicalFile().equals(new File(dir,&quot;jenkins.war&quot;).getCanonicalFile()))</span>
+<span class="nc" id="L134">                copy(req, rsp, dir, hudsonWar.toURI().toURL(), &quot;jenkins.war&quot;);</span>
+
+            // install as a service
+<span class="nc" id="L137">            ByteArrayOutputStream baos = new ByteArrayOutputStream();</span>
+<span class="nc" id="L138">            StreamTaskListener task = new StreamTaskListener(baos);</span>
+<span class="nc" id="L139">            task.getLogger().println(&quot;Installing a service&quot;);</span>
+<span class="nc" id="L140">            int r = runElevated(new File(dir, &quot;jenkins.exe&quot;), &quot;install&quot;, task, dir);</span>
+<span class="nc bnc" id="L141" title="All 2 branches missed.">            if(r!=0) {</span>
+<span class="nc" id="L142">                sendError(baos.toString(),req,rsp);</span>
+<span class="nc" id="L143">                return;</span>
+            }
+
+            // installation was successful
+<span class="nc" id="L147">            installationDir = dir;</span>
+<span class="nc" id="L148">            rsp.sendRedirect(&quot;.&quot;);</span>
+<span class="nc" id="L149">        } catch (AbortException e) {</span>
+            // this exception is used as a signal to terminate processing. the error should have been already reported
+<span class="nc" id="L151">        } catch (InterruptedException e) {</span>
+<span class="nc" id="L152">            throw new ServletException(e);</span>
+        }
+<span class="nc" id="L154">    }</span>
+
+    /**
+     * Copies a single resource into the target folder, by the given name, and handle errors gracefully.
+     */
+    private void copy(StaplerRequest req, StaplerResponse rsp, File dir, URL src, String name) throws ServletException, IOException {
+        try {
+<span class="nc" id="L161">            FileUtils.copyURLToFile(src,new File(dir, name));</span>
+<span class="nc" id="L162">        } catch (IOException e) {</span>
+<span class="nc" id="L163">            LOGGER.log(Level.SEVERE, &quot;Failed to copy &quot;+name,e);</span>
+<span class="nc" id="L164">            sendError(&quot;Failed to copy &quot;+name+&quot;: &quot;+e.getMessage(),req,rsp);</span>
+<span class="nc" id="L165">            throw new AbortException();</span>
+        }
+<span class="nc" id="L167">    }</span>
+
+    public void doRestart(StaplerRequest req, StaplerResponse rsp) throws IOException, ServletException {
+<span class="nc bnc" id="L170" title="All 2 branches missed.">        if(installationDir==null) {</span>
+            // if the user reloads the page after Hudson has restarted,
+            // it comes back here. In such a case, don't let this restart Hudson.
+            // so just send them back to the top page
+<span class="nc" id="L174">            rsp.sendRedirect(req.getContextPath()+&quot;/&quot;);</span>
+<span class="nc" id="L175">            return;</span>
+        }
+<span class="nc" id="L177">        Jenkins.getInstance().checkPermission(Jenkins.ADMINISTER);</span>
+
+<span class="nc" id="L179">        rsp.forward(this,&quot;_restart&quot;,req);</span>
+<span class="nc" id="L180">        final File oldRoot = Jenkins.getInstance().getRootDir();</span>
+
+        // initiate an orderly shutdown after we finished serving this request
+<span class="nc" id="L183">        new Thread(&quot;terminator&quot;) {</span>
+            public void run() {
+                try {
+<span class="nc" id="L186">                    Thread.sleep(1000);</span>
+
+                    // let the service start after we close our sockets, to avoid conflicts
+<span class="nc" id="L189">                    Runtime.getRuntime().addShutdownHook(new Thread(&quot;service starter&quot;) {</span>
+                        public void run() {
+                            try {
+<span class="nc bnc" id="L192" title="All 2 branches missed.">                                if(!oldRoot.equals(installationDir)) {</span>
+<span class="nc" id="L193">                                    LOGGER.info(&quot;Moving data&quot;);</span>
+<span class="nc" id="L194">                                    Move mv = new Move();</span>
+<span class="nc" id="L195">                                    Project p = new Project();</span>
+<span class="nc" id="L196">                                    p.addBuildListener(createLogger());</span>
+<span class="nc" id="L197">                                    mv.setProject(p);</span>
+<span class="nc" id="L198">                                    FileSet fs = new FileSet();</span>
+<span class="nc" id="L199">                                    fs.setDir(oldRoot);</span>
+<span class="nc" id="L200">                                    fs.setExcludes(&quot;war/**&quot;); // we can't really move the exploded war. </span>
+<span class="nc" id="L201">                                    mv.addFileset(fs);</span>
+<span class="nc" id="L202">                                    mv.setTodir(installationDir);</span>
+<span class="nc" id="L203">                                    mv.setFailOnError(false); // plugins can also fail to move</span>
+<span class="nc" id="L204">                                    mv.execute();</span>
+                                }
+<span class="nc" id="L206">                                LOGGER.info(&quot;Starting a Windows service&quot;);</span>
+<span class="nc" id="L207">                                StreamTaskListener task = StreamTaskListener.fromStdout();</span>
+<span class="nc" id="L208">                                int r = runElevated(</span>
+<span class="nc" id="L209">                                        new File(installationDir, &quot;jenkins.exe&quot;), &quot;start&quot;, task, installationDir);</span>
+<span class="nc bnc" id="L210" title="All 2 branches missed.">                                task.getLogger().println(r==0?&quot;Successfully started&quot;:&quot;start service failed. Exit code=&quot;+r);</span>
+<span class="nc" id="L211">                            } catch (IOException e) {</span>
+<span class="nc" id="L212">                                e.printStackTrace();</span>
+<span class="nc" id="L213">                            } catch (InterruptedException e) {</span>
+<span class="nc" id="L214">                                e.printStackTrace();</span>
+                            }
+<span class="nc" id="L216">                        }</span>
+
+                        private DefaultLogger createLogger() {
+<span class="nc" id="L219">                            DefaultLogger logger = new DefaultLogger();</span>
+<span class="nc" id="L220">                            logger.setOutputPrintStream(System.out);</span>
+<span class="nc" id="L221">                            logger.setErrorPrintStream(System.err);</span>
+<span class="nc" id="L222">                            return logger;</span>
+                        }
+                    });
+
+<span class="nc" id="L226">                    System.exit(0);</span>
+<span class="nc" id="L227">                } catch (InterruptedException e) {</span>
+<span class="nc" id="L228">                    e.printStackTrace();</span>
+                }
+<span class="nc" id="L230">            }</span>
+<span class="nc" id="L231">        }.start();</span>
+<span class="nc" id="L232">    }</span>
+
+    /**
+     * Displays the error in a page.
+     */
+    protected final void sendError(Exception e, StaplerRequest req, StaplerResponse rsp) throws ServletException, IOException {
+<span class="nc" id="L238">        sendError(e.getMessage(),req,rsp);</span>
+<span class="nc" id="L239">    }</span>
+
+    protected final void sendError(String message, StaplerRequest req, StaplerResponse rsp) throws ServletException, IOException {
+<span class="nc" id="L242">        req.setAttribute(&quot;message&quot;,message);</span>
+<span class="nc" id="L243">        req.setAttribute(&quot;pre&quot;,true);</span>
+<span class="nc" id="L244">        rsp.forward(Jenkins.getInstance(),&quot;error&quot;,req);</span>
+<span class="nc" id="L245">    }</span>
+
+    /**
+     * Decide if {@link WindowsInstallerLink} should show up in UI, and if so, register it.
+     */
+    @Extension
+    public static WindowsInstallerLink registerIfApplicable() {
+<span class="nc bnc" id="L252" title="All 2 branches missed.">        if(!Functions.isWindows())</span>
+<span class="nc" id="L253">            return null; // this is a Windows only feature</span>
+
+<span class="nc bnc" id="L255" title="All 2 branches missed.">        if(Lifecycle.get() instanceof WindowsServiceLifecycle)</span>
+<span class="nc" id="L256">            return null; // already installed as Windows service</span>
+
+        // this system property is set by the launcher when we run &quot;java -jar jenkins.war&quot;
+        // and this is how we know where is jenkins.war.
+<span class="nc" id="L260">        String war = System.getProperty(&quot;executable-war&quot;);</span>
+<span class="nc bnc" id="L261" title="All 4 branches missed.">        if(war!=null &amp;&amp; new File(war).exists()) {</span>
+<span class="nc" id="L262">            WindowsInstallerLink link = new WindowsInstallerLink(new File(war));</span>
+
+            // in certain situations where we know the user is just trying Jenkins (like when Jenkins is launched
+            // from JNLP), also put this link on the navigation bar to increase
+            // visibility
+<span class="nc bnc" id="L267" title="All 2 branches missed.">            if(System.getProperty(WindowsInstallerLink.class.getName()+&quot;.prominent&quot;)!=null)</span>
+<span class="nc" id="L268">                Jenkins.getInstance().getActions().add(link);</span>
+
+<span class="nc" id="L270">            return link;</span>
+        }
+
+<span class="nc" id="L273">        return null;</span>
+    }
+
+    /**
+     * Invokes jenkins.exe with a SCM management command.
+     *
+     * &lt;p&gt;
+     * If it fails in a way that indicates the presence of UAC, retry in an UAC compatible manner.
+     */
+    static int runElevated(File jenkinsExe, String command, TaskListener out, File pwd) throws IOException, InterruptedException {
+        try {
+<span class="nc" id="L284">            return new LocalLauncher(out).launch().cmds(jenkinsExe, command).stdout(out).pwd(pwd).join();</span>
+<span class="nc" id="L285">        } catch (IOException e) {</span>
+<span class="nc bnc" id="L286" title="All 4 branches missed.">            if (e.getMessage().contains(&quot;CreateProcess&quot;) &amp;&amp; e.getMessage().contains(&quot;=740&quot;)) {</span>
+                // fall through
+            } else {
+<span class="nc" id="L289">                throw e;</span>
+            }
+        }
+
+        // error code 740 is ERROR_ELEVATION_REQUIRED, indicating that
+        // we run in UAC-enabled Windows and we need to run this in an elevated privilege
+<span class="nc" id="L295">        SHELLEXECUTEINFO sei = new SHELLEXECUTEINFO();</span>
+<span class="nc" id="L296">        sei.fMask = SEE_MASK_NOCLOSEPROCESS;</span>
+<span class="nc" id="L297">        sei.lpVerb = &quot;runas&quot;;</span>
+<span class="nc" id="L298">        sei.lpFile = jenkinsExe.getAbsolutePath();</span>
+<span class="nc" id="L299">        sei.lpParameters = &quot;/redirect redirect.log &quot;+command;</span>
+<span class="nc" id="L300">        sei.lpDirectory = pwd.getAbsolutePath();</span>
+<span class="nc" id="L301">        sei.nShow = SW_HIDE;</span>
+<span class="nc bnc" id="L302" title="All 2 branches missed.">        if (!Shell32.INSTANCE.ShellExecuteEx(sei))</span>
+<span class="nc" id="L303">            throw new IOException(&quot;Failed to shellExecute: &quot;+ Native.getLastError());</span>
+
+        try {
+<span class="nc" id="L306">            return Kernel32Utils.waitForExitProcess(sei.hProcess);</span>
+<span class="nc" id="L307">        } finally {</span>
+<span class="nc" id="L308">            FileInputStream fin = new FileInputStream(new File(pwd,&quot;redirect.log&quot;));</span>
+<span class="nc" id="L309">            IOUtils.copy(fin, out.getLogger());</span>
+<span class="nc" id="L310">            fin.close();</span>
+<span class="nc" id="L311">        }</span>
+    }
+
+<span class="nc" id="L314">    private static final Logger LOGGER = Logger.getLogger(WindowsInstallerLink.class.getName());</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

@@ -1,0 +1,171 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>WorkUnitContext.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.model.queue</a> &gt; <span class="el_source">WorkUnitContext.java</span></div><h1>WorkUnitContext.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">/*</span>
+ * The MIT License
+ *
+ * Copyright (c) 2010, InfraDNA, Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.model.queue;
+
+import hudson.model.Action;
+import hudson.model.Executor;
+import hudson.model.Queue;
+import hudson.model.Queue.BuildableItem;
+import hudson.model.Queue.Task;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
+/**
+ * Holds the information shared between {@link WorkUnit}s created from the same {@link Task}.
+ *
+ * @author Kohsuke Kawaguchi
+ */
+public final class WorkUnitContext {
+
+    public final BuildableItem item;
+
+    public final Task task;
+
+    /**
+     * Once the execution starts and completes, update this future object with the outcome.
+     */
+    public final FutureImpl future;
+
+    /**
+     * Associated parameters to the build.
+     */
+    public final List&lt;Action&gt; actions;
+
+    private final Latch startLatch, endLatch;
+
+<span class="nc" id="L59">    private List&lt;WorkUnit&gt; workUnits = new ArrayList&lt;WorkUnit&gt;();</span>
+
+    /**
+     * If the execution is aborted, set to non-null that indicates where it was aborted.
+     */
+    private volatile Throwable aborted;
+
+<span class="nc" id="L66">    public WorkUnitContext(BuildableItem item) {</span>
+<span class="nc" id="L67">        this.item = item;</span>
+<span class="nc" id="L68">        this.task = item.task;</span>
+<span class="nc" id="L69">        this.future = (FutureImpl)item.getFuture();</span>
+<span class="nc" id="L70">        this.actions = new ArrayList&lt;Action&gt;(item.getAllActions());</span>
+        
+        // +1 for the main task
+<span class="nc" id="L73">        int workUnitSize = Tasks.getSubTasksOf(task).size();</span>
+<span class="nc" id="L74">        startLatch = new Latch(workUnitSize) {</span>
+            @Override
+            protected void onCriteriaMet() {
+                // on behalf of the member Executors,
+                // the one that executes the main thing will send notifications
+                // Unclear if this will work with AsynchronousExecution; it *seems* this is only called from synchronize which is only called from synchronizeStart which is only called from an executor thread.
+<span class="nc" id="L80">                Executor e = Executor.currentExecutor();</span>
+<span class="nc bnc" id="L81" title="All 2 branches missed.">                if (e.getCurrentWorkUnit().isMainWork()) {</span>
+<span class="nc" id="L82">                    e.getOwner().taskAccepted(e,task);</span>
+                }
+<span class="nc" id="L84">            }</span>
+        };
+
+<span class="nc" id="L87">        endLatch = new Latch(workUnitSize);</span>
+<span class="nc" id="L88">    }</span>
+
+    /**
+     * Called by the executor that executes a member {@link SubTask} that belongs to this task
+     * to create its {@link WorkUnit}.
+     */
+    public WorkUnit createWorkUnit(SubTask execUnit) {
+<span class="nc" id="L95">        Executor executor = Executor.currentExecutor();</span>
+<span class="nc bnc" id="L96" title="All 2 branches missed.">        if (executor != null) { // TODO is it legal for this to be called by a non-executor thread?</span>
+<span class="nc" id="L97">            future.addExecutor(executor);</span>
+        }
+<span class="nc" id="L99">        WorkUnit wu = new WorkUnit(this, execUnit);</span>
+<span class="nc" id="L100">        workUnits.add(wu);</span>
+<span class="nc" id="L101">        return wu;</span>
+    }
+
+    public List&lt;WorkUnit&gt; getWorkUnits() {
+<span class="nc" id="L105">        return Collections.unmodifiableList(workUnits);</span>
+    }
+
+    public WorkUnit getPrimaryWorkUnit() {
+<span class="nc" id="L109">        return workUnits.get(0);</span>
+    }
+
+    /**
+     * All the {@link Executor}s that jointly execute a {@link Task} call this method to synchronize on the start.
+     */
+    public void synchronizeStart() throws InterruptedException {
+<span class="nc" id="L116">        startLatch.synchronize();</span>
+        // the main thread will send a notification
+<span class="nc" id="L118">        Executor e = Executor.currentExecutor();</span>
+<span class="nc" id="L119">        WorkUnit wu = e.getCurrentWorkUnit();</span>
+<span class="nc bnc" id="L120" title="All 2 branches missed.">        if (wu.isMainWork()) {</span>
+<span class="nc" id="L121">            future.start.set(e.getCurrentExecutable());</span>
+        }
+<span class="nc" id="L123">    }</span>
+
+    @Deprecated
+    public void synchronizeEnd(Queue.Executable executable, Throwable problems, long duration) throws InterruptedException {
+<span class="nc" id="L127">        synchronizeEnd(Executor.currentExecutor(), executable, problems, duration);</span>
+<span class="nc" id="L128">    }</span>
+
+    /**
+     * All the {@link Executor}s that jointly execute a {@link Task} call this method to synchronize on the end of the task.
+     *
+     * @throws InterruptedException
+     *      If any of the member thread is interrupted while waiting for other threads to join, all
+     *      the member threads will report {@link InterruptedException}.
+     */
+    public void synchronizeEnd(Executor e, Queue.Executable executable, Throwable problems, long duration) throws InterruptedException {
+<span class="nc" id="L138">        endLatch.synchronize();</span>
+
+        // the main thread will send a notification
+<span class="nc" id="L141">        WorkUnit wu = e.getCurrentWorkUnit();</span>
+<span class="nc bnc" id="L142" title="All 2 branches missed.">        if (wu.isMainWork()) {</span>
+<span class="nc bnc" id="L143" title="All 2 branches missed.">            if (problems == null) {</span>
+<span class="nc" id="L144">                future.set(executable);</span>
+<span class="nc" id="L145">                e.getOwner().taskCompleted(e, task, duration);</span>
+<span class="nc" id="L146">            } else {</span>
+<span class="nc" id="L147">                future.set(problems);</span>
+<span class="nc" id="L148">                e.getOwner().taskCompletedWithProblems(e, task, duration, problems);</span>
+            }
+        }
+<span class="nc" id="L151">    }</span>
+
+    /**
+     * When one of the work unit is aborted, call this method to abort all the other work units.
+     */
+    public synchronized void abort(Throwable cause) {
+<span class="nc bnc" id="L157" title="All 2 branches missed.">        if (cause==null)        throw new IllegalArgumentException();</span>
+<span class="nc bnc" id="L158" title="All 2 branches missed.">        if (aborted!=null)      return; // already aborted    </span>
+<span class="nc" id="L159">        aborted = cause;</span>
+<span class="nc" id="L160">        startLatch.abort(cause);</span>
+<span class="nc" id="L161">        endLatch.abort(cause);</span>
+
+<span class="nc" id="L163">        Thread c = Thread.currentThread();</span>
+<span class="nc bnc" id="L164" title="All 2 branches missed.">        for (WorkUnit wu : workUnits) {</span>
+<span class="nc" id="L165">            Executor e = wu.getExecutor();</span>
+<span class="nc bnc" id="L166" title="All 4 branches missed.">            if (e!=null &amp;&amp; e!=c)</span>
+<span class="nc" id="L167">                e.interrupt();</span>
+        }
+<span class="nc" id="L169">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

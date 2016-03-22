@@ -1,0 +1,310 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>ParameterValue.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.model</a> &gt; <span class="el_source">ParameterValue.java</span></div><h1>ParameterValue.java</h1><pre class="source lang-java linenums">/*
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2010, Sun Microsystems, Inc., Kohsuke Kawaguchi, Tom Huybrechts,
+ *      Yahoo! Inc.
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.model;
+
+import hudson.EnvVars;
+import hudson.Util;
+import hudson.model.queue.SubTask;
+import hudson.scm.SCM;
+import hudson.tasks.BuildWrapper;
+import hudson.tasks.Builder;
+import hudson.util.VariableResolver;
+
+import java.io.Serializable;
+import java.util.Map;
+
+import net.sf.json.JSONObject;
+
+import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.export.Exported;
+import org.kohsuke.stapler.export.ExportedBean;
+
+/**
+ * A value for a parameter in a build.
+ *
+ * Created by {@link ParameterDefinition#createValue(StaplerRequest, JSONObject)} for
+ * a particular build (although this 'owner' build object is passed in for every method
+ * call as a parameter so that the parameter won't have to persist it.)
+ *
+ * &lt;h2&gt;Persistence&lt;/h2&gt;
+ * &lt;p&gt;
+ * Instances of {@link ParameterValue}s are persisted into build's &lt;tt&gt;build.xml&lt;/tt&gt;
+ * through XStream (via {@link ParametersAction}), so instances need to be persistable.
+ *
+ * &lt;h2&gt;Associated Views&lt;/h2&gt;
+ * &lt;h4&gt;value.jelly&lt;/h4&gt;
+ * The &lt;tt&gt;value.jelly&lt;/tt&gt; view contributes a UI fragment to display the parameter
+ * values used for a build.
+ *
+ * &lt;h2&gt;Notes&lt;/h2&gt;
+ * &lt;ol&gt;
+ * &lt;li&gt;{@link ParameterValue} is used to record values of the past build, but
+ *     {@link ParameterDefinition} used back then might be gone already, or represent
+ *     a different parameter now. So don't try to use the name to infer
+ *     {@link ParameterDefinition} is.
+ * &lt;/ol&gt;
+ * @see ParameterDefinition
+ * @see ParametersAction
+ */
+@ExportedBean(defaultVisibility=3)
+public abstract class ParameterValue implements Serializable {
+    protected final String name;
+
+    private String description;
+
+<span class="fc" id="L77">    protected ParameterValue(String name, String description) {</span>
+<span class="fc" id="L78">        this.name = name;</span>
+<span class="fc" id="L79">        this.description = description;</span>
+<span class="fc" id="L80">    }</span>
+
+    protected ParameterValue(String name) {
+<span class="fc" id="L83">        this(name, null);</span>
+<span class="fc" id="L84">    }</span>
+
+    public String getDescription() {
+<span class="nc" id="L87">        return description;</span>
+    }
+
+    public void setDescription(String description) {
+<span class="nc" id="L91">        this.description = description;</span>
+<span class="nc" id="L92">    }</span>
+
+    /**
+     * Name of the parameter.
+     *
+     * This uniquely distinguishes {@link ParameterValue} among other parameters
+     * for the same build. This must be the same as {@link ParameterDefinition#getName()}.
+     */
+    @Exported
+    public final String getName() {
+<span class="fc" id="L102">        return name;</span>
+    }
+
+    /**
+     * Adds environmental variables for the builds to the given map.
+     *
+     * &lt;p&gt;
+     * This provides a means for a parameter to pass the parameter
+     * values to the build to be performed.
+     *
+     * &lt;p&gt;
+     * When this method is invoked, the map already contains the
+     * current &quot;planned export&quot; list. The implementation is
+     * expected to add more values to this map (or do nothing)
+     *
+     * &lt;p&gt;
+     * &lt;strike&gt;Environment variables should be by convention all upper case.
+     * (This is so that a Windows/Unix heterogeneous environment
+     * won't get inconsistent result depending on which platform to
+     * execute.)&lt;/strike&gt; (see {@link EnvVars} why upper casing is a bad idea.)
+     *
+     * @param env
+     *      never null.
+     * @param build
+     *      The build for which this parameter is being used. Never null.
+     * @deprecated as of 1.344
+     *      Use {@link #buildEnvironment(Run, EnvVars)} instead.
+     */
+    @Deprecated
+    public void buildEnvVars(AbstractBuild&lt;?,?&gt; build, Map&lt;String,String&gt; env) {
+<span class="nc bnc" id="L132" title="All 2 branches missed.">        if (env instanceof EnvVars) {</span>
+<span class="nc bnc" id="L133" title="All 2 branches missed.">            if (Util.isOverridden(ParameterValue.class, getClass(), &quot;buildEnvironment&quot;, Run.class, EnvVars.class)) {</span>
+                // if the subtype already derives buildEnvironment, then delegate to it
+<span class="nc" id="L135">                buildEnvironment(build, (EnvVars) env);</span>
+<span class="nc bnc" id="L136" title="All 2 branches missed.">            } else if (Util.isOverridden(ParameterValue.class, getClass(), &quot;buildEnvVars&quot;, AbstractBuild.class, EnvVars.class)) {</span>
+<span class="nc" id="L137">                buildEnvVars(build, (EnvVars) env);</span>
+            }
+        }
+        // otherwise no-op by default
+<span class="nc" id="L141">    }</span>
+
+    /** @deprecated Use {@link #buildEnvironment(Run, EnvVars)} instead. */
+    @Deprecated
+    public void buildEnvVars(AbstractBuild&lt;?,?&gt; build, EnvVars env) {
+<span class="nc bnc" id="L146" title="All 2 branches missed.">        if (Util.isOverridden(ParameterValue.class, getClass(), &quot;buildEnvironment&quot;, Run.class, EnvVars.class)) {</span>
+<span class="nc" id="L147">            buildEnvironment(build, env);</span>
+<span class="nc" id="L148">        } else {</span>
+            // for backward compatibility
+<span class="nc" id="L150">            buildEnvVars(build,(Map&lt;String,String&gt;)env);</span>
+        }
+<span class="nc" id="L152">    }</span>
+
+    /**
+     * Adds environmental variables for the builds to the given map.
+     *
+     * &lt;p&gt;
+     * This provides a means for a parameter to pass the parameter
+     * values to the build to be performed.
+     *
+     * &lt;p&gt;
+     * When this method is invoked, the map already contains the
+     * current &quot;planned export&quot; list. The implementation is
+     * expected to add more values to this map (or do nothing)
+     *
+     * @param env
+     *      never null.
+     * @param build
+     *      The build for which this parameter is being used. Never null.
+     * @since 1.556
+     */
+    public void buildEnvironment(Run&lt;?,?&gt; build, EnvVars env) {
+<span class="nc bnc" id="L173" title="All 2 branches missed.">        if (build instanceof AbstractBuild) {</span>
+<span class="nc" id="L174">            buildEnvVars((AbstractBuild) build, env);</span>
+        }
+        // else do not know how to do it
+<span class="nc" id="L177">    }</span>
+
+    /**
+     * Called at the beginning of a build (but after {@link SCM} operations
+     * have taken place) to let a {@link ParameterValue} contributes a
+     * {@link BuildWrapper} to the build.
+     *
+     * &lt;p&gt;
+     * This provides a means for a parameter to perform more extensive
+     * set up / tear down during a build.
+     *
+     * @param build
+     *      The build for which this parameter is being used. Never null.
+     * @return
+     *      null if the parameter has no {@link BuildWrapper} to contribute to.
+     */
+    public BuildWrapper createBuildWrapper(AbstractBuild&lt;?,?&gt; build) {
+<span class="nc" id="L194">        return null;</span>
+    }
+
+    /**
+     * Returns a {@link VariableResolver} so that other components like {@link Builder}s
+     * can perform variable substitution to reflect parameter values into the build process.
+     *
+     * &lt;p.
+     * This is yet another means in which a {@link ParameterValue} can influence
+     * a build.
+     *
+     * @param build
+     *      The build for which this parameter is being used. Never null.
+     * @return
+     *      if the parameter value is not interested in participating to the
+     *      variable replacement process, return {@link VariableResolver#NONE}.
+     */
+    public VariableResolver&lt;String&gt; createVariableResolver(AbstractBuild&lt;?,?&gt; build) {
+<span class="nc" id="L212">        return VariableResolver.NONE;</span>
+    }
+
+    // TODO should there be a Run overload of this?
+
+    /**
+     * Accessing {@link ParameterDefinition} is not a good idea.
+     *
+     * @deprecated since 2008-09-20.
+     *    parameter definition may change any time. So if you find yourself
+     *    in need of accessing the information from {@link ParameterDefinition},
+     *    instead copy them in {@link ParameterDefinition#createValue(StaplerRequest, JSONObject)}
+     *    into {@link ParameterValue}.
+     */
+    @Deprecated
+    public ParameterDefinition getDefinition() {
+<span class="nc" id="L228">        throw new UnsupportedOperationException();</span>
+    }
+
+    @Override
+    public int hashCode() {
+<span class="nc" id="L233">        final int prime = 31;</span>
+<span class="nc" id="L234">        int result = 1;</span>
+<span class="nc bnc" id="L235" title="All 2 branches missed.">        result = prime * result + ((name == null) ? 0 : name.hashCode());</span>
+<span class="nc" id="L236">        return result;</span>
+    }
+
+    @Override
+    public boolean equals(Object obj) {
+<span class="pc bpc" id="L241" title="1 of 2 branches missed.">        if (this == obj)</span>
+<span class="nc" id="L242">            return true;</span>
+<span class="pc bpc" id="L243" title="1 of 2 branches missed.">        if (obj == null)</span>
+<span class="nc" id="L244">            return false;</span>
+<span class="pc bpc" id="L245" title="1 of 2 branches missed.">        if (getClass() != obj.getClass())</span>
+<span class="nc" id="L246">            return false;</span>
+<span class="fc" id="L247">        ParameterValue other = (ParameterValue) obj;</span>
+<span class="fc bfc" id="L248" title="All 2 branches covered.">        if (name == null) {</span>
+<span class="fc bfc" id="L249" title="All 2 branches covered.">            if (other.name != null)</span>
+<span class="fc" id="L250">                return false;</span>
+<span class="fc bfc" id="L251" title="All 2 branches covered.">        } else if (!name.equals(other.name))</span>
+<span class="fc" id="L252">            return false;</span>
+<span class="fc" id="L253">        return true;</span>
+    }
+
+    /**
+     * Computes a human-readable possible-localized one-line description of the parameter value.
+     *
+     * &lt;P&gt;
+     * This message is used as a tooltip to describe jobs in the queue. The text should be one line without
+     * new line. No HTML allowed (the caller will perform necessary HTML escapes, so any text can be returend.)
+     *
+     * @since 1.323
+     */
+    public String getShortDescription() {
+<span class="nc" id="L266">        return toString();</span>
+    }
+
+    /**
+     * Returns whether the information contained in this ParameterValue is
+     * sensitive or security related. Used to determine whether the value
+     * provided by this object should be masked in output.
+     *
+     * &lt;p&gt;
+     * Subclasses can override this to control the return value.
+     *
+     * @since 1.378
+     */
+    public boolean isSensitive() {
+<span class="nc" id="L280">        return false;</span>
+    }
+
+    /**
+     * Returns the most natural Java object that represents the actual value, like
+     * boolean, string, etc.
+     *
+     * If there's nothing that really fits the bill, the callee can return {@code this}.
+     * @since 1.568
+     */
+    public Object getValue() {
+<span class="nc" id="L291">        return null;</span>
+    }
+
+    /**
+     * Controls where the build (that this parameter is submitted to) will happen.
+     *
+     * @return
+     *      null to run the build where it normally runs. If non-null, this will
+     *      override {@link AbstractProject#getAssignedLabel()}. If a build is
+     *      submitted with multiple parameters, the first one that returns non-null
+     *      from this method will win, and all others won't be consulted.
+     *
+     *
+     * @since 1.414
+     */
+    public Label getAssignedLabel(SubTask task) {
+<span class="nc" id="L307">        return null;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

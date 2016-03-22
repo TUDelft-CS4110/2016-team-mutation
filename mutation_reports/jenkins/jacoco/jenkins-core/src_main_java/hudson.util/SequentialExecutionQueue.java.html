@@ -1,0 +1,133 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>SequentialExecutionQueue.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.util</a> &gt; <span class="el_source">SequentialExecutionQueue.java</span></div><h1>SequentialExecutionQueue.java</h1><pre class="source lang-java linenums">package hudson.util;
+
+import javax.annotation.Nonnull;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Set;
+import java.util.HashSet;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
+
+/**
+ * {@link Executor} that collapses two equal {@link Runnable}s into one,
+ * and makes sure no two equal {@link Runnable}s get executed simultaneously.
+ *
+ * &lt;p&gt;
+ * That is, if a {@link Runnable} is executing and another one gets submitted,
+ * the 2nd one waits for the completion of the 1st one.
+ *
+ * {@link Object#equals(Object)} is used on {@link Runnable} to identify
+ * two equal {@link Runnable}s.
+ *
+ * @author Kohsuke Kawaguchi
+ */
+public class SequentialExecutionQueue implements Executor {
+    /**
+     * Access is sycnhronized by {@code Queue.this}
+     */
+<span class="nc" id="L28">    private final Map&lt;Runnable,QueueEntry&gt; entries = new HashMap&lt;Runnable,QueueEntry&gt;();</span>
+    private ExecutorService executors;
+
+    /**
+     * {@link Runnable}s that are currently executing. Useful for trouble-shooting.
+     */
+<span class="nc" id="L34">    private final Set&lt;QueueEntry&gt; inProgress = new HashSet&lt;QueueEntry&gt;();</span>
+
+<span class="nc" id="L36">    public SequentialExecutionQueue(ExecutorService executors) {</span>
+<span class="nc" id="L37">        this.executors = executors;</span>
+<span class="nc" id="L38">    }</span>
+
+    /**
+     * Gets the base underlying executors.,
+     */
+    public synchronized ExecutorService getExecutors() {
+<span class="nc" id="L44">        return executors;</span>
+    }
+
+    /**
+     * Starts using a new {@link ExecutorService} to carry out executions.
+     *
+     * &lt;p&gt;
+     * The older {@link ExecutorService} will be shut down (but it's still expected to
+     * complete whatever they are doing and scheduled.)
+     */
+    public synchronized void setExecutors(ExecutorService svc) {
+<span class="nc" id="L55">        ExecutorService old = this.executors;</span>
+<span class="nc" id="L56">        this.executors = svc;</span>
+        // gradually executions will be taken over by a new pool
+<span class="nc" id="L58">        old.shutdown();</span>
+<span class="nc" id="L59">    }</span>
+
+
+    public synchronized void execute(@Nonnull Runnable item) {
+<span class="nc" id="L63">        QueueEntry e = entries.get(item);</span>
+<span class="nc bnc" id="L64" title="All 2 branches missed.">        if(e==null) {</span>
+<span class="nc" id="L65">            e = new QueueEntry(item);</span>
+<span class="nc" id="L66">            entries.put(item,e);</span>
+<span class="nc" id="L67">            e.submit();</span>
+<span class="nc" id="L68">        } else {</span>
+<span class="nc" id="L69">            e.queued = true;</span>
+        }
+<span class="nc" id="L71">    }</span>
+
+    /**
+     * Returns true if too much time is spent since some {@link Runnable} is submitted into the queue
+     * until they get executed. 
+     */
+    public synchronized boolean isStarving(long threshold) {
+<span class="nc" id="L78">        long now = System.currentTimeMillis();</span>
+<span class="nc bnc" id="L79" title="All 2 branches missed.">        for (QueueEntry e : entries.values())</span>
+<span class="nc bnc" id="L80" title="All 2 branches missed.">            if (now-e.submissionTime &gt; threshold)</span>
+<span class="nc" id="L81">                return true;</span>
+<span class="nc" id="L82">        return false;</span>
+    }
+
+    /**
+     * Gets {@link Runnable}s that are currently executed by a live thread.
+     */
+    public synchronized Set&lt;Runnable&gt; getInProgress() {
+<span class="nc" id="L89">        Set&lt;Runnable&gt; items = new HashSet&lt;Runnable&gt;();</span>
+<span class="nc bnc" id="L90" title="All 2 branches missed.">        for (QueueEntry entry : inProgress) {</span>
+<span class="nc" id="L91">            items.add(entry.item);</span>
+        }
+<span class="nc" id="L93">        return items;</span>
+    }
+
+<span class="nc bnc" id="L96" title="All 2 branches missed.">    private final class QueueEntry implements Runnable {</span>
+        private final Runnable item;
+        private boolean queued;
+        private long submissionTime;
+
+<span class="nc" id="L101">        private QueueEntry(Runnable item) {</span>
+<span class="nc" id="L102">            this.item = item;</span>
+<span class="nc" id="L103">            this.queued = true;</span>
+<span class="nc" id="L104">        }</span>
+
+        // Caller must have a lock
+        private void submit() {
+<span class="nc" id="L108">            submissionTime = System.currentTimeMillis();</span>
+<span class="nc" id="L109">            executors.submit(this);</span>
+<span class="nc" id="L110">        }</span>
+
+        public void run() {
+            try {
+<span class="nc" id="L114">                synchronized (SequentialExecutionQueue.this) {</span>
+<span class="nc bnc" id="L115" title="All 4 branches missed.">                    assert queued;</span>
+<span class="nc" id="L116">                    queued = false;</span>
+<span class="nc" id="L117">                    inProgress.add(this);</span>
+                }
+<span class="nc" id="L119">                item.run();</span>
+<span class="nc" id="L120">            } finally {</span>
+<span class="nc" id="L121">                synchronized (SequentialExecutionQueue.this) {</span>
+<span class="nc bnc" id="L122" title="All 4 branches missed.">                    if(queued)</span>
+                        // another polling for this job is requested while we were doing the polling. do it again.
+<span class="nc" id="L124">                        submit();</span>
+                    else
+<span class="nc" id="L126">                        entries.remove(item);</span>
+<span class="nc" id="L127">                    inProgress.remove(this);</span>
+                }
+<span class="nc" id="L129">            }</span>
+<span class="nc" id="L130">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

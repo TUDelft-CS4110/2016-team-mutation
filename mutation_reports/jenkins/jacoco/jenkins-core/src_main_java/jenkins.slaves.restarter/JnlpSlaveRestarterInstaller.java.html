@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>JnlpSlaveRestarterInstaller.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">jenkins.slaves.restarter</a> &gt; <span class="el_source">JnlpSlaveRestarterInstaller.java</span></div><h1>JnlpSlaveRestarterInstaller.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">package jenkins.slaves.restarter;</span>
+
+import hudson.Extension;
+import hudson.model.Computer;
+import hudson.model.TaskListener;
+import hudson.remoting.Engine;
+import hudson.remoting.EngineListener;
+import hudson.remoting.EngineListenerAdapter;
+import hudson.remoting.VirtualChannel;
+import hudson.slaves.ComputerListener;
+import jenkins.model.Jenkins.MasterComputer;
+
+import java.io.IOException;
+import java.io.Serializable;
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
+import java.util.logging.Logger;
+
+import static java.util.logging.Level.*;
+import jenkins.security.MasterToSlaveCallable;
+
+/**
+ * Actual slave restart logic.
+ *
+ * &lt;p&gt;
+ * Use {@link ComputerListener} to install {@link EngineListener}, which in turn gets executed when
+ * the slave gets disconnected.
+ *
+ * @author Kohsuke Kawaguchi
+ */
+@Extension
+<span class="nc" id="L33">public class JnlpSlaveRestarterInstaller extends ComputerListener implements Serializable {</span>
+    @Override
+    public void onOnline(final Computer c, final TaskListener listener) throws IOException, InterruptedException {
+<span class="nc" id="L36">        MasterComputer.threadPoolForRemoting.submit(new java.util.concurrent.Callable&lt;Void&gt;() {</span>
+            @Override
+            public Void call() throws Exception {
+<span class="nc" id="L39">                install(c, listener);</span>
+<span class="nc" id="L40">                return null;</span>
+            }
+        });
+<span class="nc" id="L43">    }</span>
+
+    private void install(Computer c, TaskListener listener) {
+        try {
+<span class="nc" id="L47">            final List&lt;SlaveRestarter&gt; restarters = new ArrayList&lt;SlaveRestarter&gt;(SlaveRestarter.all());</span>
+
+<span class="nc" id="L49">            VirtualChannel ch = c.getChannel();</span>
+<span class="nc bnc" id="L50" title="All 2 branches missed.">            if (ch==null) return;  // defensive check</span>
+
+<span class="nc" id="L52">            List&lt;SlaveRestarter&gt; effective = ch.call(new MasterToSlaveCallable&lt;List&lt;SlaveRestarter&gt;, IOException&gt;() {</span>
+                public List&lt;SlaveRestarter&gt; call() throws IOException {
+<span class="nc" id="L54">                    Engine e = Engine.current();</span>
+<span class="nc bnc" id="L55" title="All 2 branches missed.">                    if (e == null) return null;    // not running under Engine</span>
+
+                    try {
+<span class="nc" id="L58">                        Engine.class.getMethod(&quot;addListener&quot;, EngineListener.class);</span>
+<span class="nc" id="L59">                    } catch (NoSuchMethodException _) {</span>
+<span class="nc" id="L60">                        return null;    // running with older version of remoting that doesn't support adding listener</span>
+                    }
+
+                    // filter out ones that doesn't apply
+<span class="nc bnc" id="L64" title="All 2 branches missed.">                    for (Iterator&lt;SlaveRestarter&gt; itr = restarters.iterator(); itr.hasNext(); ) {</span>
+<span class="nc" id="L65">                        SlaveRestarter r =  itr.next();</span>
+<span class="nc bnc" id="L66" title="All 2 branches missed.">                        if (!r.canWork())</span>
+<span class="nc" id="L67">                            itr.remove();</span>
+                    }
+
+<span class="nc" id="L70">                    e.addListener(new EngineListenerAdapter() {</span>
+                        @Override
+                        public void onReconnect() {
+                            try {
+<span class="nc bnc" id="L74" title="All 2 branches missed.">                                for (SlaveRestarter r : restarters) {</span>
+                                    try {
+<span class="nc" id="L76">                                        LOGGER.info(&quot;Restarting slave via &quot;+r);</span>
+<span class="nc" id="L77">                                        r.restart();</span>
+<span class="nc" id="L78">                                    } catch (Exception x) {</span>
+<span class="nc" id="L79">                                        LOGGER.log(SEVERE, &quot;Failed to restart slave with &quot;+r, x);</span>
+                                    }
+                                }
+<span class="nc" id="L82">                            } finally {</span>
+                                // if we move on to the reconnection without restart,
+                                // don't let the current implementations kick in when the slave loses connection again
+<span class="nc" id="L85">                                restarters.clear();</span>
+<span class="nc" id="L86">                            }</span>
+<span class="nc" id="L87">                        }</span>
+                    });
+
+<span class="nc" id="L90">                    return restarters;</span>
+                }
+            });
+
+<span class="nc" id="L94">            LOGGER.log(FINE, &quot;Effective SlaveRestarter on {0}: {1}&quot;, new Object[] {c.getName(), effective});</span>
+<span class="nc" id="L95">        } catch (Throwable e) {</span>
+<span class="nc" id="L96">            e.printStackTrace(listener.error(&quot;Failed to install restarter&quot;));</span>
+        }
+<span class="nc" id="L98">    }</span>
+
+<span class="nc" id="L100">    private static final Logger LOGGER = Logger.getLogger(JnlpSlaveRestarterInstaller.class.getName());</span>
+
+<span class="nc" id="L102">    private static final long serialVersionUID = 1L;</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

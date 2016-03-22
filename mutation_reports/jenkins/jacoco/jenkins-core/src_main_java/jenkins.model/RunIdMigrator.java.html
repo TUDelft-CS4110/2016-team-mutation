@@ -1,0 +1,456 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>RunIdMigrator.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">jenkins.model</a> &gt; <span class="el_source">RunIdMigrator.java</span></div><h1>RunIdMigrator.java</h1><pre class="source lang-java linenums">/*
+ * The MIT License
+ *
+ * Copyright 2014 Jesse Glick.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+
+package jenkins.model;
+
+import hudson.Extension;
+import hudson.Util;
+import hudson.model.Job;
+import hudson.model.RootAction;
+import hudson.util.AtomicFileWriter;
+import hudson.util.StreamTaskListener;
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.lang.reflect.Array;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.net.URISyntaxException;
+import java.net.URL;
+import java.text.DateFormat;
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Date;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.logging.Logger;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import javax.annotation.CheckForNull;
+import javax.annotation.Nonnull;
+import org.apache.commons.io.Charsets;
+import org.apache.commons.io.FileUtils;
+import org.apache.commons.lang.time.FastDateFormat;
+import org.apache.tools.ant.BuildException;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
+import org.kohsuke.stapler.StaplerProxy;
+import org.kohsuke.stapler.framework.io.WriterOutputStream;
+
+import static java.util.logging.Level.*;
+
+/**
+ * Converts legacy {@code builds} directories to the current format.
+ *
+ * There would be one instance associated with each {@link Job}, to retain ID -&gt; build# mapping.
+ *
+ * The {@link Job#getBuildDir} is passed to every method call (rather than being cached) in case it is moved.
+ */
+@Restricted(NoExternalUse.class)
+public final class RunIdMigrator {
+
+<span class="fc" id="L80">    private final DateFormat legacyIdFormatter = new SimpleDateFormat(&quot;yyyy-MM-dd_HH-mm-ss&quot;);</span>
+
+<span class="fc" id="L82">    static final Logger LOGGER = Logger.getLogger(RunIdMigrator.class.getName());</span>
+    private static final String MAP_FILE = &quot;legacyIds&quot;;
+    /** avoids wasting a map for new jobs */
+<span class="fc" id="L85">    private static final Map&lt;String,Integer&gt; EMPTY = new TreeMap&lt;String,Integer&gt;();</span>
+
+    /**
+     * Did we record &quot;unmigrate&quot; instruction for this $JENKINS_HOME? Yes if it's in the set.
+     */
+<span class="fc" id="L90">    private static final Set&lt;File&gt; offeredToUnmigrate = Collections.synchronizedSet(new HashSet&lt;File&gt;());</span>
+
+<span class="fc" id="L92">    private @Nonnull Map&lt;String,Integer&gt; idToNumber = EMPTY;</span>
+
+<span class="fc" id="L94">    public RunIdMigrator() {}</span>
+
+    /**
+     * @return whether there was a file to load
+     */
+    private boolean load(File dir) {
+<span class="fc" id="L100">        File f = new File(dir, MAP_FILE);</span>
+<span class="pc bpc" id="L101" title="1 of 2 branches missed.">        if (!f.isFile()) {</span>
+<span class="nc" id="L102">            return false;</span>
+        }
+<span class="pc bpc" id="L104" title="1 of 2 branches missed.">        if (f.length() == 0) {</span>
+<span class="fc" id="L105">            return true;</span>
+        }
+<span class="nc" id="L107">        idToNumber = new TreeMap&lt;String,Integer&gt;();</span>
+        try {
+<span class="nc bnc" id="L109" title="All 2 branches missed.">            for (String line : FileUtils.readLines(f)) {</span>
+<span class="nc" id="L110">                int i = line.indexOf(' ');</span>
+<span class="nc" id="L111">                idToNumber.put(line.substring(0, i), Integer.parseInt(line.substring(i + 1)));</span>
+            }
+<span class="nc" id="L113">        } catch (Exception x) { // IOException, IndexOutOfBoundsException, NumberFormatException</span>
+<span class="nc" id="L114">            LOGGER.log(WARNING, &quot;could not read from &quot; + f, x);</span>
+        }
+<span class="nc" id="L116">        return true;</span>
+    }
+
+    private void save(File dir) {
+<span class="fc" id="L120">        File f = new File(dir, MAP_FILE);</span>
+        try {
+<span class="fc" id="L122">            AtomicFileWriter w = new AtomicFileWriter(f);</span>
+            try {
+<span class="pc bpc" id="L124" title="1 of 2 branches missed.">                for (Map.Entry&lt;String,Integer&gt; entry : idToNumber.entrySet()) {</span>
+<span class="nc" id="L125">                    w.write(entry.getKey() + ' ' + entry.getValue() + '\n');</span>
+                }
+<span class="fc" id="L127">                w.commit();</span>
+<span class="pc" id="L128">            } finally {</span>
+<span class="pc" id="L129">                w.abort();</span>
+<span class="nc" id="L130">            }</span>
+<span class="pc" id="L131">        } catch (IOException x) {</span>
+<span class="nc" id="L132">            LOGGER.log(WARNING, &quot;could not save changes to &quot; + f, x);</span>
+        }
+<span class="fc" id="L134">    }</span>
+
+    /**
+     * Called when a job is first created.
+     * Just saves an empty marker indicating that this job needs no migration.
+     * @param dir as in {@link Job#getBuildDir}
+     */
+    public void created(File dir) {
+<span class="fc" id="L142">        save(dir);</span>
+<span class="fc" id="L143">    }</span>
+
+    /**
+     * Perform one-time migration if this has not been done already.
+     * Where previously there would be a {@code 2014-01-02_03-04-05/build.xml} specifying {@code &lt;number&gt;99&lt;/number&gt;} plus a symlink {@code 99 → 2014-01-02_03-04-05},
+     * after migration there will be just {@code 99/build.xml} specifying {@code &lt;id&gt;2014-01-02_03-04-05&lt;/id&gt;} and {@code &lt;timestamp&gt;…&lt;/timestamp&gt;} according to local time zone at time of migration.
+     * Newly created builds are untouched.
+     * Does not throw {@link IOException} since we make a best effort to migrate but do not consider it fatal to job loading if we cannot.
+     * @param dir as in {@link Job#getBuildDir}
+     * @param jenkinsHome root directory of Jenkins (for logging only)
+     * @return true if migration was performed
+     */
+    public synchronized boolean migrate(File dir, @CheckForNull File jenkinsHome) {
+<span class="pc bpc" id="L156" title="1 of 2 branches missed.">        if (load(dir)) {</span>
+<span class="fc" id="L157">            LOGGER.log(FINER, &quot;migration already performed for {0}&quot;, dir);</span>
+<span class="fc" id="L158">            return false;</span>
+        }
+<span class="nc bnc" id="L160" title="All 2 branches missed.">        if (!dir.isDirectory()) {</span>
+<span class="nc" id="L161">            LOGGER.log(/* normal during Job.movedTo */FINE, &quot;{0} was unexpectedly missing&quot;, dir);</span>
+<span class="nc" id="L162">            return false;</span>
+        }
+<span class="nc" id="L164">        LOGGER.log(INFO, &quot;Migrating build records in {0}&quot;, dir);</span>
+<span class="nc" id="L165">        doMigrate(dir);</span>
+<span class="nc" id="L166">        save(dir);</span>
+<span class="nc bnc" id="L167" title="All 4 branches missed.">        if (jenkinsHome != null &amp;&amp; offeredToUnmigrate.add(jenkinsHome))</span>
+<span class="nc" id="L168">            LOGGER.log(WARNING, &quot;Build record migration (https://wiki.jenkins-ci.org/display/JENKINS/JENKINS-24380+Migration) is one-way. If you need to downgrade Jenkins, run: {0}&quot;, getUnmigrationCommandLine(jenkinsHome));</span>
+<span class="nc" id="L169">        return true;</span>
+    }
+
+    private static String getUnmigrationCommandLine(File jenkinsHome) {
+<span class="nc" id="L173">        StringBuilder cp = new StringBuilder();</span>
+<span class="nc bnc" id="L174" title="All 2 branches missed.">        for (Class&lt;?&gt; c : new Class&lt;?&gt;[] {RunIdMigrator.class, /* TODO how to calculate transitive dependencies automatically? */Charsets.class, WriterOutputStream.class, BuildException.class, FastDateFormat.class}) {</span>
+<span class="nc" id="L175">            URL location = c.getProtectionDomain().getCodeSource().getLocation();</span>
+<span class="nc" id="L176">            String locationS = location.toString();</span>
+<span class="nc bnc" id="L177" title="All 2 branches missed.">            if (location.getProtocol().equals(&quot;file&quot;)) {</span>
+                try {
+<span class="nc" id="L179">                    locationS = new File(location.toURI()).getAbsolutePath();</span>
+<span class="nc" id="L180">                } catch (URISyntaxException x) {</span>
+                    // never mind
+                }
+            }
+<span class="nc bnc" id="L184" title="All 2 branches missed.">            if (cp.length() &gt; 0) {</span>
+<span class="nc" id="L185">                cp.append(File.pathSeparator);</span>
+            }
+<span class="nc" id="L187">            cp.append(locationS);</span>
+        }
+<span class="nc" id="L189">        return String.format(&quot;java -classpath \&quot;%s\&quot; %s \&quot;%s\&quot;&quot;, cp, RunIdMigrator.class.getName(), jenkinsHome);</span>
+    }
+
+<span class="fc" id="L192">    private static final Pattern NUMBER_ELT = Pattern.compile(&quot;(?m)^  &lt;number&gt;(\\d+)&lt;/number&gt;(\r?\n)&quot;);</span>
+    private void doMigrate(File dir) {
+<span class="nc" id="L194">        idToNumber = new TreeMap&lt;String,Integer&gt;();</span>
+<span class="nc" id="L195">        File[] kids = dir.listFiles();</span>
+        // Need to process symlinks first so we can rename to them.
+<span class="nc" id="L197">        List&lt;File&gt; kidsList = new ArrayList&lt;File&gt;(Arrays.asList(kids));</span>
+<span class="nc" id="L198">        Iterator&lt;File&gt; it = kidsList.iterator();</span>
+<span class="nc bnc" id="L199" title="All 2 branches missed.">        while (it.hasNext()) {</span>
+<span class="nc" id="L200">            File kid = it.next();</span>
+<span class="nc" id="L201">            String name = kid.getName();</span>
+            try {
+<span class="nc" id="L203">                Integer.parseInt(name);</span>
+<span class="nc" id="L204">            } catch (NumberFormatException x) {</span>
+<span class="nc" id="L205">                LOGGER.log(FINE, &quot;ignoring nonnumeric entry {0}&quot;, name);</span>
+<span class="nc" id="L206">                continue;</span>
+            }
+            try {
+<span class="nc bnc" id="L209" title="All 2 branches missed.">                if (Util.isSymlink(kid)) {</span>
+<span class="nc" id="L210">                    LOGGER.log(FINE, &quot;deleting build number symlink {0} → {1}&quot;, new Object[] {name, Util.resolveSymlink(kid)});</span>
+<span class="nc bnc" id="L211" title="All 2 branches missed.">                } else if (kid.isDirectory()) {</span>
+<span class="nc" id="L212">                    LOGGER.log(FINE, &quot;ignoring build directory {0}&quot;, name);</span>
+<span class="nc" id="L213">                    continue;</span>
+                } else {
+<span class="nc" id="L215">                    LOGGER.log(WARNING, &quot;need to delete anomalous file entry {0}&quot;, name);</span>
+                }
+<span class="nc" id="L217">                Util.deleteFile(kid);</span>
+<span class="nc" id="L218">                it.remove();</span>
+<span class="nc" id="L219">            } catch (Exception x) {</span>
+<span class="nc" id="L220">                LOGGER.log(WARNING, &quot;failed to process &quot; + kid, x);</span>
+            }
+        }
+<span class="nc" id="L223">        it = kidsList.iterator();</span>
+<span class="nc bnc" id="L224" title="All 2 branches missed.">        while (it.hasNext()) {</span>
+<span class="nc" id="L225">            File kid = it.next();</span>
+            try {
+<span class="nc" id="L227">                String name = kid.getName();</span>
+                try {
+<span class="nc" id="L229">                    Integer.parseInt(name);</span>
+<span class="nc" id="L230">                    LOGGER.log(FINE, &quot;skipping new build dir {0}&quot;, name);</span>
+<span class="nc" id="L231">                    continue;</span>
+<span class="nc" id="L232">                } catch (NumberFormatException x) {</span>
+                    // OK, next…
+                }
+<span class="nc bnc" id="L235" title="All 2 branches missed.">                if (!kid.isDirectory()) {</span>
+<span class="nc" id="L236">                    LOGGER.log(FINE, &quot;skipping non-directory {0}&quot;, name);</span>
+<span class="nc" id="L237">                    continue;</span>
+                }
+                long timestamp;
+                try {
+<span class="nc" id="L241">                    synchronized (legacyIdFormatter) {</span>
+<span class="nc" id="L242">                        timestamp = legacyIdFormatter.parse(name).getTime();</span>
+                    }
+<span class="nc" id="L244">                } catch (ParseException x) {</span>
+<span class="nc" id="L245">                    LOGGER.log(WARNING, &quot;found unexpected dir {0}&quot;, name);</span>
+<span class="nc" id="L246">                    continue;</span>
+                }
+<span class="nc" id="L248">                File buildXml = new File(kid, &quot;build.xml&quot;);</span>
+<span class="nc bnc" id="L249" title="All 2 branches missed.">                if (!buildXml.isFile()) {</span>
+<span class="nc" id="L250">                    LOGGER.log(WARNING, &quot;found no build.xml in {0}&quot;, name);</span>
+<span class="nc" id="L251">                    continue;</span>
+                }
+<span class="nc" id="L253">                String xml = FileUtils.readFileToString(buildXml, Charsets.UTF_8);</span>
+<span class="nc" id="L254">                Matcher m = NUMBER_ELT.matcher(xml);</span>
+<span class="nc bnc" id="L255" title="All 2 branches missed.">                if (!m.find()) {</span>
+<span class="nc" id="L256">                    LOGGER.log(WARNING, &quot;could not find &lt;number&gt; in {0}/build.xml&quot;, name);</span>
+<span class="nc" id="L257">                    continue;</span>
+                }
+<span class="nc" id="L259">                int number = Integer.parseInt(m.group(1));</span>
+<span class="nc" id="L260">                String nl = m.group(2);</span>
+<span class="nc" id="L261">                xml = m.replaceFirst(&quot;  &lt;id&gt;&quot; + name + &quot;&lt;/id&gt;&quot; + nl + &quot;  &lt;timestamp&gt;&quot; + timestamp + &quot;&lt;/timestamp&gt;&quot; + nl);</span>
+<span class="nc" id="L262">                File newKid = new File(dir, Integer.toString(number));</span>
+<span class="nc" id="L263">                move(kid, newKid);</span>
+<span class="nc" id="L264">                FileUtils.writeStringToFile(new File(newKid, &quot;build.xml&quot;), xml, Charsets.UTF_8);</span>
+<span class="nc" id="L265">                LOGGER.log(FINE, &quot;fully processed {0} → {1}&quot;, new Object[] {name, number});</span>
+<span class="nc" id="L266">                idToNumber.put(name, number);</span>
+<span class="nc" id="L267">            } catch (Exception x) {</span>
+<span class="nc" id="L268">                LOGGER.log(WARNING, &quot;failed to process &quot; + kid, x);</span>
+            }
+        }
+<span class="nc" id="L271">    }</span>
+
+    /**
+     * Tries to move/rename a file from one path to another.
+     * Uses {@link java.nio.file.Files#move} when available.
+     * Does not use {@link java.nio.file.StandardCopyOption#REPLACE_EXISTING} or any other options.
+     * TODO candidate for moving to {@link Util}
+     */
+    static void move(File src, File dest) throws IOException {
+        Class&lt;?&gt; pathC;
+        try {
+<span class="fc" id="L282">            pathC = Class.forName(&quot;java.nio.file.Path&quot;);</span>
+<span class="pc" id="L283">        } catch (ClassNotFoundException x) {</span>
+            // Java 6, do our best
+<span class="nc bnc" id="L285" title="All 2 branches missed.">            if (dest.exists()) {</span>
+<span class="nc" id="L286">                throw new IOException(dest + &quot; already exists&quot;);</span>
+            }
+<span class="nc bnc" id="L288" title="All 2 branches missed.">            if (src.renameTo(dest)) {</span>
+<span class="nc" id="L289">                return;</span>
+            }
+<span class="nc" id="L291">            throw new IOException(&quot;could not move &quot; + src + &quot; to &quot; + dest);</span>
+        }
+        try {
+<span class="fc" id="L294">            Method toPath = File.class.getMethod(&quot;toPath&quot;);</span>
+<span class="fc" id="L295">            Class&lt;?&gt; copyOptionAC = Class.forName(&quot;[Ljava.nio.file.CopyOption;&quot;);</span>
+<span class="fc" id="L296">            Class.forName(&quot;java.nio.file.Files&quot;).getMethod(&quot;move&quot;, pathC, pathC, copyOptionAC).invoke(null, toPath.invoke(src), toPath.invoke(dest), Array.newInstance(copyOptionAC.getComponentType(), 0));</span>
+<span class="fc" id="L297">        } catch (InvocationTargetException x) {</span>
+<span class="fc" id="L298">            Throwable cause = x.getCause();</span>
+<span class="pc bpc" id="L299" title="1 of 2 branches missed.">            if (cause instanceof IOException) {</span>
+<span class="fc" id="L300">                throw (IOException) cause;</span>
+            } else {
+<span class="nc" id="L302">                throw new IOException(cause);</span>
+            }
+<span class="nc" id="L304">        } catch (Exception x) {</span>
+<span class="nc" id="L305">            throw new IOException(x);</span>
+        }
+<span class="fc" id="L307">    }</span>
+
+    /**
+     * Look up a historical run by ID.
+     * @param id a nonnumeric ID which may be a valid {@link Run#getId}
+     * @return the corresponding {@link Run#number}, or 0 if unknown
+     */
+    public synchronized int findNumber(@Nonnull String id) {
+<span class="fc" id="L315">        Integer number = idToNumber.get(id);</span>
+<span class="pc bpc" id="L316" title="1 of 2 branches missed.">        return number != null ? number : 0;</span>
+    }
+
+    /**
+     * Delete the record of a build.
+     * @param dir as in {@link Job#getBuildDir}
+     * @param id a {@link Run#getId}
+     */
+    public synchronized void delete(File dir, String id) {
+<span class="pc bpc" id="L325" title="1 of 2 branches missed.">        if (idToNumber.remove(id) != null) {</span>
+<span class="nc" id="L326">            save(dir);</span>
+        }
+<span class="fc" id="L328">    }</span>
+
+    /**
+     * Reverses the migration, in case you want to revert to the older format.
+     * @param args one parameter, {@code $JENKINS_HOME}
+     */
+    public static void main(String... args) throws Exception {
+<span class="pc bpc" id="L335" title="1 of 2 branches missed.">        if (args.length != 1) {</span>
+<span class="nc" id="L336">            throw new Exception(&quot;pass one parameter, $JENKINS_HOME&quot;);</span>
+        }
+<span class="fc" id="L338">        File root = new File(args[0]);</span>
+<span class="fc" id="L339">        File jobs = new File(root, &quot;jobs&quot;);</span>
+<span class="pc bpc" id="L340" title="1 of 2 branches missed.">        if (!jobs.isDirectory()) {</span>
+<span class="nc" id="L341">            throw new FileNotFoundException(&quot;no such $JENKINS_HOME &quot; + root);</span>
+        }
+<span class="fc" id="L343">        new RunIdMigrator().unmigrateJobsDir(jobs);</span>
+<span class="fc" id="L344">    }</span>
+    private void unmigrateJobsDir(File jobs) throws Exception {
+<span class="fc" id="L346">        File[] jobDirs = jobs.listFiles();</span>
+<span class="pc bpc" id="L347" title="1 of 2 branches missed.">        if (jobDirs == null) {</span>
+<span class="nc" id="L348">            System.err.println(jobs + &quot; claimed to exist, but cannot be listed&quot;);</span>
+<span class="nc" id="L349">            return;</span>
+        }
+<span class="fc bfc" id="L351" title="All 2 branches covered.">        for (File job : jobDirs) {</span>
+
+<span class="fc bfc" id="L353" title="All 2 branches covered.">            if (job.getName().equals(&quot;builds&quot;)) {</span>
+                // Might be maven modules, matrix builds, etc. which are direct children of job
+<span class="fc" id="L355">                unmigrateBuildsDir(job);</span>
+            }
+
+<span class="fc" id="L358">            File[] kids = job.listFiles();</span>
+<span class="fc bfc" id="L359" title="All 2 branches covered.">            if (kids == null) {</span>
+<span class="fc" id="L360">                continue;</span>
+            }
+<span class="fc bfc" id="L362" title="All 2 branches covered.">            for (File kid : kids) {</span>
+<span class="pc bpc" id="L363" title="1 of 2 branches missed.">                if (!kid.isDirectory()) {</span>
+<span class="nc" id="L364">                    continue;</span>
+                }
+<span class="fc bfc" id="L366" title="All 2 branches covered.">                if (kid.getName().equals(&quot;builds&quot;)) {</span>
+<span class="fc" id="L367">                    unmigrateBuildsDir(kid);</span>
+<span class="fc" id="L368">                } else {</span>
+                    // Might be jobs, modules, promotions, etc.; we assume an ItemGroup.getRootDirFor implementation
+                    // returns grandchildren, unmigrateJobsDir(job) call above handles children.
+<span class="fc" id="L371">                    unmigrateJobsDir(kid);</span>
+                }
+            }
+        }
+<span class="fc" id="L375">    }</span>
+<span class="fc" id="L376">    private static final Pattern ID_ELT = Pattern.compile(&quot;(?m)^  &lt;id&gt;([0-9_-]+)&lt;/id&gt;(\r?\n)&quot;);</span>
+<span class="fc" id="L377">    private static final Pattern TIMESTAMP_ELT = Pattern.compile(&quot;(?m)^  &lt;timestamp&gt;(\\d+)&lt;/timestamp&gt;(\r?\n)&quot;);</span>
+    /** Inverse of {@link #doMigrate}. */
+    private void unmigrateBuildsDir(File builds) throws Exception {
+<span class="fc" id="L380">        File mapFile = new File(builds, MAP_FILE);</span>
+<span class="pc bpc" id="L381" title="1 of 2 branches missed.">        if (!mapFile.isFile()) {</span>
+<span class="nc" id="L382">            System.err.println(builds + &quot; does not look to have been migrated yet; skipping&quot;);</span>
+<span class="nc" id="L383">            return;</span>
+        }
+<span class="fc bfc" id="L385" title="All 2 branches covered.">        for (File build : builds.listFiles()) {</span>
+            int number;
+            try {
+<span class="fc" id="L388">                number = Integer.parseInt(build.getName());</span>
+<span class="fc" id="L389">            } catch (NumberFormatException x) {</span>
+<span class="fc" id="L390">                continue;</span>
+            }
+<span class="fc" id="L392">            File buildXml = new File(build, &quot;build.xml&quot;);</span>
+<span class="pc bpc" id="L393" title="1 of 2 branches missed.">            if (!buildXml.isFile()) {</span>
+<span class="nc" id="L394">                System.err.println(buildXml + &quot; did not exist&quot;);</span>
+<span class="nc" id="L395">                continue;</span>
+            }
+<span class="fc" id="L397">            String xml = FileUtils.readFileToString(buildXml, Charsets.UTF_8);</span>
+<span class="fc" id="L398">            Matcher m = TIMESTAMP_ELT.matcher(xml);</span>
+<span class="pc bpc" id="L399" title="1 of 2 branches missed.">            if (!m.find()) {</span>
+<span class="nc" id="L400">                System.err.println(buildXml + &quot; did not contain &lt;timestamp&gt; as expected&quot;);</span>
+<span class="nc" id="L401">                continue;</span>
+            }
+<span class="fc" id="L403">            long timestamp = Long.parseLong(m.group(1));</span>
+<span class="fc" id="L404">            String nl = m.group(2);</span>
+<span class="fc" id="L405">            xml = m.replaceFirst(&quot;  &lt;number&gt;&quot; + number + &quot;&lt;/number&gt;&quot; + nl);</span>
+<span class="fc" id="L406">            m = ID_ELT.matcher(xml);</span>
+            String id;
+<span class="pc bpc" id="L408" title="1 of 2 branches missed.">            if (m.find()) {</span>
+<span class="nc" id="L409">                id = m.group(1);</span>
+<span class="nc" id="L410">                xml = m.replaceFirst(&quot;&quot;);</span>
+<span class="nc" id="L411">            } else {</span>
+                // Post-migration build. We give it a new ID based on its timestamp.
+<span class="fc" id="L413">                id = legacyIdFormatter.format(new Date(timestamp));</span>
+            }
+<span class="fc" id="L415">            FileUtils.write(buildXml, xml, Charsets.UTF_8);</span>
+<span class="pc bpc" id="L416" title="1 of 2 branches missed.">            if (!build.renameTo(new File(builds, id))) {</span>
+<span class="nc" id="L417">                System.err.println(build + &quot; could not be renamed&quot;);</span>
+            }
+<span class="fc" id="L419">            Util.createSymlink(builds, id, Integer.toString(number), StreamTaskListener.fromStderr());</span>
+        }
+<span class="fc" id="L421">        Util.deleteFile(mapFile);</span>
+<span class="fc" id="L422">        System.err.println(builds + &quot; has been restored to its original format&quot;);</span>
+<span class="fc" id="L423">    }</span>
+
+    /**
+     * Expose unmigration instruction to the user.
+     */
+    @Extension
+<span class="nc" id="L429">    public static class UnmigrationInstruction implements RootAction, StaplerProxy {</span>
+        @Override
+        public String getIconFileName() {
+<span class="nc" id="L432">            return null;</span>
+        }
+
+        @Override
+        public String getDisplayName() {
+<span class="nc" id="L437">            return null;</span>
+        }
+
+        @Override
+        public String getUrlName() {
+<span class="nc" id="L442">            return &quot;JENKINS-24380&quot;;</span>
+        }
+
+        @Override
+        public Object getTarget() {
+<span class="nc" id="L447">            Jenkins.getInstance().checkPermission(Jenkins.ADMINISTER);</span>
+<span class="nc" id="L448">            return this;</span>
+        }
+
+        public String getCommand() {
+<span class="nc" id="L452">            return RunIdMigrator.getUnmigrationCommandLine(Jenkins.getInstance().getRootDir());</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

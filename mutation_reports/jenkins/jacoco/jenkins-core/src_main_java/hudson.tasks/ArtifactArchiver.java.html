@@ -1,0 +1,389 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>ArtifactArchiver.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.tasks</a> &gt; <span class="el_source">ArtifactArchiver.java</span></div><h1>ArtifactArchiver.java</h1><pre class="source lang-java linenums">/*
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc., Kohsuke Kawaguchi, Brian Westrich, Jean-Baptiste Quenot
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.tasks;
+
+import hudson.FilePath;
+import jenkins.MasterToSlaveFileCallable;
+import hudson.Launcher;
+import hudson.Util;
+import hudson.Extension;
+import hudson.model.AbstractProject;
+import hudson.model.Result;
+import hudson.model.Run;
+import hudson.model.TaskListener;
+import hudson.model.listeners.ItemListener;
+import hudson.remoting.VirtualChannel;
+import hudson.util.FormValidation;
+import java.io.File;
+
+import org.apache.tools.ant.types.FileSet;
+import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.DataBoundConstructor;
+import org.kohsuke.stapler.AncestorInPath;
+import org.kohsuke.stapler.QueryParameter;
+
+import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+import net.sf.json.JSONObject;
+import javax.annotation.Nonnull;
+import jenkins.model.BuildDiscarder;
+import jenkins.model.Jenkins;
+import jenkins.tasks.SimpleBuildStep;
+import jenkins.util.BuildListenerAdapter;
+import org.kohsuke.stapler.DataBoundSetter;
+
+/**
+ * Copies the artifacts into an archive directory.
+ *
+ * @author Kohsuke Kawaguchi
+ */
+public class ArtifactArchiver extends Recorder implements SimpleBuildStep {
+
+<span class="nc" id="L67">    private static final Logger LOG = Logger.getLogger(ArtifactArchiver.class.getName());</span>
+
+    /**
+     * Comma- or space-separated list of patterns of files/directories to be archived.
+     */
+    private String artifacts;
+
+    /**
+     * Possibly null 'excludes' pattern as in Ant.
+     */
+<span class="nc" id="L77">    private String excludes = &quot;&quot;;</span>
+
+    @Deprecated
+    private Boolean latestOnly;
+
+    /**
+     * Fail (or not) the build if archiving returns nothing.
+     */
+    @Nonnull
+    private Boolean allowEmptyArchive;
+
+    /**
+     * Archive only if build is successful, skip archiving on failed builds.
+     */
+    private boolean onlyIfSuccessful;
+
+    private boolean fingerprint;
+
+    /**
+     * Default ant exclusion
+     */
+    @Nonnull
+<span class="nc" id="L99">    private Boolean defaultExcludes = true;</span>
+    
+    /**
+     * Indicate whether include and exclude patterns should be considered as case sensitive
+     */
+    @Nonnull
+<span class="nc" id="L105">    private Boolean caseSensitive = true;</span>
+
+<span class="nc" id="L107">    @DataBoundConstructor public ArtifactArchiver(String artifacts) {</span>
+<span class="nc" id="L108">        this.artifacts = artifacts.trim();</span>
+<span class="nc" id="L109">        allowEmptyArchive = false;</span>
+<span class="nc" id="L110">    }</span>
+
+    @Deprecated
+    public ArtifactArchiver(String artifacts, String excludes, boolean latestOnly) {
+<span class="nc" id="L114">        this(artifacts, excludes, latestOnly, false, false);</span>
+<span class="nc" id="L115">    }</span>
+
+    @Deprecated
+    public ArtifactArchiver(String artifacts, String excludes, boolean latestOnly, boolean allowEmptyArchive) {
+<span class="nc" id="L119">        this(artifacts, excludes, latestOnly, allowEmptyArchive, false);</span>
+<span class="nc" id="L120">    }</span>
+
+    @Deprecated
+    public ArtifactArchiver(String artifacts, String excludes, boolean latestOnly, boolean allowEmptyArchive, boolean onlyIfSuccessful) {
+<span class="nc" id="L124">        this(artifacts, excludes , latestOnly , allowEmptyArchive, onlyIfSuccessful , true);</span>
+<span class="nc" id="L125">    }</span>
+
+    @Deprecated
+    public ArtifactArchiver(String artifacts, String excludes, boolean latestOnly, boolean allowEmptyArchive, boolean onlyIfSuccessful, Boolean defaultExcludes) {
+<span class="nc" id="L129">        this(artifacts);</span>
+<span class="nc" id="L130">        setExcludes(excludes);</span>
+<span class="nc" id="L131">        this.latestOnly = latestOnly;</span>
+<span class="nc" id="L132">        setAllowEmptyArchive(allowEmptyArchive);</span>
+<span class="nc" id="L133">        setOnlyIfSuccessful(onlyIfSuccessful);</span>
+<span class="nc" id="L134">        setDefaultExcludes(defaultExcludes);</span>
+<span class="nc" id="L135">    }</span>
+
+    // Backwards compatibility for older builds
+    public Object readResolve() {
+<span class="nc bnc" id="L139" title="All 2 branches missed.">        if (allowEmptyArchive == null) {</span>
+<span class="nc" id="L140">            this.allowEmptyArchive = Boolean.getBoolean(ArtifactArchiver.class.getName()+&quot;.warnOnEmpty&quot;);</span>
+        }
+<span class="nc bnc" id="L142" title="All 2 branches missed.">        if (defaultExcludes == null){</span>
+<span class="nc" id="L143">            defaultExcludes = true;</span>
+        }
+<span class="nc bnc" id="L145" title="All 2 branches missed.">        if (caseSensitive == null) {</span>
+<span class="nc" id="L146">            caseSensitive = true;</span>
+        }
+<span class="nc" id="L148">        return this;</span>
+    }
+
+    public String getArtifacts() {
+<span class="nc" id="L152">        return artifacts;</span>
+    }
+
+    public String getExcludes() {
+<span class="nc" id="L156">        return excludes;</span>
+    }
+
+    @DataBoundSetter public final void setExcludes(String excludes) {
+<span class="nc" id="L160">        this.excludes = Util.fixEmptyAndTrim(excludes);</span>
+<span class="nc" id="L161">    }</span>
+
+    @Deprecated
+    public boolean isLatestOnly() {
+<span class="nc bnc" id="L165" title="All 2 branches missed.">        return latestOnly != null ? latestOnly : false;</span>
+    }
+
+    public boolean isOnlyIfSuccessful() {
+<span class="nc" id="L169">        return onlyIfSuccessful;</span>
+    }
+
+    @DataBoundSetter public final void setOnlyIfSuccessful(boolean onlyIfSuccessful) {
+<span class="nc" id="L173">        this.onlyIfSuccessful = onlyIfSuccessful;</span>
+<span class="nc" id="L174">    }</span>
+
+    public boolean isFingerprint() {
+<span class="nc" id="L177">        return fingerprint;</span>
+    }
+
+    /** Whether to fingerprint the artifacts after we archive them. */
+    @DataBoundSetter public void setFingerprint(boolean fingerprint) {
+<span class="nc" id="L182">        this.fingerprint = fingerprint;</span>
+<span class="nc" id="L183">    }</span>
+
+    public boolean getAllowEmptyArchive() {
+<span class="nc" id="L186">        return allowEmptyArchive;</span>
+    }
+
+    @DataBoundSetter public final void setAllowEmptyArchive(boolean allowEmptyArchive) {
+<span class="nc" id="L190">        this.allowEmptyArchive = allowEmptyArchive;</span>
+<span class="nc" id="L191">    }</span>
+
+    public boolean isDefaultExcludes() {
+<span class="nc" id="L194">        return defaultExcludes;</span>
+    }
+
+    @DataBoundSetter public final void setDefaultExcludes(boolean defaultExcludes) {
+<span class="nc" id="L198">        this.defaultExcludes = defaultExcludes;</span>
+<span class="nc" id="L199">    }</span>
+    
+    public boolean isCaseSensitive() {
+<span class="nc" id="L202">        return caseSensitive;</span>
+    }
+
+    @DataBoundSetter public final void setCaseSensitive(boolean caseSensitive) {
+<span class="nc" id="L206">        this.caseSensitive = caseSensitive;</span>
+<span class="nc" id="L207">    }</span>
+
+    private void listenerWarnOrError(TaskListener listener, String message) {
+<span class="nc bnc" id="L210" title="All 2 branches missed.">    	if (allowEmptyArchive) {</span>
+<span class="nc" id="L211">    		listener.getLogger().println(String.format(&quot;WARN: %s&quot;, message));</span>
+<span class="nc" id="L212">    	} else {</span>
+<span class="nc" id="L213">    		listener.error(message);</span>
+    	}
+<span class="nc" id="L215">    }</span>
+
+    @Override
+    public void perform(Run&lt;?,?&gt; build, FilePath ws, Launcher launcher, TaskListener listener) throws InterruptedException {
+<span class="nc bnc" id="L219" title="All 2 branches missed.">        if(artifacts.length()==0) {</span>
+<span class="nc" id="L220">            listener.error(Messages.ArtifactArchiver_NoIncludes());</span>
+<span class="nc" id="L221">            build.setResult(Result.FAILURE);</span>
+<span class="nc" id="L222">            return;</span>
+        }
+
+<span class="nc bnc" id="L225" title="All 6 branches missed.">        if (onlyIfSuccessful &amp;&amp; build.getResult() != null &amp;&amp; build.getResult().isWorseThan(Result.UNSTABLE)) {</span>
+<span class="nc" id="L226">            listener.getLogger().println(Messages.ArtifactArchiver_SkipBecauseOnlyIfSuccessful());</span>
+<span class="nc" id="L227">            return;</span>
+        }
+
+<span class="nc" id="L230">        listener.getLogger().println(Messages.ArtifactArchiver_ARCHIVING_ARTIFACTS());</span>
+        try {
+<span class="nc" id="L232">            String artifacts = build.getEnvironment(listener).expand(this.artifacts);</span>
+
+<span class="nc" id="L234">            Map&lt;String,String&gt; files = ws.act(new ListFiles(artifacts, excludes, defaultExcludes, caseSensitive));</span>
+<span class="nc bnc" id="L235" title="All 2 branches missed.">            if (!files.isEmpty()) {</span>
+<span class="nc" id="L236">                build.pickArtifactManager().archive(ws, launcher, BuildListenerAdapter.wrap(listener), files);</span>
+<span class="nc bnc" id="L237" title="All 2 branches missed.">                if (fingerprint) {</span>
+<span class="nc" id="L238">                    new Fingerprinter(artifacts).perform(build, ws, launcher, listener);</span>
+                }
+<span class="nc" id="L240">            } else {</span>
+<span class="nc" id="L241">                Result result = build.getResult();</span>
+<span class="nc bnc" id="L242" title="All 4 branches missed.">                if (result != null &amp;&amp; result.isBetterOrEqualTo(Result.UNSTABLE)) {</span>
+                    // If the build failed, don't complain that there was no matching artifact.
+                    // The build probably didn't even get to the point where it produces artifacts. 
+<span class="nc" id="L245">                    listenerWarnOrError(listener, Messages.ArtifactArchiver_NoMatchFound(artifacts));</span>
+<span class="nc" id="L246">                    String msg = null;</span>
+                    try {
+<span class="nc" id="L248">                    	msg = ws.validateAntFileMask(artifacts, FilePath.VALIDATE_ANT_FILE_MASK_BOUND, caseSensitive);</span>
+<span class="nc" id="L249">                    } catch (Exception e) {</span>
+<span class="nc" id="L250">                    	listenerWarnOrError(listener, e.getMessage());</span>
+                    }
+<span class="nc bnc" id="L252" title="All 2 branches missed.">                    if(msg!=null)</span>
+<span class="nc" id="L253">                        listenerWarnOrError(listener, msg);</span>
+                }
+<span class="nc bnc" id="L255" title="All 2 branches missed.">                if (!allowEmptyArchive) {</span>
+<span class="nc" id="L256">                	build.setResult(Result.FAILURE);</span>
+                }
+<span class="nc" id="L258">                return;</span>
+            }
+<span class="nc" id="L260">        } catch (IOException e) {</span>
+<span class="nc" id="L261">            Util.displayIOException(e,listener);</span>
+<span class="nc" id="L262">            e.printStackTrace(listener.error(</span>
+<span class="nc" id="L263">                    Messages.ArtifactArchiver_FailedToArchive(artifacts)));</span>
+<span class="nc" id="L264">            build.setResult(Result.FAILURE);</span>
+<span class="nc" id="L265">            return;</span>
+        }
+<span class="nc" id="L267">    }</span>
+
+    private static final class ListFiles extends MasterToSlaveFileCallable&lt;Map&lt;String,String&gt;&gt; {
+        private static final long serialVersionUID = 1;
+        private final String includes, excludes;
+        private final boolean defaultExcludes;
+        private final boolean caseSensitive;
+
+<span class="nc" id="L275">        ListFiles(String includes, String excludes, boolean defaultExcludes, boolean caseSensitive) {</span>
+<span class="nc" id="L276">            this.includes = includes;</span>
+<span class="nc" id="L277">            this.excludes = excludes;</span>
+<span class="nc" id="L278">            this.defaultExcludes = defaultExcludes;</span>
+<span class="nc" id="L279">            this.caseSensitive = caseSensitive;</span>
+<span class="nc" id="L280">        }</span>
+
+        @Override public Map&lt;String,String&gt; invoke(File basedir, VirtualChannel channel) throws IOException, InterruptedException {
+<span class="nc" id="L283">            Map&lt;String,String&gt; r = new HashMap&lt;String,String&gt;();</span>
+
+<span class="nc" id="L285">            FileSet fileSet = Util.createFileSet(basedir, includes, excludes);</span>
+<span class="nc" id="L286">            fileSet.setDefaultexcludes(defaultExcludes);</span>
+<span class="nc" id="L287">            fileSet.setCaseSensitive(caseSensitive);</span>
+
+<span class="nc bnc" id="L289" title="All 2 branches missed.">            for (String f : fileSet.getDirectoryScanner().getIncludedFiles()) {</span>
+<span class="nc" id="L290">                f = f.replace(File.separatorChar, '/');</span>
+<span class="nc" id="L291">                r.put(f, f);</span>
+            }
+<span class="nc" id="L293">            return r;</span>
+        }
+    }
+
+    public BuildStepMonitor getRequiredMonitorService() {
+<span class="nc" id="L298">        return BuildStepMonitor.NONE;</span>
+    }
+    
+    /**
+     * @deprecated as of 1.286
+     *      Some plugin depends on this, so this field is left here and points to the last created instance.
+     *      Use {@link jenkins.model.Jenkins#getDescriptorByType(Class)} instead.
+     */
+    @Deprecated
+<span class="nc" id="L307">    public static volatile DescriptorImpl DESCRIPTOR;</span>
+
+    @Extension
+    public static class DescriptorImpl extends BuildStepDescriptor&lt;Publisher&gt; {
+<span class="nc" id="L311">        public DescriptorImpl() {</span>
+<span class="nc" id="L312">            DESCRIPTOR = this; // backward compatibility</span>
+<span class="nc" id="L313">        }</span>
+
+        public String getDisplayName() {
+<span class="nc" id="L316">            return Messages.ArtifactArchiver_DisplayName();</span>
+        }
+
+        /**
+         * Performs on-the-fly validation of the file mask wildcard, when the artifacts
+         * textbox or the caseSensitive checkbox are modified
+         */
+        public FormValidation doCheckArtifacts(@AncestorInPath AbstractProject project,
+                @QueryParameter String value,
+                @QueryParameter(value = &quot;caseSensitive&quot;) String caseSensitive)
+                throws IOException {
+<span class="nc bnc" id="L327" title="All 2 branches missed.">            if (project == null) {</span>
+<span class="nc" id="L328">                return FormValidation.ok();</span>
+            }
+            // defensive approach to remain case sensitive in doubtful situations
+<span class="nc bnc" id="L331" title="All 4 branches missed.">            boolean bCaseSensitive = caseSensitive == null || !&quot;false&quot;.equals(caseSensitive);</span>
+<span class="nc" id="L332">            return FilePath.validateFileMask(project.getSomeWorkspace(), value, bCaseSensitive);</span>
+        }
+
+        @Override
+        public ArtifactArchiver newInstance(StaplerRequest req, JSONObject formData) throws FormException {
+<span class="nc" id="L337">            return req.bindJSON(ArtifactArchiver.class,formData);</span>
+        }
+
+        public boolean isApplicable(Class&lt;? extends AbstractProject&gt; jobType) {
+<span class="nc" id="L341">            return true;</span>
+        }
+    }
+
+<span class="nc" id="L345">    @Extension public static final class Migrator extends ItemListener {</span>
+        @SuppressWarnings(&quot;deprecation&quot;)
+        @Override public void onLoaded() {
+<span class="nc bnc" id="L348" title="All 2 branches missed.">            for (AbstractProject&lt;?,?&gt; p : Jenkins.getInstance().getAllItems(AbstractProject.class)) {</span>
+                try {
+<span class="nc" id="L350">                    ArtifactArchiver aa = p.getPublishersList().get(ArtifactArchiver.class);</span>
+<span class="nc bnc" id="L351" title="All 4 branches missed.">                    if (aa != null &amp;&amp; aa.latestOnly != null) {</span>
+<span class="nc bnc" id="L352" title="All 2 branches missed.">                        if (aa.latestOnly) {</span>
+<span class="nc" id="L353">                            BuildDiscarder bd = p.getBuildDiscarder();</span>
+<span class="nc bnc" id="L354" title="All 2 branches missed.">                            if (bd instanceof LogRotator) {</span>
+<span class="nc" id="L355">                                LogRotator lr = (LogRotator) bd;</span>
+<span class="nc bnc" id="L356" title="All 2 branches missed.">                                if (lr.getArtifactNumToKeep() == -1) {</span>
+<span class="nc" id="L357">                                    p.setBuildDiscarder(new LogRotator(lr.getDaysToKeep(), lr.getNumToKeep(), lr.getArtifactDaysToKeep(), 1));</span>
+<span class="nc" id="L358">                                } else {</span>
+<span class="nc" id="L359">                                    LOG.log(Level.WARNING, &quot;will not clobber artifactNumToKeep={0} in {1}&quot;, new Object[] {lr.getArtifactNumToKeep(), p});</span>
+                                }
+<span class="nc bnc" id="L361" title="All 2 branches missed.">                            } else if (bd == null) {</span>
+<span class="nc" id="L362">                                p.setBuildDiscarder(new LogRotator(-1, -1, -1, 1));</span>
+<span class="nc" id="L363">                            } else {</span>
+<span class="nc" id="L364">                                LOG.log(Level.WARNING, &quot;unrecognized BuildDiscarder {0} in {1}&quot;, new Object[] {bd, p});</span>
+                            }
+                        }
+<span class="nc" id="L367">                        aa.latestOnly = null;</span>
+<span class="nc" id="L368">                        p.save();</span>
+                    }
+<span class="nc" id="L370">                    Fingerprinter f = p.getPublishersList().get(Fingerprinter.class);</span>
+<span class="nc bnc" id="L371" title="All 4 branches missed.">                    if (f != null &amp;&amp; f.getRecordBuildArtifacts()) {</span>
+<span class="nc" id="L372">                        f.recordBuildArtifacts = null;</span>
+<span class="nc bnc" id="L373" title="All 2 branches missed.">                        if (aa != null) {</span>
+<span class="nc" id="L374">                            aa.setFingerprint(true);</span>
+                        }
+<span class="nc bnc" id="L376" title="All 2 branches missed.">                        if (f.getTargets().isEmpty()) { // no other reason to be here</span>
+<span class="nc" id="L377">                            p.getPublishersList().remove(f);</span>
+                        }
+<span class="nc" id="L379">                        p.save();</span>
+                    }
+<span class="nc" id="L381">                } catch (IOException x) {</span>
+<span class="nc" id="L382">                    LOG.log(Level.WARNING, &quot;could not migrate &quot; + p, x);</span>
+                }
+            }
+<span class="nc" id="L385">        }</span>
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

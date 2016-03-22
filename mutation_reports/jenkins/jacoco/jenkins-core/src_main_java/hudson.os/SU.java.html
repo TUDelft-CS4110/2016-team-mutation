@@ -1,0 +1,172 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>SU.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.os</a> &gt; <span class="el_source">SU.java</span></div><h1>SU.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">/*</span>
+ * The MIT License
+ *
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc., Kohsuke Kawaguchi
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.os;
+
+import com.sun.solaris.EmbeddedSu;
+import hudson.FilePath;
+import hudson.Launcher.LocalLauncher;
+import hudson.Util;
+import hudson.model.Computer;
+import hudson.model.TaskListener;
+import hudson.remoting.Callable;
+import hudson.remoting.Launcher;
+import hudson.remoting.LocalChannel;
+import hudson.remoting.VirtualChannel;
+import hudson.remoting.Which;
+import hudson.slaves.Channels;
+import hudson.util.ArgumentListBuilder;
+
+import java.io.File;
+import java.io.IOException;
+import java.io.PrintStream;
+import java.util.Collections;
+
+import static hudson.util.jna.GNUCLibrary.*;
+
+/**
+ * Executes {@link Callable} as the super user, by forking a new process and executing the closure in there
+ * if necessary.
+ *
+ * &lt;p&gt;
+ * A best effort is made to execute the closure as root, but we may still end up executing the closure
+ * in the non-root privilege, so the closure should expect that and handle it gracefully.
+ *
+ * &lt;p&gt;
+ * Still very much experimental. Subject to change. &lt;b&gt;Don't use it.&lt;/b&gt;
+ *
+ * @author Kohsuke Kawaguchi
+ */
+public abstract class SU {
+<span class="nc" id="L61">    private SU() { // not meant to be instantiated</span>
+<span class="nc" id="L62">    }</span>
+
+    /**
+     * Returns a {@link VirtualChannel} that's connected to the privilege-escalated environment.
+     *
+     * @param listener
+     *      What this method is doing (such as what process it's invoking) will be sent here.
+     * @return
+     *      Never null. This may represent a channel to a separate JVM, or just {@link LocalChannel}.
+     *      Close this channel and the SU environment will be shut down.
+     */
+    public static VirtualChannel start(final TaskListener listener, final String rootUsername, final String rootPassword) throws IOException, InterruptedException {
+<span class="nc bnc" id="L74" title="All 2 branches missed.">        if(File.pathSeparatorChar==';') // on Windows</span>
+<span class="nc" id="L75">            return newLocalChannel();  // TODO: perhaps use RunAs to run as an Administrator?</span>
+
+<span class="nc" id="L77">        String os = Util.fixNull(System.getProperty(&quot;os.name&quot;));</span>
+<span class="nc bnc" id="L78" title="All 2 branches missed.">        if(os.equals(&quot;Linux&quot;))</span>
+<span class="nc" id="L79">            return new UnixSu() {</span>
+                protected String sudoExe() {
+<span class="nc" id="L81">                    return &quot;sudo&quot;;</span>
+                }
+
+                protected Process sudoWithPass(ArgumentListBuilder args) throws IOException {
+<span class="nc" id="L85">                    args.prepend(sudoExe(),&quot;-S&quot;);</span>
+<span class="nc" id="L86">                    listener.getLogger().println(&quot;$ &quot;+Util.join(args.toList(),&quot; &quot;));</span>
+<span class="nc" id="L87">                    ProcessBuilder pb = new ProcessBuilder(args.toCommandArray());</span>
+<span class="nc" id="L88">                    Process p = pb.start();</span>
+                    // TODO: use -p to detect prompt
+                    // TODO: detect if the password didn't work
+<span class="nc" id="L91">                    PrintStream ps = new PrintStream(p.getOutputStream());</span>
+<span class="nc" id="L92">                    ps.println(rootPassword);</span>
+<span class="nc" id="L93">                    ps.println(rootPassword);</span>
+<span class="nc" id="L94">                    ps.println(rootPassword);</span>
+<span class="nc" id="L95">                    return p;</span>
+                }
+<span class="nc" id="L97">            }.start(listener,rootPassword);</span>
+
+<span class="nc bnc" id="L99" title="All 2 branches missed.">        if(os.equals(&quot;SunOS&quot;))</span>
+<span class="nc" id="L100">            return new UnixSu() {</span>
+                protected String sudoExe() {
+<span class="nc" id="L102">                    return &quot;/usr/bin/pfexec&quot;;</span>
+                }
+
+                protected Process sudoWithPass(ArgumentListBuilder args) throws IOException {
+<span class="nc" id="L106">                    listener.getLogger().println(&quot;Running with embedded_su&quot;);</span>
+<span class="nc" id="L107">                    ProcessBuilder pb = new ProcessBuilder(args.prepend(sudoExe()).toCommandArray());</span>
+<span class="nc" id="L108">                    return EmbeddedSu.startWithSu(rootUsername, rootPassword, pb);</span>
+                }
+            // in solaris, pfexec never asks for a password, so username==null means
+            // we won't be using password. this helps disambiguate empty password
+<span class="nc bnc" id="L112" title="All 2 branches missed.">            }.start(listener,rootUsername==null?null:rootPassword);</span>
+
+        // TODO: Mac?
+
+        // unsupported platform, take a chance
+<span class="nc" id="L117">        return newLocalChannel();</span>
+    }
+
+    private static LocalChannel newLocalChannel() {
+<span class="nc" id="L121">        return FilePath.localChannel;</span>
+    }
+
+    /**
+     * Starts a new privilege-escalated environment, execute a closure, and shut it down.
+     */
+    public static &lt;V,T extends Throwable&gt; V execute(TaskListener listener, String rootUsername, String rootPassword, final Callable&lt;V, T&gt; closure) throws T, IOException, InterruptedException {
+<span class="nc" id="L128">        VirtualChannel ch = start(listener, rootUsername, rootPassword);</span>
+        try {
+<span class="nc" id="L130">            return ch.call(closure);</span>
+<span class="nc" id="L131">        } finally {</span>
+<span class="nc" id="L132">            ch.close();</span>
+<span class="nc" id="L133">            ch.join(3000); // give some time for orderly shutdown, but don't block forever.</span>
+<span class="nc" id="L134">        }</span>
+    }
+
+<span class="nc" id="L137">    private static abstract class UnixSu {</span>
+
+        protected abstract String sudoExe();
+
+        protected abstract Process sudoWithPass(ArgumentListBuilder args) throws IOException;
+
+        VirtualChannel start(TaskListener listener, String rootPassword) throws IOException, InterruptedException {
+<span class="nc" id="L144">            final int uid = LIBC.geteuid();</span>
+
+<span class="nc bnc" id="L146" title="All 2 branches missed.">            if(uid==0)  // already running as root</span>
+<span class="nc" id="L147">                return newLocalChannel();</span>
+
+<span class="nc" id="L149">            String javaExe = System.getProperty(&quot;java.home&quot;) + &quot;/bin/java&quot;;</span>
+<span class="nc" id="L150">            File slaveJar = Which.jarFile(Launcher.class);</span>
+
+<span class="nc" id="L152">            ArgumentListBuilder args = new ArgumentListBuilder().add(javaExe);</span>
+<span class="nc bnc" id="L153" title="All 2 branches missed.">            if(slaveJar.isFile())</span>
+<span class="nc" id="L154">                args.add(&quot;-jar&quot;).add(slaveJar);</span>
+            else // in production code this never happens, but during debugging this is convenientud    
+<span class="nc" id="L156">                args.add(&quot;-cp&quot;).add(slaveJar).add(hudson.remoting.Launcher.class.getName());</span>
+
+<span class="nc bnc" id="L158" title="All 2 branches missed.">            if(rootPassword==null) {</span>
+                // try sudo, in the hope that the user has the permission to do so without password
+<span class="nc" id="L160">                return new LocalLauncher(listener).launchChannel(</span>
+<span class="nc" id="L161">                        args.prepend(sudoExe()).toCommandArray(),</span>
+<span class="nc" id="L162">                        listener.getLogger(), null, Collections.&lt;String, String&gt;emptyMap());</span>
+            } else {
+                // try sudo with the given password. Also run in pfexec so that we can elevate the privileges
+<span class="nc" id="L165">                Process proc = sudoWithPass(args);</span>
+<span class="nc" id="L166">                return Channels.forProcess(args.toStringWithQuote(), Computer.threadPoolForRemoting, proc,</span>
+<span class="nc" id="L167">                        listener.getLogger() );</span>
+            }
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

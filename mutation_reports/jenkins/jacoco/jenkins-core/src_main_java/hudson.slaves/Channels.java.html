@@ -1,0 +1,237 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>Channels.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.slaves</a> &gt; <span class="el_source">Channels.java</span></div><h1>Channels.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">/*</span>
+ * The MIT License
+ *
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.slaves;
+
+import hudson.Launcher.LocalLauncher;
+import hudson.Proc;
+import hudson.FilePath;
+import hudson.model.Computer;
+import hudson.model.TaskListener;
+import hudson.remoting.Channel;
+import hudson.remoting.ChannelBuilder;
+import hudson.remoting.CommandTransport;
+import hudson.remoting.Launcher;
+import hudson.remoting.SocketChannelStream;
+import hudson.util.ClasspathBuilder;
+import hudson.util.JVMBuilder;
+import hudson.util.StreamCopyThread;
+import jenkins.security.ChannelConfigurator;
+
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.IOError;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+/**
+ * Various convenient subtype of {@link Channel}s.
+ * 
+ * @author Kohsuke Kawaguchi
+ */
+<span class="nc" id="L60">public class Channels {</span>
+    /**
+     * @deprecated since 2009-04-13.
+     *      Use {@link #forProcess(String, ExecutorService, InputStream, OutputStream, OutputStream, Proc)}
+     */
+    @Deprecated
+    public static Channel forProcess(String name, ExecutorService execService, InputStream in, OutputStream out, Proc proc) throws IOException {
+<span class="nc" id="L67">        return forProcess(name,execService,in,out,null,proc);</span>
+    }
+
+    /**
+     * Creates a channel that wraps a remote process, so that when we shut down the connection
+     * we kill the process.
+     */
+    public static Channel forProcess(String name, ExecutorService execService, InputStream in, OutputStream out, OutputStream header, final Proc proc) throws IOException {
+<span class="nc" id="L75">        ChannelBuilder cb = new ChannelBuilder(name,execService) {</span>
+            @Override
+            public Channel build(CommandTransport transport) throws IOException {
+<span class="nc" id="L78">                return new Channel(this,transport) {</span>
+                    /**
+                     * Kill the process when the channel is severed.
+                     */
+                    @Override
+                    public synchronized void terminate(IOException e) {
+<span class="nc" id="L84">                        super.terminate(e);</span>
+                        try {
+<span class="nc" id="L86">                            proc.kill();</span>
+<span class="nc" id="L87">                        } catch (IOException x) {</span>
+                            // we are already in the error recovery mode, so just record it and move on
+<span class="nc" id="L89">                            LOGGER.log(Level.INFO, &quot;Failed to terminate the severed connection&quot;,x);</span>
+<span class="nc" id="L90">                        } catch (InterruptedException x) {</span>
+                            // process the interrupt later
+<span class="nc" id="L92">                            Thread.currentThread().interrupt();</span>
+                        }
+<span class="nc" id="L94">                    }</span>
+
+                    @Override
+                    public synchronized void join() throws InterruptedException {
+<span class="nc" id="L98">                        super.join();</span>
+                        // wait for the child process to complete, too
+                        try {
+<span class="nc" id="L101">                            proc.join();</span>
+<span class="nc" id="L102">                        } catch (IOException e) {</span>
+<span class="nc" id="L103">                            throw new IOError(e);</span>
+                        }
+<span class="nc" id="L105">                    }</span>
+                };
+            }
+        };
+<span class="nc" id="L109">        cb.withHeaderStream(header);</span>
+
+<span class="nc bnc" id="L111" title="All 2 branches missed.">        for (ChannelConfigurator cc : ChannelConfigurator.all()) {</span>
+<span class="nc" id="L112">            cc.onChannelBuilding(cb,null);  // TODO: what to pass as a context?</span>
+        }
+
+<span class="nc" id="L115">        return cb.build(in,out);</span>
+    }
+
+    public static Channel forProcess(String name, ExecutorService execService, final Process proc, OutputStream header) throws IOException {
+<span class="nc" id="L119">        final Thread thread = new StreamCopyThread(name + &quot; stderr&quot;, proc.getErrorStream(), header);</span>
+<span class="nc" id="L120">        thread.start();</span>
+
+<span class="nc" id="L122">        ChannelBuilder cb = new ChannelBuilder(name,execService) {</span>
+            @Override
+            public Channel build(CommandTransport transport) throws IOException {
+<span class="nc" id="L125">                return new Channel(this,transport) {</span>
+                    /**
+                     * Kill the process when the channel is severed.
+                     */
+                    @Override
+                    public synchronized void terminate(IOException e) {
+<span class="nc" id="L131">                        super.terminate(e);</span>
+<span class="nc" id="L132">                        proc.destroy();</span>
+                        // the stderr copier should exit by itself
+<span class="nc" id="L134">                    }</span>
+
+                    @Override
+                    public synchronized void join() throws InterruptedException {
+<span class="nc" id="L138">                        super.join();</span>
+                        // wait for the child process to complete, too
+<span class="nc" id="L140">                        proc.waitFor();</span>
+<span class="nc" id="L141">                        thread.join();</span>
+<span class="nc" id="L142">                    }</span>
+                };
+            }
+        };
+<span class="nc" id="L146">        cb.withHeaderStream(header);</span>
+
+<span class="nc bnc" id="L148" title="All 2 branches missed.">        for (ChannelConfigurator cc : ChannelConfigurator.all()) {</span>
+<span class="nc" id="L149">            cc.onChannelBuilding(cb,null);  // TODO: what to pass as a context?</span>
+        }
+
+<span class="nc" id="L152">        return cb.build(proc.getInputStream(),proc.getOutputStream());</span>
+    }
+
+    /**
+     * Launches a new JVM with the given classpath and system properties, establish a communication channel,
+     * and return a {@link Channel} to it.
+     *
+     * @param displayName
+     *      Human readable name of what this JVM represents. For example &quot;Selenium grid&quot; or &quot;Hadoop&quot;.
+     *      This token is used for messages to {@code listener}.
+     * @param listener
+     *      The progress of the launcher and the failure information will be sent here. Must not be null.
+     * @param workDir
+     *      If non-null, the new JVM will have this directory as the working directory. This must be a local path.
+     * @param classpath
+     *      The classpath of the new JVM. Can be null if you just need {@code slave.jar} (and everything else
+     *      can be sent over the channel.) But if you have jars that are known to be necessary by the new JVM,
+     *      setting it here will improve the classloading performance (by avoiding remote class file transfer.)
+     *      Classes in this classpath will also take precedence over any other classes that's sent via the channel
+     *      later, so it's also useful for making sure you get the version of the classes you want.
+     * @param systemProperties
+     *      If the new JVM should have a certain system properties set. Can be null.
+     *
+     * @return
+     *      never null
+     * @since 1.300
+     */
+    public static Channel newJVM(String displayName, TaskListener listener, FilePath workDir, ClasspathBuilder classpath, Map&lt;String,String&gt; systemProperties) throws IOException {
+<span class="nc" id="L180">        JVMBuilder vmb = new JVMBuilder();</span>
+<span class="nc" id="L181">        vmb.systemProperties(systemProperties);</span>
+
+<span class="nc" id="L183">        return newJVM(displayName,listener,vmb,workDir,classpath);</span>
+    }
+
+    /**
+     * Launches a new JVM with the given classpath, establish a communication channel,
+     * and return a {@link Channel} to it.
+     *
+     * @param displayName
+     *      Human readable name of what this JVM represents. For example &quot;Selenium grid&quot; or &quot;Hadoop&quot;.
+     *      This token is used for messages to {@code listener}.
+     * @param listener
+     *      The progress of the launcher and the failure information will be sent here. Must not be null.
+     * @param workDir
+     *      If non-null, the new JVM will have this directory as the working directory. This must be a local path.
+     * @param classpath
+     *      The classpath of the new JVM. Can be null if you just need {@code slave.jar} (and everything else
+     *      can be sent over the channel.) But if you have jars that are known to be necessary by the new JVM,
+     *      setting it here will improve the classloading performance (by avoiding remote class file transfer.)
+     *      Classes in this classpath will also take precedence over any other classes that's sent via the channel
+     *      later, so it's also useful for making sure you get the version of the classes you want.
+     * @param vmb
+     *      A partially configured {@link JVMBuilder} that allows the caller to fine-tune the launch parameter.
+     *
+     * @return
+     *      never null
+     * @since 1.361
+     */
+    public static Channel newJVM(String displayName, TaskListener listener, JVMBuilder vmb, FilePath workDir, ClasspathBuilder classpath) throws IOException {
+<span class="nc" id="L211">        ServerSocket serverSocket = new ServerSocket();</span>
+<span class="nc" id="L212">        serverSocket.bind(new InetSocketAddress(&quot;localhost&quot;,0));</span>
+<span class="nc" id="L213">        serverSocket.setSoTimeout(10*1000);</span>
+
+        // use -cp + FQCN instead of -jar since remoting.jar can be rebundled (like in the case of the swarm plugin.)
+<span class="nc" id="L216">        vmb.classpath().addJarOf(Channel.class);</span>
+<span class="nc" id="L217">        vmb.mainClass(Launcher.class);</span>
+
+<span class="nc bnc" id="L219" title="All 2 branches missed.">        if(classpath!=null)</span>
+<span class="nc" id="L220">            vmb.args().add(&quot;-cp&quot;).add(classpath);</span>
+<span class="nc" id="L221">        vmb.args().add(&quot;-connectTo&quot;,&quot;localhost:&quot;+serverSocket.getLocalPort());</span>
+
+<span class="nc" id="L223">        listener.getLogger().println(&quot;Starting &quot;+displayName);</span>
+<span class="nc" id="L224">        Proc p = vmb.launch(new LocalLauncher(listener)).stdout(listener).pwd(workDir).start();</span>
+
+<span class="nc" id="L226">        Socket s = serverSocket.accept();</span>
+<span class="nc" id="L227">        serverSocket.close();</span>
+
+<span class="nc" id="L229">        return forProcess(&quot;Channel to &quot;+displayName, Computer.threadPoolForRemoting,</span>
+<span class="nc" id="L230">                new BufferedInputStream(SocketChannelStream.in(s)),</span>
+<span class="nc" id="L231">                new BufferedOutputStream(SocketChannelStream.out(s)),null,p);</span>
+    }
+
+
+<span class="nc" id="L235">    private static final Logger LOGGER = Logger.getLogger(Channels.class.getName());</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

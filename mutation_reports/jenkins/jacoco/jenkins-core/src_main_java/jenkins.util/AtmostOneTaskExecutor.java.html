@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>AtmostOneTaskExecutor.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">jenkins.util</a> &gt; <span class="el_source">AtmostOneTaskExecutor.java</span></div><h1>AtmostOneTaskExecutor.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">package jenkins.util;</span>
+
+import com.google.common.util.concurrent.SettableFuture;
+import hudson.remoting.AtmostOneThreadExecutor;
+import hudson.util.DaemonThreadFactory;
+import hudson.util.NamingThreadFactory;
+
+import java.util.concurrent.Callable;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
+
+/**
+ * {@link Executor}-like class that executes a single task repeatedly, in such a way that a single execution
+ * can cover multiple pending queued requests.
+ *
+ * &lt;p&gt;
+ * This is akin to doing laundry &amp;mdash; when you put a dirty cloth into the laundry box, you mentally &quot;schedule&quot;
+ * a laundry task, regardless of whether there already is some cloths in the box or not. When you later actually get around
+ * doing laundry, you wash all the dirty cloths in the box, not just your cloths. And if someone brings
+ * more dirty cloths while a washer and dryer are in operation, the person has to mentally &quot;schedule&quot; the task
+ * and run the machines another time later, as the current batch is already in progress.
+ *
+ * &lt;p&gt;
+ * Since this class collapses multiple submitted tasks into just one run, it only makes sense when everyone
+ * submits the same task. Thus {@link #submit()} method does not take {@link Callable} as a parameter,
+ * instead you pass that in the constructor.
+ *
+ *
+ * &lt;h2&gt;Implementation&lt;/h2&gt;
+ * &lt;p&gt;
+ * This instance has two independent states. One is {@link #pending}, which indicates that
+ * the task execution is requested but not yet scheduled. The other is {@link #inprogress},
+ * which indicates that the task execution is scheduled but not yet completed.
+ *
+ * &lt;p&gt;
+ * All the internal state transition is guarded by the monitor of 'this'. {@link #pending}
+ * is non-null only if {@link #inprogress} is non-null.
+ *
+ * @author Kohsuke Kawaguchi
+ * @see AtmostOneThreadExecutor
+ */
+public class AtmostOneTaskExecutor&lt;V&gt; {
+    /**
+     * The actual executor that executes {@link #task}
+     */
+    private final ExecutorService base;
+
+    /**
+     * Task to be executed.
+     */
+    private final Callable&lt;V&gt; task;
+
+    /**
+     * If a task is already submitted and pending execution, non-null.
+     * Guarded by &quot;synchronized(this)&quot;
+     */
+    private SettableFuture&lt;V&gt; pending;
+
+    private SettableFuture&lt;V&gt; inprogress;
+
+<span class="nc" id="L62">    public AtmostOneTaskExecutor(ExecutorService base, Callable&lt;V&gt; task) {</span>
+<span class="nc" id="L63">        this.base = base;</span>
+<span class="nc" id="L64">        this.task = task;</span>
+<span class="nc" id="L65">    }</span>
+
+    public AtmostOneTaskExecutor(Callable&lt;V&gt; task) {
+<span class="nc" id="L68">        this(new AtmostOneThreadExecutor(new NamingThreadFactory(</span>
+<span class="nc" id="L69">                        new DaemonThreadFactory(),</span>
+<span class="nc" id="L70">                        String.format(&quot;AtmostOneTaskExecutor[%s]&quot;, task)</span>
+                )),
+<span class="nc" id="L72">                task</span>
+        );
+<span class="nc" id="L74">    }</span>
+
+    public synchronized Future&lt;V&gt; submit() {
+<span class="nc bnc" id="L77" title="All 2 branches missed.">        if (pending==null) {</span>
+<span class="nc" id="L78">            pending = SettableFuture.create();</span>
+<span class="nc" id="L79">            maybeRun();</span>
+        }
+<span class="nc" id="L81">        return pending;</span>
+    }
+
+    /**
+     * If {@link #pending} is non-null (meaning someone requested the task to be kicked),
+     * but {@link #inprogress} is null (meaning none is executing right now),
+     * get one going.
+     */
+    private synchronized void maybeRun() {
+<span class="nc bnc" id="L90" title="All 4 branches missed.">        if (inprogress==null &amp;&amp; pending!=null) {</span>
+<span class="nc" id="L91">            base.submit(new Callable&lt;Void&gt;() {</span>
+                @Override
+                public Void call() throws Exception {
+<span class="nc" id="L94">                    synchronized (AtmostOneTaskExecutor.this) {</span>
+                        // everyone who submits after this should form a next batch
+<span class="nc" id="L96">                        inprogress = pending;</span>
+<span class="nc" id="L97">                        pending = null;</span>
+                    }
+
+                    try {
+<span class="nc" id="L101">                        inprogress.set(task.call());</span>
+<span class="nc" id="L102">                    } catch (Throwable t) {</span>
+<span class="nc" id="L103">                        inprogress.setException(t);</span>
+<span class="nc" id="L104">                    } finally {</span>
+<span class="nc" id="L105">                        synchronized (AtmostOneTaskExecutor.this) {</span>
+                            // if next one is pending, get that scheduled
+<span class="nc" id="L107">                            inprogress = null;</span>
+<span class="nc" id="L108">                            maybeRun();</span>
+                        }
+<span class="nc" id="L110">                    }</span>
+<span class="nc" id="L111">                    return null;</span>
+                }
+            });
+        }
+<span class="nc" id="L115">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

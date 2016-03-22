@@ -1,0 +1,183 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>HudsonFilter.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.security</a> &gt; <span class="el_source">HudsonFilter.java</span></div><h1>HudsonFilter.java</h1><pre class="source lang-java linenums">/*
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc., Kohsuke Kawaguchi
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.security;
+
+import jenkins.model.Jenkins;
+
+import java.io.IOException;
+import java.util.logging.Logger;
+import static java.util.logging.Level.SEVERE;
+
+import javax.servlet.Filter;
+import javax.servlet.FilterChain;
+import javax.servlet.FilterConfig;
+import javax.servlet.ServletContext;
+import javax.servlet.ServletException;
+import javax.servlet.ServletRequest;
+import javax.servlet.ServletResponse;
+import javax.servlet.http.HttpServletResponse;
+
+import org.acegisecurity.AuthenticationManager;
+import org.acegisecurity.ui.rememberme.RememberMeServices;
+import org.acegisecurity.userdetails.UserDetailsService;
+
+/**
+ * {@link Filter} that Jenkins uses to implement security support.
+ *
+ * &lt;p&gt;
+ * This is the instance the servlet container creates, but
+ * internally this just acts as a proxy to the real {@link Filter},
+ * created by {@link SecurityRealm#createFilter(FilterConfig)}.
+ *
+ * @author Kohsuke Kawaguchi
+ * @since 1.160
+ */
+<span class="nc" id="L56">public class HudsonFilter implements Filter {</span>
+    /**
+     * The SecurityRealm specific filter.
+     */
+    private volatile Filter filter;
+    
+    /**
+     * The {@link #init(FilterConfig)} may be called before the Jenkins instance is up (which is
+     * required for initialization of the filter).  So we store the
+     * filterConfig for later lazy-initialization of the filter.
+     */
+    private FilterConfig filterConfig;
+
+    /**
+     * {@link AuthenticationManager} proxy so that the acegi filter chain can stay the same
+     * even when security setting is reconfigured.
+     *
+     * @deprecated in 1.271.
+     * This proxy always delegate to {@code Hudson.getInstance().getSecurityRealm().getSecurityComponents().manager},
+     * so use that instead.
+     */
+    @Deprecated
+<span class="nc" id="L78">    public static final AuthenticationManagerProxy AUTHENTICATION_MANAGER = new AuthenticationManagerProxy();</span>
+
+    /**
+     * {@link UserDetailsService} proxy so that the acegi filter chain can stay the same
+     * even when security setting is reconfigured.
+     *
+     * @deprecated in 1.271.
+     * This proxy always delegate to {@code Hudson.getInstance().getSecurityRealm().getSecurityComponents().userDetails},
+     * so use that instead.
+     */
+    @Deprecated
+<span class="nc" id="L89">    public static final UserDetailsServiceProxy USER_DETAILS_SERVICE_PROXY = new UserDetailsServiceProxy();</span>
+    
+    /**
+     * {@link RememberMeServices} proxy so that the acegi filter chain can stay the same
+     * even when security setting is reconfigured.
+     *
+     * @deprecated in 1.271.
+     * This proxy always delegate to {@code Hudson.getInstance().getSecurityRealm().getSecurityComponents().rememberMe},
+     * so use that instead.
+     */
+    @Deprecated
+<span class="nc" id="L100">    public static final RememberMeServicesProxy REMEMBER_ME_SERVICES_PROXY = new RememberMeServicesProxy();</span>
+
+    public void init(FilterConfig filterConfig) throws ServletException {
+<span class="nc" id="L103">        this.filterConfig = filterConfig;</span>
+        // this is how we make us available to the rest of Hudson.
+<span class="nc" id="L105">        filterConfig.getServletContext().setAttribute(HudsonFilter.class.getName(),this);</span>
+        try {
+<span class="nc" id="L107">            Jenkins hudson = Jenkins.getInstance();</span>
+<span class="nc bnc" id="L108" title="All 2 branches missed.">            if (hudson != null) {</span>
+                // looks like we are initialized after Hudson came into being. initialize it now. See #3069
+<span class="nc" id="L110">                LOGGER.fine(&quot;Security wasn't initialized; Initializing it...&quot;);</span>
+<span class="nc" id="L111">                SecurityRealm securityRealm = hudson.getSecurityRealm();</span>
+<span class="nc" id="L112">                reset(securityRealm);</span>
+<span class="nc" id="L113">                LOGGER.fine(&quot;securityRealm is &quot; + securityRealm);</span>
+<span class="nc" id="L114">                LOGGER.fine(&quot;Security initialized&quot;);</span>
+            }
+<span class="nc" id="L116">        } catch (ExceptionInInitializerError e) {</span>
+            // see HUDSON-4592. In some containers this happens before
+            // WebAppMain.contextInitialized kicks in, which makes
+            // the whole thing fail hard before a nicer error check
+            // in WebAppMain.contextInitialized. So for now,
+            // just report it here, and let the WebAppMain handle the failure gracefully.
+<span class="nc" id="L122">            LOGGER.log(SEVERE, &quot;Failed to initialize Jenkins&quot;,e);</span>
+        }
+<span class="nc" id="L124">    }</span>
+
+    /**
+     * Gets the {@link HudsonFilter} created for the given {@link ServletContext}.
+     */
+    public static HudsonFilter get(ServletContext context) {
+<span class="nc" id="L130">        return (HudsonFilter)context.getAttribute(HudsonFilter.class.getName());</span>
+    }
+
+    /**
+     * Reset the proxies and filter for a change in {@link SecurityRealm}.
+     */
+    public void reset(SecurityRealm securityRealm) throws ServletException {
+<span class="nc bnc" id="L137" title="All 2 branches missed.">        if (securityRealm != null) {</span>
+<span class="nc" id="L138">            SecurityRealm.SecurityComponents sc = securityRealm.getSecurityComponents();</span>
+<span class="nc" id="L139">            AUTHENTICATION_MANAGER.setDelegate(sc.manager);</span>
+<span class="nc" id="L140">            USER_DETAILS_SERVICE_PROXY.setDelegate(sc.userDetails);</span>
+<span class="nc" id="L141">            REMEMBER_ME_SERVICES_PROXY.setDelegate(sc.rememberMe);</span>
+            // make sure this.filter is always a valid filter.
+<span class="nc" id="L143">            Filter oldf = this.filter;</span>
+<span class="nc" id="L144">            Filter newf = securityRealm.createFilter(this.filterConfig);</span>
+<span class="nc" id="L145">            newf.init(this.filterConfig);</span>
+<span class="nc" id="L146">            this.filter = newf;</span>
+<span class="nc bnc" id="L147" title="All 2 branches missed.">            if(oldf!=null)</span>
+<span class="nc" id="L148">                oldf.destroy();</span>
+<span class="nc" id="L149">        } else {</span>
+            // no security related filter needed.
+<span class="nc" id="L151">            AUTHENTICATION_MANAGER.setDelegate(null);</span>
+<span class="nc" id="L152">            USER_DETAILS_SERVICE_PROXY.setDelegate(null);</span>
+<span class="nc" id="L153">            REMEMBER_ME_SERVICES_PROXY.setDelegate(null);</span>
+<span class="nc" id="L154">            filter = null;</span>
+        }
+<span class="nc" id="L156">    }</span>
+
+    public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain) throws IOException, ServletException {
+<span class="nc" id="L159">        LOGGER.entering(HudsonFilter.class.getName(), &quot;doFilter&quot;);</span>
+
+        // this is not the best place to do it, but doing it here makes the patch smaller.
+<span class="nc" id="L162">        ((HttpServletResponse)response).setHeader(&quot;X-Content-Type-Options&quot;, &quot;nosniff&quot;);</span>
+
+        // to deal with concurrency, we need to capture the object.
+<span class="nc" id="L165">        Filter f = filter;</span>
+
+<span class="nc bnc" id="L167" title="All 2 branches missed.">        if(f==null) {</span>
+            // Hudson is starting up.
+<span class="nc" id="L169">            chain.doFilter(request,response);</span>
+<span class="nc" id="L170">        } else {</span>
+<span class="nc" id="L171">            f.doFilter(request,response,chain);</span>
+        }
+<span class="nc" id="L173">    }</span>
+
+    public void destroy() {
+        // the filter can be null if the filter is not initialized yet.
+<span class="nc bnc" id="L177" title="All 2 branches missed.">        if(filter != null)</span>
+<span class="nc" id="L178">            filter.destroy();</span>
+<span class="nc" id="L179">    }</span>
+
+<span class="nc" id="L181">    private static final Logger LOGGER = Logger.getLogger(HudsonFilter.class.getName());</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

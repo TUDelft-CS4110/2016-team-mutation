@@ -1,0 +1,252 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>FileSystemProvisioner.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson</a> &gt; <span class="el_source">FileSystemProvisioner.java</span></div><h1>FileSystemProvisioner.java</h1><pre class="source lang-java linenums">/*
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc., Kohsuke Kawaguchi
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson;
+
+import hudson.FilePath.TarCompression;
+import hudson.model.AbstractBuild;
+import hudson.model.AbstractProject;
+import hudson.model.Computer;
+import hudson.model.Describable;
+import hudson.model.Job;
+import hudson.model.TaskListener;
+import hudson.util.io.ArchiverFactory;
+import jenkins.model.Jenkins;
+import hudson.model.listeners.RunListener;
+import hudson.scm.SCM;
+
+import java.io.BufferedOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.OutputStream;
+
+/**
+ * Prepares and provisions workspaces for {@link AbstractProject}s.
+ *
+ * &lt;p&gt;
+ *
+ *
+ * &lt;p&gt;
+ * STILL A WORK IN PROGRESS. SUBJECT TO CHANGE! DO NOT EXTEND.
+ *
+ * TODO: is this per {@link Computer}? Per {@link Job}?
+ *   -&gt; probably per slave.
+ *
+ * &lt;h2&gt;Design Problems&lt;/h2&gt;
+ * &lt;ol&gt;
+ * &lt;li&gt;
+ * Garbage collection of snapshots. When do we discard snapshots?
+ * In one use case, it would be convenient to keep the snapshot of the
+ * last promoted/successful build. So we need to define a mechanism
+ * to veto GC of snapshot? like an interface that Action can implement?
+ *
+ * Snapshot should be obtained per user's direction. That would be a good
+ * moment for the user to specify the retention policy.
+ *
+ * &lt;li&gt;
+ * Configuration mechanism. Should we auto-detect FileSystemProvisioner
+ * per OS? (but for example, zfs support would require the root access.)
+ * People probably needs to be able to disable this feature, which means
+ * one more configuration option. It's especially tricky because
+ * during the configuration we don't know the OS type.
+ *
+ * OTOH special slave type like the ones for network.com grid can
+ * hide this.
+ * &lt;/ol&gt;
+ *
+ *
+ * &lt;h2&gt;Recap&lt;/h2&gt;
+ *
+ * To recap,
+ *
+ * - when a slave connects, we auto-detect the file system provisioner.
+ *   (for example, ZFS FSP would check the slave root user prop
+ *   and/or attempt to &quot;pfexec zfs create&quot; and take over.)
+ *
+ * - the user may configure jobs for snapshot collection, along with
+ *   the retention policy.
+ *
+ * - keep workspace snapshots that correspond to the permalinks
+ *   In ZFS, use a user property to remember the build and the job.
+ *
+ * Can't the 2nd step happen automatically, when someone else depends on
+ * the workspace snapshot of the upstream? Yes, by using {@link RunListener}.
+ * So this becomes like a special SCM type.
+ *
+ *
+ *
+ * &lt;h2&gt;Design take 2&lt;/h2&gt;
+ * &lt;p&gt;
+ * The first piece of this is the custom {@link SCM}, which inherits the
+ * workspace of another job. When this executes, it picks up
+ * {@link WorkspaceSnapshot} from the other job and use it to obtain the workspace.
+ *
+ * &lt;p&gt;
+ * Then there's {@link RunListener}, which creates a snapshot if
+ * someone else is interested in using a snapshot later.
+ *
+ * &lt;h3&gt;TODOs&lt;/h3&gt;
+ * &lt;ul&gt;
+ * &lt;li&gt;
+ * Garbage collection of workspace snapshots. 
+ *
+ * &lt;/ul&gt;
+ *
+ * @author Kohsuke Kawaguchi
+ * @since 1.235
+ */
+<span class="nc" id="L119">public abstract class FileSystemProvisioner implements ExtensionPoint, Describable&lt;FileSystemProvisioner&gt; {</span>
+    /**
+     * Called very early in the build (before a build places any files
+     * in the workspace, such as SCM checkout) to provision a workspace
+     * for the build.
+     *
+     * &lt;p&gt;
+     * This method can prepare the underlying file system in preparation
+     * for the later {@link FileSystemProvisioner.Default#snapshot(AbstractBuild, FilePath, TaskListener)}.
+     *
+     * TODO : the method needs to be able to see the snapshot would
+     * be later needed. In fact, perhaps we should only call this method
+     * when Hudson knows that a snapshot is later needed?
+     *
+     * @param ws
+     *      New workspace should be prepared in this location. This is the same value as
+     *      {@code build.getProject().getWorkspace()} but passed separately for convenience.
+     */
+    public abstract void prepareWorkspace(AbstractBuild&lt;?,?&gt; build, FilePath ws, TaskListener listener) throws IOException, InterruptedException;
+
+    /**
+     * When a project is deleted, this method is called to undo the effect of
+     * {@link #prepareWorkspace(AbstractBuild, FilePath, TaskListener)}.
+     *
+     * @param project
+     *      Project whose workspace is being discarded.
+     * @param ws
+     *      Workspace to be discarded. This workspace is on the node
+     *      this {@link FileSystemProvisioner} is provisioned for.
+     */
+    public abstract void discardWorkspace(AbstractProject&lt;?, ?&gt; project, FilePath ws) throws IOException, InterruptedException;
+
+//    public abstract void moveWorkspace(AbstractProject&lt;?,?&gt; project, File oldWorkspace, File newWorkspace) throws IOException;
+
+    /**
+     * Obtains the snapshot of the workspace of the given build.
+     *
+     * &lt;p&gt;
+     * The state of the build when this method is invoked depends on
+     * the project type. Most would call this at the end of the build,
+     * but for example {@code MatrixBuild} would call this after
+     * SCM check out so that the state of the fresh workspace
+     * can be then propagated to elsewhere.
+     *
+     * &lt;p&gt;
+     * If the implementation of this method needs to store data in a file system,
+     * do so under {@link AbstractBuild#getRootDir()}, since the lifecycle of
+     * the snapshot is tied to the life cycle of a build.
+     *
+     * @param ws
+     *      New workspace should be prepared in this location. This is the same value as
+     *      {@code build.getWorkspace()} but passed separately for convenience.
+     * @param glob
+     *      Ant-style file glob for files to include in the snapshot. May not be pertinent for all
+     *      implementations.
+     */
+    public abstract WorkspaceSnapshot snapshot(AbstractBuild&lt;?,?&gt; build, FilePath ws, String glob, TaskListener listener) throws IOException, InterruptedException;
+
+    public FileSystemProvisionerDescriptor getDescriptor() {
+<span class="nc" id="L178">        return (FileSystemProvisionerDescriptor) Jenkins.getInstance().getDescriptorOrDie(getClass());</span>
+    }
+
+    /**
+     * Default implementation.
+     */
+<span class="nc" id="L184">    public static final FileSystemProvisioner DEFAULT = new Default();</span>
+
+    /**
+     * Returns all the registered {@link FileSystemProvisioner} descriptors.
+     */
+    public static DescriptorExtensionList&lt;FileSystemProvisioner,FileSystemProvisionerDescriptor&gt; all() {
+<span class="nc" id="L190">        return Jenkins.getInstance().&lt;FileSystemProvisioner,FileSystemProvisionerDescriptor&gt;getDescriptorList(FileSystemProvisioner.class);</span>
+    }
+
+    /**
+     * Default implementation that doesn't rely on any file system specific capability,
+     * and thus can be used anywhere that Hudson runs.
+     */
+<span class="nc" id="L197">    public static final class Default extends FileSystemProvisioner {</span>
+        public void prepareWorkspace(AbstractBuild&lt;?, ?&gt; build, FilePath ws, TaskListener listener) throws IOException, InterruptedException {
+<span class="nc" id="L199">        }</span>
+
+        public void discardWorkspace(AbstractProject&lt;?, ?&gt; project, FilePath ws) throws IOException, InterruptedException {
+<span class="nc" id="L202">        }</span>
+
+        /**
+         * @deprecated as of 1.350
+         */
+        @Deprecated
+        public WorkspaceSnapshot snapshot(AbstractBuild&lt;?, ?&gt; build, FilePath ws, TaskListener listener) throws IOException, InterruptedException {
+<span class="nc" id="L209">            return snapshot(build, ws, &quot;**/*&quot;, listener);</span>
+        }
+        
+        /**
+         * Creates a tar ball.
+         */
+        public WorkspaceSnapshot snapshot(AbstractBuild&lt;?, ?&gt; build, FilePath ws, String glob, TaskListener listener) throws IOException, InterruptedException {
+<span class="nc" id="L216">            File wss = new File(build.getRootDir(),&quot;workspace.tgz&quot;);</span>
+<span class="nc" id="L217">            OutputStream os = new BufferedOutputStream(new FileOutputStream(wss));</span>
+            try {
+<span class="nc" id="L219">                ws.archive(ArchiverFactory.TARGZ,os,glob);</span>
+<span class="nc" id="L220">            } finally {</span>
+<span class="nc" id="L221">                os.close();</span>
+<span class="nc" id="L222">            }</span>
+<span class="nc" id="L223">            return new WorkspaceSnapshotImpl();</span>
+        }
+
+<span class="nc" id="L226">        public static final class WorkspaceSnapshotImpl extends WorkspaceSnapshot {</span>
+            public void restoreTo(AbstractBuild&lt;?,?&gt; owner, FilePath dst, TaskListener listener) throws IOException, InterruptedException {
+<span class="nc" id="L228">                File zip = new File(owner.getRootDir(),&quot;workspace.zip&quot;);</span>
+<span class="nc bnc" id="L229" title="All 2 branches missed.">                if (zip.exists()) {// we used to keep it in zip</span>
+<span class="nc" id="L230">                    new FilePath(zip).unzip(dst);</span>
+<span class="nc" id="L231">                } else {// but since 1.456 we do tgz</span>
+<span class="nc" id="L232">                    File tgz = new File(owner.getRootDir(),&quot;workspace.tgz&quot;);</span>
+<span class="nc" id="L233">                    new FilePath(tgz).untar(dst, TarCompression.GZIP);</span>
+                }
+<span class="nc" id="L235">            }</span>
+        }
+
+        @Extension
+<span class="nc" id="L239">        public static final class DescriptorImpl extends FileSystemProvisionerDescriptor {</span>
+            public boolean discard(FilePath ws, TaskListener listener) throws IOException, InterruptedException {
+                // the default provisioner does not do anything special,
+                // so allow other types to manage it
+<span class="nc" id="L243">                return false;</span>
+            }
+
+            public String getDisplayName() {
+<span class="nc" id="L247">                return &quot;Default&quot;;</span>
+            }
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

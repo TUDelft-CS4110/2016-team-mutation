@@ -1,0 +1,112 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>AbstractAsyncNodeMonitorDescriptor.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.node_monitors</a> &gt; <span class="el_source">AbstractAsyncNodeMonitorDescriptor.java</span></div><h1>AbstractAsyncNodeMonitorDescriptor.java</h1><pre class="source lang-java linenums">package hudson.node_monitors;
+
+import hudson.model.Computer;
+import hudson.remoting.Callable;
+import hudson.remoting.VirtualChannel;
+import jenkins.model.Jenkins;
+
+import javax.annotation.CheckForNull;
+import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeoutException;
+import java.util.logging.Logger;
+
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
+import static java.util.logging.Level.WARNING;
+
+/**
+ * Sophisticated version of {@link AbstractNodeMonitorDescriptor} that
+ * performs monitoring on all slaves concurrently and asynchronously.
+ *
+ * @param &lt;T&gt;
+ *     represents the the result of the monitoring.
+ * @author Kohsuke Kawaguchi
+ */
+public abstract class AbstractAsyncNodeMonitorDescriptor&lt;T&gt; extends AbstractNodeMonitorDescriptor&lt;T&gt; {
+<span class="nc" id="L30">    protected AbstractAsyncNodeMonitorDescriptor() {</span>
+<span class="nc" id="L31">    }</span>
+
+    protected AbstractAsyncNodeMonitorDescriptor(long interval) {
+<span class="nc" id="L34">        super(interval);</span>
+<span class="nc" id="L35">    }</span>
+
+    protected AbstractAsyncNodeMonitorDescriptor(Class&lt;? extends NodeMonitor&gt; clazz) {
+<span class="nc" id="L38">        super(clazz);</span>
+<span class="nc" id="L39">    }</span>
+
+    protected AbstractAsyncNodeMonitorDescriptor(Class&lt;? extends NodeMonitor&gt; clazz, long interval) {
+<span class="nc" id="L42">        super(clazz, interval);</span>
+<span class="nc" id="L43">    }</span>
+
+    /**
+     * Creates a {@link Callable} that performs the monitoring when executed.
+     */
+    protected abstract @CheckForNull Callable&lt;T,IOException&gt; createCallable(Computer c);
+
+    @Override
+    protected T monitor(Computer c) throws IOException, InterruptedException {
+<span class="nc" id="L52">        VirtualChannel ch = c.getChannel();</span>
+<span class="nc bnc" id="L53" title="All 2 branches missed.">        if (ch != null) {</span>
+<span class="nc" id="L54">            Callable&lt;T,IOException&gt; cc = createCallable(c);</span>
+<span class="nc bnc" id="L55" title="All 2 branches missed.">            if (cc!=null)</span>
+<span class="nc" id="L56">                return ch.call(cc);</span>
+        }
+<span class="nc" id="L58">        return null;</span>
+    }
+
+    /**
+     * Performs all monitoring concurrently.
+     */
+    @Override
+    protected Map&lt;Computer, T&gt; monitor() throws InterruptedException {
+<span class="nc" id="L66">        Map&lt;Computer,Future&lt;T&gt;&gt; futures = new HashMap&lt;Computer,Future&lt;T&gt;&gt;();</span>
+
+<span class="nc bnc" id="L68" title="All 2 branches missed.">        for (Computer c : Jenkins.getInstance().getComputers()) {</span>
+            try {
+<span class="nc" id="L70">                VirtualChannel ch = c.getChannel();</span>
+<span class="nc" id="L71">                futures.put(c,null);    // sentinel value</span>
+<span class="nc bnc" id="L72" title="All 2 branches missed.">                if (ch!=null) {</span>
+<span class="nc" id="L73">                    Callable&lt;T, ?&gt; cc = createCallable(c);</span>
+<span class="nc bnc" id="L74" title="All 2 branches missed.">                    if (cc!=null)</span>
+<span class="nc" id="L75">                        futures.put(c,ch.callAsync(cc));</span>
+                }
+<span class="nc" id="L77">            } catch (RuntimeException e) {</span>
+<span class="nc" id="L78">                LOGGER.log(WARNING, &quot;Failed to monitor &quot;+c.getDisplayName()+&quot; for &quot;+getDisplayName(), e);</span>
+<span class="nc" id="L79">            } catch (IOException e) {</span>
+<span class="nc" id="L80">                LOGGER.log(WARNING, &quot;Failed to monitor &quot;+c.getDisplayName()+&quot; for &quot;+getDisplayName(), e);</span>
+            }
+        }
+
+<span class="nc" id="L84">        final long now = System.currentTimeMillis();</span>
+<span class="nc" id="L85">        final long end = now + getMonitoringTimeOut();</span>
+
+<span class="nc" id="L87">        final Map&lt;Computer,T&gt; data = new HashMap&lt;Computer,T&gt;();</span>
+
+<span class="nc bnc" id="L89" title="All 2 branches missed.">        for (Entry&lt;Computer, Future&lt;T&gt;&gt; e : futures.entrySet()) {</span>
+<span class="nc" id="L90">            Computer c = e.getKey();</span>
+<span class="nc" id="L91">            Future&lt;T&gt; f = futures.get(c);</span>
+<span class="nc" id="L92">            data.put(c, null);  // sentinel value</span>
+
+<span class="nc bnc" id="L94" title="All 2 branches missed.">            if (f!=null) {</span>
+                try {
+<span class="nc" id="L96">                    data.put(c,f.get(Math.max(0,end-System.currentTimeMillis()), MILLISECONDS));</span>
+<span class="nc" id="L97">                } catch (RuntimeException x) {</span>
+<span class="nc" id="L98">                    LOGGER.log(WARNING, &quot;Failed to monitor &quot; + c.getDisplayName() + &quot; for &quot; + getDisplayName(), x);</span>
+<span class="nc" id="L99">                } catch (ExecutionException x) {</span>
+<span class="nc" id="L100">                    LOGGER.log(WARNING, &quot;Failed to monitor &quot; + c.getDisplayName() + &quot; for &quot; + getDisplayName(), x);</span>
+<span class="nc" id="L101">                } catch (TimeoutException x) {</span>
+<span class="nc" id="L102">                    LOGGER.log(WARNING, &quot;Failed to monitor &quot; + c.getDisplayName() + &quot; for &quot; + getDisplayName(), x);</span>
+                }
+            }
+        }
+
+<span class="nc" id="L107">        return data;</span>
+    }
+
+<span class="nc" id="L110">    private static final Logger LOGGER = Logger.getLogger(AbstractAsyncNodeMonitorDescriptor.class.getName());</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

@@ -1,0 +1,467 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>XStream2.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.util</a> &gt; <span class="el_source">XStream2.java</span></div><h1>XStream2.java</h1><pre class="source lang-java linenums"><span class="fc" id="L1">/*</span>
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2010, Sun Microsystems, Inc., Kohsuke Kawaguchi, Alan Harder
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.util;
+
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
+import com.thoughtworks.xstream.XStream;
+import com.thoughtworks.xstream.mapper.AnnotationMapper;
+import com.thoughtworks.xstream.mapper.Mapper;
+import com.thoughtworks.xstream.mapper.MapperWrapper;
+import com.thoughtworks.xstream.converters.ConversionException;
+import com.thoughtworks.xstream.converters.Converter;
+import com.thoughtworks.xstream.converters.ConverterMatcher;
+import com.thoughtworks.xstream.converters.DataHolder;
+import com.thoughtworks.xstream.converters.MarshallingContext;
+import com.thoughtworks.xstream.converters.SingleValueConverter;
+import com.thoughtworks.xstream.converters.SingleValueConverterWrapper;
+import com.thoughtworks.xstream.converters.UnmarshallingContext;
+import com.thoughtworks.xstream.converters.extended.DynamicProxyConverter;
+import com.thoughtworks.xstream.core.JVM;
+import com.thoughtworks.xstream.io.HierarchicalStreamDriver;
+import com.thoughtworks.xstream.io.HierarchicalStreamReader;
+import com.thoughtworks.xstream.io.HierarchicalStreamWriter;
+import com.thoughtworks.xstream.mapper.CannotResolveClassException;
+import edu.umd.cs.findbugs.annotations.SuppressWarnings;
+import hudson.PluginManager;
+import hudson.PluginWrapper;
+import hudson.diagnosis.OldDataMonitor;
+import hudson.remoting.ClassFilter;
+import hudson.util.xstream.ImmutableSetConverter;
+import hudson.util.xstream.ImmutableSortedSetConverter;
+import jenkins.model.Jenkins;
+import hudson.model.Label;
+import hudson.model.Result;
+import hudson.model.Saveable;
+import hudson.util.xstream.ImmutableListConverter;
+import hudson.util.xstream.ImmutableMapConverter;
+import hudson.util.xstream.MapperDelegate;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.io.OutputStreamWriter;
+import java.io.Writer;
+
+import java.lang.reflect.Constructor;
+import java.lang.reflect.InvocationTargetException;
+import java.nio.charset.Charset;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import javax.annotation.CheckForNull;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
+
+/**
+ * {@link XStream} enhanced for additional Java5 support and improved robustness.
+ * @author Kohsuke Kawaguchi
+ */
+public class XStream2 extends XStream {
+    private RobustReflectionConverter reflectionConverter;
+<span class="pc" id="L80">    private final ThreadLocal&lt;Boolean&gt; oldData = new ThreadLocal&lt;Boolean&gt;();</span>
+    private final @CheckForNull ClassOwnership classOwnership;
+<span class="pc" id="L82">    private final Map&lt;String,Class&lt;?&gt;&gt; compatibilityAliases = new ConcurrentHashMap&lt;String, Class&lt;?&gt;&gt;();</span>
+
+    /**
+     * Hook to insert {@link Mapper}s after they are created.
+     */
+    private MapperInjectionPoint mapperInjectionPoint;
+
+<span class="fc" id="L89">    public XStream2() {</span>
+<span class="fc" id="L90">        init();</span>
+<span class="fc" id="L91">        classOwnership = null;</span>
+<span class="fc" id="L92">    }</span>
+
+    public XStream2(HierarchicalStreamDriver hierarchicalStreamDriver) {
+<span class="nc" id="L95">        super(hierarchicalStreamDriver);</span>
+<span class="nc" id="L96">        init();</span>
+<span class="nc" id="L97">        classOwnership = null;</span>
+<span class="nc" id="L98">    }</span>
+
+<span class="fc" id="L100">    XStream2(ClassOwnership classOwnership) {</span>
+<span class="fc" id="L101">        init();</span>
+<span class="fc" id="L102">        this.classOwnership = classOwnership;</span>
+<span class="fc" id="L103">    }</span>
+
+    @Override
+    public Object unmarshal(HierarchicalStreamReader reader, Object root, DataHolder dataHolder) {
+        // init() is too early to do this
+        // defensive because some use of XStream happens before plugins are initialized.
+<span class="fc" id="L109">        Jenkins h = Jenkins.getInstance();</span>
+<span class="pc bpc" id="L110" title="5 of 6 branches missed.">        if(h!=null &amp;&amp; h.pluginManager!=null &amp;&amp; h.pluginManager.uberClassLoader!=null) {</span>
+<span class="nc" id="L111">            setClassLoader(h.pluginManager.uberClassLoader);</span>
+        }
+
+<span class="fc" id="L114">        Object o = super.unmarshal(reader,root,dataHolder);</span>
+<span class="fc bfc" id="L115" title="All 2 branches covered.">        if (oldData.get()!=null) {</span>
+<span class="fc" id="L116">            oldData.remove();</span>
+<span class="pc bpc" id="L117" title="1 of 2 branches missed.">            if (o instanceof Saveable) OldDataMonitor.report((Saveable)o, &quot;1.106&quot;);</span>
+        }
+<span class="fc" id="L119">        return o;</span>
+    }
+
+    @Override
+    protected Converter createDefaultConverter() {
+        // replace default reflection converter
+<span class="fc" id="L125">        reflectionConverter = new RobustReflectionConverter(getMapper(),new JVM().bestReflectionProvider(), new PluginClassOwnership());</span>
+<span class="fc" id="L126">        return reflectionConverter;</span>
+    }
+
+    /**
+     * Specifies that a given field of a given class should not be treated with laxity by {@link RobustCollectionConverter}.
+     * @param clazz a class which we expect to hold a non-{@code transient} field
+     * @param field a field name in that class
+     */
+    @Restricted(NoExternalUse.class) // TODO could be opened up later
+    public void addCriticalField(Class&lt;?&gt; clazz, String field) {
+<span class="fc" id="L136">        reflectionConverter.addCriticalField(clazz, field);</span>
+<span class="fc" id="L137">    }</span>
+
+    static String trimVersion(String version) {
+        // TODO seems like there should be some trick with VersionNumber to do this
+<span class="fc" id="L141">        return version.replaceFirst(&quot; .+$&quot;, &quot;&quot;);</span>
+    }
+
+    private void init() {
+        // list up types that should be marshalled out like a value, without referential integrity tracking.
+<span class="fc" id="L146">        addImmutableType(Result.class);</span>
+
+<span class="fc" id="L148">        registerConverter(new RobustCollectionConverter(getMapper(),getReflectionProvider()),10);</span>
+<span class="fc" id="L149">        registerConverter(new RobustMapConverter(getMapper()), 10);</span>
+<span class="fc" id="L150">        registerConverter(new ImmutableMapConverter(getMapper(),getReflectionProvider()),10);</span>
+<span class="fc" id="L151">        registerConverter(new ImmutableSortedSetConverter(getMapper(),getReflectionProvider()),10);</span>
+<span class="fc" id="L152">        registerConverter(new ImmutableSetConverter(getMapper(),getReflectionProvider()),10);</span>
+<span class="fc" id="L153">        registerConverter(new ImmutableListConverter(getMapper(),getReflectionProvider()),10);</span>
+<span class="fc" id="L154">        registerConverter(new ConcurrentHashMapConverter(getMapper(),getReflectionProvider()),10);</span>
+<span class="fc" id="L155">        registerConverter(new CopyOnWriteMap.Tree.ConverterImpl(getMapper()),10); // needs to override MapConverter</span>
+<span class="fc" id="L156">        registerConverter(new DescribableList.ConverterImpl(getMapper()),10); // explicitly added to handle subtypes</span>
+<span class="fc" id="L157">        registerConverter(new Label.ConverterImpl(),10);</span>
+
+        // this should come after all the XStream's default simpler converters,
+        // but before reflection-based one kicks in.
+<span class="fc" id="L161">        registerConverter(new AssociatedConverterImpl(this), -10);</span>
+
+<span class="fc" id="L163">        registerConverter(new BlacklistedTypesConverter(), PRIORITY_VERY_HIGH); // SECURITY-247 defense</span>
+
+<span class="fc" id="L165">        registerConverter(new DynamicProxyConverter(getMapper()) { // SECURITY-105 defense</span>
+            @Override public boolean canConvert(Class type) {
+<span class="pc bpc" id="L167" title="1 of 4 branches missed.">                return /* this precedes NullConverter */ type != null &amp;&amp; super.canConvert(type);</span>
+            }
+            @Override public Object unmarshal(HierarchicalStreamReader reader, UnmarshallingContext context) {
+<span class="fc" id="L170">                throw new ConversionException(&quot;&lt;dynamic-proxy&gt; not supported&quot;);</span>
+            }
+<span class="fc" id="L172">        }, PRIORITY_VERY_HIGH);</span>
+<span class="fc" id="L173">    }</span>
+
+    @Override
+    protected MapperWrapper wrapMapper(MapperWrapper next) {
+<span class="fc" id="L177">        Mapper m = new CompatibilityMapper(new MapperWrapper(next) {</span>
+            @Override
+            public String serializedClass(Class type) {
+<span class="fc bfc" id="L180" title="All 4 branches covered.">                if (type != null &amp;&amp; ImmutableMap.class.isAssignableFrom(type))</span>
+<span class="fc" id="L181">                    return super.serializedClass(ImmutableMap.class);</span>
+<span class="fc bfc" id="L182" title="All 4 branches covered.">                else if (type != null &amp;&amp; ImmutableList.class.isAssignableFrom(type))</span>
+<span class="fc" id="L183">                    return super.serializedClass(ImmutableList.class);</span>
+                else
+<span class="fc" id="L185">                    return super.serializedClass(type);</span>
+            }
+        });
+<span class="fc" id="L188">        AnnotationMapper a = new AnnotationMapper(m, getConverterRegistry(), getConverterLookup(), getClassLoader(), getReflectionProvider(), getJvm());</span>
+        // TODO JENKINS-19561 this is unsafe:
+<span class="fc" id="L190">        a.autodetectAnnotations(true);</span>
+
+<span class="fc" id="L192">        mapperInjectionPoint = new MapperInjectionPoint(a);</span>
+
+<span class="fc" id="L194">        return mapperInjectionPoint;</span>
+    }
+
+    public Mapper getMapperInjectionPoint() {
+<span class="nc" id="L198">        return mapperInjectionPoint.getDelegate();</span>
+    }
+
+    /**
+     * @deprecated Uses default encoding yet fails to write an encoding header. Prefer {@link #toXMLUTF8}.
+     */
+    @Deprecated
+    @Override public void toXML(Object obj, OutputStream out) {
+<span class="fc" id="L206">        super.toXML(obj, out);</span>
+<span class="fc" id="L207">    }</span>
+
+    /**
+     * Serializes to a byte stream.
+     * Uses UTF-8 encoding and specifies that in the XML encoding declaration.
+     * @since 1.504
+     */
+    public void toXMLUTF8(Object obj, OutputStream out) throws IOException {
+<span class="fc" id="L215">        Writer w = new OutputStreamWriter(out, Charset.forName(&quot;UTF-8&quot;));</span>
+<span class="fc" id="L216">        w.write(&quot;&lt;?xml version=\&quot;1.0\&quot; encoding=\&quot;UTF-8\&quot;?&gt;\n&quot;);</span>
+<span class="fc" id="L217">        toXML(obj, w);</span>
+<span class="fc" id="L218">    }</span>
+
+    /**
+     * This method allows one to insert additional mappers after {@link XStream2} was created,
+     * but because of the way XStream works internally, this needs to be done carefully.
+     * Namely,
+     *
+     * &lt;ol&gt;
+     * &lt;li&gt;You need to {@link #getMapperInjectionPoint()} wrap it, then put that back into {@link #setMapper(Mapper)}.
+     * &lt;li&gt;The whole sequence needs to be synchronized against this object to avoid a concurrency issue.
+     * &lt;/ol&gt;
+     */
+    public void setMapper(Mapper m) {
+<span class="nc" id="L231">        mapperInjectionPoint.setDelegate(m);</span>
+<span class="nc" id="L232">    }</span>
+
+    final class MapperInjectionPoint extends MapperDelegate {
+<span class="fc" id="L235">        public MapperInjectionPoint(Mapper wrapped) {</span>
+<span class="fc" id="L236">            super(wrapped);</span>
+<span class="fc" id="L237">        }</span>
+
+        public Mapper getDelegate() {
+<span class="nc" id="L240">            return delegate;</span>
+        }
+
+        public void setDelegate(Mapper m) {
+<span class="nc" id="L244">            delegate = m;</span>
+<span class="nc" id="L245">        }</span>
+    }
+
+    /**
+     * Adds an alias in case class names change.
+     *
+     * Unlike {@link #alias(String, Class)}, which uses the registered alias name for writing XML,
+     * this method registers an alias to be used only for the sake of reading from XML. This makes
+     * this method usable for the situation when class names change.
+     *
+     * @param oldClassName
+     *      Fully qualified name of the old class name.
+     * @param newClass
+     *      New class that's field-compatible with the given old class name.
+     * @since 1.416
+     */
+    public void addCompatibilityAlias(String oldClassName, Class newClass) {
+<span class="fc" id="L262">        compatibilityAliases.put(oldClassName,newClass);</span>
+<span class="fc" id="L263">    }</span>
+
+    /**
+     * Prior to Hudson 1.106, XStream 1.1.x was used which encoded &quot;$&quot; in class names
+     * as &quot;-&quot; instead of &quot;_-&quot; that is used now.  Up through Hudson 1.348 compatibility
+     * for old serialized data was maintained via {@code XStream11XmlFriendlyMapper}.
+     * However, it was found (HUDSON-5768) that this caused fields with &quot;__&quot; to fail
+     * deserialization due to double decoding.  Now this class is used for compatibility.
+     */
+    private class CompatibilityMapper extends MapperWrapper {
+<span class="fc" id="L273">        private CompatibilityMapper(Mapper wrapped) {</span>
+<span class="fc" id="L274">            super(wrapped);</span>
+<span class="fc" id="L275">        }</span>
+
+        @Override
+        public Class realClass(String elementName) {
+<span class="fc" id="L279">            Class s = compatibilityAliases.get(elementName);</span>
+<span class="fc bfc" id="L280" title="All 2 branches covered.">            if (s!=null)    return s;</span>
+
+            try {
+<span class="fc" id="L283">                return super.realClass(elementName);</span>
+<span class="fc" id="L284">            } catch (CannotResolveClassException e) {</span>
+                // If a &quot;-&quot; is found, retry with mapping this to &quot;$&quot;
+<span class="pc bpc" id="L286" title="1 of 2 branches missed.">                if (elementName.indexOf('-') &gt;= 0) try {</span>
+<span class="fc" id="L287">                    Class c = super.realClass(elementName.replace('-', '$'));</span>
+<span class="fc" id="L288">                    oldData.set(Boolean.TRUE);</span>
+<span class="fc" id="L289">                    return c;</span>
+<span class="nc" id="L290">                } catch (CannotResolveClassException e2) { }</span>
+                // Throw original exception
+<span class="nc" id="L292">                throw e;</span>
+            }
+        }
+    }
+
+    /**
+     * If a class defines a nested {@code ConverterImpl} subclass, use that as a {@link Converter}.
+     * Its constructor may have XStream/XStream2 and/or Mapper parameters (or no params).
+     */
+    private static final class AssociatedConverterImpl implements Converter {
+        private final XStream xstream;
+<span class="fc" id="L303">        private final ConcurrentHashMap&lt;Class&lt;?&gt;,Converter&gt; cache =</span>
+<span class="fc" id="L304">                new ConcurrentHashMap&lt;Class&lt;?&gt;,Converter&gt;();</span>
+
+<span class="fc" id="L306">        private AssociatedConverterImpl(XStream xstream) {</span>
+<span class="fc" id="L307">            this.xstream = xstream;</span>
+<span class="fc" id="L308">        }</span>
+
+        private Converter findConverter(Class&lt;?&gt; t) {
+<span class="fc" id="L311">            Converter result = cache.get(t);</span>
+<span class="fc bfc" id="L312" title="All 2 branches covered.">            if (result != null)</span>
+                // ConcurrentHashMap does not allow null, so use this object to represent null
+<span class="pc bpc" id="L314" title="1 of 2 branches missed.">                return result == this ? null : result;</span>
+            try {
+<span class="pc bpc" id="L316" title="1 of 4 branches missed.">                if(t==null || t.getClassLoader()==null)</span>
+<span class="fc" id="L317">                    return null;</span>
+<span class="fc" id="L318">                Class&lt;?&gt; cl = t.getClassLoader().loadClass(t.getName() + &quot;$ConverterImpl&quot;);</span>
+<span class="fc" id="L319">                Constructor&lt;?&gt; c = cl.getConstructors()[0];</span>
+
+<span class="fc" id="L321">                Class&lt;?&gt;[] p = c.getParameterTypes();</span>
+<span class="fc" id="L322">                Object[] args = new Object[p.length];</span>
+<span class="fc bfc" id="L323" title="All 2 branches covered.">                for (int i = 0; i &lt; p.length; i++) {</span>
+<span class="pc bpc" id="L324" title="1 of 4 branches missed.">                    if(p[i]==XStream.class || p[i]==XStream2.class)</span>
+<span class="fc" id="L325">                        args[i] = xstream;</span>
+<span class="pc bpc" id="L326" title="1 of 2 branches missed.">                    else if(p[i]== Mapper.class)</span>
+<span class="fc" id="L327">                        args[i] = xstream.getMapper();</span>
+                    else
+<span class="nc" id="L329">                        throw new InstantiationError(&quot;Unrecognized constructor parameter: &quot;+p[i]);</span>
+
+                }
+<span class="fc" id="L332">                ConverterMatcher cm = (ConverterMatcher)c.newInstance(args);</span>
+<span class="pc bpc" id="L333" title="1 of 2 branches missed.">                result = cm instanceof SingleValueConverter</span>
+<span class="nc" id="L334">                        ? new SingleValueConverterWrapper((SingleValueConverter)cm)</span>
+<span class="fc" id="L335">                        : (Converter)cm;</span>
+<span class="fc" id="L336">                cache.put(t, result);</span>
+<span class="fc" id="L337">                return result;</span>
+<span class="fc" id="L338">            } catch (ClassNotFoundException e) {</span>
+<span class="fc" id="L339">                cache.put(t, this);  // See above.. this object in cache represents null</span>
+<span class="fc" id="L340">                return null;</span>
+<span class="nc" id="L341">            } catch (IllegalAccessException e) {</span>
+<span class="nc" id="L342">                IllegalAccessError x = new IllegalAccessError();</span>
+<span class="nc" id="L343">                x.initCause(e);</span>
+<span class="nc" id="L344">                throw x;</span>
+<span class="nc" id="L345">            } catch (InstantiationException e) {</span>
+<span class="nc" id="L346">                InstantiationError x = new InstantiationError();</span>
+<span class="nc" id="L347">                x.initCause(e);</span>
+<span class="nc" id="L348">                throw x;</span>
+<span class="nc" id="L349">            } catch (InvocationTargetException e) {</span>
+<span class="nc" id="L350">                InstantiationError x = new InstantiationError();</span>
+<span class="nc" id="L351">                x.initCause(e);</span>
+<span class="nc" id="L352">                throw x;</span>
+            }
+        }
+
+        public boolean canConvert(Class type) {
+<span class="fc bfc" id="L357" title="All 2 branches covered.">            return findConverter(type)!=null;</span>
+        }
+
+        public void marshal(Object source, HierarchicalStreamWriter writer, MarshallingContext context) {
+<span class="fc" id="L361">            findConverter(source.getClass()).marshal(source,writer,context);</span>
+<span class="fc" id="L362">        }</span>
+
+        public Object unmarshal(HierarchicalStreamReader reader, UnmarshallingContext context) {
+<span class="fc" id="L365">            return findConverter(context.getRequiredType()).unmarshal(reader,context);</span>
+        }
+    }
+
+    /**
+     * Create a nested {@code ConverterImpl} subclass that extends this class to run some
+     * callback code just after a type is unmarshalled by RobustReflectionConverter.
+     * Example: &lt;pre&gt; public static class ConverterImpl extends XStream2.PassthruConverter&amp;lt;MyType&amp;gt; {
+     *   public ConverterImpl(XStream2 xstream) { super(xstream); }
+     *   {@literal @}Override protected void callback(MyType obj, UnmarshallingContext context) {
+     *     ...
+     * &lt;/pre&gt;
+     */
+    public static abstract class PassthruConverter&lt;T&gt; implements Converter {
+        private Converter converter;
+
+<span class="nc" id="L381">        public PassthruConverter(XStream2 xstream) {</span>
+<span class="nc" id="L382">            converter = xstream.reflectionConverter;</span>
+<span class="nc" id="L383">        }</span>
+
+        public boolean canConvert(Class type) {
+            // marshal/unmarshal called directly from AssociatedConverterImpl
+<span class="nc" id="L387">            return false;</span>
+        }
+
+        public void marshal(Object source, HierarchicalStreamWriter writer, MarshallingContext context) {
+<span class="nc" id="L391">            converter.marshal(source, writer, context);</span>
+<span class="nc" id="L392">        }</span>
+
+        public Object unmarshal(HierarchicalStreamReader reader, UnmarshallingContext context) {
+<span class="nc" id="L395">            Object obj = converter.unmarshal(reader, context);</span>
+<span class="nc" id="L396">            callback((T)obj, context);</span>
+<span class="nc" id="L397">            return obj;</span>
+        }
+
+        protected abstract void callback(T obj, UnmarshallingContext context);
+    }
+
+    /**
+     * Marks serialized classes as being owned by particular components.
+     */
+    interface ClassOwnership {
+        /**
+         * Looks up the owner of a class, if any.
+         * @param clazz a class which might be from a plugin
+         * @return an identifier such as plugin name, or null
+         */
+        @CheckForNull String ownerOf(Class&lt;?&gt; clazz);
+    }
+    
+<span class="fc" id="L415">    class PluginClassOwnership implements ClassOwnership {</span>
+
+        private PluginManager pm;
+
+        @SuppressWarnings(&quot;NP_NULL_ON_SOME_PATH_FROM_RETURN_VALUE&quot;) // classOwnership checked for null so why does FB complain?
+        @Override public String ownerOf(Class&lt;?&gt; clazz) {
+<span class="fc bfc" id="L421" title="All 2 branches covered.">            if (classOwnership != null) {</span>
+<span class="fc" id="L422">                return classOwnership.ownerOf(clazz);</span>
+            }
+<span class="pc bpc" id="L424" title="1 of 2 branches missed.">            if (pm == null) {</span>
+<span class="fc" id="L425">                Jenkins j = Jenkins.getInstance();</span>
+<span class="pc bpc" id="L426" title="1 of 2 branches missed.">                if (j != null) {</span>
+<span class="nc" id="L427">                    pm = j.getPluginManager();</span>
+                }
+            }
+<span class="pc bpc" id="L430" title="1 of 2 branches missed.">            if (pm == null) {</span>
+<span class="fc" id="L431">                return null;</span>
+            }
+            // TODO: possibly recursively scan super class to discover dependencies
+<span class="nc" id="L434">            PluginWrapper p = pm.whichPlugin(clazz);</span>
+<span class="nc bnc" id="L435" title="All 2 branches missed.">            return p != null ? p.getShortName() + '@' + trimVersion(p.getVersion()) : null;</span>
+        }
+
+    }
+
+<span class="fc" id="L440">    private static class BlacklistedTypesConverter implements Converter {</span>
+        @Override
+        public void marshal(Object source, HierarchicalStreamWriter writer, MarshallingContext context) {
+<span class="nc" id="L443">            throw new UnsupportedOperationException(&quot;Refusing to marshal &quot; + source.getClass().getName() + &quot; for security reasons&quot;);</span>
+        }
+
+        @Override
+        public Object unmarshal(HierarchicalStreamReader reader, UnmarshallingContext context) {
+<span class="nc" id="L448">            throw new ConversionException(&quot;Refusing to unmarshal &quot; + reader.getNodeName() + &quot; for security reasons&quot;);</span>
+        }
+
+        @Override
+        public boolean canConvert(Class type) {
+<span class="pc bpc" id="L453" title="1 of 2 branches missed.">            if (type == null) {</span>
+<span class="nc" id="L454">                return false;</span>
+            }
+            try {
+<span class="fc" id="L457">                ClassFilter.DEFAULT.check(type);</span>
+<span class="fc" id="L458">                ClassFilter.DEFAULT.check(type.getName());</span>
+<span class="pc" id="L459">            } catch (SecurityException se) {</span>
+                // claim we can convert all the scary stuff so we can throw exceptions when attempting to do so
+<span class="nc" id="L461">                return true;</span>
+            }
+<span class="fc" id="L463">            return false;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

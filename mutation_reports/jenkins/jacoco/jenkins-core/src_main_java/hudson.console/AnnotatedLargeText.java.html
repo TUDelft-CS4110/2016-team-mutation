@@ -1,0 +1,187 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>AnnotatedLargeText.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.console</a> &gt; <span class="el_source">AnnotatedLargeText.java</span></div><h1>AnnotatedLargeText.java</h1><pre class="source lang-java linenums">/*
+ * The MIT License
+ *
+ * Copyright (c) 2004-2010, Sun Microsystems, Inc.
+ *
+ * Copyright (c) 2012, Martin Schroeder, Intel Mobile Communications GmbH
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.console;
+
+import com.trilead.ssh2.crypto.Base64;
+import jenkins.model.Jenkins;
+import hudson.remoting.ObjectInputStreamEx;
+import hudson.util.TimeUnit2;
+import jenkins.security.CryptoConfidentialKey;
+import org.apache.commons.io.output.ByteArrayOutputStream;
+import org.kohsuke.stapler.Stapler;
+import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.StaplerResponse;
+import org.kohsuke.stapler.framework.io.ByteBuffer;
+import org.kohsuke.stapler.framework.io.LargeText;
+
+import javax.crypto.Cipher;
+import javax.crypto.CipherInputStream;
+import javax.crypto.CipherOutputStream;
+import java.io.ByteArrayInputStream;
+import java.io.File;
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
+import java.io.OutputStream;
+import java.io.Writer;
+import java.nio.charset.Charset;
+import com.jcraft.jzlib.GZIPInputStream;
+import com.jcraft.jzlib.GZIPOutputStream;
+
+import static java.lang.Math.abs;
+
+/**
+ * Extension to {@link LargeText} that handles annotations by {@link ConsoleAnnotator}.
+ *
+ * &lt;p&gt;
+ * In addition to run each line through {@link ConsoleAnnotationOutputStream} for adding markup,
+ * this class persists {@link ConsoleAnnotator} into a byte sequence and send it to the client
+ * as an HTTP header. The client JavaScript sends it back next time it fetches the following output.
+ *
+ * &lt;p&gt;
+ * The serialized {@link ConsoleAnnotator} is encrypted to avoid malicious clients from instantiating
+ * arbitrary {@link ConsoleAnnotator}s.
+ *
+ * @param &lt;T&gt;
+ *      Context type.
+ * @author Kohsuke Kawaguchi
+ * @since 1.349
+ */
+public class AnnotatedLargeText&lt;T&gt; extends LargeText {
+    /**
+     * Can be null.
+     */
+    private T context;
+
+    public AnnotatedLargeText(File file, Charset charset, boolean completed, T context) {
+<span class="nc" id="L80">        super(file, charset, completed, true);</span>
+<span class="nc" id="L81">        this.context = context;</span>
+<span class="nc" id="L82">    }</span>
+
+    public AnnotatedLargeText(ByteBuffer memory, Charset charset, boolean completed, T context) {
+<span class="fc" id="L85">        super(memory, charset, completed);</span>
+<span class="fc" id="L86">        this.context = context;</span>
+<span class="fc" id="L87">    }</span>
+
+    public void doProgressiveHtml(StaplerRequest req, StaplerResponse rsp) throws IOException {
+<span class="nc" id="L90">        req.setAttribute(&quot;html&quot;,true);</span>
+<span class="nc" id="L91">        doProgressText(req,rsp);</span>
+<span class="nc" id="L92">    }</span>
+
+    /**
+     * Aliasing what I think was a wrong name in {@link LargeText}
+     */
+    public void doProgressiveText(StaplerRequest req, StaplerResponse rsp) throws IOException {
+<span class="nc" id="L98">        doProgressText(req,rsp);</span>
+<span class="nc" id="L99">    }</span>
+
+    /**
+     * For reusing code between text/html and text/plain, we run them both through the same code path
+     * and use this request attribute to differentiate. 
+     */
+    private boolean isHtml() {
+<span class="nc" id="L106">        StaplerRequest req = Stapler.getCurrentRequest();</span>
+<span class="nc bnc" id="L107" title="All 4 branches missed.">        return req!=null &amp;&amp; req.getAttribute(&quot;html&quot;)!=null;</span>
+    }
+
+    @Override
+    protected void setContentType(StaplerResponse rsp) {
+<span class="nc bnc" id="L112" title="All 2 branches missed.">        rsp.setContentType(isHtml() ? &quot;text/html;charset=UTF-8&quot; : &quot;text/plain;charset=UTF-8&quot;);</span>
+<span class="nc" id="L113">    }</span>
+
+    private ConsoleAnnotator createAnnotator(StaplerRequest req) throws IOException {
+        try {
+<span class="nc bnc" id="L117" title="All 2 branches missed.">            String base64 = req!=null ? req.getHeader(&quot;X-ConsoleAnnotator&quot;) : null;</span>
+<span class="nc bnc" id="L118" title="All 2 branches missed.">            if (base64!=null) {</span>
+<span class="nc" id="L119">                Cipher sym = PASSING_ANNOTATOR.decrypt();</span>
+
+<span class="nc" id="L121">                ObjectInputStream ois = new ObjectInputStreamEx(new GZIPInputStream(</span>
+<span class="nc" id="L122">                        new CipherInputStream(new ByteArrayInputStream(Base64.decode(base64.toCharArray())),sym)),</span>
+<span class="nc" id="L123">                        Jenkins.getInstance().pluginManager.uberClassLoader);</span>
+                try {
+<span class="nc" id="L125">                    long timestamp = ois.readLong();</span>
+<span class="nc bnc" id="L126" title="All 2 branches missed.">                    if (TimeUnit2.HOURS.toMillis(1) &gt; abs(System.currentTimeMillis()-timestamp))</span>
+                        // don't deserialize something too old to prevent a replay attack
+<span class="nc" id="L128">                        return (ConsoleAnnotator)ois.readObject();</span>
+<span class="nc" id="L129">                } finally {</span>
+<span class="nc" id="L130">                    ois.close();</span>
+<span class="nc" id="L131">                }</span>
+            }
+<span class="nc" id="L133">        } catch (ClassNotFoundException e) {</span>
+<span class="nc" id="L134">            throw new IOException(e);</span>
+        }
+        // start from scratch
+<span class="nc bnc" id="L137" title="All 2 branches missed.">        return ConsoleAnnotator.initial(context==null ? null : context.getClass());</span>
+    }
+
+    @Override
+    public long writeLogTo(long start, Writer w) throws IOException {
+<span class="nc bnc" id="L142" title="All 2 branches missed.">        if (isHtml())</span>
+<span class="nc" id="L143">            return writeHtmlTo(start, w);</span>
+        else
+<span class="nc" id="L145">            return super.writeLogTo(start,w);</span>
+    }
+
+    /**
+     * Strips annotations using a {@link PlainTextConsoleOutputStream}.
+     * {@inheritDoc}
+     */
+    @Override
+    public long writeLogTo(long start, OutputStream out) throws IOException {
+<span class="fc" id="L154">        return super.writeLogTo(start, new PlainTextConsoleOutputStream(out));</span>
+    }
+
+    /**
+     * Calls {@link LargeText#writeLogTo(long, OutputStream)} without stripping annotations as {@link #writeLogTo(long, OutputStream)} would.
+     * @since 1.577
+     */
+    public long writeRawLogTo(long start, OutputStream out) throws IOException {
+<span class="nc" id="L162">        return super.writeLogTo(start, out);</span>
+    }
+
+    public long writeHtmlTo(long start, Writer w) throws IOException {
+<span class="nc" id="L166">        ConsoleAnnotationOutputStream caw = new ConsoleAnnotationOutputStream(</span>
+<span class="nc" id="L167">                w, createAnnotator(Stapler.getCurrentRequest()), context, charset);</span>
+<span class="nc" id="L168">        long r = super.writeLogTo(start,caw);</span>
+
+<span class="nc" id="L170">        ByteArrayOutputStream baos = new ByteArrayOutputStream();</span>
+<span class="nc" id="L171">        Cipher sym = PASSING_ANNOTATOR.encrypt();</span>
+<span class="nc" id="L172">        ObjectOutputStream oos = new ObjectOutputStream(new GZIPOutputStream(new CipherOutputStream(baos,sym)));</span>
+<span class="nc" id="L173">        oos.writeLong(System.currentTimeMillis()); // send timestamp to prevent a replay attack</span>
+<span class="nc" id="L174">        oos.writeObject(caw.getConsoleAnnotator());</span>
+<span class="nc" id="L175">        oos.close();</span>
+<span class="nc" id="L176">        StaplerResponse rsp = Stapler.getCurrentResponse();</span>
+<span class="nc bnc" id="L177" title="All 2 branches missed.">        if (rsp!=null)</span>
+<span class="nc" id="L178">            rsp.setHeader(&quot;X-ConsoleAnnotator&quot;, new String(Base64.encode(baos.toByteArray())));</span>
+<span class="nc" id="L179">        return r;</span>
+    }
+
+    /**
+     * Used for sending the state of ConsoleAnnotator to the client, because we are deserializing this object later.
+     */
+<span class="fc" id="L185">    private static final CryptoConfidentialKey PASSING_ANNOTATOR = new CryptoConfidentialKey(AnnotatedLargeText.class,&quot;consoleAnnotator&quot;);</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

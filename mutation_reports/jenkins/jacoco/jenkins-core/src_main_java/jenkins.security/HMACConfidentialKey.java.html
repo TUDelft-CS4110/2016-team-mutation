@@ -1,0 +1,145 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>HMACConfidentialKey.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">jenkins.security</a> &gt; <span class="el_source">HMACConfidentialKey.java</span></div><h1>HMACConfidentialKey.java</h1><pre class="source lang-java linenums">package jenkins.security;
+
+import hudson.Util;
+
+import javax.crypto.KeyGenerator;
+import javax.crypto.Mac;
+import javax.crypto.SecretKey;
+import javax.crypto.spec.SecretKeySpec;
+import java.io.IOException;
+import java.io.UnsupportedEncodingException;
+import java.security.GeneralSecurityException;
+import java.security.NoSuchAlgorithmException;
+import java.util.Arrays;
+
+/**
+ * {@link ConfidentialKey} that's used for creating a token by hashing some information with secret
+ * (such as &lt;tt&gt;hash(msg|secret)&lt;/tt&gt;).
+ *
+ * &lt;p&gt;
+ * This provides more secure version of it by using HMAC.
+ * See http://rdist.root.org/2009/10/29/stop-using-unsafe-keyed-hashes-use-hmac/ for background.
+ * This implementation also never leaks the secret value to outside, so it makes it impossible
+ * for the careless caller to misuse the key (thus protecting ourselves from our own stupidity!)
+ *
+ * @author Kohsuke Kawaguchi
+ * @since 1.498
+ */
+public class HMACConfidentialKey extends ConfidentialKey {
+    private volatile SecretKey key;
+    private final int length;
+
+    /**
+     * @param length
+     *      Byte length of the HMAC code.
+     *      By default we use HMAC-SHA256, which produces 256bit (=32bytes) HMAC,
+     *      but if different use cases requires a shorter HMAC, specify the desired length here.
+     *      Note that when using {@link #mac(String)}, string encoding causes the length to double.
+     *      So if you want to get 16-letter HMAC, you specify 8 here.
+     */
+    public HMACConfidentialKey(String id, int length) {
+<span class="nc" id="L41">        super(id);</span>
+<span class="nc" id="L42">        this.length = length;</span>
+<span class="nc" id="L43">    }</span>
+
+    /**
+     * Calls into {@link #HMACConfidentialKey(String, int)} with the longest possible HMAC length.
+     */
+    public HMACConfidentialKey(String id) {
+<span class="nc" id="L49">        this(id,Integer.MAX_VALUE);</span>
+<span class="nc" id="L50">    }</span>
+
+    /**
+     * Calls into {@link #HMACConfidentialKey(String, int)} by combining the class name and the shortName
+     * as the ID.
+     */
+    public HMACConfidentialKey(Class owner, String shortName, int length) {
+<span class="nc" id="L57">        this(owner.getName()+'.'+shortName,length);</span>
+<span class="nc" id="L58">    }</span>
+
+    public HMACConfidentialKey(Class owner, String shortName) {
+<span class="nc" id="L61">        this(owner,shortName,Integer.MAX_VALUE);</span>
+<span class="nc" id="L62">    }</span>
+
+
+    /**
+     * Computes the message authentication code for the specified byte sequence.
+     */
+    public byte[] mac(byte[] message) {
+<span class="nc" id="L69">        return chop(createMac().doFinal(message));</span>
+    }
+
+    /**
+     * Convenience method for verifying the MAC code.
+     */
+    public boolean checkMac(byte[] message, byte[] mac) {
+<span class="nc" id="L76">        return Arrays.equals(mac(message),mac);</span>
+    }
+
+    /**
+     * Computes the message authentication code and return it as a string.
+     * While redundant, often convenient.
+     */
+    public String mac(String message) {
+        try {
+<span class="nc" id="L85">            return Util.toHexString(mac(message.getBytes(&quot;UTF-8&quot;)));</span>
+<span class="nc" id="L86">        } catch (UnsupportedEncodingException e) {</span>
+<span class="nc" id="L87">            throw new AssertionError(e);</span>
+        }
+    }
+
+    /**
+     * Verifies MAC constructed from {@link #mac(String)}
+     */
+    public boolean checkMac(String message, String mac) {
+<span class="nc" id="L95">        return mac(message).equals(mac);</span>
+    }
+
+    private byte[] chop(byte[] mac) {
+<span class="nc bnc" id="L99" title="All 2 branches missed.">        if (mac.length&lt;=length)  return mac; // already too short</span>
+
+<span class="nc" id="L101">        byte[] b = new byte[length];</span>
+<span class="nc" id="L102">        System.arraycopy(mac,0,b,0,b.length);</span>
+<span class="nc" id="L103">        return b;</span>
+    }
+
+    /**
+     * Creates a new {@link Mac} object.
+     */
+    public Mac createMac() {
+        try {
+<span class="nc" id="L111">            Mac mac = Mac.getInstance(ALGORITHM);</span>
+<span class="nc" id="L112">            mac.init(getKey());</span>
+<span class="nc" id="L113">            return mac;</span>
+<span class="nc" id="L114">        } catch (GeneralSecurityException e) {</span>
+            // Javadoc says HmacSHA256 must be supported by every Java implementation.
+<span class="nc" id="L116">            throw new Error(ALGORITHM+&quot; not supported?&quot;,e);</span>
+        }
+    }
+
+    private SecretKey getKey() {
+<span class="nc bnc" id="L121" title="All 2 branches missed.">        if (key==null) {</span>
+<span class="nc" id="L122">            synchronized (this) {</span>
+<span class="nc bnc" id="L123" title="All 2 branches missed.">                if (key==null) {</span>
+                    try {
+<span class="nc" id="L125">                        byte[] encoded = load();</span>
+<span class="nc bnc" id="L126" title="All 2 branches missed.">                        if (encoded==null) {</span>
+<span class="nc" id="L127">                            KeyGenerator kg = KeyGenerator.getInstance(ALGORITHM);</span>
+<span class="nc" id="L128">                            SecretKey key = kg.generateKey();</span>
+<span class="nc" id="L129">                            store(encoded=key.getEncoded());</span>
+                        }
+<span class="nc" id="L131">                        key = new SecretKeySpec(encoded,ALGORITHM);</span>
+<span class="nc" id="L132">                    } catch (IOException e) {</span>
+<span class="nc" id="L133">                        throw new Error(&quot;Failed to load the key: &quot;+getId(),e);</span>
+<span class="nc" id="L134">                    } catch (NoSuchAlgorithmException e) {</span>
+<span class="nc" id="L135">                        throw new Error(&quot;Failed to load the key: &quot;+getId(),e);</span>
+                    }
+                }
+            }
+        }
+<span class="nc" id="L140">        return key;</span>
+    }
+
+    private static final String ALGORITHM = &quot;HmacSHA256&quot;;
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

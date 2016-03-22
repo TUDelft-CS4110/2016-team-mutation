@@ -1,0 +1,940 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>JDKInstaller.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.tools</a> &gt; <span class="el_source">JDKInstaller.java</span></div><h1>JDKInstaller.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">/*</span>
+ * The MIT License
+ *
+ * Copyright (c) 2009-2010, Sun Microsystems, Inc., CloudBees, Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.tools;
+
+import hudson.AbortException;
+import hudson.Extension;
+import hudson.FilePath;
+import hudson.Launcher;
+import hudson.Launcher.ProcStarter;
+import hudson.ProxyConfiguration;
+import hudson.Util;
+import hudson.model.DownloadService.Downloadable;
+import hudson.model.JDK;
+import hudson.model.Job;
+import hudson.model.Node;
+import hudson.model.TaskListener;
+import hudson.util.ArgumentListBuilder;
+import hudson.util.FormValidation;
+import hudson.util.HttpResponses;
+import hudson.util.Secret;
+import jenkins.model.Jenkins;
+import jenkins.security.MasterToSlaveCallable;
+import net.sf.json.JSONObject;
+import net.sf.json.JsonConfig;
+import org.apache.commons.httpclient.Cookie;
+import org.apache.commons.httpclient.HttpClient;
+import org.apache.commons.httpclient.HttpMethodBase;
+import org.apache.commons.httpclient.UsernamePasswordCredentials;
+import org.apache.commons.httpclient.auth.AuthScope;
+import org.apache.commons.httpclient.methods.GetMethod;
+import org.apache.commons.httpclient.methods.PostMethod;
+import org.apache.commons.httpclient.protocol.Protocol;
+import org.apache.commons.io.IOUtils;
+import org.kohsuke.stapler.DataBoundConstructor;
+import org.kohsuke.stapler.HttpResponse;
+import org.kohsuke.stapler.QueryParameter;
+import org.kohsuke.stapler.Stapler;
+
+import javax.servlet.ServletException;
+import java.io.ByteArrayInputStream;
+import java.io.DataInputStream;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStreamWriter;
+import java.io.PrintStream;
+import java.net.URL;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Iterator;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Locale;
+import java.util.logging.Logger;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import static hudson.tools.JDKInstaller.Preference.*;
+
+/**
+ * Install JDKs from java.sun.com.
+ *
+ * @author Kohsuke Kawaguchi
+ * @since 1.305
+ */
+<span class="nc bnc" id="L89" title="All 2 branches missed.">public class JDKInstaller extends ToolInstaller {</span>
+
+    static {
+        // this socket factory will not attempt to bind to the client interface
+<span class="nc" id="L93">        Protocol.registerProtocol(&quot;http&quot;, new Protocol(&quot;http&quot;, new hudson.util.NoClientBindProtocolSocketFactory(), 80));</span>
+<span class="nc" id="L94">        Protocol.registerProtocol(&quot;https&quot;, new Protocol(&quot;https&quot;, new hudson.util.NoClientBindSSLProtocolSocketFactory(), 443));</span>
+    }
+
+    /**
+     * The release ID that Sun assigns to each JDK, such as &quot;jdk-6u13-oth-JPR@CDS-CDS_Developer&quot;
+     *
+     * &lt;p&gt;
+     * This ID can be seen in the &quot;ProductRef&quot; query parameter of the download page, like
+     * https://cds.sun.com/is-bin/INTERSHOP.enfinity/WFS/CDS-CDS_Developer-Site/en_US/-/USD/ViewProductDetail-Start?ProductRef=jdk-6u13-oth-JPR@CDS-CDS_Developer
+     */
+    public final String id;
+
+    /**
+     * We require that the user accepts the license by clicking a checkbox, to make up for the part
+     * that we auto-accept cds.sun.com license click through.
+     */
+    public final boolean acceptLicense;
+
+    @DataBoundConstructor
+    public JDKInstaller(String id, boolean acceptLicense) {
+<span class="nc" id="L114">        super(null);</span>
+<span class="nc" id="L115">        this.id = id;</span>
+<span class="nc" id="L116">        this.acceptLicense = acceptLicense;</span>
+<span class="nc" id="L117">    }</span>
+
+    public FilePath performInstallation(ToolInstallation tool, Node node, TaskListener log) throws IOException, InterruptedException {
+<span class="nc" id="L120">        FilePath expectedLocation = preferredLocation(tool, node);</span>
+<span class="nc" id="L121">        PrintStream out = log.getLogger();</span>
+        try {
+<span class="nc bnc" id="L123" title="All 2 branches missed.">            if(!acceptLicense) {</span>
+<span class="nc" id="L124">                out.println(Messages.JDKInstaller_UnableToInstallUntilLicenseAccepted());</span>
+<span class="nc" id="L125">                return expectedLocation;</span>
+            }
+            // already installed?
+<span class="nc" id="L128">            FilePath marker = expectedLocation.child(&quot;.installedByHudson&quot;);</span>
+<span class="nc bnc" id="L129" title="All 4 branches missed.">            if (marker.exists() &amp;&amp; marker.readToString().equals(id)) {</span>
+<span class="nc" id="L130">                return expectedLocation;</span>
+            }
+<span class="nc" id="L132">            expectedLocation.deleteRecursive();</span>
+<span class="nc" id="L133">            expectedLocation.mkdirs();</span>
+
+<span class="nc" id="L135">            Platform p = Platform.of(node);</span>
+<span class="nc" id="L136">            URL url = locate(log, p, CPU.of(node));</span>
+
+//            out.println(&quot;Downloading &quot;+url);
+<span class="nc" id="L139">            FilePath file = expectedLocation.child(p.bundleFileName);</span>
+<span class="nc" id="L140">            file.copyFrom(url);</span>
+
+            // JDK6u13 on Windows doesn't like path representation like &quot;/tmp/foo&quot;, so make it a strict platform native format by doing 'absolutize'
+<span class="nc" id="L143">            install(node.createLauncher(log), p, new FilePathFileSystem(node), log, expectedLocation.absolutize().getRemote(), file.getRemote());</span>
+
+            // successfully installed
+<span class="nc" id="L146">            file.delete();</span>
+<span class="nc" id="L147">            marker.write(id, null);</span>
+
+<span class="nc" id="L149">        } catch (DetectionFailedException e) {</span>
+<span class="nc" id="L150">            out.println(&quot;JDK installation skipped: &quot;+e.getMessage());</span>
+        }
+
+<span class="nc" id="L153">        return expectedLocation;</span>
+    }
+
+    /**
+     * Performs the JDK installation to a system, provided that the bundle was already downloaded.
+     *
+     * @param launcher
+     *      Used to launch processes on the system.
+     * @param p
+     *      Platform of the system. This determines how the bundle is installed.
+     * @param fs
+     *      Abstraction of the file system manipulation on this system.
+     * @param log
+     *      Where the output from the installation will be written.
+     * @param expectedLocation
+     *      Path to install JDK to. Must be absolute and in the native file system notation.
+     * @param jdkBundle
+     *      Path to the installed JDK bundle. (The bundle to download can be determined by {@link #locate(TaskListener, Platform, CPU)} call.)
+     */
+    public void install(Launcher launcher, Platform p, FileSystem fs, TaskListener log, String expectedLocation, String jdkBundle) throws IOException, InterruptedException {
+<span class="nc" id="L173">        PrintStream out = log.getLogger();</span>
+
+<span class="nc" id="L175">        out.println(&quot;Installing &quot;+ jdkBundle);</span>
+<span class="nc" id="L176">        FilePath parent = new FilePath(launcher.getChannel(), expectedLocation).getParent();</span>
+<span class="nc bnc" id="L177" title="All 4 branches missed.">        switch (p) {</span>
+        case LINUX:
+        case SOLARIS:
+            // JDK on Unix up to 6 was distributed as shell script installer, but in JDK7 it switched to a plain tgz.
+            // so check if the file is gzipped, and if so, treat it accordingly
+<span class="nc" id="L182">            byte[] header = new byte[2];</span>
+            {
+<span class="nc" id="L184">                DataInputStream in = new DataInputStream(fs.read(jdkBundle));</span>
+                try {
+<span class="nc" id="L186">                    in.readFully(header);</span>
+<span class="nc" id="L187">                } finally {</span>
+<span class="nc" id="L188">                    IOUtils.closeQuietly(in);</span>
+<span class="nc" id="L189">                }</span>
+            }
+
+            ProcStarter starter;
+<span class="nc bnc" id="L193" title="All 4 branches missed.">            if (header[0]==0x1F &amp;&amp; header[1]==(byte)0x8B) {// gzip</span>
+<span class="nc" id="L194">                starter = launcher.launch().cmds(&quot;tar&quot;, &quot;xvzf&quot;, jdkBundle);</span>
+<span class="nc" id="L195">            } else {</span>
+<span class="nc" id="L196">                fs.chmod(jdkBundle,0755);</span>
+<span class="nc" id="L197">                starter = launcher.launch().cmds(jdkBundle, &quot;-noregister&quot;);</span>
+            }
+
+<span class="nc" id="L200">            int exit = starter</span>
+<span class="nc" id="L201">                    .stdin(new ByteArrayInputStream(&quot;yes&quot;.getBytes())).stdout(out)</span>
+<span class="nc" id="L202">                    .pwd(new FilePath(launcher.getChannel(), expectedLocation)).join();</span>
+<span class="nc bnc" id="L203" title="All 2 branches missed.">            if (exit != 0)</span>
+<span class="nc" id="L204">                throw new AbortException(Messages.JDKInstaller_FailedToInstallJDK(exit));</span>
+
+            // JDK creates its own sub-directory, so pull them up
+<span class="nc" id="L207">            List&lt;String&gt; paths = fs.listSubDirectories(expectedLocation);</span>
+<span class="nc bnc" id="L208" title="All 2 branches missed.">            for (Iterator&lt;String&gt; itr = paths.iterator(); itr.hasNext();) {</span>
+<span class="nc" id="L209">                String s =  itr.next();</span>
+<span class="nc bnc" id="L210" title="All 2 branches missed.">                if (!s.matches(&quot;j(2s)?dk.*&quot;))</span>
+<span class="nc" id="L211">                    itr.remove();</span>
+            }
+<span class="nc bnc" id="L213" title="All 2 branches missed.">            if(paths.size()!=1)</span>
+<span class="nc" id="L214">                throw new AbortException(&quot;Failed to find the extracted JDKs: &quot;+paths);</span>
+
+            // remove the intermediate directory
+<span class="nc" id="L217">            fs.pullUp(expectedLocation+'/'+paths.get(0),expectedLocation);</span>
+<span class="nc" id="L218">            break;</span>
+        case WINDOWS:
+            /*
+                Windows silent installation is full of bad know-how.
+
+                On Windows, command line argument to a process at the OS level is a single string,
+                not a string array like POSIX. When we pass arguments as string array, JRE eventually
+                turn it into a single string with adding quotes to &quot;the right place&quot;. Unfortunately,
+                with the strange argument layout of InstallShield (like /v/qn&quot; INSTALLDIR=foobar&quot;),
+                it appears that the escaping done by JRE gets in the way, and prevents the installation.
+                Presumably because of this, my attempt to use /q/vn&quot; INSTALLDIR=foo&quot; didn't work with JDK5.
+
+                I tried to locate exactly how InstallShield parses the arguments (and why it uses
+                awkward option like /qn, but couldn't find any. Instead, experiments revealed that
+                &quot;/q/vn ARG ARG ARG&quot; works just as well. This is presumably due to the Visual C++ runtime library
+                (which does single string -&gt; string array conversion to invoke the main method in most Win32 process),
+                and this consistently worked on JDK5 and JDK4.
+
+                Some of the official documentations are available at
+                - http://java.sun.com/j2se/1.5.0/sdksilent.html
+                - http://java.sun.com/j2se/1.4.2/docs/guide/plugin/developer_guide/silent.html
+             */
+
+<span class="nc" id="L241">            expectedLocation = expectedLocation.trim();</span>
+<span class="nc bnc" id="L242" title="All 2 branches missed.">            if (expectedLocation.endsWith(&quot;\\&quot;)) {</span>
+                // Prevent a trailing slash from escaping quotes
+<span class="nc" id="L244">                expectedLocation = expectedLocation.substring(0, expectedLocation.length() - 1);</span>
+            }
+<span class="nc" id="L246">            String logFile = parent.createTempFile(&quot;install&quot;, &quot;log&quot;).getRemote();</span>
+
+
+<span class="nc" id="L249">            ArgumentListBuilder args = new ArgumentListBuilder();</span>
+<span class="nc bnc" id="L250" title="All 4 branches missed.">            assert (new File(expectedLocation).exists()) : expectedLocation</span>
+<span class="nc" id="L251">                    + &quot; must exist, otherwise /L will cause the installer to fail with error 1622&quot;;</span>
+<span class="nc bnc" id="L252" title="All 4 branches missed.">            if (isJava15() || isJava14()) {</span>
+                // Installer uses InstallShield.
+<span class="nc" id="L254">                args.add(&quot;CMD.EXE&quot;, &quot;/C&quot;);</span>
+
+                // see http://docs.oracle.com/javase/1.5.0/docs/guide/deployment/deployment-guide/silent.html
+                // CMD.EXE /C must be followed by a single parameter (do not split it!)
+<span class="nc" id="L258">                args.add(jdkBundle + &quot; /s /v\&quot;/qn REBOOT=ReallySuppress INSTALLDIR=\\\&quot;&quot;</span>
+<span class="nc" id="L259">                        + expectedLocation + &quot;\\\&quot; /L \\\&quot;&quot; + logFile + &quot;\\\&quot;\&quot;&quot;);</span>
+<span class="nc" id="L260">            } else {</span>
+                // Installed uses Windows Installer (MSI)
+<span class="nc" id="L262">                args.add(jdkBundle, &quot;/s&quot;);</span>
+
+                // Create a private JRE by omitting &quot;PublicjreFeature&quot;
+                // @see http://docs.oracle.com/javase/7/docs/webnotes/install/windows/jdk-installation-windows.html#jdk-silent-installation
+<span class="nc" id="L266">                args.add(&quot;ADDLOCAL=\&quot;ToolsFeature\&quot;&quot;,</span>
+<span class="nc" id="L267">                        &quot;REBOOT=ReallySuppress&quot;, &quot;INSTALLDIR=&quot; + expectedLocation,</span>
+<span class="nc" id="L268">                        &quot;/L&quot;,  logFile);</span>
+            }
+<span class="nc" id="L270">            int r = launcher.launch().cmds(args).stdout(out)</span>
+<span class="nc" id="L271">                    .pwd(new FilePath(launcher.getChannel(), expectedLocation)).join();</span>
+<span class="nc bnc" id="L272" title="All 2 branches missed.">            if (r != 0) {</span>
+<span class="nc" id="L273">                out.println(Messages.JDKInstaller_FailedToInstallJDK(r));</span>
+                // log file is in UTF-16
+<span class="nc" id="L275">                InputStreamReader in = new InputStreamReader(fs.read(logFile), &quot;UTF-16&quot;);</span>
+                try {
+<span class="nc" id="L277">                    IOUtils.copy(in,new OutputStreamWriter(out));</span>
+<span class="nc" id="L278">                } finally {</span>
+<span class="nc" id="L279">                    in.close();</span>
+<span class="nc" id="L280">                }</span>
+<span class="nc" id="L281">                throw new AbortException();</span>
+            }
+
+<span class="nc" id="L284">            fs.delete(logFile);</span>
+
+<span class="nc" id="L286">            break;</span>
+
+        case OSX:
+            // Mount the DMG distribution bundle
+<span class="nc" id="L290">            FilePath dmg = parent.createTempDir(&quot;jdk&quot;, &quot;dmg&quot;);</span>
+<span class="nc" id="L291">            exit = launcher.launch()</span>
+<span class="nc" id="L292">                    .cmds(&quot;hdiutil&quot;, &quot;attach&quot;, &quot;-puppetstrings&quot;, &quot;-mountpoint&quot;, dmg.getRemote(), jdkBundle)</span>
+<span class="nc" id="L293">                    .stdout(log)</span>
+<span class="nc" id="L294">                    .join();</span>
+<span class="nc bnc" id="L295" title="All 2 branches missed.">            if (exit != 0)</span>
+<span class="nc" id="L296">                throw new AbortException(Messages.JDKInstaller_FailedToInstallJDK(exit));</span>
+
+            // expand the installation PKG
+<span class="nc" id="L299">            FilePath[] list = dmg.list(&quot;*.pkg&quot;);</span>
+<span class="nc bnc" id="L300" title="All 2 branches missed.">            if (list.length != 1) {</span>
+<span class="nc" id="L301">                log.getLogger().println(&quot;JDK dmg bundle does not contain expected pkg installer&quot;);</span>
+<span class="nc" id="L302">                throw new AbortException(Messages.JDKInstaller_FailedToInstallJDK(exit));</span>
+            }
+<span class="nc" id="L304">            String installer = list[0].getRemote();</span>
+
+<span class="nc" id="L306">            FilePath pkg = parent.createTempDir(&quot;jdk&quot;, &quot;pkg&quot;);</span>
+<span class="nc" id="L307">            pkg.deleteRecursive(); // pkgutil fails if target directory exists</span>
+<span class="nc" id="L308">            exit = launcher.launch()</span>
+<span class="nc" id="L309">                    .cmds(&quot;pkgutil&quot;, &quot;--expand&quot;, installer, pkg.getRemote())</span>
+<span class="nc" id="L310">                    .stdout(log)</span>
+<span class="nc" id="L311">                    .join();</span>
+<span class="nc bnc" id="L312" title="All 2 branches missed.">            if (exit != 0)</span>
+<span class="nc" id="L313">                throw new AbortException(Messages.JDKInstaller_FailedToInstallJDK(exit));</span>
+
+<span class="nc" id="L315">            exit = launcher.launch()</span>
+<span class="nc" id="L316">                    .cmds(&quot;umount&quot;, dmg.getRemote())</span>
+<span class="nc" id="L317">                    .stdout(log)</span>
+<span class="nc" id="L318">                    .join();</span>
+<span class="nc bnc" id="L319" title="All 2 branches missed.">            if (exit != 0)</span>
+<span class="nc" id="L320">                throw new AbortException(Messages.JDKInstaller_FailedToInstallJDK(exit));</span>
+
+            // We only want the actual JDK sub-package, which &quot;Payload&quot; is actually a tar.gz archive
+<span class="nc" id="L323">            list = pkg.list(&quot;jdk*.pkg/Payload&quot;);</span>
+<span class="nc bnc" id="L324" title="All 2 branches missed.">            if (list.length != 1) {</span>
+<span class="nc" id="L325">                log.getLogger().println(&quot;JDK pkg installer does not contain expected JDK Payload archive&quot;);</span>
+<span class="nc" id="L326">                throw new AbortException(Messages.JDKInstaller_FailedToInstallJDK(exit));</span>
+            }
+<span class="nc" id="L328">            String payload = list[0].getRemote();</span>
+<span class="nc" id="L329">            exit = launcher.launch()</span>
+<span class="nc" id="L330">                    .pwd(parent).cmds(&quot;tar&quot;, &quot;xzf&quot;, payload)</span>
+<span class="nc" id="L331">                    .stdout(log)</span>
+<span class="nc" id="L332">                    .join();</span>
+<span class="nc bnc" id="L333" title="All 2 branches missed.">            if (exit != 0)</span>
+<span class="nc" id="L334">                throw new AbortException(Messages.JDKInstaller_FailedToInstallJDK(exit));</span>
+
+<span class="nc" id="L336">            parent.child(&quot;Contents/Home&quot;).moveAllChildrenTo(new FilePath(launcher.getChannel(), expectedLocation));</span>
+<span class="nc" id="L337">            parent.child(&quot;Contents&quot;).deleteRecursive();</span>
+
+<span class="nc" id="L339">            pkg.deleteRecursive();</span>
+<span class="nc" id="L340">            dmg.deleteRecursive();</span>
+            break;
+        }
+<span class="nc" id="L343">    }</span>
+
+    private boolean isJava15() {
+<span class="nc" id="L346">        return id.contains(&quot;-1.5&quot;);</span>
+    }
+
+    private boolean isJava14() {
+<span class="nc" id="L350">        return id.contains(&quot;-1.4&quot;);</span>
+    }
+
+    /**
+     * Abstraction of the file system to perform JDK installation.
+     * Consider {@link JDKInstaller.FilePathFileSystem} as the canonical documentation of the contract.
+     */
+    public interface FileSystem {
+        void delete(String file) throws IOException, InterruptedException;
+        void chmod(String file,int mode) throws IOException, InterruptedException;
+        InputStream read(String file) throws IOException, InterruptedException;
+        /**
+         * List sub-directories of the given directory and just return the file name portion.
+         */
+        List&lt;String&gt; listSubDirectories(String dir) throws IOException, InterruptedException;
+        void pullUp(String from, String to) throws IOException, InterruptedException;
+    }
+
+    /*package*/ static final class FilePathFileSystem implements FileSystem {
+        private final Node node;
+
+<span class="nc" id="L371">        FilePathFileSystem(Node node) {</span>
+<span class="nc" id="L372">            this.node = node;</span>
+<span class="nc" id="L373">        }</span>
+
+        public void delete(String file) throws IOException, InterruptedException {
+<span class="nc" id="L376">            $(file).delete();</span>
+<span class="nc" id="L377">        }</span>
+
+        public void chmod(String file, int mode) throws IOException, InterruptedException {
+<span class="nc" id="L380">            $(file).chmod(mode);</span>
+<span class="nc" id="L381">        }</span>
+
+        public InputStream read(String file) throws IOException, InterruptedException {
+<span class="nc" id="L384">            return $(file).read();</span>
+        }
+
+        public List&lt;String&gt; listSubDirectories(String dir) throws IOException, InterruptedException {
+<span class="nc" id="L388">            List&lt;String&gt; r = new ArrayList&lt;String&gt;();</span>
+<span class="nc bnc" id="L389" title="All 2 branches missed.">            for( FilePath f : $(dir).listDirectories())</span>
+<span class="nc" id="L390">                r.add(f.getName());</span>
+<span class="nc" id="L391">            return r;</span>
+        }
+
+        public void pullUp(String from, String to) throws IOException, InterruptedException {
+<span class="nc" id="L395">            $(from).moveAllChildrenTo($(to));</span>
+<span class="nc" id="L396">        }</span>
+
+        private FilePath $(String file) {
+<span class="nc" id="L399">            return node.createPath(file);</span>
+        }
+    }
+
+    /**
+     * This is where we locally cache this JDK.
+     */
+    private File getLocalCacheFile(Platform platform, CPU cpu) {
+<span class="nc" id="L407">        return new File(Jenkins.getInstance().getRootDir(),&quot;cache/jdks/&quot;+platform+&quot;/&quot;+cpu+&quot;/&quot;+id);</span>
+    }
+
+    /**
+     * Performs a license click through and obtains the one-time URL for downloading bits.
+     */
+    public URL locate(TaskListener log, Platform platform, CPU cpu) throws IOException {
+<span class="nc" id="L414">        File cache = getLocalCacheFile(platform, cpu);</span>
+<span class="nc bnc" id="L415" title="All 4 branches missed.">        if (cache.exists() &amp;&amp; cache.length()&gt;1*1024*1024) return cache.toURL(); // if the file is too small, don't trust it. In the past, the download site served error message in 200 status code</span>
+
+<span class="nc" id="L417">        log.getLogger().println(&quot;Installing JDK &quot;+id);</span>
+<span class="nc" id="L418">        JDKFamilyList families = JDKList.all().get(JDKList.class).toList();</span>
+<span class="nc bnc" id="L419" title="All 2 branches missed.">        if (families.isEmpty())</span>
+<span class="nc" id="L420">            throw new IOException(&quot;JDK data is empty.&quot;);</span>
+
+<span class="nc" id="L422">        JDKRelease release = families.getRelease(id);</span>
+<span class="nc bnc" id="L423" title="All 2 branches missed.">        if (release==null)</span>
+<span class="nc" id="L424">            throw new IOException(&quot;Unable to find JDK with ID=&quot;+id);</span>
+
+<span class="nc" id="L426">        JDKFile primary=null,secondary=null;</span>
+<span class="nc bnc" id="L427" title="All 2 branches missed.">        for (JDKFile f : release.files) {</span>
+<span class="nc" id="L428">            String vcap = f.name.toUpperCase(Locale.ENGLISH);</span>
+
+            // JDK files have either 'windows', 'linux', or 'solaris' in its name, so that allows us to throw
+            // away unapplicable stuff right away
+<span class="nc bnc" id="L432" title="All 2 branches missed.">            if(!platform.is(vcap))</span>
+<span class="nc" id="L433">                continue;</span>
+
+<span class="nc bnc" id="L435" title="All 3 branches missed.">            switch (cpu.accept(vcap)) {</span>
+<span class="nc" id="L436">            case PRIMARY:   primary = f;break;</span>
+<span class="nc" id="L437">            case SECONDARY: secondary=f;break;</span>
+            case UNACCEPTABLE:  break;
+            }
+        }
+
+<span class="nc bnc" id="L442" title="All 2 branches missed.">        if(primary==null)   primary=secondary;</span>
+<span class="nc bnc" id="L443" title="All 2 branches missed.">        if(primary==null)</span>
+<span class="nc" id="L444">            throw new AbortException(&quot;Couldn't find the right download for &quot;+platform+&quot; and &quot;+ cpu +&quot; combination&quot;);</span>
+<span class="nc" id="L445">        LOGGER.fine(&quot;Platform choice:&quot;+primary);</span>
+
+<span class="nc" id="L447">        log.getLogger().println(&quot;Downloading JDK from &quot;+primary.filepath);</span>
+
+<span class="nc" id="L449">        HttpClient hc = new HttpClient();</span>
+<span class="nc" id="L450">        hc.getParams().setParameter(&quot;http.useragent&quot;,&quot;Mozilla/5.0 (Windows; U; MSIE 9.0; Windows NT 9.0; en-US)&quot;);</span>
+<span class="nc" id="L451">        Jenkins j = Jenkins.getInstance();</span>
+<span class="nc bnc" id="L452" title="All 2 branches missed.">        ProxyConfiguration jpc = j!=null ? j.proxy : null;</span>
+<span class="nc bnc" id="L453" title="All 2 branches missed.">        if(jpc != null) {</span>
+<span class="nc" id="L454">            hc.getHostConfiguration().setProxy(jpc.name, jpc.port);</span>
+<span class="nc bnc" id="L455" title="All 2 branches missed.">            if(jpc.getUserName() != null)</span>
+<span class="nc" id="L456">                hc.getState().setProxyCredentials(AuthScope.ANY,new UsernamePasswordCredentials(jpc.getUserName(),jpc.getPassword()));</span>
+        }
+
+<span class="nc" id="L459">        int authCount=0, totalPageCount=0;  // counters for avoiding infinite loop</span>
+
+<span class="nc" id="L461">        HttpMethodBase m = new GetMethod(primary.filepath);</span>
+<span class="nc" id="L462">        hc.getState().addCookie(new Cookie(&quot;.oracle.com&quot;,&quot;gpw_e24&quot;,&quot;.&quot;, &quot;/&quot;, -1, false));</span>
+<span class="nc" id="L463">        hc.getState().addCookie(new Cookie(&quot;.oracle.com&quot;,&quot;oraclelicense&quot;,&quot;accept-securebackup-cookie&quot;, &quot;/&quot;, -1, false));</span>
+        try {
+            while (true) {
+<span class="nc bnc" id="L466" title="All 2 branches missed.">                if (totalPageCount++&gt;16) // looping too much</span>
+<span class="nc" id="L467">                    throw new IOException(&quot;Unable to find the login form&quot;);</span>
+
+<span class="nc" id="L469">                LOGGER.fine(&quot;Requesting &quot; + m.getURI());</span>
+<span class="nc" id="L470">                int r = hc.executeMethod(m);</span>
+<span class="nc bnc" id="L471" title="All 2 branches missed.">                if (r/100==3) {</span>
+                    // redirect?
+<span class="nc" id="L473">                    String loc = m.getResponseHeader(&quot;Location&quot;).getValue();</span>
+<span class="nc" id="L474">                    m.releaseConnection();</span>
+<span class="nc" id="L475">                    m = new GetMethod(loc);</span>
+<span class="nc" id="L476">                    continue;</span>
+                }
+<span class="nc bnc" id="L478" title="All 2 branches missed.">                if (r!=200)</span>
+<span class="nc" id="L479">                    throw new IOException(&quot;Failed to request &quot; + m.getURI() +&quot; exit code=&quot;+r);</span>
+
+<span class="nc bnc" id="L481" title="All 2 branches missed.">                if (m.getURI().getHost().equals(&quot;login.oracle.com&quot;)) {</span>
+<span class="nc" id="L482">                    LOGGER.fine(&quot;Appears to be a login page&quot;);</span>
+<span class="nc" id="L483">                    String resp = IOUtils.toString(m.getResponseBodyAsStream(), m.getResponseCharSet());</span>
+<span class="nc" id="L484">                    m.releaseConnection();</span>
+<span class="nc" id="L485">                    Matcher pm = Pattern.compile(&quot;&lt;form .*?action=\&quot;([^\&quot;]*)\&quot; .*?&lt;/form&gt;&quot;, Pattern.DOTALL).matcher(resp);</span>
+<span class="nc bnc" id="L486" title="All 2 branches missed.">                    if (!pm.find())</span>
+<span class="nc" id="L487">                        throw new IllegalStateException(&quot;Unable to find a form in the response:\n&quot;+resp);</span>
+
+<span class="nc" id="L489">                    String form = pm.group();</span>
+<span class="nc" id="L490">                    PostMethod post = new PostMethod(</span>
+<span class="nc" id="L491">                            new URL(new URL(m.getURI().getURI()),pm.group(1)).toExternalForm());</span>
+
+<span class="nc" id="L493">                    String u = getDescriptor().getUsername();</span>
+<span class="nc" id="L494">                    Secret p = getDescriptor().getPassword();</span>
+<span class="nc bnc" id="L495" title="All 4 branches missed.">                    if (u==null || p==null) {</span>
+<span class="nc" id="L496">                        log.hyperlink(getCredentialPageUrl(),&quot;Oracle now requires Oracle account to download previous versions of JDK. Please specify your Oracle account username/password.\n&quot;);</span>
+<span class="nc" id="L497">                        throw new AbortException(&quot;Unable to install JDK unless a valid Oracle account username/password is provided in the system configuration.&quot;);</span>
+                    }
+
+<span class="nc bnc" id="L500" title="All 2 branches missed.">                    for (String fragment : form.split(&quot;&lt;input&quot;)) {</span>
+<span class="nc" id="L501">                        String n = extractAttribute(fragment,&quot;name&quot;);</span>
+<span class="nc" id="L502">                        String v = extractAttribute(fragment,&quot;value&quot;);</span>
+<span class="nc bnc" id="L503" title="All 4 branches missed.">                        if (n==null || v==null)     continue;</span>
+<span class="nc bnc" id="L504" title="All 2 branches missed.">                        if (n.equals(&quot;ssousername&quot;))</span>
+<span class="nc" id="L505">                            v = u;</span>
+<span class="nc bnc" id="L506" title="All 2 branches missed.">                        if (n.equals(&quot;password&quot;)) {</span>
+<span class="nc" id="L507">                            v = p.getPlainText();</span>
+<span class="nc bnc" id="L508" title="All 2 branches missed.">                            if (authCount++ &gt; 3) {</span>
+<span class="nc" id="L509">                                log.hyperlink(getCredentialPageUrl(),&quot;Your Oracle account doesn't appear valid. Please specify a valid username/password\n&quot;);</span>
+<span class="nc" id="L510">                                throw new AbortException(&quot;Unable to install JDK unless a valid username/password is provided.&quot;);</span>
+                            }
+                        }
+<span class="nc" id="L513">                        post.addParameter(n, v);</span>
+                    }
+
+<span class="nc" id="L516">                    m = post;</span>
+<span class="nc" id="L517">                } else {</span>
+<span class="nc" id="L518">                    log.getLogger().println(&quot;Downloading &quot; + m.getResponseContentLength() + &quot; bytes&quot;);</span>
+
+                    // download to a temporary file and rename it in to handle concurrency and failure correctly,
+<span class="nc" id="L521">                    File tmp = new File(cache.getPath()+&quot;.tmp&quot;);</span>
+                    try {
+<span class="nc" id="L523">                        tmp.getParentFile().mkdirs();</span>
+<span class="nc" id="L524">                        FileOutputStream out = new FileOutputStream(tmp);</span>
+                        try {
+<span class="nc" id="L526">                            IOUtils.copy(m.getResponseBodyAsStream(), out);</span>
+<span class="nc" id="L527">                        } finally {</span>
+<span class="nc" id="L528">                            out.close();</span>
+<span class="nc" id="L529">                        }</span>
+
+<span class="nc" id="L531">                        tmp.renameTo(cache);</span>
+<span class="nc" id="L532">                        return cache.toURL();</span>
+<span class="nc" id="L533">                    } finally {</span>
+<span class="nc" id="L534">                        tmp.delete();</span>
+<span class="nc" id="L535">                    }</span>
+                }
+            }
+<span class="nc" id="L538">        } finally {</span>
+<span class="nc" id="L539">            m.releaseConnection();</span>
+<span class="nc" id="L540">        }</span>
+    }
+
+    private static String extractAttribute(String s, String name) {
+<span class="nc" id="L544">        String h = name + &quot;=\&quot;&quot;;</span>
+<span class="nc" id="L545">        int si = s.indexOf(h);</span>
+<span class="nc bnc" id="L546" title="All 2 branches missed.">        if (si&lt;0)   return null;</span>
+<span class="nc" id="L547">        int ei = s.indexOf('\&quot;',si+h.length());</span>
+<span class="nc" id="L548">        return s.substring(si+h.length(),ei);</span>
+    }
+
+    private String getCredentialPageUrl() {
+<span class="nc" id="L552">        return &quot;/&quot;+getDescriptor().getDescriptorUrl()+&quot;/enterCredential&quot;;</span>
+    }
+
+<span class="nc" id="L555">    public enum Preference {</span>
+<span class="nc" id="L556">        PRIMARY, SECONDARY, UNACCEPTABLE</span>
+    }
+
+    /**
+     * Supported platform.
+     */
+<span class="nc" id="L562">    public enum Platform {</span>
+<span class="nc" id="L563">        LINUX(&quot;jdk.sh&quot;), SOLARIS(&quot;jdk.sh&quot;), WINDOWS(&quot;jdk.exe&quot;), OSX(&quot;jdk.dmg&quot;);</span>
+
+        /**
+         * Choose the file name suitable for the downloaded JDK bundle.
+         */
+        public final String bundleFileName;
+
+<span class="nc" id="L570">        Platform(String bundleFileName) {</span>
+<span class="nc" id="L571">            this.bundleFileName = bundleFileName;</span>
+<span class="nc" id="L572">        }</span>
+
+        public boolean is(String line) {
+<span class="nc" id="L575">            return line.contains(name());</span>
+        }
+
+        /**
+         * Determines the platform of the given node.
+         */
+        public static Platform of(Node n) throws IOException,InterruptedException,DetectionFailedException {
+<span class="nc" id="L582">            return n.getChannel().call(new GetCurrentPlatform());</span>
+        }
+
+        public static Platform current() throws DetectionFailedException {
+<span class="nc" id="L586">            String arch = System.getProperty(&quot;os.name&quot;).toLowerCase(Locale.ENGLISH);</span>
+<span class="nc bnc" id="L587" title="All 2 branches missed.">            if(arch.contains(&quot;linux&quot;))  return LINUX;</span>
+<span class="nc bnc" id="L588" title="All 2 branches missed.">            if(arch.contains(&quot;windows&quot;))   return WINDOWS;</span>
+<span class="nc bnc" id="L589" title="All 4 branches missed.">            if(arch.contains(&quot;sun&quot;) || arch.contains(&quot;solaris&quot;))    return SOLARIS;</span>
+<span class="nc bnc" id="L590" title="All 2 branches missed.">            if(arch.contains(&quot;mac&quot;)) return OSX;</span>
+<span class="nc" id="L591">            throw new DetectionFailedException(&quot;Unknown CPU name: &quot;+arch);</span>
+        }
+
+<span class="nc" id="L594">        static class GetCurrentPlatform extends MasterToSlaveCallable&lt;Platform,DetectionFailedException&gt; {</span>
+            private static final long serialVersionUID = 1L;
+            public Platform call() throws DetectionFailedException {
+<span class="nc" id="L597">                return current();</span>
+            }
+        }
+
+    }
+
+    /**
+     * CPU type.
+     */
+<span class="nc" id="L606">    public enum CPU {</span>
+<span class="nc" id="L607">        i386, amd64, Sparc, Itanium;</span>
+
+        /**
+         * In JDK5u3, I see platform like &quot;Linux AMD64&quot;, while JDK6u3 refers to &quot;Linux x64&quot;, so
+         * just use &quot;64&quot; for locating bits.
+         */
+        public Preference accept(String line) {
+<span class="nc bnc" id="L614" title="All 5 branches missed.">            switch (this) {</span>
+            // these two guys are totally incompatible with everything else, so no fallback
+<span class="nc" id="L616">            case Sparc:     return must(line.contains(&quot;SPARC&quot;));</span>
+<span class="nc" id="L617">            case Itanium:   return must(line.contains(&quot;IA64&quot;));</span>
+
+            // 64bit Solaris, Linux, and Windows can all run 32bit executable, so fall back to 32bit if 64bit bundle is not found
+            case amd64:
+<span class="nc bnc" id="L621" title="All 4 branches missed.">                if(line.contains(&quot;SPARC&quot;) || line.contains(&quot;IA64&quot;))  return UNACCEPTABLE;</span>
+<span class="nc bnc" id="L622" title="All 2 branches missed.">                if(line.contains(&quot;64&quot;))     return PRIMARY;</span>
+<span class="nc" id="L623">                return SECONDARY;</span>
+            case i386:
+<span class="nc bnc" id="L625" title="All 6 branches missed.">                if(line.contains(&quot;64&quot;) || line.contains(&quot;SPARC&quot;) || line.contains(&quot;IA64&quot;))     return UNACCEPTABLE;</span>
+<span class="nc" id="L626">                return PRIMARY;</span>
+            }
+<span class="nc" id="L628">            return UNACCEPTABLE;</span>
+        }
+
+        private static Preference must(boolean b) {
+<span class="nc bnc" id="L632" title="All 2 branches missed.">             return b ? PRIMARY : UNACCEPTABLE;</span>
+        }
+
+        /**
+         * Determines the CPU of the given node.
+         */
+        public static CPU of(Node n) throws IOException,InterruptedException, DetectionFailedException {
+<span class="nc" id="L639">            return n.getChannel().call(new GetCurrentCPU());</span>
+        }
+
+        /**
+         * Determines the CPU of the current JVM.
+         *
+         * http://lopica.sourceforge.net/os.html was useful in writing this code.
+         */
+        public static CPU current() throws DetectionFailedException {
+<span class="nc" id="L648">            String arch = System.getProperty(&quot;os.arch&quot;).toLowerCase(Locale.ENGLISH);</span>
+<span class="nc bnc" id="L649" title="All 2 branches missed.">            if(arch.contains(&quot;sparc&quot;))  return Sparc;</span>
+<span class="nc bnc" id="L650" title="All 2 branches missed.">            if(arch.contains(&quot;ia64&quot;))   return Itanium;</span>
+<span class="nc bnc" id="L651" title="All 4 branches missed.">            if(arch.contains(&quot;amd64&quot;) || arch.contains(&quot;86_64&quot;))    return amd64;</span>
+<span class="nc bnc" id="L652" title="All 2 branches missed.">            if(arch.contains(&quot;86&quot;))    return i386;</span>
+<span class="nc" id="L653">            throw new DetectionFailedException(&quot;Unknown CPU architecture: &quot;+arch);</span>
+        }
+
+<span class="nc" id="L656">        static class GetCurrentCPU extends MasterToSlaveCallable&lt;CPU,DetectionFailedException&gt; {</span>
+            private static final long serialVersionUID = 1L;
+            public CPU call() throws DetectionFailedException {
+<span class="nc" id="L659">                return current();</span>
+            }
+        }
+
+    }
+
+    /**
+     * Indicates the failure to detect the OS or CPU.
+     */
+    private static final class DetectionFailedException extends Exception {
+        private DetectionFailedException(String message) {
+<span class="nc" id="L670">            super(message);</span>
+<span class="nc" id="L671">        }</span>
+    }
+
+<span class="nc" id="L674">    public static final class JDKFamilyList {</span>
+<span class="nc" id="L675">        public JDKFamily[] data = new JDKFamily[0];</span>
+        public int version;
+
+        public boolean isEmpty() {
+<span class="nc bnc" id="L679" title="All 2 branches missed.">            for (JDKFamily f : data) {</span>
+<span class="nc bnc" id="L680" title="All 2 branches missed.">                if (f.releases.length&gt;0)</span>
+<span class="nc" id="L681">                    return false;</span>
+            }
+<span class="nc" id="L683">            return true;</span>
+        }
+
+        public JDKRelease getRelease(String productCode) {
+<span class="nc bnc" id="L687" title="All 2 branches missed.">            for (JDKFamily f : data) {</span>
+<span class="nc bnc" id="L688" title="All 2 branches missed.">                for (JDKRelease r : f.releases) {</span>
+<span class="nc bnc" id="L689" title="All 2 branches missed.">                    if (r.matchesId(productCode))</span>
+<span class="nc" id="L690">                        return r;</span>
+                }
+            }
+<span class="nc" id="L693">            return null;</span>
+        }
+    }
+
+<span class="nc" id="L697">    public static final class JDKFamily {</span>
+        public String name;
+        public JDKRelease[] releases;
+    }
+
+<span class="nc" id="L702">    public static final class JDKRelease {</span>
+        /**
+         * the list of {@Link JDKFile}s
+         */
+        public JDKFile[] files;
+        /**
+         * the license path
+         */
+        public String licpath;
+        /**
+         * the license title
+         */
+        public String lictitle;
+        /**
+         * This maps to the former product code, like &quot;jdk-6u13-oth-JPR&quot;
+         */
+        public String name;
+        /**
+         * This is human readable.
+         */
+        public String title;
+
+        /**
+         * We used to use IDs like &quot;jdk-6u13-oth-JPR@CDS-CDS_Developer&quot;, but Oracle switched to just &quot;jdk-6u13-oth-JPR&quot;.
+         * This method matches if the specified string matches the name, and it accepts both the old and the new format.
+         */
+        public boolean matchesId(String rhs) {
+<span class="nc bnc" id="L729" title="All 6 branches missed.">            return rhs!=null &amp;&amp; (rhs.equals(name) || rhs.startsWith(name+&quot;@&quot;));</span>
+        }
+    }
+
+<span class="nc" id="L733">    public static final class JDKFile {</span>
+        public String filepath;
+        public String name;
+        public String title;
+    }
+
+    @Override
+    public DescriptorImpl getDescriptor() {
+<span class="nc" id="L741">        return (DescriptorImpl)super.getDescriptor();</span>
+    }
+
+    @Extension
+    public static final class DescriptorImpl extends ToolInstallerDescriptor&lt;JDKInstaller&gt; {
+        private String username;
+        private Secret password;
+
+<span class="nc" id="L749">        public DescriptorImpl() {</span>
+<span class="nc" id="L750">            load();</span>
+<span class="nc" id="L751">        }</span>
+
+        public String getDisplayName() {
+<span class="nc" id="L754">            return Messages.JDKInstaller_DescriptorImpl_displayName();</span>
+        }
+
+        @Override
+        public boolean isApplicable(Class&lt;? extends ToolInstallation&gt; toolType) {
+<span class="nc bnc" id="L759" title="All 2 branches missed.">            return toolType==JDK.class;</span>
+        }
+
+        public String getUsername() {
+<span class="nc" id="L763">            return username;</span>
+        }
+
+        public Secret getPassword() {
+<span class="nc" id="L767">            return password;</span>
+        }
+
+        public FormValidation doCheckId(@QueryParameter String value) {
+<span class="nc bnc" id="L771" title="All 2 branches missed.">            if (Util.fixEmpty(value) == null)</span>
+<span class="nc" id="L772">                return FormValidation.error(Messages.JDKInstaller_DescriptorImpl_doCheckId()); // improve message</span>
+<span class="nc" id="L773">            return FormValidation.ok();</span>
+        }
+
+        /**
+         * List of installable JDKs.
+         * @return never null.
+         */
+        public List&lt;JDKFamily&gt; getInstallableJDKs() throws IOException {
+<span class="nc" id="L781">            return Arrays.asList(JDKList.all().get(JDKList.class).toList().data);</span>
+        }
+
+        public FormValidation doCheckAcceptLicense(@QueryParameter boolean value) {
+<span class="nc bnc" id="L785" title="All 4 branches missed.">            if (username==null || password==null)</span>
+<span class="nc" id="L786">                return FormValidation.errorWithMarkup(Messages.JDKInstaller_RequireOracleAccount(Stapler.getCurrentRequest().getContextPath()+'/'+getDescriptorUrl()+&quot;/enterCredential&quot;));</span>
+<span class="nc bnc" id="L787" title="All 2 branches missed.">            if (value) {</span>
+<span class="nc" id="L788">                return FormValidation.ok();</span>
+            } else {
+<span class="nc" id="L790">                return FormValidation.error(Messages.JDKInstaller_DescriptorImpl_doCheckAcceptLicense());</span>
+            }
+        }
+
+        /**
+         * Submits the Oracle account username/password.
+         */
+        public HttpResponse doPostCredential(@QueryParameter String username, @QueryParameter String password) throws IOException, ServletException {
+<span class="nc" id="L798">            this.username = username;</span>
+<span class="nc" id="L799">            this.password = Secret.fromString(password);</span>
+<span class="nc" id="L800">            save();</span>
+<span class="nc" id="L801">            return HttpResponses.redirectTo(&quot;credentialOK&quot;);</span>
+        }
+    }
+
+    /**
+     * JDK list.
+     */
+    @Extension
+    public static final class JDKList extends Downloadable {
+        public JDKList() {
+<span class="nc" id="L811">            super(JDKInstaller.class);</span>
+<span class="nc" id="L812">        }</span>
+
+        public JDKFamilyList toList() throws IOException {
+<span class="nc" id="L815">            JSONObject d = getData();</span>
+<span class="nc bnc" id="L816" title="All 2 branches missed.">            if(d==null) return new JDKFamilyList();</span>
+<span class="nc" id="L817">            return (JDKFamilyList)JSONObject.toBean(d,JDKFamilyList.class);</span>
+        }
+
+        /**
+         * @{inheritDoc}
+         */
+        @Override
+        public JSONObject reduce (List&lt;JSONObject&gt; jsonObjectList) {
+<span class="nc" id="L825">            List&lt;JDKFamily&gt; reducedFamilies = new LinkedList&lt;&gt;();</span>
+<span class="nc" id="L826">            int version = 0;</span>
+<span class="nc" id="L827">            JsonConfig jsonConfig = new JsonConfig();</span>
+<span class="nc" id="L828">            jsonConfig.registerPropertyExclusion(JDKFamilyList.class, &quot;empty&quot;);</span>
+<span class="nc" id="L829">            jsonConfig.setRootClass(JDKFamilyList.class);</span>
+            //collect all JDKFamily objects from the multiple json objects
+<span class="nc bnc" id="L831" title="All 2 branches missed.">            for (JSONObject jsonJdkFamilyList : jsonObjectList) {</span>
+<span class="nc" id="L832">                JDKFamilyList jdkFamilyList = (JDKFamilyList)JSONObject.toBean(jsonJdkFamilyList, jsonConfig);</span>
+<span class="nc bnc" id="L833" title="All 2 branches missed.">                if (version == 0) {</span>
+                    //we set as version the version of the first update center
+<span class="nc" id="L835">                    version = jdkFamilyList.version;</span>
+                }
+<span class="nc" id="L837">                JDKFamily[] jdkFamilies = jdkFamilyList.data;</span>
+<span class="nc" id="L838">                reducedFamilies.addAll(Arrays.asList(jdkFamilies));</span>
+            }
+            //we  iterate on the list and reduce it until there are no more duplicates
+            //this could be made recursive
+<span class="nc bnc" id="L842" title="All 2 branches missed.">            while (hasDuplicates(reducedFamilies, &quot;name&quot;)) {</span>
+                //create a temporary list to store the tmp result
+<span class="nc" id="L844">                List&lt;JDKFamily&gt; tmpReducedFamilies = new LinkedList&lt;&gt;();</span>
+                //we need to skip the processed families
+<span class="nc" id="L846">                boolean processed [] = new boolean[reducedFamilies.size()];</span>
+<span class="nc bnc" id="L847" title="All 2 branches missed.">                for (int i = 0; i &lt; reducedFamilies.size(); i ++ ) {</span>
+<span class="nc bnc" id="L848" title="All 2 branches missed.">                    if (processed [i] == true) {</span>
+<span class="nc" id="L849">                        continue;</span>
+                    }
+<span class="nc" id="L851">                    JDKFamily data1 = reducedFamilies.get(i);</span>
+<span class="nc" id="L852">                    boolean hasDuplicate = false;</span>
+<span class="nc bnc" id="L853" title="All 2 branches missed.">                    for (int j = i + 1; j &lt; reducedFamilies.size(); j ++ ) {</span>
+<span class="nc" id="L854">                        JDKFamily data2 = reducedFamilies.get(j);</span>
+                        //if we found a duplicate we need to merge the families
+<span class="nc bnc" id="L856" title="All 2 branches missed.">                        if (data1.name.equals(data2.name)) {</span>
+<span class="nc" id="L857">                            hasDuplicate = true;</span>
+<span class="nc" id="L858">                            processed [j] = true;</span>
+<span class="nc" id="L859">                            JDKFamily reducedData = reduceData(data1.name, new LinkedList&lt;JDKRelease&gt;(Arrays.asList(data1.releases)), new LinkedList&lt;JDKRelease&gt;(Arrays.asList(data2.releases)));</span>
+<span class="nc" id="L860">                            tmpReducedFamilies.add(reducedData);</span>
+                            //after the first duplicate has been found we break the loop since the duplicates are
+                            //processed two by two
+<span class="nc" id="L863">                            break;</span>
+                        }
+                    }
+                    //if no duplicate has been found we just insert the whole family in the tmp list
+<span class="nc bnc" id="L867" title="All 2 branches missed.">                    if (!hasDuplicate) {</span>
+<span class="nc" id="L868">                        tmpReducedFamilies.add(data1);</span>
+                    }
+                }
+<span class="nc" id="L871">                reducedFamilies = tmpReducedFamilies;</span>
+            }
+<span class="nc" id="L873">            JDKFamilyList jdkFamilyList = new JDKFamilyList();</span>
+<span class="nc" id="L874">            jdkFamilyList.version = version;</span>
+<span class="nc" id="L875">            jdkFamilyList.data = new JDKFamily[reducedFamilies.size()];</span>
+<span class="nc" id="L876">            reducedFamilies.toArray(jdkFamilyList.data);</span>
+<span class="nc" id="L877">            JSONObject reducedJdkFamilyList = JSONObject.fromObject(jdkFamilyList, jsonConfig);</span>
+            //return the list with no duplicates
+<span class="nc" id="L879">            return reducedJdkFamilyList;</span>
+        }
+
+        private JDKFamily reduceData(String name, List&lt;JDKRelease&gt; releases1, List&lt;JDKRelease&gt; releases2) {
+<span class="nc" id="L883">            LinkedList&lt;JDKRelease&gt; reducedReleases = new LinkedList&lt;&gt;();</span>
+<span class="nc bnc" id="L884" title="All 2 branches missed.">            for (Iterator&lt;JDKRelease&gt; iterator = releases1.iterator(); iterator.hasNext(); ) {</span>
+<span class="nc" id="L885">                JDKRelease release1 = iterator.next();</span>
+<span class="nc" id="L886">                boolean hasDuplicate = false;</span>
+<span class="nc bnc" id="L887" title="All 2 branches missed.">                for (Iterator&lt;JDKRelease&gt; iterator2 = releases2.iterator(); iterator2.hasNext(); ) {</span>
+<span class="nc" id="L888">                    JDKRelease release2 = iterator2.next();</span>
+<span class="nc bnc" id="L889" title="All 2 branches missed.">                    if (release1.name.equals(release2.name)) {</span>
+<span class="nc" id="L890">                        hasDuplicate = true;</span>
+<span class="nc" id="L891">                        JDKRelease reducedRelease = reduceReleases(release1, new LinkedList&lt;JDKFile&gt;(Arrays.asList(release1.files)), new LinkedList&lt;JDKFile&gt;(Arrays.asList(release2.files)));</span>
+<span class="nc" id="L892">                        iterator2.remove();</span>
+<span class="nc" id="L893">                        reducedReleases.add(reducedRelease);</span>
+                        //we assume that in one release list there are no duplicates so we stop at the first one
+<span class="nc" id="L895">                        break;</span>
+                    }
+                }
+<span class="nc bnc" id="L898" title="All 2 branches missed.">                if (!hasDuplicate) {</span>
+<span class="nc" id="L899">                    reducedReleases.add(release1);</span>
+                }
+            }
+<span class="nc" id="L902">            reducedReleases.addAll(releases2);</span>
+<span class="nc" id="L903">            JDKFamily reducedFamily = new JDKFamily();</span>
+<span class="nc" id="L904">            reducedFamily.name = name;</span>
+<span class="nc" id="L905">            reducedFamily.releases = new JDKRelease[reducedReleases.size()];</span>
+<span class="nc" id="L906">            reducedReleases.toArray(reducedFamily.releases);</span>
+<span class="nc" id="L907">            return reducedFamily;</span>
+        }
+
+        private JDKRelease reduceReleases(JDKRelease release, List&lt;JDKFile&gt; files1, List&lt;JDKFile&gt; files2) {
+<span class="nc" id="L911">            LinkedList&lt;JDKFile&gt; reducedFiles = new LinkedList&lt;&gt;();</span>
+<span class="nc bnc" id="L912" title="All 2 branches missed.">            for (Iterator&lt;JDKFile&gt; iterator1 = files1.iterator(); iterator1.hasNext(); ) {</span>
+<span class="nc" id="L913">                JDKFile file1 = iterator1.next();</span>
+<span class="nc bnc" id="L914" title="All 2 branches missed.">                for (Iterator&lt;JDKFile&gt; iterator2 = files2.iterator(); iterator2.hasNext(); ) {</span>
+<span class="nc" id="L915">                    JDKFile file2 = iterator2.next();</span>
+<span class="nc bnc" id="L916" title="All 2 branches missed.">                    if (file1.name.equals(file2.name)) {</span>
+<span class="nc" id="L917">                        iterator2.remove();</span>
+                        //we assume the in one file list there are no duplicates so we break after we find the
+                        //first match
+<span class="nc" id="L920">                        break;</span>
+                    }
+                }
+            }
+<span class="nc" id="L924">            reducedFiles.addAll(files1);</span>
+<span class="nc" id="L925">            reducedFiles.addAll(files2);</span>
+
+<span class="nc" id="L927">            JDKRelease jdkRelease = new JDKRelease();</span>
+<span class="nc" id="L928">            jdkRelease.files = new JDKFile[reducedFiles.size()];</span>
+<span class="nc" id="L929">            reducedFiles.toArray(jdkRelease.files);</span>
+<span class="nc" id="L930">            jdkRelease.name = release.name;</span>
+<span class="nc" id="L931">            jdkRelease.licpath = release.licpath;</span>
+<span class="nc" id="L932">            jdkRelease.lictitle = release.lictitle;</span>
+<span class="nc" id="L933">            jdkRelease.title = release.title;</span>
+<span class="nc" id="L934">            return jdkRelease;</span>
+        }
+    }
+
+<span class="nc" id="L938">    private static final Logger LOGGER = Logger.getLogger(JDKInstaller.class.getName());</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

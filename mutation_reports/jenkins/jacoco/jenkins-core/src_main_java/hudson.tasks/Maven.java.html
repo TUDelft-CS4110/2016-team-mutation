@@ -1,0 +1,723 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>Maven.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.tasks</a> &gt; <span class="el_source">Maven.java</span></div><h1>Maven.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">/*</span>
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2010, Sun Microsystems, Inc., Kohsuke Kawaguchi, Jene Jasper, Stephen Connolly, Tom Huybrechts, Yahoo! Inc.
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.tasks;
+
+import hudson.Extension;
+import jenkins.MasterToSlaveFileCallable;
+import hudson.Launcher;
+import hudson.Functions;
+import hudson.EnvVars;
+import hudson.Util;
+import hudson.CopyOnWrite;
+import hudson.Launcher.LocalLauncher;
+import hudson.model.AbstractBuild;
+import hudson.model.AbstractProject;
+import hudson.model.BuildListener;
+import hudson.model.Computer;
+import hudson.model.EnvironmentSpecific;
+import hudson.model.Node;
+import jenkins.model.Jenkins;
+import jenkins.mvn.GlobalMavenConfig;
+import jenkins.mvn.GlobalSettingsProvider;
+import jenkins.mvn.SettingsProvider;
+import hudson.model.TaskListener;
+import hudson.remoting.VirtualChannel;
+import hudson.slaves.NodeSpecific;
+import hudson.tasks._maven.MavenConsoleAnnotator;
+import hudson.tools.ToolDescriptor;
+import hudson.tools.ToolInstallation;
+import hudson.tools.DownloadFromUrlInstaller;
+import hudson.tools.ToolInstaller;
+import hudson.tools.ToolProperty;
+import hudson.util.ArgumentListBuilder;
+import hudson.util.NullStream;
+import hudson.util.StreamTaskListener;
+import hudson.util.VariableResolver;
+import hudson.util.VariableResolver.ByMap;
+import hudson.util.VariableResolver.Union;
+import hudson.util.FormValidation;
+import hudson.util.XStream2;
+import jenkins.security.MasterToSlaveCallable;
+import net.sf.json.JSONObject;
+
+import org.apache.commons.lang.StringUtils;
+import org.kohsuke.stapler.DataBoundConstructor;
+import org.kohsuke.stapler.StaplerRequest;
+
+import java.io.File;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Properties;
+import java.util.StringTokenizer;
+import java.util.List;
+import java.util.Collections;
+import java.util.Set;
+import java.util.jar.Attributes;
+import java.util.jar.JarFile;
+import java.util.jar.Manifest;
+import java.util.regex.Pattern;
+
+/**
+ * Build by using Maven.
+ *
+ * @author Kohsuke Kawaguchi
+ */
+public class Maven extends Builder {
+    /**
+     * The targets and other maven options.
+     * Can be separated by SP or NL.
+     */
+    public final String targets;
+
+    /**
+     * Identifies {@link MavenInstallation} to be used.
+     */
+    public final String mavenName;
+
+    /**
+     * MAVEN_OPTS if not null.
+     */
+    public final String jvmOptions;
+
+    /**
+     * Optional POM file path relative to the workspace.
+     * Used for the Maven '-f' option.
+     */
+    public final String pom;
+
+    /**
+     * Optional properties to be passed to Maven. Follows {@link Properties} syntax.
+     */
+    public final String properties;
+
+    /**
+     * If true, the build will use its own local Maven repository
+     * via &quot;-Dmaven.repo.local=...&quot;.
+     * &lt;p&gt;
+     * This would consume additional disk space, but provides isolation with other builds on the same machine,
+     * such as mixing SNAPSHOTS. Maven also doesn't try to coordinate the concurrent access to Maven repositories
+     * from multiple Maven process, so this helps there too.
+     *
+     * Identical to logic used in maven-plugin.
+     *
+     * @since 1.322
+     */
+<span class="nc" id="L126">    public boolean usePrivateRepository = false;</span>
+    
+    /**
+     * Provides access to the settings.xml to be used for a build.
+     * @since 1.491
+     */
+    private SettingsProvider settings;
+    
+    /**
+     * Provides access to the global settings.xml to be used for a build.
+     * @since 1.491
+     */
+    private GlobalSettingsProvider globalSettings;
+
+    private final static String MAVEN_1_INSTALLATION_COMMON_FILE = &quot;bin/maven&quot;;
+    private final static String MAVEN_2_INSTALLATION_COMMON_FILE = &quot;bin/mvn&quot;;
+    
+<span class="nc" id="L143">    private static final Pattern S_PATTERN = Pattern.compile(&quot;(^| )-s &quot;);</span>
+<span class="nc" id="L144">    private static final Pattern GS_PATTERN = Pattern.compile(&quot;(^| )-gs &quot;);</span>
+
+    public Maven(String targets,String name) {
+<span class="nc" id="L147">        this(targets,name,null,null,null,false, null, null);</span>
+<span class="nc" id="L148">    }</span>
+
+    public Maven(String targets, String name, String pom, String properties, String jvmOptions) {
+<span class="nc" id="L151">        this(targets, name, pom, properties, jvmOptions, false, null, null);</span>
+<span class="nc" id="L152">    }</span>
+    
+    public Maven(String targets,String name, String pom, String properties, String jvmOptions, boolean usePrivateRepository) {
+<span class="nc" id="L155">        this(targets, name, pom, properties, jvmOptions, usePrivateRepository, null, null);</span>
+<span class="nc" id="L156">    }</span>
+    
+    @DataBoundConstructor
+<span class="nc" id="L159">    public Maven(String targets,String name, String pom, String properties, String jvmOptions, boolean usePrivateRepository, SettingsProvider settings, GlobalSettingsProvider globalSettings) {</span>
+<span class="nc" id="L160">        this.targets = targets;</span>
+<span class="nc" id="L161">        this.mavenName = name;</span>
+<span class="nc" id="L162">        this.pom = Util.fixEmptyAndTrim(pom);</span>
+<span class="nc" id="L163">        this.properties = Util.fixEmptyAndTrim(properties);</span>
+<span class="nc" id="L164">        this.jvmOptions = Util.fixEmptyAndTrim(jvmOptions);</span>
+<span class="nc" id="L165">        this.usePrivateRepository = usePrivateRepository;</span>
+<span class="nc bnc" id="L166" title="All 2 branches missed.">        this.settings = settings != null ? settings : GlobalMavenConfig.get().getSettingsProvider();</span>
+<span class="nc bnc" id="L167" title="All 2 branches missed.">        this.globalSettings = globalSettings != null ? globalSettings : GlobalMavenConfig.get().getGlobalSettingsProvider();</span>
+<span class="nc" id="L168">    }</span>
+
+    public String getTargets() {
+<span class="nc" id="L171">        return targets;</span>
+    }
+
+    /**
+     * @since 1.491
+     */
+    public SettingsProvider getSettings() {
+<span class="nc bnc" id="L178" title="All 2 branches missed.">        return settings != null ? settings : GlobalMavenConfig.get().getSettingsProvider();</span>
+    }
+    
+    protected void setSettings(SettingsProvider settings) {
+<span class="nc" id="L182">        this.settings = settings;</span>
+<span class="nc" id="L183">    }</span>
+    
+    /**
+     * @since 1.491
+     */
+    public GlobalSettingsProvider getGlobalSettings() {
+<span class="nc bnc" id="L189" title="All 2 branches missed.">        return globalSettings != null ? globalSettings : GlobalMavenConfig.get().getGlobalSettingsProvider();</span>
+    }
+    
+    protected void setGlobalSettings(GlobalSettingsProvider globalSettings) {
+<span class="nc" id="L193">        this.globalSettings = globalSettings;</span>
+<span class="nc" id="L194">    }</span>
+
+    public void setUsePrivateRepository(boolean usePrivateRepository) {
+<span class="nc" id="L197">        this.usePrivateRepository = usePrivateRepository;</span>
+<span class="nc" id="L198">    }</span>
+
+    public boolean usesPrivateRepository() {
+<span class="nc" id="L201">        return usePrivateRepository;</span>
+    }
+
+    /**
+     * Gets the Maven to invoke,
+     * or null to invoke the default one.
+     */
+    public MavenInstallation getMaven() {
+<span class="nc bnc" id="L209" title="All 2 branches missed.">        for( MavenInstallation i : getDescriptor().getInstallations() ) {</span>
+<span class="nc bnc" id="L210" title="All 4 branches missed.">            if(mavenName !=null &amp;&amp; mavenName.equals(i.getName()))</span>
+<span class="nc" id="L211">                return i;</span>
+        }
+<span class="nc" id="L213">        return null;</span>
+    }
+
+    /**
+     * Looks for &lt;tt&gt;pom.xlm&lt;/tt&gt; or &lt;tt&gt;project.xml&lt;/tt&gt; to determine the maven executable
+     * name.
+     */
+    private static final class DecideDefaultMavenCommand extends MasterToSlaveFileCallable&lt;String&gt; {
+        private static final long serialVersionUID = -2327576423452215146L;
+        // command line arguments.
+        private final String arguments;
+
+<span class="nc" id="L225">        public DecideDefaultMavenCommand(String arguments) {</span>
+<span class="nc" id="L226">            this.arguments = arguments;</span>
+<span class="nc" id="L227">        }</span>
+
+        public String invoke(File ws, VirtualChannel channel) throws IOException {
+<span class="nc" id="L230">            String seed=null;</span>
+
+            // check for the -f option
+<span class="nc" id="L233">            StringTokenizer tokens = new StringTokenizer(arguments);</span>
+<span class="nc bnc" id="L234" title="All 2 branches missed.">            while(tokens.hasMoreTokens()) {</span>
+<span class="nc" id="L235">                String t = tokens.nextToken();</span>
+<span class="nc bnc" id="L236" title="All 4 branches missed.">                if(t.equals(&quot;-f&quot;) &amp;&amp; tokens.hasMoreTokens()) {</span>
+<span class="nc" id="L237">                    File file = new File(ws,tokens.nextToken());</span>
+<span class="nc bnc" id="L238" title="All 2 branches missed.">                    if(!file.exists())</span>
+<span class="nc" id="L239">                        continue;   // looks like an error, but let the execution fail later</span>
+<span class="nc bnc" id="L240" title="All 2 branches missed.">                    seed = file.isDirectory() ?</span>
+<span class="nc" id="L241">                        /* in M1, you specify a directory in -f */ &quot;maven&quot;</span>
+<span class="nc" id="L242">                        /* in M2, you specify a POM file name.  */ : &quot;mvn&quot;;</span>
+<span class="nc" id="L243">                    break;</span>
+                }
+            }
+
+<span class="nc bnc" id="L247" title="All 2 branches missed.">            if(seed==null) {</span>
+                // as of 1.212 (2008 April), I think Maven2 mostly replaced Maven1, so
+                // switching to err on M2 side.
+<span class="nc bnc" id="L250" title="All 2 branches missed.">                seed = new File(ws,&quot;project.xml&quot;).exists() ? &quot;maven&quot; : &quot;mvn&quot;;</span>
+            }
+
+<span class="nc bnc" id="L253" title="All 2 branches missed.">            if(Functions.isWindows())</span>
+<span class="nc" id="L254">                seed += &quot;.bat&quot;;</span>
+<span class="nc" id="L255">            return seed;</span>
+        }
+    }
+
+    @Override
+    public boolean perform(AbstractBuild&lt;?,?&gt; build, Launcher launcher, BuildListener listener) throws IOException, InterruptedException {
+<span class="nc" id="L261">        VariableResolver&lt;String&gt; vr = build.getBuildVariableResolver();</span>
+
+<span class="nc" id="L263">        EnvVars env = build.getEnvironment(listener);</span>
+
+<span class="nc" id="L265">        String targets = Util.replaceMacro(this.targets,vr);</span>
+<span class="nc" id="L266">        targets = env.expand(targets);</span>
+<span class="nc" id="L267">        String pom = env.expand(this.pom);</span>
+
+<span class="nc" id="L269">        int startIndex = 0;</span>
+        int endIndex;
+<span class="nc bnc" id="L271" title="All 2 branches missed.">        do {</span>
+            // split targets into multiple invokations of maven separated by |
+<span class="nc" id="L273">            endIndex = targets.indexOf('|', startIndex);</span>
+<span class="nc bnc" id="L274" title="All 2 branches missed.">            if (-1 == endIndex) {</span>
+<span class="nc" id="L275">                endIndex = targets.length();</span>
+            }
+
+<span class="nc" id="L278">            String normalizedTarget = targets</span>
+<span class="nc" id="L279">                    .substring(startIndex, endIndex)</span>
+<span class="nc" id="L280">                    .replaceAll(&quot;[\t\r\n]+&quot;,&quot; &quot;);</span>
+
+<span class="nc" id="L282">            ArgumentListBuilder args = new ArgumentListBuilder();</span>
+<span class="nc" id="L283">            MavenInstallation mi = getMaven();</span>
+<span class="nc bnc" id="L284" title="All 2 branches missed.">            if(mi==null) {</span>
+<span class="nc" id="L285">                String execName = build.getWorkspace().act(new DecideDefaultMavenCommand(normalizedTarget));</span>
+<span class="nc" id="L286">                args.add(execName);</span>
+<span class="nc" id="L287">            } else {</span>
+<span class="nc" id="L288">                mi = mi.forNode(Computer.currentComputer().getNode(), listener);</span>
+<span class="nc" id="L289">            	mi = mi.forEnvironment(env);</span>
+<span class="nc" id="L290">                String exec = mi.getExecutable(launcher);</span>
+<span class="nc bnc" id="L291" title="All 2 branches missed.">                if(exec==null) {</span>
+<span class="nc" id="L292">                    listener.fatalError(Messages.Maven_NoExecutable(mi.getHome()));</span>
+<span class="nc" id="L293">                    return false;</span>
+                }
+<span class="nc" id="L295">                args.add(exec);</span>
+            }
+<span class="nc bnc" id="L297" title="All 2 branches missed.">            if(pom!=null)</span>
+<span class="nc" id="L298">                args.add(&quot;-f&quot;,pom);</span>
+            
+            
+<span class="nc bnc" id="L301" title="All 2 branches missed.">            if(!S_PATTERN.matcher(targets).find()){ // check the given target/goals do not contain settings parameter already</span>
+<span class="nc" id="L302">                String settingsPath = SettingsProvider.getSettingsRemotePath(getSettings(), build, listener);</span>
+<span class="nc bnc" id="L303" title="All 2 branches missed.">                if(StringUtils.isNotBlank(settingsPath)){</span>
+<span class="nc" id="L304">                    args.add(&quot;-s&quot;, settingsPath);</span>
+                }
+            }
+<span class="nc bnc" id="L307" title="All 2 branches missed.">            if(!GS_PATTERN.matcher(targets).find()){</span>
+<span class="nc" id="L308">                String settingsPath = GlobalSettingsProvider.getSettingsRemotePath(getGlobalSettings(), build, listener);</span>
+<span class="nc bnc" id="L309" title="All 2 branches missed.">                if(StringUtils.isNotBlank(settingsPath)){</span>
+<span class="nc" id="L310">                    args.add(&quot;-gs&quot;, settingsPath);</span>
+                }
+            }
+
+<span class="nc" id="L314">            Set&lt;String&gt; sensitiveVars = build.getSensitiveBuildVariables();</span>
+
+<span class="nc" id="L316">            args.addKeyValuePairs(&quot;-D&quot;,build.getBuildVariables(),sensitiveVars);</span>
+<span class="nc" id="L317">            final VariableResolver&lt;String&gt; resolver = new Union&lt;String&gt;(new ByMap&lt;String&gt;(env), vr);</span>
+<span class="nc" id="L318">            args.addKeyValuePairsFromPropertyString(&quot;-D&quot;,this.properties,resolver,sensitiveVars);</span>
+<span class="nc bnc" id="L319" title="All 2 branches missed.">            if (usesPrivateRepository())</span>
+<span class="nc" id="L320">                args.add(&quot;-Dmaven.repo.local=&quot; + build.getWorkspace().child(&quot;.repository&quot;));</span>
+<span class="nc" id="L321">            args.addTokenized(normalizedTarget);</span>
+<span class="nc" id="L322">            wrapUpArguments(args,normalizedTarget,build,launcher,listener);</span>
+
+<span class="nc" id="L324">            buildEnvVars(env, mi);</span>
+            
+<span class="nc bnc" id="L326" title="All 2 branches missed.">            if (!launcher.isUnix()) {</span>
+<span class="nc" id="L327">                args = args.toWindowsCommand();</span>
+            }
+
+            try {
+<span class="nc" id="L331">                MavenConsoleAnnotator mca = new MavenConsoleAnnotator(listener.getLogger(),build.getCharset());</span>
+<span class="nc" id="L332">                int r = launcher.launch().cmds(args).envs(env).stdout(mca).pwd(build.getModuleRoot()).join();</span>
+<span class="nc bnc" id="L333" title="All 2 branches missed.">                if (0 != r) {</span>
+<span class="nc" id="L334">                    return false;</span>
+                }
+<span class="nc" id="L336">            } catch (IOException e) {</span>
+<span class="nc" id="L337">                Util.displayIOException(e,listener);</span>
+<span class="nc" id="L338">                e.printStackTrace( listener.fatalError(Messages.Maven_ExecFailed()) );</span>
+<span class="nc" id="L339">                return false;</span>
+            }
+<span class="nc" id="L341">            startIndex = endIndex + 1;</span>
+<span class="nc" id="L342">        } while (startIndex &lt; targets.length());</span>
+<span class="nc" id="L343">        return true;</span>
+    }
+
+    /**
+     * Allows the derived type to make additional modifications to the arguments list.
+     *
+     * @since 1.344
+     */
+    protected void wrapUpArguments(ArgumentListBuilder args, String normalizedTarget, AbstractBuild&lt;?,?&gt; build, Launcher launcher, BuildListener listener) throws IOException, InterruptedException {
+<span class="nc" id="L352">    }</span>
+
+    /**
+     * Build up the environment variables toward the Maven launch.
+     */
+    protected void buildEnvVars(EnvVars env, MavenInstallation mi) throws IOException, InterruptedException {
+<span class="nc bnc" id="L358" title="All 2 branches missed.">        if(mi!=null) {</span>
+            // if somebody has use M2_HOME they will get a classloading error
+            // when M2_HOME points to a different version of Maven2 from
+            // MAVEN_HOME (as Maven 2 gives M2_HOME priority.)
+            //
+            // The other solution would be to set M2_HOME if we are calling Maven2
+            // and MAVEN_HOME for Maven1 (only of use for strange people that
+            // are calling Maven2 from Maven1)
+<span class="nc" id="L366">            mi.buildEnvVars(env);</span>
+        }
+        // just as a precaution
+        // see http://maven.apache.org/continuum/faqs.html#how-does-continuum-detect-a-successful-build
+<span class="nc" id="L370">        env.put(&quot;MAVEN_TERMINATE_CMD&quot;,&quot;on&quot;);</span>
+
+<span class="nc" id="L372">        String jvmOptions = env.expand(this.jvmOptions);</span>
+<span class="nc bnc" id="L373" title="All 2 branches missed.">        if(jvmOptions!=null)</span>
+<span class="nc" id="L374">            env.put(&quot;MAVEN_OPTS&quot;,jvmOptions.replaceAll(&quot;[\t\r\n]+&quot;,&quot; &quot;));</span>
+<span class="nc" id="L375">    }</span>
+
+    @Override
+    public DescriptorImpl getDescriptor() {
+<span class="nc" id="L379">        return (DescriptorImpl)super.getDescriptor();</span>
+    }
+
+    /**
+     * @deprecated as of 1.286
+     *      Use {@link jenkins.model.Jenkins#getDescriptorByType(Class)} to obtain the current instance.
+     *      For compatibility, this field retains the last created {@link DescriptorImpl}.
+     *      TODO: fix sonar plugin that depends on this. That's the only plugin that depends on this field.
+     */
+    @Deprecated
+<span class="nc" id="L389">    public static DescriptorImpl DESCRIPTOR;</span>
+
+    @Extension
+    public static final class DescriptorImpl extends BuildStepDescriptor&lt;Builder&gt; {
+        @CopyOnWrite
+<span class="nc" id="L394">        private volatile MavenInstallation[] installations = new MavenInstallation[0];</span>
+
+<span class="nc" id="L396">        public DescriptorImpl() {</span>
+<span class="nc" id="L397">            DESCRIPTOR = this;</span>
+<span class="nc" id="L398">            load();</span>
+<span class="nc" id="L399">        }</span>
+
+        public boolean isApplicable(Class&lt;? extends AbstractProject&gt; jobType) {
+<span class="nc" id="L402">            return true;</span>
+        }
+
+        @Override
+        public String getHelpFile(String fieldName) {
+<span class="nc bnc" id="L407" title="All 4 branches missed.">            if (fieldName != null &amp;&amp; fieldName.equals(&quot;globalSettings&quot;)) fieldName = &quot;settings&quot;; // same help file</span>
+<span class="nc" id="L408">            return super.getHelpFile(fieldName);</span>
+        }
+
+        public String getDisplayName() {
+<span class="nc" id="L412">            return Messages.Maven_DisplayName();</span>
+        }
+        
+        public GlobalSettingsProvider getDefaultGlobalSettingsProvider() {
+<span class="nc" id="L416">            return GlobalMavenConfig.get().getGlobalSettingsProvider();</span>
+        }
+        
+        public SettingsProvider getDefaultSettingsProvider() {
+<span class="nc" id="L420">            return GlobalMavenConfig.get().getSettingsProvider();</span>
+        }
+
+        public MavenInstallation[] getInstallations() {
+<span class="nc" id="L424">            return installations;</span>
+        }
+
+		public void setInstallations(MavenInstallation... installations) {
+<span class="nc" id="L428">			List&lt;MavenInstallation&gt; tmpList = new ArrayList&lt;Maven.MavenInstallation&gt;();</span>
+			// remote empty Maven installation : 
+<span class="nc bnc" id="L430" title="All 2 branches missed.">			if(installations != null) {</span>
+<span class="nc" id="L431">				Collections.addAll(tmpList, installations);</span>
+<span class="nc bnc" id="L432" title="All 2 branches missed.">				for(MavenInstallation installation : installations) {</span>
+<span class="nc bnc" id="L433" title="All 2 branches missed.">					if(Util.fixEmptyAndTrim(installation.getName()) == null) {</span>
+<span class="nc" id="L434">						tmpList.remove(installation);</span>
+					}
+				}
+			}
+<span class="nc" id="L438">            this.installations = tmpList.toArray(new MavenInstallation[tmpList.size()]);</span>
+<span class="nc" id="L439">            save();</span>
+<span class="nc" id="L440">        }</span>
+
+        @Override
+        public Builder newInstance(StaplerRequest req, JSONObject formData) throws FormException {
+<span class="nc" id="L444">            return req.bindJSON(Maven.class,formData);</span>
+        }
+    }
+
+    /**
+     * Represents a Maven installation in a system.
+     */
+    public static final class MavenInstallation extends ToolInstallation implements EnvironmentSpecific&lt;MavenInstallation&gt;, NodeSpecific&lt;MavenInstallation&gt; {
+        /**
+         * Constants for describing Maven versions for comparison.
+         */
+        public static final int MAVEN_20 = 0;
+        public static final int MAVEN_21 = 1;
+        public static final int MAVEN_30 = 2;
+        
+    
+        /**
+         * @deprecated since 2009-02-25.
+         */
+        @Deprecated // kept for backward compatibility - use getHome()
+        private transient String mavenHome;
+
+        /**
+         * @deprecated as of 1.308.
+         *      Use {@link #Maven.MavenInstallation(String, String, List)}
+         */
+        @Deprecated
+        public MavenInstallation(String name, String home) {
+<span class="nc" id="L472">            super(name, home);</span>
+<span class="nc" id="L473">        }</span>
+
+        @DataBoundConstructor
+        public MavenInstallation(String name, String home, List&lt;? extends ToolProperty&lt;?&gt;&gt; properties) {
+<span class="nc" id="L477">            super(Util.fixEmptyAndTrim(name), Util.fixEmptyAndTrim(home), properties);</span>
+<span class="nc" id="L478">        }</span>
+
+        /**
+         * install directory.
+         *
+         * @deprecated as of 1.308. Use {@link #getHome()}.
+         */
+        @Deprecated
+        public String getMavenHome() {
+<span class="nc" id="L487">            return getHome();</span>
+        }
+
+        public File getHomeDir() {
+<span class="nc" id="L491">            return new File(getHome());</span>
+        }
+
+        @Override
+        public void buildEnvVars(EnvVars env) {
+<span class="nc" id="L496">            String home = getHome();</span>
+<span class="nc bnc" id="L497" title="All 2 branches missed.">            if (home == null) {</span>
+<span class="nc" id="L498">                return;</span>
+            }
+<span class="nc" id="L500">            env.put(&quot;M2_HOME&quot;, home);</span>
+<span class="nc" id="L501">            env.put(&quot;MAVEN_HOME&quot;, home);</span>
+<span class="nc" id="L502">            env.put(&quot;PATH+MAVEN&quot;, home + &quot;/bin&quot;);</span>
+<span class="nc" id="L503">        }</span>
+
+        /**
+         * Compares the version of this Maven installation to the minimum required version specified.
+         *
+         * @param launcher
+         *      Represents the node on which we evaluate the path.
+         * @param mavenReqVersion
+         *      Represents the minimum required Maven version - constants defined above.
+         */
+        public boolean meetsMavenReqVersion(Launcher launcher, int mavenReqVersion) throws IOException, InterruptedException {
+            // FIXME using similar stuff as in the maven plugin could be better 
+            // olamy : but will add a dependency on maven in core -&gt; so not so good 
+<span class="nc" id="L516">            String mavenVersion = launcher.getChannel().call(new MasterToSlaveCallable&lt;String,IOException&gt;() {</span>
+                    private static final long serialVersionUID = -4143159957567745621L;
+
+                    public String call() throws IOException {
+<span class="nc" id="L520">                        File[] jars = new File(getHomeDir(),&quot;lib&quot;).listFiles();</span>
+<span class="nc bnc" id="L521" title="All 2 branches missed.">                        if(jars!=null) { // be defensive</span>
+<span class="nc bnc" id="L522" title="All 2 branches missed.">                            for (File jar : jars) {</span>
+<span class="nc bnc" id="L523" title="All 2 branches missed.">                                if (jar.getName().startsWith(&quot;maven-&quot;)) {</span>
+<span class="nc" id="L524">                                    JarFile jf = null;</span>
+                                    try {
+<span class="nc" id="L526">                                        jf = new JarFile(jar);</span>
+<span class="nc" id="L527">                                        Manifest manifest = jf.getManifest();</span>
+<span class="nc" id="L528">                                        String version = manifest.getMainAttributes().getValue(Attributes.Name.IMPLEMENTATION_VERSION);</span>
+<span class="nc bnc" id="L529" title="All 2 branches missed.">                                        if(version != null) return version;</span>
+<span class="nc" id="L530">                                    } finally {</span>
+<span class="nc bnc" id="L531" title="All 6 branches missed.">                                        if(jf != null) jf.close();</span>
+<span class="nc" id="L532">                                    }</span>
+                                }
+                            }
+                        }
+<span class="nc" id="L536">                        return &quot;&quot;;</span>
+                    }
+                });
+
+<span class="nc bnc" id="L540" title="All 2 branches missed.">            if (!mavenVersion.equals(&quot;&quot;)) {</span>
+<span class="nc bnc" id="L541" title="All 2 branches missed.">                if (mavenReqVersion == MAVEN_20) {</span>
+<span class="nc bnc" id="L542" title="All 2 branches missed.">                    if(mavenVersion.startsWith(&quot;2.&quot;))</span>
+<span class="nc" id="L543">                        return true;</span>
+                }
+<span class="nc bnc" id="L545" title="All 2 branches missed.">                else if (mavenReqVersion == MAVEN_21) {</span>
+<span class="nc bnc" id="L546" title="All 4 branches missed.">                    if(mavenVersion.startsWith(&quot;2.&quot;) &amp;&amp; !mavenVersion.startsWith(&quot;2.0&quot;))</span>
+<span class="nc" id="L547">                        return true;</span>
+                }
+<span class="nc bnc" id="L549" title="All 2 branches missed.">                else if (mavenReqVersion == MAVEN_30) {</span>
+<span class="nc bnc" id="L550" title="All 2 branches missed.">                    if(mavenVersion.startsWith(&quot;3.&quot;))</span>
+<span class="nc" id="L551">                        return true;</span>
+                }                
+            }
+<span class="nc" id="L554">            return false;</span>
+            
+        }
+        
+        /**
+         * Is this Maven 2.1.x or 2.2.x - but not Maven 3.x?
+         *
+         * @param launcher
+         *      Represents the node on which we evaluate the path.
+         */
+        public boolean isMaven2_1(Launcher launcher) throws IOException, InterruptedException {
+<span class="nc" id="L565">            return meetsMavenReqVersion(launcher, MAVEN_21);</span>
+        }
+
+        /**
+         * Gets the executable path of this maven on the given target system.
+         */
+        public String getExecutable(Launcher launcher) throws IOException, InterruptedException {
+<span class="nc" id="L572">            return launcher.getChannel().call(new MasterToSlaveCallable&lt;String,IOException&gt;() {</span>
+                private static final long serialVersionUID = 2373163112639943768L;
+
+                public String call() throws IOException {
+<span class="nc" id="L576">                    File exe = getExeFile(&quot;mvn&quot;);</span>
+<span class="nc bnc" id="L577" title="All 2 branches missed.">                    if(exe.exists())</span>
+<span class="nc" id="L578">                        return exe.getPath();</span>
+<span class="nc" id="L579">                    exe = getExeFile(&quot;maven&quot;);</span>
+<span class="nc bnc" id="L580" title="All 2 branches missed.">                    if(exe.exists())</span>
+<span class="nc" id="L581">                        return exe.getPath();</span>
+<span class="nc" id="L582">                    return null;</span>
+                }
+            });
+        }
+
+        private File getExeFile(String execName) {
+<span class="nc" id="L588">            String m2Home = Util.replaceMacro(getHome(),EnvVars.masterEnvVars);</span>
+
+<span class="nc bnc" id="L590" title="All 2 branches missed.">            if(Functions.isWindows()) {</span>
+<span class="nc" id="L591">                File exeFile = new File(m2Home, &quot;bin/&quot; + execName + &quot;.bat&quot;);</span>
+
+                // since Maven 3.3 .bat files are replaced with .cmd
+<span class="nc bnc" id="L594" title="All 2 branches missed.">                if (!exeFile.exists()) {</span>
+<span class="nc" id="L595">                    return new File(m2Home, &quot;bin/&quot; + execName + &quot;.cmd&quot;);</span>
+                }
+
+<span class="nc" id="L598">                return exeFile;</span>
+            } else {
+<span class="nc" id="L600">                return new File(m2Home, &quot;bin/&quot; + execName);</span>
+            }
+        }
+
+        /**
+         * Returns true if the executable exists.
+         */
+        public boolean getExists() {
+            try {
+<span class="nc bnc" id="L609" title="All 2 branches missed.">                return getExecutable(new LocalLauncher(new StreamTaskListener(new NullStream())))!=null;</span>
+<span class="nc" id="L610">            } catch (IOException e) {</span>
+<span class="nc" id="L611">                return false;</span>
+<span class="nc" id="L612">            } catch (InterruptedException e) {</span>
+<span class="nc" id="L613">                return false;</span>
+            }
+        }
+
+        private static final long serialVersionUID = 1L;
+
+        public MavenInstallation forEnvironment(EnvVars environment) {
+<span class="nc" id="L620">            return new MavenInstallation(getName(), environment.expand(getHome()), getProperties().toList());</span>
+        }
+
+        public MavenInstallation forNode(Node node, TaskListener log) throws IOException, InterruptedException {
+<span class="nc" id="L624">            return new MavenInstallation(getName(), translateFor(node, log), getProperties().toList());</span>
+        }
+
+        @Extension
+<span class="nc" id="L628">        public static class DescriptorImpl extends ToolDescriptor&lt;MavenInstallation&gt; {</span>
+            @Override
+            public String getDisplayName() {
+<span class="nc" id="L631">                return &quot;Maven&quot;;</span>
+            }
+
+            @Override
+            public List&lt;? extends ToolInstaller&gt; getDefaultInstallers() {
+<span class="nc" id="L636">                return Collections.singletonList(new MavenInstaller(null));</span>
+            }
+
+            // overriding them for backward compatibility.
+            // newer code need not do this
+            @Override
+            public MavenInstallation[] getInstallations() {
+<span class="nc" id="L643">                return Jenkins.getInstance().getDescriptorByType(Maven.DescriptorImpl.class).getInstallations();</span>
+            }
+
+            // overriding them for backward compatibility.
+            // newer code need not do this
+            @Override
+            public void setInstallations(MavenInstallation... installations) {
+<span class="nc" id="L650">                Jenkins.getInstance().getDescriptorByType(Maven.DescriptorImpl.class).setInstallations(installations);</span>
+<span class="nc" id="L651">            }</span>
+
+            /**
+             * Checks if the MAVEN_HOME is valid.
+             */
+            @Override protected FormValidation checkHomeDirectory(File value) {
+<span class="nc" id="L657">                File maven1File = new File(value,MAVEN_1_INSTALLATION_COMMON_FILE);</span>
+<span class="nc" id="L658">                File maven2File = new File(value,MAVEN_2_INSTALLATION_COMMON_FILE);</span>
+
+<span class="nc bnc" id="L660" title="All 4 branches missed.">                if(!maven1File.exists() &amp;&amp; !maven2File.exists())</span>
+<span class="nc" id="L661">                    return FormValidation.error(Messages.Maven_NotMavenDirectory(value));</span>
+
+<span class="nc" id="L663">                return FormValidation.ok();</span>
+            }
+
+        }
+
+        public static class ConverterImpl extends ToolConverter {
+<span class="nc" id="L669">            public ConverterImpl(XStream2 xstream) { super(xstream); }</span>
+            @Override protected String oldHomeField(ToolInstallation obj) {
+<span class="nc" id="L671">                return ((MavenInstallation)obj).mavenHome;</span>
+            }
+        }
+    }
+
+    /**
+     * Automatic Maven installer from apache.org.
+     */
+    public static class MavenInstaller extends DownloadFromUrlInstaller {
+        @DataBoundConstructor
+        public MavenInstaller(String id) {
+<span class="nc" id="L682">            super(id);</span>
+<span class="nc" id="L683">        }</span>
+
+        @Extension
+<span class="nc" id="L686">        public static final class DescriptorImpl extends DownloadFromUrlInstaller.DescriptorImpl&lt;MavenInstaller&gt; {</span>
+            public String getDisplayName() {
+<span class="nc" id="L688">                return Messages.InstallFromApache();</span>
+            }
+
+            @Override
+            public boolean isApplicable(Class&lt;? extends ToolInstallation&gt; toolType) {
+<span class="nc bnc" id="L693" title="All 2 branches missed.">                return toolType==MavenInstallation.class;</span>
+            }
+        }
+    }
+
+    /**
+     * Optional interface that can be implemented by {@link AbstractProject}
+     * that has &quot;contextual&quot; {@link MavenInstallation} associated with it.
+     *
+     * &lt;p&gt;
+     * Code like RedeployPublisher uses this interface in an attempt
+     * to use the consistent Maven installation attached to the project.
+     *
+     * @since 1.235
+     */
+    public interface ProjectWithMaven {
+        /**
+         * Gets the {@link MavenInstallation} associated with the project.
+         * Can be null.
+         *
+         * &lt;p&gt;
+         * If the Maven installation can not be uniquely determined,
+         * it's often better to return just one of them, rather than returning
+         * null, since this method is currently ultimately only used to
+         * decide where to parse &lt;tt&gt;conf/settings.xml&lt;/tt&gt; from.
+         */
+        MavenInstallation inferMavenInstallation();
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

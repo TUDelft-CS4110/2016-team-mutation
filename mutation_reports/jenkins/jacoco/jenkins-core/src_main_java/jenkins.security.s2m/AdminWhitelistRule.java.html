@@ -1,0 +1,230 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>AdminWhitelistRule.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">jenkins.security.s2m</a> &gt; <span class="el_source">AdminWhitelistRule.java</span></div><h1>AdminWhitelistRule.java</h1><pre class="source lang-java linenums">package jenkins.security.s2m;
+
+import hudson.Extension;
+import hudson.FilePath;
+import hudson.Functions;
+import hudson.Util;
+import hudson.util.HttpResponses;
+import jenkins.model.Jenkins;
+import jenkins.util.io.FileBoolean;
+import org.apache.commons.io.FileUtils;
+import org.jenkinsci.remoting.Role;
+import org.jenkinsci.remoting.RoleSensitive;
+import org.kohsuke.stapler.HttpResponse;
+import org.kohsuke.stapler.QueryParameter;
+import org.kohsuke.stapler.StaplerProxy;
+import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.interceptor.RequirePOST;
+
+import java.io.BufferedReader;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.PrintStream;
+import java.util.Collection;
+import java.util.Enumeration;
+import java.util.logging.Logger;
+
+import static java.util.logging.Level.*;
+
+/**
+ * Rules of whitelisting for {@link RoleSensitive} objects and {@link FilePath}s.
+ *
+ * @author Kohsuke Kawaguchi
+ */
+@Extension
+public class AdminWhitelistRule implements StaplerProxy {
+    /**
+     * Ones that we rejected but want to run by admins.
+     */
+    public final CallableRejectionConfig rejected;
+
+    /**
+     * Callables that admins have whitelisted explicitly.
+     */
+    public final CallableWhitelistConfig whitelisted;
+
+    /**
+     * FilePath access pattern rules specified by the admin
+     */
+    public final FilePathRuleConfig filePathRules;
+
+    private final Jenkins jenkins;
+
+    private boolean masterKillSwitch;
+
+<span class="nc" id="L59">    public AdminWhitelistRule() throws IOException, InterruptedException {</span>
+<span class="nc" id="L60">        this.jenkins = Jenkins.getInstance();</span>
+
+        // while this file is not a secret, write access to this file is dangerous,
+        // so put this in the better-protected part of $JENKINS_HOME, which is in secrets/
+
+        // overwrite 30-default.conf with what we think is the best from the core.
+        // this file shouldn't be touched by anyone. For local customization, use other files in the conf dir.
+        // 0-byte file is used as a signal from the admin to prevent this overwriting
+<span class="nc" id="L68">        placeDefaultRule(</span>
+<span class="nc" id="L69">                new File(jenkins.getRootDir(), &quot;secrets/whitelisted-callables.d/default.conf&quot;),</span>
+<span class="nc" id="L70">                getClass().getResourceAsStream(&quot;callable.conf&quot;));</span>
+<span class="nc" id="L71">        placeDefaultRule(</span>
+<span class="nc" id="L72">                new File(jenkins.getRootDir(), &quot;secrets/filepath-filters.d/30-default.conf&quot;),</span>
+<span class="nc" id="L73">                transformForWindows(getClass().getResourceAsStream(&quot;filepath-filter.conf&quot;)));</span>
+
+<span class="nc" id="L75">        this.whitelisted = new CallableWhitelistConfig(</span>
+<span class="nc" id="L76">                new File(jenkins.getRootDir(),&quot;secrets/whitelisted-callables.d/gui.conf&quot;));</span>
+<span class="nc" id="L77">        this.rejected = new CallableRejectionConfig(</span>
+<span class="nc" id="L78">                new File(jenkins.getRootDir(),&quot;secrets/rejected-callables.txt&quot;),</span>
+<span class="nc" id="L79">                whitelisted);</span>
+<span class="nc" id="L80">        this.filePathRules = new FilePathRuleConfig(</span>
+<span class="nc" id="L81">                new File(jenkins.getRootDir(),&quot;secrets/filepath-filters.d/50-gui.conf&quot;));</span>
+<span class="nc" id="L82">        this.masterKillSwitch = loadMasterKillSwitchFile();</span>
+<span class="nc" id="L83">    }</span>
+
+    /**
+     * Reads the master kill switch.
+     *
+     * Instead of {@link FileBoolean}, we use a text file so that the admin can prevent Jenkins from
+     * writing this to file.
+     */
+    private boolean loadMasterKillSwitchFile() {
+<span class="nc" id="L92">        File f = getMasterKillSwitchFile();</span>
+        try {
+<span class="nc bnc" id="L94" title="All 2 branches missed.">            if (!f.exists())    return true;</span>
+<span class="nc" id="L95">            return Boolean.parseBoolean(FileUtils.readFileToString(f).trim());</span>
+<span class="nc" id="L96">        } catch (IOException e) {</span>
+<span class="nc" id="L97">            LOGGER.log(WARNING, &quot;Failed to read &quot;+f, e);</span>
+<span class="nc" id="L98">            return false;</span>
+        }
+    }
+
+    private File getMasterKillSwitchFile() {
+<span class="nc" id="L103">        return new File(jenkins.getRootDir(),&quot;secrets/slave-to-master-security-kill-switch&quot;);</span>
+    }
+
+    /**
+     * Transform path for Windows.
+     */
+    private InputStream transformForWindows(InputStream src) throws IOException {
+<span class="nc" id="L110">        BufferedReader r = new BufferedReader(new InputStreamReader(src));</span>
+<span class="nc" id="L111">        ByteArrayOutputStream out = new ByteArrayOutputStream();</span>
+<span class="nc" id="L112">        PrintStream p = new PrintStream(out);</span>
+        String line;
+<span class="nc bnc" id="L114" title="All 2 branches missed.">        while ((line=r.readLine())!=null) {</span>
+<span class="nc bnc" id="L115" title="All 4 branches missed.">            if (!line.startsWith(&quot;#&quot;) &amp;&amp; Functions.isWindows())</span>
+<span class="nc" id="L116">                line = line.replace(&quot;/&quot;,&quot;\\\\&quot;);</span>
+<span class="nc" id="L117">            p.println(line);</span>
+        }
+<span class="nc" id="L119">        p.close();</span>
+<span class="nc" id="L120">        return new ByteArrayInputStream(out.toByteArray());</span>
+    }
+
+    private void placeDefaultRule(File f, InputStream src) throws IOException, InterruptedException {
+        try {
+<span class="nc" id="L125">            new FilePath(f).copyFrom(src);</span>
+<span class="nc" id="L126">        } catch (IOException e) {</span>
+            // we allow admins to create a read-only file here to block overwrite,
+            // so this can fail legitimately
+<span class="nc bnc" id="L129" title="All 2 branches missed.">            if (!f.canWrite())  return;</span>
+<span class="nc" id="L130">            LOGGER.log(WARNING, &quot;Failed to generate &quot;+f,e);</span>
+        }
+<span class="nc" id="L132">    }</span>
+
+    public boolean isWhitelisted(RoleSensitive subject, Collection&lt;Role&gt; expected, Object context) {
+<span class="nc bnc" id="L135" title="All 2 branches missed.">        if (masterKillSwitch)</span>
+<span class="nc" id="L136">            return true;    // master kill switch is on. subsystem deactivated</span>
+
+<span class="nc" id="L138">        String name = subject.getClass().getName();</span>
+
+<span class="nc bnc" id="L140" title="All 2 branches missed.">        if (whitelisted.contains(name))</span>
+<span class="nc" id="L141">            return true;    // whitelisted by admin</span>
+
+        // otherwise record the problem and refuse to execute that
+<span class="nc" id="L144">        rejected.report(subject.getClass());</span>
+<span class="nc" id="L145">        return false;</span>
+    }
+
+    public boolean checkFileAccess(String op, File f) {
+        // if the master kill switch is off, we allow everything
+<span class="nc bnc" id="L150" title="All 2 branches missed.">        if (masterKillSwitch)</span>
+<span class="nc" id="L151">            return true;</span>
+
+<span class="nc" id="L153">        return filePathRules.checkFileAccess(op, f);</span>
+    }
+
+    @RequirePOST
+    public HttpResponse doSubmit(StaplerRequest req) throws IOException {
+<span class="nc" id="L158">        jenkins.checkPermission(Jenkins.RUN_SCRIPTS);</span>
+
+<span class="nc" id="L160">        String whitelist = Util.fixNull(req.getParameter(&quot;whitelist&quot;));</span>
+<span class="nc bnc" id="L161" title="All 2 branches missed.">        if (!whitelist.endsWith(&quot;\n&quot;))</span>
+<span class="nc" id="L162">            whitelist+=&quot;\n&quot;;</span>
+
+<span class="nc" id="L164">        Enumeration e = req.getParameterNames();</span>
+<span class="nc bnc" id="L165" title="All 2 branches missed.">        while (e.hasMoreElements()) {</span>
+<span class="nc" id="L166">            String name = (String) e.nextElement();</span>
+<span class="nc bnc" id="L167" title="All 2 branches missed.">            if (name.startsWith(&quot;class:&quot;)) {</span>
+<span class="nc" id="L168">                whitelist += name.substring(6)+&quot;\n&quot;;</span>
+            }
+        }
+
+<span class="nc" id="L172">        whitelisted.set(whitelist);</span>
+
+<span class="nc" id="L174">        String newRules = Util.fixNull(req.getParameter(&quot;filePathRules&quot;));</span>
+<span class="nc" id="L175">        filePathRules.parseTest(newRules);  // test first before writing a potentially broken rules</span>
+<span class="nc" id="L176">        filePathRules.set(newRules);</span>
+
+<span class="nc" id="L178">        return HttpResponses.redirectToDot();</span>
+    }
+
+    /**
+     * Approves all the currently rejected subjects
+     */
+    @RequirePOST
+    public HttpResponse doApproveAll() throws IOException {
+<span class="nc" id="L186">        StringBuilder buf = new StringBuilder();</span>
+<span class="nc bnc" id="L187" title="All 2 branches missed.">        for (Class c : rejected.get()) {</span>
+<span class="nc" id="L188">            buf.append(c.getName()).append('\n');</span>
+        }
+<span class="nc" id="L190">        whitelisted.append(buf.toString());</span>
+
+<span class="nc" id="L192">        return HttpResponses.ok();</span>
+    }
+
+    /**
+     * Approves specific callables by their names.
+     */
+    @RequirePOST
+    public HttpResponse doApprove(@QueryParameter String value) throws IOException {
+<span class="nc" id="L200">        whitelisted.append(value);</span>
+<span class="nc" id="L201">        return HttpResponses.ok();</span>
+    }
+
+    public boolean getMasterKillSwitch() {
+<span class="nc" id="L205">        return masterKillSwitch;</span>
+    }
+
+    public void setMasterKillSwitch(boolean state) {
+        try {
+<span class="nc" id="L210">            jenkins.checkPermission(Jenkins.RUN_SCRIPTS);</span>
+<span class="nc" id="L211">            FileUtils.writeStringToFile(getMasterKillSwitchFile(),Boolean.toString(state));</span>
+            // treat the file as the canonical source of information in case write fails
+<span class="nc" id="L213">            masterKillSwitch = loadMasterKillSwitchFile();</span>
+<span class="nc" id="L214">        } catch (IOException e) {</span>
+<span class="nc" id="L215">            LOGGER.log(WARNING, &quot;Failed to write master kill switch&quot;, e);</span>
+        }
+<span class="nc" id="L217">    }</span>
+
+    /**
+     * Restricts the access to administrator.
+     */
+    @Override
+    public Object getTarget() {
+<span class="nc" id="L224">        jenkins.checkPermission(Jenkins.RUN_SCRIPTS);</span>
+<span class="nc" id="L225">        return this;</span>
+    }
+
+<span class="nc" id="L228">    private static final Logger LOGGER = Logger.getLogger(AdminWhitelistRule.class.getName());</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

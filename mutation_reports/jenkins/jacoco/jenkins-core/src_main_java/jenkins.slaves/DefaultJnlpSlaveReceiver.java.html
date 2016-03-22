@@ -1,0 +1,112 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>DefaultJnlpSlaveReceiver.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">jenkins.slaves</a> &gt; <span class="el_source">DefaultJnlpSlaveReceiver.java</span></div><h1>DefaultJnlpSlaveReceiver.java</h1><pre class="source lang-java linenums">package jenkins.slaves;
+
+import hudson.Extension;
+import hudson.TcpSlaveAgentListener.ConnectionFromCurrentPeer;
+import hudson.Util;
+import hudson.model.Slave;
+import hudson.remoting.Channel;
+import hudson.slaves.SlaveComputer;
+import jenkins.model.Jenkins;
+
+import java.io.IOException;
+import java.security.SecureRandom;
+import java.util.Properties;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+/**
+ * Match the name against the slave name and route the incoming JNLP agent as {@link Slave}.
+ *
+ * @author Kohsuke Kawaguchi
+ * @since 1.561  
+ * @since 1.614 handle() returns true on handshake error as it required in JnlpAgentReceiver.
+ */
+@Extension
+<span class="nc" id="L28">public class DefaultJnlpSlaveReceiver extends JnlpAgentReceiver {</span>
+    @Override
+    public boolean handle(String nodeName, JnlpSlaveHandshake handshake) throws IOException, InterruptedException {
+<span class="nc" id="L31">        SlaveComputer computer = (SlaveComputer) Jenkins.getInstance().getComputer(nodeName);</span>
+
+<span class="nc bnc" id="L33" title="All 2 branches missed.">        if (computer==null) {</span>
+<span class="nc" id="L34">            return false;</span>
+        }
+
+<span class="nc" id="L37">        Channel ch = computer.getChannel();</span>
+<span class="nc bnc" id="L38" title="All 2 branches missed.">        if (ch !=null) {</span>
+<span class="nc" id="L39">            String c = handshake.getRequestProperty(&quot;Cookie&quot;);</span>
+<span class="nc bnc" id="L40" title="All 4 branches missed.">            if (c!=null &amp;&amp; c.equals(ch.getProperty(COOKIE_NAME))) {</span>
+                // we think we are currently connected, but this request proves that it's from the party
+                // we are supposed to be communicating to. so let the current one get disconnected
+<span class="nc" id="L43">                LOGGER.info(&quot;Disconnecting &quot;+nodeName+&quot; as we are reconnected from the current peer&quot;);</span>
+                try {
+<span class="nc" id="L45">                    computer.disconnect(new ConnectionFromCurrentPeer()).get(15, TimeUnit.SECONDS);</span>
+<span class="nc" id="L46">                } catch (ExecutionException e) {</span>
+<span class="nc" id="L47">                    throw new IOException(&quot;Failed to disconnect the current client&quot;,e);</span>
+<span class="nc" id="L48">                } catch (TimeoutException e) {</span>
+<span class="nc" id="L49">                    throw new IOException(&quot;Failed to disconnect the current client&quot;,e);</span>
+                }
+            } else {
+<span class="nc" id="L52">                handshake.error(nodeName + &quot; is already connected to this master. Rejecting this connection.&quot;);</span>
+<span class="nc" id="L53">                return true;</span>
+            }
+        }
+
+<span class="nc bnc" id="L57" title="All 2 branches missed.">        if (!matchesSecret(nodeName,handshake)) {</span>
+<span class="nc" id="L58">            handshake.error(nodeName + &quot; can't be connected since the slave's secret does not match the handshake secret.&quot;);</span>
+<span class="nc" id="L59">            return true;</span>
+        }
+
+<span class="nc" id="L62">        Properties response = new Properties();</span>
+<span class="nc" id="L63">        String cookie = generateCookie();</span>
+<span class="nc" id="L64">        response.put(&quot;Cookie&quot;,cookie);</span>
+<span class="nc" id="L65">        handshake.success(response);</span>
+
+        // this cast is leaking abstraction
+<span class="nc" id="L68">        JnlpSlaveAgentProtocol2.Handler handler = (JnlpSlaveAgentProtocol2.Handler)handshake;</span>
+
+<span class="nc" id="L70">        ch = handler.jnlpConnect(computer);</span>
+
+<span class="nc" id="L72">        ch.setProperty(COOKIE_NAME, cookie);</span>
+
+<span class="nc" id="L74">        return true;</span>
+    }
+    
+    /**
+     * Called after the client has connected to check if the slave secret matches the handshake secret
+     *
+     * @param nodeName
+     * Name of the incoming JNLP agent. All {@link JnlpAgentReceiver} shares a single namespace
+     * of names. The implementation needs to be able to tell which name belongs to them.
+     *
+     * @param handshake
+     * Encapsulation of the interaction with the incoming JNLP agent.
+     *
+     * @return
+     * true if the slave secret matches the handshake secret, false otherwise.
+     */
+    private boolean matchesSecret(String nodeName, JnlpSlaveHandshake handshake){
+<span class="nc" id="L91">        SlaveComputer computer = (SlaveComputer) Jenkins.getInstance().getComputer(nodeName);</span>
+<span class="nc" id="L92">        String handshakeSecret = handshake.getRequestProperty(&quot;Secret-Key&quot;);</span>
+        // Verify that the slave secret matches the handshake secret.
+<span class="nc bnc" id="L94" title="All 2 branches missed.">        if (!computer.getJnlpMac().equals(handshakeSecret)) {</span>
+<span class="nc bnc" id="L95" title="All 2 branches missed.">            LOGGER.log(Level.WARNING, &quot;An attempt was made to connect as {0} from {1} with an incorrect secret&quot;, new Object[]{nodeName, handshake.getSocket()!=null?handshake.getSocket().getRemoteSocketAddress():null});</span>
+<span class="nc" id="L96">            return false;</span>
+        } else {
+<span class="nc" id="L98">            return true;</span>
+        }
+    }
+
+    private String generateCookie() {
+<span class="nc" id="L103">        byte[] cookie = new byte[32];</span>
+<span class="nc" id="L104">        new SecureRandom().nextBytes(cookie);</span>
+<span class="nc" id="L105">        return Util.toHexString(cookie);</span>
+    }
+
+<span class="nc" id="L108">    private static final Logger LOGGER = Logger.getLogger(DefaultJnlpSlaveReceiver.class.getName());</span>
+
+<span class="nc" id="L110">    private static final String COOKIE_NAME = JnlpSlaveAgentProtocol2.class.getName()+&quot;.cookie&quot;;</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

@@ -1,0 +1,144 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>WindowsServiceLifecycle.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.lifecycle</a> &gt; <span class="el_source">WindowsServiceLifecycle.java</span></div><h1>WindowsServiceLifecycle.java</h1><pre class="source lang-java linenums">/*
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc., Kohsuke Kawaguchi
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.lifecycle;
+
+import hudson.FilePath;
+import hudson.Launcher.LocalLauncher;
+import hudson.Util;
+import jenkins.model.Jenkins;
+import hudson.util.StreamTaskListener;
+import hudson.util.jna.Kernel32;
+import static hudson.util.jna.Kernel32.MOVEFILE_DELAY_UNTIL_REBOOT;
+import static hudson.util.jna.Kernel32.MOVEFILE_REPLACE_EXISTING;
+
+import org.apache.commons.io.FileUtils;
+import org.apache.commons.io.output.ByteArrayOutputStream;
+
+import java.io.File;
+import java.io.IOException;
+import java.io.FileWriter;
+import java.net.URL;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+/**
+ * {@link Lifecycle} for Hudson installed as Windows service.
+ * 
+ * @author Kohsuke Kawaguchi
+ * @see WindowsInstallerLink
+ */
+public class WindowsServiceLifecycle extends Lifecycle {
+<span class="nc" id="L52">    public WindowsServiceLifecycle() {</span>
+<span class="nc" id="L53">        updateJenkinsExeIfNeeded();</span>
+<span class="nc" id="L54">    }</span>
+
+    /**
+     * If &lt;tt&gt;jenkins.exe&lt;/tt&gt; is old compared to our copy,
+     * schedule an overwrite (except that since it's currently running,
+     * we can only do it when Jenkins restarts next time.)
+     */
+    private void updateJenkinsExeIfNeeded() {
+        try {
+<span class="nc" id="L63">            File rootDir = Jenkins.getInstance().getRootDir();</span>
+
+<span class="nc" id="L65">            URL exe = getClass().getResource(&quot;/windows-service/jenkins.exe&quot;);</span>
+<span class="nc" id="L66">            String ourCopy = Util.getDigestOf(exe.openStream());</span>
+
+<span class="nc bnc" id="L68" title="All 2 branches missed.">            for (String name : new String[]{&quot;hudson.exe&quot;,&quot;jenkins.exe&quot;}) {</span>
+                try {
+<span class="nc" id="L70">                    File currentCopy = new File(rootDir,name);</span>
+<span class="nc bnc" id="L71" title="All 2 branches missed.">                    if(!currentCopy.exists())   continue;</span>
+<span class="nc" id="L72">                    String curCopy = new FilePath(currentCopy).digest();</span>
+
+<span class="nc bnc" id="L74" title="All 2 branches missed.">                    if(ourCopy.equals(curCopy))     continue; // identical</span>
+
+<span class="nc" id="L76">                    File stage = new File(rootDir,name+&quot;.new&quot;);</span>
+<span class="nc" id="L77">                    FileUtils.copyURLToFile(exe,stage);</span>
+<span class="nc" id="L78">                    Kernel32.INSTANCE.MoveFileExA(stage.getAbsolutePath(),currentCopy.getAbsolutePath(),MOVEFILE_DELAY_UNTIL_REBOOT|MOVEFILE_REPLACE_EXISTING);</span>
+<span class="nc" id="L79">                    LOGGER.info(&quot;Scheduled a replacement of &quot;+name);</span>
+<span class="nc" id="L80">                } catch (IOException e) {</span>
+<span class="nc" id="L81">                    LOGGER.log(Level.SEVERE, &quot;Failed to replace &quot;+name,e);</span>
+<span class="nc" id="L82">                } catch (InterruptedException e) {</span>
+                }
+            }
+<span class="nc" id="L85">        } catch (IOException e) {</span>
+<span class="nc" id="L86">            LOGGER.log(Level.SEVERE, &quot;Failed to replace jenkins.exe&quot;,e);</span>
+        }
+<span class="nc" id="L88">    }</span>
+
+    /**
+     * On Windows, jenkins.war is locked, so we place a new version under a special name,
+     * which is picked up by the service wrapper upon restart.
+     */
+    @Override
+    public void rewriteHudsonWar(File by) throws IOException {
+<span class="nc" id="L96">        File dest = getHudsonWar();</span>
+        // this should be impossible given the canRewriteHudsonWar method,
+        // but let's be defensive
+<span class="nc bnc" id="L99" title="All 2 branches missed.">        if(dest==null)  throw new IOException(&quot;jenkins.war location is not known.&quot;);</span>
+
+        // backing up the old jenkins.war before its lost due to upgrading
+        // unless we are trying to rewrite jenkins.war by a backup itself
+<span class="nc" id="L103">        File bak = new File(dest.getPath() + &quot;.bak&quot;);</span>
+<span class="nc bnc" id="L104" title="All 2 branches missed.">        if (!by.equals(bak))</span>
+<span class="nc" id="L105">            FileUtils.copyFile(dest, bak);</span>
+
+<span class="nc" id="L107">        String baseName = dest.getName();</span>
+<span class="nc" id="L108">        baseName = baseName.substring(0,baseName.indexOf('.'));</span>
+
+<span class="nc" id="L110">        File rootDir = Jenkins.getInstance().getRootDir();</span>
+<span class="nc" id="L111">        File copyFiles = new File(rootDir,baseName+&quot;.copies&quot;);</span>
+
+<span class="nc" id="L113">        FileWriter w = new FileWriter(copyFiles, true);</span>
+        try {
+<span class="nc" id="L115">            w.write(by.getAbsolutePath()+'&gt;'+getHudsonWar().getAbsolutePath()+'\n');</span>
+<span class="nc" id="L116">        } finally {</span>
+<span class="nc" id="L117">            w.close();</span>
+<span class="nc" id="L118">        }</span>
+<span class="nc" id="L119">    }</span>
+
+    @Override
+    public void restart() throws IOException, InterruptedException {
+<span class="nc" id="L123">        File me = getHudsonWar();</span>
+<span class="nc" id="L124">        File home = me.getParentFile();</span>
+
+<span class="nc" id="L126">        ByteArrayOutputStream baos = new ByteArrayOutputStream();</span>
+<span class="nc" id="L127">        StreamTaskListener task = new StreamTaskListener(baos);</span>
+<span class="nc" id="L128">        task.getLogger().println(&quot;Restarting a service&quot;);</span>
+<span class="nc" id="L129">        String exe = System.getenv(&quot;WINSW_EXECUTABLE&quot;);</span>
+        File executable;
+<span class="nc bnc" id="L131" title="All 2 branches missed.">        if (exe!=null)   executable = new File(exe);</span>
+<span class="nc" id="L132">        else            executable = new File(home, &quot;hudson.exe&quot;);</span>
+<span class="nc bnc" id="L133" title="All 2 branches missed.">        if (!executable.exists())   executable = new File(home, &quot;jenkins.exe&quot;);</span>
+
+        // use restart! to run hudson/jenkins.exe restart in a separate process, so it doesn't kill itself
+<span class="nc" id="L136">        int r = new LocalLauncher(task).launch().cmds(executable, &quot;restart!&quot;)</span>
+<span class="nc" id="L137">                .stdout(task).pwd(home).join();</span>
+<span class="nc bnc" id="L138" title="All 2 branches missed.">        if(r!=0)</span>
+<span class="nc" id="L139">            throw new IOException(baos.toString());</span>
+<span class="nc" id="L140">    }</span>
+
+<span class="nc" id="L142">    private static final Logger LOGGER = Logger.getLogger(WindowsServiceLifecycle.class.getName());</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

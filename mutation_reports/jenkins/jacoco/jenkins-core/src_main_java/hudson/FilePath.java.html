@@ -1,0 +1,2907 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>FilePath.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson</a> &gt; <span class="el_source">FilePath.java</span></div><h1>FilePath.java</h1><pre class="source lang-java linenums"><span class="pc" id="L1">/*</span>
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2010, Sun Microsystems, Inc., Kohsuke Kawaguchi,
+ * Eric Lefevre-Ardant, Erik Ramfelt, Michael B. Donohue, Alan Harder,
+ * Manufacture Francaise des Pneumatiques Michelin, Romain Seguy
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson;
+
+import com.jcraft.jzlib.GZIPInputStream;
+import com.jcraft.jzlib.GZIPOutputStream;
+import hudson.Launcher.LocalLauncher;
+import hudson.Launcher.RemoteLauncher;
+import hudson.model.AbstractProject;
+import hudson.model.Computer;
+import hudson.model.Item;
+import hudson.model.TaskListener;
+import hudson.os.PosixAPI;
+import hudson.os.PosixException;
+import hudson.remoting.Callable;
+import hudson.remoting.Channel;
+import hudson.remoting.DelegatingCallable;
+import hudson.remoting.Future;
+import hudson.remoting.LocalChannel;
+import hudson.remoting.Pipe;
+import hudson.remoting.RemoteInputStream;
+import hudson.remoting.RemoteInputStream.Flag;
+import hudson.remoting.RemoteOutputStream;
+import hudson.remoting.VirtualChannel;
+import hudson.remoting.Which;
+import hudson.security.AccessControlled;
+import hudson.util.DaemonThreadFactory;
+import hudson.util.DirScanner;
+import hudson.util.ExceptionCatchingThreadFactory;
+import hudson.util.FileVisitor;
+import hudson.util.FormValidation;
+import hudson.util.HeadBufferingStream;
+import hudson.util.IOUtils;
+import hudson.util.NamingThreadFactory;
+import hudson.util.io.Archiver;
+import hudson.util.io.ArchiverFactory;
+import jenkins.FilePathFilter;
+import jenkins.MasterToSlaveFileCallable;
+import jenkins.SlaveToMasterFileCallable;
+import jenkins.SoloFilePathFilter;
+import jenkins.model.Jenkins;
+import jenkins.util.ContextResettingExecutorService;
+import jenkins.util.VirtualFile;
+import org.apache.commons.fileupload.FileItem;
+import org.apache.commons.io.input.CountingInputStream;
+import org.apache.tools.ant.DirectoryScanner;
+import org.apache.tools.ant.Project;
+import org.apache.tools.ant.types.FileSet;
+import org.apache.tools.zip.ZipEntry;
+import org.apache.tools.zip.ZipFile;
+import org.kohsuke.stapler.Stapler;
+
+import javax.annotation.CheckForNull;
+import java.io.BufferedOutputStream;
+import java.io.File;
+import java.io.FileFilter;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InterruptedIOException;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
+import java.io.OutputStream;
+import java.io.OutputStreamWriter;
+import java.io.RandomAccessFile;
+import java.io.Serializable;
+import java.io.Writer;
+import java.net.HttpURLConnection;
+import java.net.URI;
+import java.net.URL;
+import java.net.URLConnection;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.Enumeration;
+import java.util.List;
+import java.util.Map;
+import java.util.StringTokenizer;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import static hudson.FilePath.TarCompression.*;
+import static hudson.Util.*;
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+import jenkins.security.MasterToSlaveCallable;
+import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
+import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
+import org.jenkinsci.remoting.RoleChecker;
+import org.jenkinsci.remoting.RoleSensitive;
+        
+/**
+ * {@link File} like object with remoting support.
+ *
+ * &lt;p&gt;
+ * Unlike {@link File}, which always implies a file path on the current computer,
+ * {@link FilePath} represents a file path on a specific slave or the master.
+ *
+ * Despite that, {@link FilePath} can be used much like {@link File}. It exposes
+ * a bunch of operations (and we should add more operations as long as they are
+ * generally useful), and when invoked against a file on a remote node, {@link FilePath}
+ * executes the necessary code remotely, thereby providing semi-transparent file
+ * operations.
+ *
+ * &lt;h2&gt;Using {@link FilePath} smartly&lt;/h2&gt;
+ * &lt;p&gt;
+ * The transparency makes it easy to write plugins without worrying too much about
+ * remoting, by making it works like NFS, where remoting happens at the file-system
+ * layer.
+ *
+ * &lt;p&gt;
+ * But one should note that such use of remoting may not be optional. Sometimes,
+ * it makes more sense to move some computation closer to the data, as opposed to
+ * move the data to the computation. For example, if you are just computing a MD5
+ * digest of a file, then it would make sense to do the digest on the host where
+ * the file is located, as opposed to send the whole data to the master and do MD5
+ * digesting there.
+ *
+ * &lt;p&gt;
+ * {@link FilePath} supports this &quot;code migration&quot; by in the
+ * {@link #act(FileCallable)} method. One can pass in a custom implementation
+ * of {@link FileCallable}, to be executed on the node where the data is located.
+ * The following code shows the example:
+ *
+ * &lt;pre&gt;
+ * void someMethod(FilePath file) {
+ *     // make 'file' a fresh empty directory.
+ *     file.act(new Freshen());
+ * }
+ * // if 'file' is on a different node, this FileCallable will
+ * // be transferred to that node and executed there.
+ * private static final class Freshen implements FileCallable&amp;lt;Void&gt; {
+ *     private static final long serialVersionUID = 1;
+ *     &amp;#64;Override public Void invoke(File f, VirtualChannel channel) {
+ *         // f and file represent the same thing
+ *         f.deleteContents();
+ *         f.mkdirs();
+ *         return null;
+ *     }
+ * }
+ * &lt;/pre&gt;
+ *
+ * &lt;p&gt;
+ * When {@link FileCallable} is transferred to a remote node, it will be done so
+ * by using the same Java serialization scheme that the remoting module uses.
+ * See {@link Channel} for more about this. 
+ *
+ * &lt;p&gt;
+ * {@link FilePath} itself can be sent over to a remote node as a part of {@link Callable}
+ * serialization. For example, sending a {@link FilePath} of a remote node to that
+ * node causes {@link FilePath} to become &quot;local&quot;. Similarly, sending a
+ * {@link FilePath} that represents the local computer causes it to become &quot;remote.&quot;
+ *
+ * @author Kohsuke Kawaguchi
+ * @see VirtualFile
+ */
+<span class="pc bpc" id="L190" title="1 of 2 branches missed.">public final class FilePath implements Serializable {</span>
+    /**
+     * When this {@link FilePath} represents the remote path,
+     * this field is always non-null on master (the field represents
+     * the channel to the remote slave.) When transferred to a slave via remoting,
+     * this field reverts back to null, since it's transient.
+     *
+     * When this {@link FilePath} represents a path on the master,
+     * this field is null on master. When transferred to a slave via remoting,
+     * this field becomes non-null, representing the {@link Channel}
+     * back to the master.
+     *
+     * This is used to determine whether we are running on the master or the slave.
+     */
+    private transient VirtualChannel channel;
+
+    // since the platform of the slave might be different, can't use java.io.File
+    private final String remote;
+
+    /**
+     * If this {@link FilePath} is deserialized to handle file access request from a remote computer,
+     * this field is set to the filter that performs access control.
+     *
+     * &lt;p&gt;
+     * If null, no access control is needed.
+     *
+     * @see #filterNonNull()
+     */
+    private transient @Nullable
+    SoloFilePathFilter filter;
+
+    /**
+     * Creates a {@link FilePath} that represents a path on the given node.
+     *
+     * @param channel
+     *      To create a path that represents a remote path, pass in a {@link Channel}
+     *      that's connected to that machine. If null, that means the local file path.
+     */
+<span class="fc" id="L228">    public FilePath(VirtualChannel channel, String remote) {</span>
+<span class="pc bpc" id="L229" title="1 of 2 branches missed.">        this.channel = channel instanceof LocalChannel ? null : channel;</span>
+<span class="fc" id="L230">        this.remote = normalize(remote);</span>
+<span class="fc" id="L231">    }</span>
+
+    /**
+     * To create {@link FilePath} that represents a &quot;local&quot; path.
+     *
+     * &lt;p&gt;
+     * A &quot;local&quot; path means a file path on the computer where the
+     * constructor invocation happened.
+     */
+<span class="fc" id="L240">    public FilePath(File localPath) {</span>
+<span class="fc" id="L241">        this.channel = null;</span>
+<span class="fc" id="L242">        this.remote = normalize(localPath.getPath());</span>
+<span class="fc" id="L243">    }</span>
+
+    /**
+     * Construct a path starting with a base location.
+     * @param base starting point for resolution, and defines channel
+     * @param rel a path which if relative will be resolved against base
+     */
+<span class="fc" id="L250">    public FilePath(FilePath base, String rel) {</span>
+<span class="fc" id="L251">        this.channel = base.channel;</span>
+<span class="fc" id="L252">        this.remote = normalize(resolvePathIfRelative(base, rel));</span>
+<span class="fc" id="L253">    }</span>
+
+    private String resolvePathIfRelative(FilePath base, String rel) {
+<span class="pc bpc" id="L256" title="1 of 2 branches missed.">        if(isAbsolute(rel)) return rel;</span>
+<span class="fc bfc" id="L257" title="All 2 branches covered.">        if(base.isUnix()) {</span>
+            // shouldn't need this replace, but better safe than sorry
+<span class="fc" id="L259">            return base.remote+'/'+rel.replace('\\','/');</span>
+        } else {
+            // need this replace, see Slave.getWorkspaceFor and AbstractItem.getFullName, nested jobs on Windows
+            // slaves will always have a rel containing at least one '/' character. JENKINS-13649
+<span class="fc" id="L263">            return base.remote+'\\'+rel.replace('/','\\');</span>
+        }
+    }
+
+    /**
+     * Is the given path name an absolute path?
+     */
+    private static boolean isAbsolute(String rel) {
+<span class="pc bpc" id="L271" title="3 of 6 branches missed.">        return rel.startsWith(&quot;/&quot;) || DRIVE_PATTERN.matcher(rel).matches() || UNC_PATTERN.matcher(rel).matches();</span>
+    }
+
+<span class="fc" id="L274">    private static final Pattern DRIVE_PATTERN = Pattern.compile(&quot;[A-Za-z]:[\\\\/].*&quot;),</span>
+<span class="fc" id="L275">            UNC_PATTERN = Pattern.compile(&quot;^\\\\\\\\.*&quot;),</span>
+<span class="fc" id="L276">            ABSOLUTE_PREFIX_PATTERN = Pattern.compile(&quot;^(\\\\\\\\|(?:[A-Za-z]:)?[\\\\/])[\\\\/]*&quot;);</span>
+
+    /**
+     * {@link File#getParent()} etc cannot handle &quot;..&quot; and &quot;.&quot; in the path component very well,
+     * so remove them.
+     */
+    private static String normalize(String path) {
+<span class="fc" id="L283">        StringBuilder buf = new StringBuilder();</span>
+        // Check for prefix designating absolute path
+<span class="fc" id="L285">        Matcher m = ABSOLUTE_PREFIX_PATTERN.matcher(path);</span>
+<span class="fc bfc" id="L286" title="All 2 branches covered.">        if (m.find()) {</span>
+<span class="fc" id="L287">            buf.append(m.group(1));</span>
+<span class="fc" id="L288">            path = path.substring(m.end());</span>
+        }
+<span class="fc bfc" id="L290" title="All 2 branches covered.">        boolean isAbsolute = buf.length() &gt; 0;</span>
+        // Split remaining path into tokens, trimming any duplicate or trailing separators
+<span class="fc" id="L292">        List&lt;String&gt; tokens = new ArrayList&lt;String&gt;();</span>
+<span class="fc" id="L293">        int s = 0, end = path.length();</span>
+<span class="fc bfc" id="L294" title="All 2 branches covered.">        for (int i = 0; i &lt; end; i++) {</span>
+<span class="fc" id="L295">            char c = path.charAt(i);</span>
+<span class="fc bfc" id="L296" title="All 4 branches covered.">            if (c == '/' || c == '\\') {</span>
+<span class="fc" id="L297">                tokens.add(path.substring(s, i));</span>
+<span class="fc" id="L298">                s = i;</span>
+                // Skip any extra separator chars
+<span class="fc bfc" id="L300" title="All 6 branches covered.">                while (++i &lt; end &amp;&amp; ((c = path.charAt(i)) == '/' || c == '\\')) { }</span>
+                // Add token for separator unless we reached the end
+<span class="fc bfc" id="L302" title="All 2 branches covered.">                if (i &lt; end) tokens.add(path.substring(s, s+1));</span>
+<span class="fc" id="L303">                s = i;</span>
+            }
+        }
+<span class="fc bfc" id="L306" title="All 2 branches covered.">        if (s &lt; end) tokens.add(path.substring(s));</span>
+        // Look through tokens for &quot;.&quot; or &quot;..&quot;
+<span class="fc bfc" id="L308" title="All 2 branches covered.">        for (int i = 0; i &lt; tokens.size();) {</span>
+<span class="fc" id="L309">            String token = tokens.get(i);</span>
+<span class="fc bfc" id="L310" title="All 2 branches covered.">            if (token.equals(&quot;.&quot;)) {</span>
+<span class="fc" id="L311">                tokens.remove(i);</span>
+<span class="fc bfc" id="L312" title="All 2 branches covered.">                if (tokens.size() &gt; 0)</span>
+<span class="fc bfc" id="L313" title="All 2 branches covered.">                    tokens.remove(i &gt; 0 ? i - 1 : i);</span>
+<span class="fc bfc" id="L314" title="All 2 branches covered.">            } else if (token.equals(&quot;..&quot;)) {</span>
+<span class="fc bfc" id="L315" title="All 2 branches covered.">                if (i == 0) {</span>
+                    // If absolute path, just remove: /../something
+                    // If relative path, not collapsible so leave as-is
+<span class="fc" id="L318">                    tokens.remove(0);</span>
+<span class="pc bpc" id="L319" title="1 of 2 branches missed.">                    if (tokens.size() &gt; 0) token += tokens.remove(0);</span>
+<span class="fc bfc" id="L320" title="All 2 branches covered.">                    if (!isAbsolute) buf.append(token);</span>
+<span class="fc" id="L321">                } else {</span>
+                    // Normalize: remove something/.. plus separator before/after
+<span class="fc" id="L323">                    i -= 2;</span>
+<span class="fc bfc" id="L324" title="All 2 branches covered.">                    for (int j = 0; j &lt; 3; j++) tokens.remove(i);</span>
+<span class="fc bfc" id="L325" title="All 2 branches covered.">                    if (i &gt; 0) tokens.remove(i-1);</span>
+<span class="fc bfc" id="L326" title="All 2 branches covered.">                    else if (tokens.size() &gt; 0) tokens.remove(0);</span>
+                }
+<span class="fc" id="L328">            } else</span>
+<span class="fc" id="L329">                i += 2;</span>
+        }
+        // Recombine tokens
+<span class="fc bfc" id="L332" title="All 2 branches covered.">        for (String token : tokens) buf.append(token);</span>
+<span class="fc bfc" id="L333" title="All 2 branches covered.">        if (buf.length() == 0) buf.append('.');</span>
+<span class="fc" id="L334">        return buf.toString();</span>
+    }
+
+    /**
+     * Checks if the remote path is Unix.
+     */
+    boolean isUnix() {
+        // if the path represents a local path, there' no need to guess.
+<span class="fc bfc" id="L342" title="All 2 branches covered.">        if(!isRemote())</span>
+<span class="pc bpc" id="L343" title="1 of 2 branches missed.">            return File.pathSeparatorChar!=';';</span>
+            
+        // note that we can't use the usual File.pathSeparator and etc., as the OS of
+        // the machine where this code runs and the OS that this FilePath refers to may be different.
+
+        // Windows absolute path is 'X:\...', so this is usually a good indication of Windows path
+<span class="pc bpc" id="L349" title="2 of 6 branches missed.">        if(remote.length()&gt;3 &amp;&amp; remote.charAt(1)==':' &amp;&amp; remote.charAt(2)=='\\')</span>
+<span class="fc" id="L350">            return false;</span>
+        // Windows can handle '/' as a path separator but Unix can't,
+        // so err on Unix side
+<span class="fc bfc" id="L353" title="All 2 branches covered.">        return remote.indexOf(&quot;\\&quot;)==-1;</span>
+    }
+
+    /**
+     * Gets the full path of the file on the remote machine.
+     *
+     */
+    public String getRemote() {
+<span class="fc" id="L361">        return remote;</span>
+    }
+
+    /**
+     * Creates a zip file from this directory or a file and sends that to the given output stream.
+     *
+     * @deprecated as of 1.315. Use {@link #zip(OutputStream)} that has more consistent name.
+     */
+    @Deprecated
+    public void createZipArchive(OutputStream os) throws IOException, InterruptedException {
+<span class="nc" id="L371">        zip(os);</span>
+<span class="nc" id="L372">    }</span>
+
+    /**
+     * Creates a zip file from this directory or a file and sends that to the given output stream.
+     */
+    public void zip(OutputStream os) throws IOException, InterruptedException {
+<span class="fc" id="L378">        zip(os,(FileFilter)null);</span>
+<span class="fc" id="L379">    }</span>
+
+    public void zip(FilePath dst) throws IOException, InterruptedException {
+<span class="nc" id="L382">        OutputStream os = dst.write();</span>
+        try {
+<span class="nc" id="L384">            zip(os);</span>
+<span class="nc" id="L385">        } finally {</span>
+<span class="nc" id="L386">            os.close();</span>
+<span class="nc" id="L387">        }</span>
+<span class="nc" id="L388">    }</span>
+    
+    /**
+     * Creates a zip file from this directory by using the specified filter,
+     * and sends the result to the given output stream.
+     *
+     * @param filter
+     *      Must be serializable since it may be executed remotely. Can be null to add all files.
+     *
+     * @since 1.315
+     */
+    public void zip(OutputStream os, FileFilter filter) throws IOException, InterruptedException {
+<span class="fc" id="L400">        archive(ArchiverFactory.ZIP,os,filter);</span>
+<span class="fc" id="L401">    }</span>
+
+    /**
+     * Creates a zip file from this directory by only including the files that match the given glob.
+     *
+     * @param glob
+     *      Ant style glob, like &quot;**&amp;#x2F;*.xml&quot;. If empty or null, this method
+     *      works like {@link #createZipArchive(OutputStream)}
+     *
+     * @since 1.129
+     * @deprecated as of 1.315
+     *      Use {@link #zip(OutputStream,String)} that has more consistent name.
+     */
+    @Deprecated
+    public void createZipArchive(OutputStream os, final String glob) throws IOException, InterruptedException {
+<span class="nc" id="L416">        archive(ArchiverFactory.ZIP,os,glob);</span>
+<span class="nc" id="L417">    }</span>
+
+    /**
+     * Creates a zip file from this directory by only including the files that match the given glob.
+     *
+     * @param glob
+     *      Ant style glob, like &quot;**&amp;#x2F;*.xml&quot;. If empty or null, this method
+     *      works like {@link #createZipArchive(OutputStream)}, inserting a top-level directory into the ZIP.
+     *
+     * @since 1.315
+     */
+    public void zip(OutputStream os, final String glob) throws IOException, InterruptedException {
+<span class="fc" id="L429">        archive(ArchiverFactory.ZIP,os,glob);</span>
+<span class="fc" id="L430">    }</span>
+
+    /**
+     * Uses the given scanner on 'this' directory to list up files and then archive it to a zip stream.
+     */
+    public int zip(OutputStream out, DirScanner scanner) throws IOException, InterruptedException {
+<span class="nc" id="L436">        return archive(ArchiverFactory.ZIP, out, scanner);</span>
+    }
+
+    /**
+     * Archives this directory into the specified archive format, to the given {@link OutputStream}, by using
+     * {@link DirScanner} to choose what files to include.
+     *
+     * @return
+     *      number of files/directories archived. This is only really useful to check for a situation where nothing
+     *      is archived.
+     */
+    public int archive(final ArchiverFactory factory, OutputStream os, final DirScanner scanner) throws IOException, InterruptedException {
+<span class="fc bfc" id="L448" title="All 2 branches covered.">        final OutputStream out = (channel!=null)?new RemoteOutputStream(os):os;</span>
+<span class="fc" id="L449">        return act(new SecureFileCallable&lt;Integer&gt;() {</span>
+            public Integer invoke(File f, VirtualChannel channel) throws IOException {
+<span class="fc" id="L451">                Archiver a = factory.create(out);</span>
+                try {
+<span class="fc" id="L453">                    scanner.scan(f,reading(a));</span>
+<span class="pc" id="L454">                } finally {</span>
+<span class="pc" id="L455">                    a.close();</span>
+<span class="nc" id="L456">                }</span>
+<span class="fc" id="L457">                return a.countEntries();</span>
+            }
+
+            private static final long serialVersionUID = 1L;
+        });
+    }
+
+    public int archive(final ArchiverFactory factory, OutputStream os, final FileFilter filter) throws IOException, InterruptedException {
+<span class="fc" id="L465">        return archive(factory,os,new DirScanner.Filter(filter));</span>
+    }
+
+    public int archive(final ArchiverFactory factory, OutputStream os, final String glob) throws IOException, InterruptedException {
+<span class="fc" id="L469">        return archive(factory,os,new DirScanner.Glob(glob,null));</span>
+    }
+
+    /**
+     * When this {@link FilePath} represents a zip file, extracts that zip file.
+     *
+     * @param target
+     *      Target directory to expand files to. All the necessary directories will be created.
+     * @since 1.248
+     * @see #unzipFrom(InputStream)
+     */
+    public void unzip(final FilePath target) throws IOException, InterruptedException {
+        // TODO: post release, re-unite two branches by introducing FileStreamCallable that resolves InputStream
+<span class="nc bnc" id="L482" title="All 2 branches missed.">        if (this.channel!=target.channel) {// local -&gt; remote or remote-&gt;local</span>
+<span class="nc" id="L483">            final RemoteInputStream in = new RemoteInputStream(read(), Flag.GREEDY);</span>
+<span class="nc" id="L484">            target.act(new SecureFileCallable&lt;Void&gt;() {</span>
+                public Void invoke(File dir, VirtualChannel channel) throws IOException, InterruptedException {
+<span class="nc" id="L486">                    unzip(dir, in);</span>
+<span class="nc" id="L487">                    return null;</span>
+                }
+
+                private static final long serialVersionUID = 1L;
+            });
+<span class="nc" id="L492">        } else {// local -&gt; local or remote-&gt;remote</span>
+<span class="nc" id="L493">            target.act(new SecureFileCallable&lt;Void&gt;() {</span>
+
+                public Void invoke(File dir, VirtualChannel channel) throws IOException, InterruptedException {
+<span class="nc bnc" id="L496" title="All 4 branches missed.">                    assert !FilePath.this.isRemote();       // this.channel==target.channel above</span>
+<span class="nc" id="L497">                    unzip(dir, reading(new File(FilePath.this.getRemote()))); // shortcut to local file</span>
+<span class="nc" id="L498">                    return null;</span>
+                }
+
+                private static final long serialVersionUID = 1L;
+            });
+        }
+<span class="nc" id="L504">    }</span>
+
+    /**
+     * When this {@link FilePath} represents a tar file, extracts that tar file.
+     *
+     * @param target
+     *      Target directory to expand files to. All the necessary directories will be created.
+     * @param compression
+     *      Compression mode of this tar file.
+     * @since 1.292
+     * @see #untarFrom(InputStream, TarCompression)
+     */
+    public void untar(final FilePath target, final TarCompression compression) throws IOException, InterruptedException {
+        // TODO: post release, re-unite two branches by introducing FileStreamCallable that resolves InputStream
+<span class="pc bpc" id="L518" title="1 of 2 branches missed.">        if (this.channel!=target.channel) {// local -&gt; remote or remote-&gt;local</span>
+<span class="nc" id="L519">            final RemoteInputStream in = new RemoteInputStream(read(), Flag.GREEDY);</span>
+<span class="nc" id="L520">            target.act(new SecureFileCallable&lt;Void&gt;() {</span>
+                public Void invoke(File dir, VirtualChannel channel) throws IOException, InterruptedException {
+<span class="nc" id="L522">                    readFromTar(FilePath.this.getName(),dir,compression.extract(in));</span>
+<span class="nc" id="L523">                    return null;</span>
+                }
+
+                private static final long serialVersionUID = 1L;
+            });
+<span class="nc" id="L528">        } else {// local -&gt; local or remote-&gt;remote</span>
+<span class="fc" id="L529">            target.act(new SecureFileCallable&lt;Void&gt;() {</span>
+                public Void invoke(File dir, VirtualChannel channel) throws IOException, InterruptedException {
+<span class="fc" id="L531">                    readFromTar(FilePath.this.getName(),dir,compression.extract(FilePath.this.read()));</span>
+<span class="fc" id="L532">                    return null;</span>
+                }
+                private static final long serialVersionUID = 1L;
+            });
+        }
+<span class="fc" id="L537">    }</span>
+
+    /**
+     * Reads the given InputStream as a zip file and extracts it into this directory.
+     *
+     * @param _in
+     *      The stream will be closed by this method after it's fully read.
+     * @since 1.283
+     * @see #unzip(FilePath)
+     */
+    public void unzipFrom(InputStream _in) throws IOException, InterruptedException {
+<span class="fc" id="L548">        final InputStream in = new RemoteInputStream(_in);</span>
+<span class="fc" id="L549">        act(new SecureFileCallable&lt;Void&gt;() {</span>
+            public Void invoke(File dir, VirtualChannel channel) throws IOException {
+<span class="fc" id="L551">                unzip(dir, in);</span>
+<span class="fc" id="L552">                return null;</span>
+            }
+            private static final long serialVersionUID = 1L;
+        });
+<span class="fc" id="L556">    }</span>
+
+    private void unzip(File dir, InputStream in) throws IOException {
+<span class="fc" id="L559">        File tmpFile = File.createTempFile(&quot;tmpzip&quot;, null); // uses java.io.tmpdir</span>
+        try {
+            // TODO why does this not simply use ZipInputStream?
+<span class="fc" id="L562">            IOUtils.copy(in, tmpFile);</span>
+<span class="fc" id="L563">            unzip(dir,tmpFile);</span>
+<span class="fc" id="L564">        }</span>
+<span class="nc" id="L565">        finally {</span>
+<span class="pc" id="L566">            tmpFile.delete();</span>
+<span class="nc" id="L567">        }</span>
+<span class="fc" id="L568">    }</span>
+
+    private void unzip(File dir, File zipFile) throws IOException {
+<span class="fc" id="L571">        dir = dir.getAbsoluteFile();    // without absolutization, getParentFile below seems to fail</span>
+<span class="fc" id="L572">        ZipFile zip = new ZipFile(zipFile);</span>
+        @SuppressWarnings(&quot;unchecked&quot;)
+<span class="fc" id="L574">        Enumeration&lt;ZipEntry&gt; entries = zip.getEntries();</span>
+
+        try {
+<span class="fc bfc" id="L577" title="All 2 branches covered.">            while (entries.hasMoreElements()) {</span>
+<span class="fc" id="L578">                ZipEntry e = entries.nextElement();</span>
+<span class="fc" id="L579">                File f = new File(dir, e.getName());</span>
+<span class="pc bpc" id="L580" title="1 of 2 branches missed.">                if (e.isDirectory()) {</span>
+<span class="nc" id="L581">                    mkdirs(f);</span>
+<span class="nc" id="L582">                } else {</span>
+<span class="fc" id="L583">                    File p = f.getParentFile();</span>
+<span class="pc bpc" id="L584" title="1 of 2 branches missed.">                    if (p != null) {</span>
+<span class="fc" id="L585">                        mkdirs(p);</span>
+                    }
+<span class="fc" id="L587">                    InputStream input = zip.getInputStream(e);</span>
+                    try {
+<span class="fc" id="L589">                        IOUtils.copy(input, writing(f));</span>
+<span class="pc" id="L590">                    } finally {</span>
+<span class="pc" id="L591">                        input.close();</span>
+<span class="nc" id="L592">                    }</span>
+                    try {
+<span class="fc" id="L594">                        FilePath target = new FilePath(f);</span>
+<span class="fc" id="L595">                        int mode = e.getUnixMode();</span>
+<span class="pc bpc" id="L596" title="1 of 2 branches missed.">                        if (mode!=0)    // Ant returns 0 if the archive doesn't record the access mode</span>
+<span class="nc" id="L597">                            target.chmod(mode);</span>
+<span class="nc" id="L598">                    } catch (InterruptedException ex) {</span>
+<span class="nc" id="L599">                        LOGGER.log(Level.WARNING, &quot;unable to set permissions&quot;, ex);</span>
+                    }
+<span class="fc" id="L601">                    f.setLastModified(e.getTime());</span>
+                }
+            }
+<span class="pc" id="L604">        } finally {</span>
+<span class="pc" id="L605">            zip.close();</span>
+<span class="nc" id="L606">        }</span>
+<span class="fc" id="L607">    }</span>
+
+    /**
+     * Absolutizes this {@link FilePath} and returns the new one.
+     */
+    public FilePath absolutize() throws IOException, InterruptedException {
+<span class="nc" id="L613">        return new FilePath(channel,act(new SecureFileCallable&lt;String&gt;() {</span>
+            private static final long serialVersionUID = 1L;
+            public String invoke(File f, VirtualChannel channel) throws IOException {
+<span class="nc" id="L616">                return f.getAbsolutePath();</span>
+            }
+        }));
+    }
+
+    /**
+     * Creates a symlink to the specified target.
+     *
+     * @param target
+     *      The file that the symlink should point to.
+     * @param listener
+     *      If symlink creation requires a help of an external process, the error will be reported here.
+     * @since 1.456
+     */
+    public void symlinkTo(final String target, final TaskListener listener) throws IOException, InterruptedException {
+<span class="nc" id="L631">        act(new SecureFileCallable&lt;Void&gt;() {</span>
+            private static final long serialVersionUID = 1L;
+            public Void invoke(File f, VirtualChannel channel) throws IOException, InterruptedException {
+<span class="nc" id="L634">                symlinking(f);</span>
+<span class="nc" id="L635">                Util.createSymlink(f.getParentFile(),target,f.getName(),listener);</span>
+<span class="nc" id="L636">                return null;</span>
+            }
+        });
+<span class="nc" id="L639">    }</span>
+    
+    /**
+     * Resolves symlink, if the given file is a symlink. Otherwise return null.
+     * &lt;p&gt;
+     * If the resolution fails, report an error.
+     *
+     * @since 1.456
+     */
+    public String readLink() throws IOException, InterruptedException {
+<span class="nc" id="L649">        return act(new SecureFileCallable&lt;String&gt;() {</span>
+            private static final long serialVersionUID = 1L;
+            public String invoke(File f, VirtualChannel channel) throws IOException, InterruptedException {
+<span class="nc" id="L652">                return Util.resolveSymlink(reading(f));</span>
+            }
+        });
+    }
+
+    @Override
+    public boolean equals(Object o) {
+<span class="pc bpc" id="L659" title="1 of 2 branches missed.">        if (this == o) return true;</span>
+<span class="pc bpc" id="L660" title="2 of 4 branches missed.">        if (o == null || getClass() != o.getClass()) return false;</span>
+
+<span class="fc" id="L662">        FilePath that = (FilePath) o;</span>
+
+<span class="pc bpc" id="L664" title="4 of 6 branches missed.">        if (channel != null ? !channel.equals(that.channel) : that.channel != null) return false;</span>
+<span class="fc" id="L665">        return remote.equals(that.remote);</span>
+
+    }
+
+    @Override
+    public int hashCode() {
+<span class="pc bpc" id="L671" title="1 of 2 branches missed.">        return 31 * (channel != null ? channel.hashCode() : 0) + remote.hashCode();</span>
+    }
+    
+    /**
+     * Supported tar file compression methods.
+     */
+<span class="fc" id="L677">    public enum TarCompression {</span>
+<span class="fc" id="L678">        NONE {</span>
+            public InputStream extract(InputStream in) {
+<span class="fc" id="L680">                return in;</span>
+            }
+            public OutputStream compress(OutputStream out) {
+<span class="fc" id="L683">                return out;</span>
+            }
+        },
+<span class="fc" id="L686">        GZIP {</span>
+            public InputStream extract(InputStream _in) throws IOException {
+<span class="fc" id="L688">                HeadBufferingStream in = new HeadBufferingStream(_in,SIDE_BUFFER_SIZE);</span>
+                try {
+<span class="fc" id="L690">                    return new GZIPInputStream(in, 8192, true);</span>
+<span class="nc" id="L691">                } catch (IOException e) {</span>
+                    // various people reported &quot;java.io.IOException: Not in GZIP format&quot; here, so diagnose this problem better
+<span class="nc" id="L693">                    in.fillSide();</span>
+<span class="nc" id="L694">                    throw new IOException(e.getMessage()+&quot;\nstream=&quot;+Util.toHexString(in.getSideBuffer()),e);</span>
+                }
+            }
+            public OutputStream compress(OutputStream out) throws IOException {
+<span class="fc" id="L698">                return new GZIPOutputStream(new BufferedOutputStream(out));</span>
+            }
+        };
+
+        public abstract InputStream extract(InputStream in) throws IOException;
+        public abstract OutputStream compress(OutputStream in) throws IOException;
+    }
+
+    /**
+     * Reads the given InputStream as a tar file and extracts it into this directory.
+     *
+     * @param _in
+     *      The stream will be closed by this method after it's fully read.
+     * @param compression
+     *      The compression method in use.
+     * @since 1.292
+     */
+    public void untarFrom(InputStream _in, final TarCompression compression) throws IOException, InterruptedException {
+        try {
+<span class="nc" id="L717">            final InputStream in = new RemoteInputStream(_in);</span>
+<span class="nc" id="L718">            act(new SecureFileCallable&lt;Void&gt;() {</span>
+                public Void invoke(File dir, VirtualChannel channel) throws IOException {
+<span class="nc" id="L720">                    readFromTar(&quot;input stream&quot;,dir, compression.extract(in));</span>
+<span class="nc" id="L721">                    return null;</span>
+                }
+                private static final long serialVersionUID = 1L;
+            });
+<span class="nc" id="L725">        } finally {</span>
+<span class="nc" id="L726">            org.apache.commons.io.IOUtils.closeQuietly(_in);</span>
+<span class="nc" id="L727">        }</span>
+<span class="nc" id="L728">    }</span>
+
+    /**
+     * Given a tgz/zip file, extracts it to the given target directory, if necessary.
+     *
+     * &lt;p&gt;
+     * This method is a convenience method designed for installing a binary package to a location
+     * that supports upgrade and downgrade. Specifically,
+     *
+     * &lt;ul&gt;
+     * &lt;li&gt;If the target directory doesn't exist {@linkplain #mkdirs() it will be created}.
+     * &lt;li&gt;The timestamp of the archive is left in the installation directory upon extraction.
+     * &lt;li&gt;If the timestamp left in the directory does not match the timestamp of the current archive file,
+     *     the directory contents will be discarded and the archive file will be re-extracted.
+     * &lt;li&gt;If the connection is refused but the target directory already exists, it is left alone.
+     * &lt;/ul&gt;
+     *
+     * @param archive
+     *      The resource that represents the tgz/zip file. This URL must support the {@code Last-Modified} header.
+     *      (For example, you could use {@link ClassLoader#getResource}.)
+     * @param listener
+     *      If non-null, a message will be printed to this listener once this method decides to
+     *      extract an archive, or if there is any issue.
+     * @param message a message to be printed in case extraction will proceed.
+     * @return
+     *      true if the archive was extracted. false if the extraction was skipped because the target directory
+     *      was considered up to date.
+     * @since 1.299
+     */
+    public boolean installIfNecessaryFrom(@Nonnull URL archive, @CheckForNull TaskListener listener, @Nonnull String message) throws IOException, InterruptedException {
+        try {
+<span class="fc" id="L759">            FilePath timestamp = this.child(&quot;.timestamp&quot;);</span>
+<span class="fc" id="L760">            long lastModified = timestamp.lastModified();</span>
+            URLConnection con;
+            try {
+<span class="fc" id="L763">                con = ProxyConfiguration.open(archive);</span>
+<span class="fc bfc" id="L764" title="All 2 branches covered.">                if (lastModified != 0) {</span>
+<span class="fc" id="L765">                    con.setIfModifiedSince(lastModified);</span>
+                }
+<span class="fc" id="L767">                con.connect();</span>
+<span class="pc" id="L768">            } catch (IOException x) {</span>
+<span class="nc bnc" id="L769" title="All 2 branches missed.">                if (this.exists()) {</span>
+                    // Cannot connect now, so assume whatever was last unpacked is still OK.
+<span class="nc bnc" id="L771" title="All 2 branches missed.">                    if (listener != null) {</span>
+<span class="nc" id="L772">                        listener.getLogger().println(&quot;Skipping installation of &quot; + archive + &quot; to &quot; + remote + &quot;: &quot; + x);</span>
+                    }
+<span class="nc" id="L774">                    return false;</span>
+                } else {
+<span class="nc" id="L776">                    throw x;</span>
+                }
+            }
+
+<span class="pc bpc" id="L780" title="1 of 4 branches missed.">            if (lastModified != 0 &amp;&amp; con instanceof HttpURLConnection) {</span>
+<span class="fc" id="L781">                HttpURLConnection httpCon = (HttpURLConnection) con;</span>
+<span class="fc" id="L782">                int responseCode = httpCon.getResponseCode();</span>
+<span class="fc bfc" id="L783" title="All 2 branches covered.">                if (responseCode == HttpURLConnection.HTTP_NOT_MODIFIED) {</span>
+<span class="fc" id="L784">                    return false;</span>
+<span class="pc bpc" id="L785" title="1 of 2 branches missed.">                } else if (responseCode != HttpURLConnection.HTTP_OK) {</span>
+<span class="fc" id="L786">                    listener.getLogger().println(&quot;Skipping installation of &quot; + archive + &quot; to &quot; + remote + &quot; due to server error: &quot; + responseCode + &quot; &quot; + httpCon.getResponseMessage());</span>
+<span class="fc" id="L787">                    return false;</span>
+                }
+            }
+
+<span class="fc" id="L791">            long sourceTimestamp = con.getLastModified();</span>
+
+<span class="pc bpc" id="L793" title="1 of 2 branches missed.">            if(this.exists()) {</span>
+<span class="pc bpc" id="L794" title="3 of 4 branches missed.">                if (lastModified != 0 &amp;&amp; sourceTimestamp == lastModified)</span>
+<span class="nc" id="L795">                    return false;   // already up to date</span>
+<span class="fc" id="L796">                this.deleteContents();</span>
+<span class="fc" id="L797">            } else {</span>
+<span class="nc" id="L798">                this.mkdirs();</span>
+            }
+
+<span class="pc bpc" id="L801" title="1 of 2 branches missed.">            if(listener!=null)</span>
+<span class="nc" id="L802">                listener.getLogger().println(message);</span>
+
+<span class="pc bpc" id="L804" title="1 of 2 branches missed.">            if (isRemote()) {</span>
+                // First try to download from the slave machine.
+                try {
+<span class="nc" id="L807">                    act(new Unpack(archive));</span>
+<span class="nc" id="L808">                    timestamp.touch(sourceTimestamp);</span>
+<span class="nc" id="L809">                    return true;</span>
+<span class="nc" id="L810">                } catch (IOException x) {</span>
+<span class="nc bnc" id="L811" title="All 2 branches missed.">                    if (listener != null) {</span>
+<span class="nc" id="L812">                        x.printStackTrace(listener.error(&quot;Failed to download &quot; + archive + &quot; from slave; will retry from master&quot;));</span>
+                    }
+                }
+            }
+
+            // for HTTP downloads, enable automatic retry for added resilience
+<span class="pc bpc" id="L818" title="1 of 2 branches missed.">            InputStream in = archive.getProtocol().startsWith(&quot;http&quot;) ? ProxyConfiguration.getInputStream(archive) : con.getInputStream();</span>
+<span class="fc" id="L819">            CountingInputStream cis = new CountingInputStream(in);</span>
+            try {
+<span class="pc bpc" id="L821" title="1 of 2 branches missed.">                if(archive.toExternalForm().endsWith(&quot;.zip&quot;))</span>
+<span class="fc" id="L822">                    unzipFrom(cis);</span>
+                else
+<span class="nc" id="L824">                    untarFrom(cis,GZIP);</span>
+<span class="nc" id="L825">            } catch (IOException e) {</span>
+<span class="nc" id="L826">                throw new IOException(String.format(&quot;Failed to unpack %s (%d bytes read of total %d)&quot;,</span>
+<span class="nc" id="L827">                        archive,cis.getByteCount(),con.getContentLength()),e);</span>
+            }
+<span class="fc" id="L829">            timestamp.touch(sourceTimestamp);</span>
+<span class="fc" id="L830">            return true;</span>
+<span class="nc" id="L831">        } catch (IOException e) {</span>
+<span class="nc" id="L832">            throw new IOException(&quot;Failed to install &quot;+archive+&quot; to &quot;+remote,e);</span>
+        }
+    }
+
+    // this reads from arbitrary URL
+    private final class Unpack extends MasterToSlaveFileCallable&lt;Void&gt; {
+        private final URL archive;
+<span class="nc" id="L839">        Unpack(URL archive) {</span>
+<span class="nc" id="L840">            this.archive = archive;</span>
+<span class="nc" id="L841">        }</span>
+        @Override public Void invoke(File dir, VirtualChannel channel) throws IOException, InterruptedException {
+<span class="nc" id="L843">            InputStream in = archive.openStream();</span>
+            try {
+<span class="nc" id="L845">                CountingInputStream cis = new CountingInputStream(in);</span>
+                try {
+<span class="nc bnc" id="L847" title="All 2 branches missed.">                    if (archive.toExternalForm().endsWith(&quot;.zip&quot;)) {</span>
+<span class="nc" id="L848">                        unzip(dir, cis);</span>
+<span class="nc" id="L849">                    } else {</span>
+<span class="nc" id="L850">                        readFromTar(&quot;input stream&quot;, dir, GZIP.extract(cis));</span>
+                    }
+<span class="nc" id="L852">                } catch (IOException x) {</span>
+<span class="nc" id="L853">                    throw new IOException(String.format(&quot;Failed to unpack %s (%d bytes read)&quot;, archive, cis.getByteCount()), x);</span>
+                }
+<span class="nc" id="L855">            } finally {</span>
+<span class="nc" id="L856">                in.close();</span>
+<span class="nc" id="L857">            }</span>
+<span class="nc" id="L858">            return null;</span>
+        }
+    }
+
+    /**
+     * Reads the URL on the current VM, and writes all the data to this {@link FilePath}
+     * (this is different from resolving URL remotely.)
+     *
+     * @since 1.293
+     */
+    public void copyFrom(URL url) throws IOException, InterruptedException {
+<span class="nc" id="L869">        InputStream in = url.openStream();</span>
+        try {
+<span class="nc" id="L871">            copyFrom(in);</span>
+<span class="nc" id="L872">        } finally {</span>
+<span class="nc" id="L873">            in.close();</span>
+<span class="nc" id="L874">        }</span>
+<span class="nc" id="L875">    }</span>
+
+    /**
+     * Replaces the content of this file by the data from the given {@link InputStream}.
+     *
+     * @since 1.293
+     */
+    public void copyFrom(InputStream in) throws IOException, InterruptedException {
+<span class="nc" id="L883">        OutputStream os = write();</span>
+        try {
+<span class="nc" id="L885">            org.apache.commons.io.IOUtils.copy(in, os);</span>
+<span class="nc" id="L886">        } finally {</span>
+<span class="nc" id="L887">            os.close();</span>
+<span class="nc" id="L888">        }</span>
+<span class="nc" id="L889">    }</span>
+
+    /**
+     * Convenience method to call {@link FilePath#copyTo(FilePath)}.
+     * 
+     * @since 1.311
+     */
+    public void copyFrom(FilePath src) throws IOException, InterruptedException {
+<span class="nc" id="L897">        src.copyTo(this);</span>
+<span class="nc" id="L898">    }</span>
+
+    /**
+     * Place the data from {@link FileItem} into the file location specified by this {@link FilePath} object.
+     */
+    public void copyFrom(FileItem file) throws IOException, InterruptedException {
+<span class="nc bnc" id="L904" title="All 2 branches missed.">        if(channel==null) {</span>
+            try {
+<span class="nc" id="L906">                file.write(writing(new File(remote)));</span>
+<span class="nc" id="L907">            } catch (IOException e) {</span>
+<span class="nc" id="L908">                throw e;</span>
+<span class="nc" id="L909">            } catch (Exception e) {</span>
+<span class="nc" id="L910">                throw new IOException(e);</span>
+            }
+        } else {
+<span class="nc" id="L913">            InputStream i = file.getInputStream();</span>
+<span class="nc" id="L914">            OutputStream o = write();</span>
+            try {
+<span class="nc" id="L916">                org.apache.commons.io.IOUtils.copy(i,o);</span>
+<span class="nc" id="L917">            } finally {</span>
+                try {
+<span class="nc" id="L919">                    o.close();</span>
+<span class="nc" id="L920">                } finally {</span>
+<span class="nc" id="L921">                    i.close();</span>
+<span class="nc" id="L922">                }</span>
+<span class="nc" id="L923">            }</span>
+        }
+<span class="nc" id="L925">    }</span>
+
+    /**
+     * Code that gets executed on the machine where the {@link FilePath} is local.
+     * Used to act on {@link FilePath}.
+     * &lt;strong&gt;Warning:&lt;/code&gt; implementations must be serializable, so prefer a static nested class to an inner class.
+     *
+     * &lt;p&gt;
+     * Subtypes would likely want to extend from either {@link MasterToSlaveCallable}
+     * or {@link SlaveToMasterFileCallable}.
+     *
+     * @see FilePath#act(FileCallable)
+     */
+    public interface FileCallable&lt;T&gt; extends Serializable, RoleSensitive {
+        /**
+         * Performs the computational task on the node where the data is located.
+         *
+         * &lt;p&gt;
+         * All the exceptions are forwarded to the caller.
+         *
+         * @param f
+         *      {@link File} that represents the local file that {@link FilePath} has represented.
+         * @param channel
+         *      The &quot;back pointer&quot; of the {@link Channel} that represents the communication
+         *      with the node from where the code was sent.
+         */
+        T invoke(File f, VirtualChannel channel) throws IOException, InterruptedException;
+    }
+
+    /**
+     * {@link FileCallable}s that can be executed anywhere, including the master.
+     *
+     * The code is the same as {@link SlaveToMasterFileCallable}, but used as a marker to
+     * designate those impls that use {@link FilePathFilter}.
+     */
+<span class="fc" id="L960">    /*package*/ static abstract class SecureFileCallable&lt;T&gt; extends SlaveToMasterFileCallable&lt;T&gt; {</span>
+    }
+
+    /**
+     * Executes some program on the machine that this {@link FilePath} exists,
+     * so that one can perform local file operations.
+     */
+    public &lt;T&gt; T act(final FileCallable&lt;T&gt; callable) throws IOException, InterruptedException {
+<span class="fc" id="L968">        return act(callable,callable.getClass().getClassLoader());</span>
+    }
+
+    private &lt;T&gt; T act(final FileCallable&lt;T&gt; callable, ClassLoader cl) throws IOException, InterruptedException {
+<span class="fc bfc" id="L972" title="All 2 branches covered.">        if(channel!=null) {</span>
+            // run this on a remote system
+            try {
+<span class="fc" id="L975">                DelegatingCallable&lt;T,IOException&gt; wrapper = new FileCallableWrapper&lt;T&gt;(callable, cl);</span>
+<span class="pc bpc" id="L976" title="1 of 2 branches missed.">                for (FileCallableWrapperFactory factory : ExtensionList.lookup(FileCallableWrapperFactory.class)) {</span>
+<span class="nc" id="L977">                    wrapper = factory.wrap(wrapper);</span>
+                }
+<span class="fc" id="L979">                return channel.call(wrapper);</span>
+<span class="fc" id="L980">            } catch (TunneledInterruptedException e) {</span>
+<span class="fc" id="L981">                throw (InterruptedException)new InterruptedException(e.getMessage()).initCause(e);</span>
+<span class="nc" id="L982">            } catch (AbortException e) {</span>
+<span class="nc" id="L983">                throw e;    // pass through so that the caller can catch it as AbortException</span>
+<span class="nc" id="L984">            } catch (IOException e) {</span>
+                // wrap it into a new IOException so that we get the caller's stack trace as well.
+<span class="nc" id="L986">                throw new IOException(&quot;remote file operation failed: &quot; + remote + &quot; at &quot; + channel + &quot;: &quot; + e, e);</span>
+            }
+        } else {
+            // the file is on the local machine.
+<span class="fc" id="L990">            return callable.invoke(new File(remote), localChannel);</span>
+        }
+    }
+
+    /**
+     * This extension point allows to contribute a wrapper around a fileCallable so that a plugin can &quot;intercept&quot; a
+     * call.
+     * &lt;p&gt;The {@link #wrap(hudson.remoting.DelegatingCallable)} method itself will be executed on master
+     * (and may collect contextual data if needed) and the returned wrapper will be executed on remote.
+     *
+     * @since 1.482
+     * @see AbstractInterceptorCallableWrapper
+     */
+<span class="nc" id="L1003">    public static abstract class FileCallableWrapperFactory implements ExtensionPoint {</span>
+
+        public abstract &lt;T&gt; DelegatingCallable&lt;T,IOException&gt; wrap(DelegatingCallable&lt;T,IOException&gt; callable);
+
+    }
+
+    /**
+     * Abstract {@link DelegatingCallable} that exposes an Before/After pattern for
+     * {@link hudson.FilePath.FileCallableWrapperFactory} that want to implement AOP-style interceptors
+     * @since 1.482
+     */
+    public static abstract class AbstractInterceptorCallableWrapper&lt;T&gt; implements DelegatingCallable&lt;T, IOException&gt; {
+        private static final long serialVersionUID = 1L;
+
+        private final DelegatingCallable&lt;T, IOException&gt; callable;
+
+<span class="nc" id="L1019">        public AbstractInterceptorCallableWrapper(DelegatingCallable&lt;T, IOException&gt; callable) {</span>
+<span class="nc" id="L1020">            this.callable = callable;</span>
+<span class="nc" id="L1021">        }</span>
+
+        @Override
+        public final ClassLoader getClassLoader() {
+<span class="nc" id="L1025">            return callable.getClassLoader();</span>
+        }
+
+        public final T call() throws IOException {
+<span class="nc" id="L1029">            before();</span>
+            try {
+<span class="nc" id="L1031">                return callable.call();</span>
+<span class="nc" id="L1032">            } finally {</span>
+<span class="nc" id="L1033">                after();</span>
+<span class="nc" id="L1034">            }</span>
+        }
+
+        /**
+         * Executed before the actual FileCallable is invoked. This code will run on remote
+         */
+<span class="nc" id="L1040">        protected void before() {}</span>
+
+        /**
+         * Executed after the actual FileCallable is invoked (even if this one failed). This code will run on remote
+         */
+<span class="nc" id="L1045">        protected void after() {}</span>
+    }
+
+
+    /**
+     * Executes some program on the machine that this {@link FilePath} exists,
+     * so that one can perform local file operations.
+     */
+    public &lt;T&gt; Future&lt;T&gt; actAsync(final FileCallable&lt;T&gt; callable) throws IOException, InterruptedException {
+        try {
+<span class="fc" id="L1055">            DelegatingCallable&lt;T,IOException&gt; wrapper = new FileCallableWrapper&lt;T&gt;(callable);</span>
+<span class="pc bpc" id="L1056" title="1 of 2 branches missed.">            for (FileCallableWrapperFactory factory : ExtensionList.lookup(FileCallableWrapperFactory.class)) {</span>
+<span class="nc" id="L1057">                wrapper = factory.wrap(wrapper);</span>
+            }
+<span class="fc bfc" id="L1059" title="All 2 branches covered.">            return (channel!=null ? channel : localChannel)</span>
+<span class="fc" id="L1060">                .callAsync(wrapper);</span>
+<span class="nc" id="L1061">        } catch (IOException e) {</span>
+            // wrap it into a new IOException so that we get the caller's stack trace as well.
+<span class="nc" id="L1063">            throw new IOException(&quot;remote file operation failed&quot;,e);</span>
+        }
+    }
+
+    /**
+     * Executes some program on the machine that this {@link FilePath} exists,
+     * so that one can perform local file operations.
+     */
+    public &lt;V,E extends Throwable&gt; V act(Callable&lt;V,E&gt; callable) throws IOException, InterruptedException, E {
+<span class="nc bnc" id="L1072" title="All 2 branches missed.">        if(channel!=null) {</span>
+            // run this on a remote system
+<span class="nc" id="L1074">            return channel.call(callable);</span>
+        } else {
+            // the file is on the local machine
+<span class="nc" id="L1077">            return callable.call();</span>
+        }
+    }
+
+    /**
+     * Takes a {@link FilePath}+{@link FileCallable} pair and returns the equivalent {@link Callable}.
+     * When executing the resulting {@link Callable}, it executes {@link FileCallable#act(FileCallable)}
+     * on this {@link FilePath}.
+     *
+     * @since 1.522
+     */
+    public &lt;V&gt; Callable&lt;V,IOException&gt; asCallableWith(final FileCallable&lt;V&gt; task) {
+<span class="nc" id="L1089">        return new Callable&lt;V,IOException&gt;() {</span>
+            @Override
+            public V call() throws IOException {
+                try {
+<span class="nc" id="L1093">                    return act(task);</span>
+<span class="nc" id="L1094">                } catch (InterruptedException e) {</span>
+<span class="nc" id="L1095">                    throw (IOException)new InterruptedIOException().initCause(e);</span>
+                }
+            }
+
+            @Override
+            public void checkRoles(RoleChecker checker) throws SecurityException {
+<span class="nc" id="L1101">                task.checkRoles(checker);</span>
+<span class="nc" id="L1102">            }</span>
+
+            private static final long serialVersionUID = 1L;
+        };
+    }
+
+    /**
+     * Converts this file to the URI, relative to the machine
+     * on which this file is available.
+     */
+    public URI toURI() throws IOException, InterruptedException {
+<span class="nc" id="L1113">        return act(new SecureFileCallable&lt;URI&gt;() {</span>
+            private static final long serialVersionUID = 1L;
+            public URI invoke(File f, VirtualChannel channel) {
+<span class="nc" id="L1116">                return f.toURI();</span>
+            }
+        });
+    }
+
+    /**
+     * Gets the {@link VirtualFile} representation of this {@link FilePath}
+     *
+     * @since 1.532
+     */
+    public VirtualFile toVirtualFile() {
+<span class="nc" id="L1127">        return VirtualFile.forFilePath(this);</span>
+    }
+
+    /**
+     * If this {@link FilePath} represents a file on a particular {@link Computer}, return it.
+     * Otherwise null.
+     * @since 1.571
+     */
+    public @CheckForNull Computer toComputer() {
+<span class="nc" id="L1136">        Jenkins j = Jenkins.getInstance();</span>
+<span class="nc bnc" id="L1137" title="All 2 branches missed.">        if (j != null) {</span>
+<span class="nc bnc" id="L1138" title="All 2 branches missed.">            for (Computer c : j.getComputers()) {</span>
+<span class="nc bnc" id="L1139" title="All 2 branches missed.">                if (getChannel()==c.getChannel()) {</span>
+<span class="nc" id="L1140">                    return c;</span>
+                }
+            }
+        }
+<span class="nc" id="L1144">        return null;</span>
+    }
+
+    /**
+     * Creates this directory.
+     */
+    public void mkdirs() throws IOException, InterruptedException {
+<span class="fc" id="L1151">        if(!act(new SecureFileCallable&lt;Boolean&gt;() {</span>
+            private static final long serialVersionUID = 1L;
+            public Boolean invoke(File f, VirtualChannel channel) throws IOException, InterruptedException {
+<span class="pc bpc" id="L1154" title="3 of 4 branches missed.">                if(mkdirs(f) || f.exists())</span>
+<span class="fc" id="L1155">                    return true;    // OK</span>
+
+                // following Ant &lt;mkdir&gt; task to avoid possible race condition.
+<span class="nc" id="L1158">                Thread.sleep(10);</span>
+
+<span class="nc bnc" id="L1160" title="All 4 branches missed.">                return f.mkdirs() || f.exists();</span>
+            }
+<span class="pc bpc" id="L1162" title="1 of 2 branches missed.">        }))</span>
+<span class="nc" id="L1163">            throw new IOException(&quot;Failed to mkdirs: &quot;+remote);</span>
+<span class="fc" id="L1164">    }</span>
+
+    /**
+     * Deletes this directory, including all its contents recursively.
+     */
+    public void deleteRecursive() throws IOException, InterruptedException {
+<span class="fc" id="L1170">        act(new SecureFileCallable&lt;Void&gt;() {</span>
+            private static final long serialVersionUID = 1L;
+            public Void invoke(File f, VirtualChannel channel) throws IOException {
+<span class="fc" id="L1173">                deleteRecursive(deleting(f));</span>
+<span class="fc" id="L1174">                return null;</span>
+            }
+        });
+<span class="fc" id="L1177">    }</span>
+
+    /**
+     * Deletes all the contents of this directory, but not the directory itself
+     */
+    public void deleteContents() throws IOException, InterruptedException {
+<span class="fc" id="L1183">        act(new SecureFileCallable&lt;Void&gt;() {</span>
+            private static final long serialVersionUID = 1L;
+            public Void invoke(File f, VirtualChannel channel) throws IOException {
+<span class="fc" id="L1186">                deleteContentsRecursive(f);</span>
+<span class="fc" id="L1187">                return null;</span>
+            }
+        });
+<span class="fc" id="L1190">    }</span>
+
+    private void deleteRecursive(File dir) throws IOException {
+<span class="pc bpc" id="L1193" title="1 of 2 branches missed.">        if(!isSymlink(dir))</span>
+<span class="fc" id="L1194">            deleteContentsRecursive(dir);</span>
+        try {
+<span class="fc" id="L1196">            deleteFile(deleting(dir));</span>
+<span class="pc" id="L1197">        } catch (IOException e) {</span>
+            // if some of the child directories are big, it might take long enough to delete that
+            // it allows others to create new files, causing problemsl ike JENKINS-10113
+            // so give it one more attempt before we give up.
+<span class="nc bnc" id="L1201" title="All 2 branches missed.">            if(!isSymlink(dir))</span>
+<span class="nc" id="L1202">                deleteContentsRecursive(dir);</span>
+<span class="nc" id="L1203">            deleteFile(deleting(dir));</span>
+        }
+<span class="fc" id="L1205">    }</span>
+
+    private void deleteContentsRecursive(File file) throws IOException {
+<span class="fc" id="L1208">        File[] files = file.listFiles();</span>
+<span class="fc bfc" id="L1209" title="All 2 branches covered.">        if(files==null)</span>
+<span class="fc" id="L1210">            return;     // the directory didn't exist in the first place</span>
+<span class="fc bfc" id="L1211" title="All 2 branches covered.">        for (File child : files)</span>
+<span class="fc" id="L1212">            deleteRecursive(child);</span>
+<span class="fc" id="L1213">    }</span>
+
+    /**
+     * Gets the file name portion except the extension.
+     *
+     * For example, &quot;foo&quot; for &quot;foo.txt&quot; and &quot;foo.tar&quot; for &quot;foo.tar.gz&quot;.
+     */
+    public String getBaseName() {
+<span class="nc" id="L1221">        String n = getName();</span>
+<span class="nc" id="L1222">        int idx = n.lastIndexOf('.');</span>
+<span class="nc bnc" id="L1223" title="All 2 branches missed.">        if (idx&lt;0)  return n;</span>
+<span class="nc" id="L1224">        return n.substring(0,idx);</span>
+    }
+    /**
+     * Gets just the file name portion without directories.
+     *
+     * For example, &quot;foo.txt&quot; for &quot;../abc/foo.txt&quot;
+     */
+    public String getName() {
+<span class="fc" id="L1232">        String r = remote;</span>
+<span class="pc bpc" id="L1233" title="2 of 4 branches missed.">        if(r.endsWith(&quot;\\&quot;) || r.endsWith(&quot;/&quot;))</span>
+<span class="nc" id="L1234">            r = r.substring(0,r.length()-1);</span>
+
+<span class="fc" id="L1236">        int len = r.length()-1;</span>
+<span class="pc bpc" id="L1237" title="1 of 2 branches missed.">        while(len&gt;=0) {</span>
+<span class="fc" id="L1238">            char ch = r.charAt(len);</span>
+<span class="pc bpc" id="L1239" title="1 of 4 branches missed.">            if(ch=='\\' || ch=='/')</span>
+<span class="nc" id="L1240">                break;</span>
+<span class="fc" id="L1241">            len--;</span>
+        }
+
+<span class="fc" id="L1244">        return r.substring(len+1);</span>
+    }
+
+    /**
+     * Short for {@code getParent().child(rel)}. Useful for getting other files in the same directory. 
+     */
+    public FilePath sibling(String rel) {
+<span class="nc" id="L1251">        return getParent().child(rel);</span>
+    }
+
+    /**
+     * Returns a {@link FilePath} by adding the given suffix to this path name.
+     */
+    public FilePath withSuffix(String suffix) {
+<span class="nc" id="L1258">        return new FilePath(channel,remote+suffix);</span>
+    }
+
+    /**
+     * The same as {@link FilePath#FilePath(FilePath,String)} but more OO.
+     * @param relOrAbsolute a relative or absolute path
+     * @return a file on the same channel
+     */
+    public @Nonnull FilePath child(String relOrAbsolute) {
+<span class="fc" id="L1267">        return new FilePath(this,relOrAbsolute);</span>
+    }
+
+    /**
+     * Gets the parent file.
+     * @return parent FilePath or null if there is no parent
+     */
+    public FilePath getParent() {
+<span class="fc" id="L1275">        int i = remote.length() - 2;</span>
+<span class="fc bfc" id="L1276" title="All 2 branches covered.">        for (; i &gt;= 0; i--) {</span>
+<span class="fc" id="L1277">            char ch = remote.charAt(i);</span>
+<span class="fc bfc" id="L1278" title="All 4 branches covered.">            if(ch=='\\' || ch=='/')</span>
+<span class="fc" id="L1279">                break;</span>
+        }
+
+<span class="fc bfc" id="L1282" title="All 2 branches covered.">        return i &gt;= 0 ? new FilePath( channel, remote.substring(0,i+1) ) : null;</span>
+    }
+
+    /**
+     * Creates a temporary file in the directory that this {@link FilePath} object designates.
+     *
+     * @param prefix
+     *      The prefix string to be used in generating the file's name; must be
+     *      at least three characters long
+     * @param suffix
+     *      The suffix string to be used in generating the file's name; may be
+     *      null, in which case the suffix &quot;.tmp&quot; will be used
+     * @return
+     *      The new FilePath pointing to the temporary file
+     * @see File#createTempFile(String, String)
+     */
+    public FilePath createTempFile(final String prefix, final String suffix) throws IOException, InterruptedException {
+        try {
+<span class="nc" id="L1300">            return new FilePath(this,act(new SecureFileCallable&lt;String&gt;() {</span>
+                private static final long serialVersionUID = 1L;
+                public String invoke(File dir, VirtualChannel channel) throws IOException {
+<span class="nc" id="L1303">                    File f = writing(File.createTempFile(prefix, suffix, dir));</span>
+<span class="nc" id="L1304">                    return f.getName();</span>
+                }
+            }));
+<span class="nc" id="L1307">        } catch (IOException e) {</span>
+<span class="nc" id="L1308">            throw new IOException(&quot;Failed to create a temp file on &quot;+remote,e);</span>
+        }
+    }
+
+    /**
+     * Creates a temporary file in this directory and set the contents to the
+     * given text (encoded in the platform default encoding)
+     *
+     * @param prefix
+     *      The prefix string to be used in generating the file's name; must be
+     *      at least three characters long
+     * @param suffix
+     *      The suffix string to be used in generating the file's name; may be
+     *      null, in which case the suffix &quot;.tmp&quot; will be used
+     * @param contents
+     *      The initial contents of the temporary file.
+     * @return
+     *      The new FilePath pointing to the temporary file
+     * @see File#createTempFile(String, String)
+     */
+    public FilePath createTextTempFile(final String prefix, final String suffix, final String contents) throws IOException, InterruptedException {
+<span class="nc" id="L1329">        return createTextTempFile(prefix,suffix,contents,true);</span>
+    }
+
+    /**
+     * Creates a temporary file in this directory (or the system temporary
+     * directory) and set the contents to the given text (encoded in the
+     * platform default encoding)
+     *
+     * @param prefix
+     *      The prefix string to be used in generating the file's name; must be
+     *      at least three characters long
+     * @param suffix
+     *      The suffix string to be used in generating the file's name; may be
+     *      null, in which case the suffix &quot;.tmp&quot; will be used
+     * @param contents
+     *      The initial contents of the temporary file.
+     * @param inThisDirectory
+     *      If true, then create this temporary in the directory pointed to by
+     *      this.
+     *      If false, then the temporary file is created in the system temporary
+     *      directory (java.io.tmpdir)
+     * @return
+     *      The new FilePath pointing to the temporary file
+     * @see File#createTempFile(String, String)
+     */
+    public FilePath createTextTempFile(final String prefix, final String suffix, final String contents, final boolean inThisDirectory) throws IOException, InterruptedException {
+        try {
+<span class="nc" id="L1356">            return new FilePath(channel,act(new SecureFileCallable&lt;String&gt;() {</span>
+                private static final long serialVersionUID = 1L;
+                public String invoke(File dir, VirtualChannel channel) throws IOException {
+<span class="nc bnc" id="L1359" title="All 2 branches missed.">                    if(!inThisDirectory)</span>
+<span class="nc" id="L1360">                        dir = new File(System.getProperty(&quot;java.io.tmpdir&quot;));</span>
+                    else
+<span class="nc" id="L1362">                        mkdirs(dir);</span>
+
+                    File f;
+                    try {
+<span class="nc" id="L1366">                        f = creating(File.createTempFile(prefix, suffix, dir));</span>
+<span class="nc" id="L1367">                    } catch (IOException e) {</span>
+<span class="nc" id="L1368">                        throw new IOException(&quot;Failed to create a temporary directory in &quot;+dir,e);</span>
+                    }
+
+<span class="nc" id="L1371">                    Writer w = new FileWriter(writing(f));</span>
+                    try {
+<span class="nc" id="L1373">                        w.write(contents);</span>
+<span class="nc" id="L1374">                    } finally {</span>
+<span class="nc" id="L1375">                        w.close();</span>
+<span class="nc" id="L1376">                    }</span>
+
+<span class="nc" id="L1378">                    return f.getAbsolutePath();</span>
+                }
+            }));
+<span class="nc" id="L1381">        } catch (IOException e) {</span>
+<span class="nc" id="L1382">            throw new IOException(&quot;Failed to create a temp file on &quot;+remote,e);</span>
+        }
+    }
+
+    /**
+     * Creates a temporary directory inside the directory represented by 'this'
+     *
+     * @param prefix
+     *      The prefix string to be used in generating the directory's name;
+     *      must be at least three characters long
+     * @param suffix
+     *      The suffix string to be used in generating the directory's name; may
+     *      be null, in which case the suffix &quot;.tmp&quot; will be used
+     * @return
+     *      The new FilePath pointing to the temporary directory
+     * @since 1.311
+     * @see File#createTempFile(String, String)
+     */
+    public FilePath createTempDir(final String prefix, final String suffix) throws IOException, InterruptedException {
+        try {
+<span class="nc" id="L1402">            return new FilePath(this,act(new SecureFileCallable&lt;String&gt;() {</span>
+                private static final long serialVersionUID = 1L;
+                public String invoke(File dir, VirtualChannel channel) throws IOException {
+<span class="nc" id="L1405">                    File f = File.createTempFile(prefix, suffix, dir);</span>
+<span class="nc" id="L1406">                    f.delete();</span>
+<span class="nc" id="L1407">                    f.mkdir();</span>
+<span class="nc" id="L1408">                    return f.getName();</span>
+                }
+            }));
+<span class="nc" id="L1411">        } catch (IOException e) {</span>
+<span class="nc" id="L1412">            throw new IOException(&quot;Failed to create a temp directory on &quot;+remote,e);</span>
+        }
+    }
+
+    /**
+     * Deletes this file.
+     * @throws IOException if it exists but could not be successfully deleted
+     * @return true, for a modicum of compatibility
+     */
+    public boolean delete() throws IOException, InterruptedException {
+<span class="fc" id="L1422">        act(new SecureFileCallable&lt;Void&gt;() {</span>
+            private static final long serialVersionUID = 1L;
+            public Void invoke(File f, VirtualChannel channel) throws IOException {
+<span class="fc" id="L1425">                Util.deleteFile(deleting(f));</span>
+<span class="fc" id="L1426">                return null;</span>
+            }
+        });
+<span class="fc" id="L1429">        return true;</span>
+    }
+
+    /**
+     * Checks if the file exists.
+     */
+    public boolean exists() throws IOException, InterruptedException {
+<span class="fc" id="L1436">        return act(new SecureFileCallable&lt;Boolean&gt;() {</span>
+            private static final long serialVersionUID = 1L;
+            public Boolean invoke(File f, VirtualChannel channel) throws IOException {
+<span class="fc" id="L1439">                return stating(f).exists();</span>
+            }
+        });
+    }
+
+    /**
+     * Gets the last modified time stamp of this file, by using the clock
+     * of the machine where this file actually resides.
+     *
+     * @see File#lastModified()
+     * @see #touch(long)
+     */
+    public long lastModified() throws IOException, InterruptedException {
+<span class="fc" id="L1452">        return act(new SecureFileCallable&lt;Long&gt;() {</span>
+            private static final long serialVersionUID = 1L;
+            public Long invoke(File f, VirtualChannel channel) throws IOException {
+<span class="fc" id="L1455">                return stating(f).lastModified();</span>
+            }
+        });
+    }
+
+    /**
+     * Creates a file (if not already exist) and sets the timestamp.
+     *
+     * @since 1.299
+     */
+    public void touch(final long timestamp) throws IOException, InterruptedException {
+<span class="fc" id="L1466">        act(new SecureFileCallable&lt;Void&gt;() {</span>
+            private static final long serialVersionUID = -5094638816500738429L;
+            public Void invoke(File f, VirtualChannel channel) throws IOException {
+<span class="pc bpc" id="L1469" title="1 of 2 branches missed.">                if(!f.exists())</span>
+<span class="fc" id="L1470">                    new FileOutputStream(creating(f)).close();</span>
+<span class="pc bpc" id="L1471" title="1 of 2 branches missed.">                if(!stating(f).setLastModified(timestamp))</span>
+<span class="nc" id="L1472">                    throw new IOException(&quot;Failed to set the timestamp of &quot;+f+&quot; to &quot;+timestamp);</span>
+<span class="fc" id="L1473">                return null;</span>
+            }
+        });
+<span class="fc" id="L1476">    }</span>
+    
+    private void setLastModifiedIfPossible(final long timestamp) throws IOException, InterruptedException {
+<span class="fc" id="L1479">        String message = act(new SecureFileCallable&lt;String&gt;() {</span>
+            private static final long serialVersionUID = -828220335793641630L;
+            public String invoke(File f, VirtualChannel channel) throws IOException {
+<span class="pc bpc" id="L1482" title="1 of 2 branches missed.">                if(!writing(f).setLastModified(timestamp)) {</span>
+<span class="nc bnc" id="L1483" title="All 2 branches missed.">                    if (Functions.isWindows()) {</span>
+                        // On Windows this seems to fail often. See JENKINS-11073
+                        // Therefore don't fail, but just log a warning
+<span class="nc" id="L1486">                        return &quot;Failed to set the timestamp of &quot;+f+&quot; to &quot;+timestamp;</span>
+                    } else {
+<span class="nc" id="L1488">                        throw new IOException(&quot;Failed to set the timestamp of &quot;+f+&quot; to &quot;+timestamp);</span>
+                    }
+                }
+<span class="fc" id="L1491">                return null;</span>
+            }
+        });
+
+<span class="pc bpc" id="L1495" title="1 of 2 branches missed.">        if (message!=null) {</span>
+<span class="nc" id="L1496">            LOGGER.warning(message);</span>
+        }
+<span class="fc" id="L1498">    }</span>
+
+    /**
+     * Checks if the file is a directory.
+     */
+    public boolean isDirectory() throws IOException, InterruptedException {
+<span class="nc" id="L1504">        return act(new SecureFileCallable&lt;Boolean&gt;() {</span>
+            private static final long serialVersionUID = 1L;
+            public Boolean invoke(File f, VirtualChannel channel) throws IOException {
+<span class="nc" id="L1507">                return stating(f).isDirectory();</span>
+            }
+        });
+    }
+    
+    /**
+     * Returns the file size in bytes.
+     *
+     * @since 1.129
+     */
+    public long length() throws IOException, InterruptedException {
+<span class="nc" id="L1518">        return act(new SecureFileCallable&lt;Long&gt;() {</span>
+            private static final long serialVersionUID = 1L;
+            public Long invoke(File f, VirtualChannel channel) throws IOException {
+<span class="nc" id="L1521">                return stating(f).length();</span>
+            }
+        });
+    }
+
+    /**
+     * Returns the number of unallocated bytes in the partition of that file.
+     * @since 1.542
+     */
+    public long getFreeDiskSpace() throws IOException, InterruptedException {
+<span class="nc" id="L1531">        return act(new SecureFileCallable&lt;Long&gt;() {</span>
+            private static final long serialVersionUID = 1L;
+            @Override public Long invoke(File f, VirtualChannel channel) throws IOException {
+<span class="nc" id="L1534">                return f.getFreeSpace();</span>
+            }
+        });
+    }
+
+    /**
+     * Returns the total number of bytes in the partition of that file.
+     * @since 1.542
+     */
+    public long getTotalDiskSpace() throws IOException, InterruptedException {
+<span class="nc" id="L1544">        return act(new SecureFileCallable&lt;Long&gt;() {</span>
+            private static final long serialVersionUID = 1L;
+            @Override public Long invoke(File f, VirtualChannel channel) throws IOException {
+<span class="nc" id="L1547">                return f.getTotalSpace();</span>
+            }
+        });
+    }
+
+    /**
+     * Returns the number of usable bytes in the partition of that file.
+     * @since 1.542
+     */
+    public long getUsableDiskSpace() throws IOException, InterruptedException {
+<span class="nc" id="L1557">        return act(new SecureFileCallable&lt;Long&gt;() {</span>
+            private static final long serialVersionUID = 1L;
+            @Override public Long invoke(File f, VirtualChannel channel) throws IOException {
+<span class="nc" id="L1560">                return f.getUsableSpace();</span>
+            }
+        });
+    }
+
+    /**
+     * Sets the file permission.
+     *
+     * On Windows, no-op.
+     *
+     * @param mask
+     *      File permission mask. To simplify the permission copying,
+     *      if the parameter is -1, this method becomes no-op.
+     *      &lt;p&gt;
+     *      please note mask is expected to be an octal if you use &lt;a href=&quot;http://en.wikipedia.org/wiki/Chmod&quot;&gt;chmod command line values&lt;/a&gt;,
+     *      so preceded by a '0' in java notation, ie &lt;code&gt;chmod(0644)&lt;/code&gt;
+     *
+     * @since 1.303
+     * @see #mode()
+     */
+    public void chmod(final int mask) throws IOException, InterruptedException {
+<span class="pc bpc" id="L1581" title="3 of 4 branches missed.">        if(!isUnix() || mask==-1)   return;</span>
+<span class="nc" id="L1582">        act(new SecureFileCallable&lt;Void&gt;() {</span>
+            private static final long serialVersionUID = 1L;
+            public Void invoke(File f, VirtualChannel channel) throws IOException {
+                // TODO first check for Java 7+ and use PosixFileAttributeView
+<span class="nc" id="L1586">                _chmod(writing(f), mask);</span>
+
+<span class="nc" id="L1588">                return null;</span>
+            }
+        });
+<span class="nc" id="L1591">    }</span>
+
+    /**
+     * Run chmod via jnr-posix
+     */
+    private static void _chmod(File f, int mask) throws IOException {
+        // TODO WindowsPosix actually does something here (WindowsLibC._wchmod); should we let it?
+        // Anyway the existing calls already skip this method if on Windows.
+<span class="nc bnc" id="L1599" title="All 2 branches missed.">        if (File.pathSeparatorChar==';')  return; // noop</span>
+
+<span class="nc" id="L1601">        PosixAPI.jnr().chmod(f.getAbsolutePath(),mask);</span>
+<span class="nc" id="L1602">    }</span>
+
+<span class="fc" id="L1604">    private static boolean CHMOD_WARNED = false;</span>
+
+    /**
+     * Gets the file permission bit mask.
+     *
+     * @return
+     *      -1 on Windows, since such a concept doesn't make sense.
+     * @since 1.311
+     * @see #chmod(int)
+     */
+    public int mode() throws IOException, InterruptedException, PosixException {
+<span class="pc bpc" id="L1615" title="1 of 2 branches missed.">        if(!isUnix())   return -1;</span>
+<span class="nc" id="L1616">        return act(new SecureFileCallable&lt;Integer&gt;() {</span>
+            private static final long serialVersionUID = 1L;
+            public Integer invoke(File f, VirtualChannel channel) throws IOException {
+<span class="nc" id="L1619">                return IOUtils.mode(stating(f));</span>
+            }
+        });
+    }
+
+    /**
+     * List up files and directories in this directory.
+     *
+     * &lt;p&gt;
+     * This method returns direct children of the directory denoted by the 'this' object.
+     */
+    public List&lt;FilePath&gt; list() throws IOException, InterruptedException {
+<span class="nc" id="L1631">        return list((FileFilter)null);</span>
+    }
+
+    /**
+     * List up subdirectories.
+     *
+     * @return can be empty but never null. Doesn't contain &quot;.&quot; and &quot;..&quot;
+     */
+    public List&lt;FilePath&gt; listDirectories() throws IOException, InterruptedException {
+<span class="nc" id="L1640">        return list(new DirectoryFilter());</span>
+    }
+
+<span class="nc" id="L1643">    private static final class DirectoryFilter implements FileFilter, Serializable {</span>
+        public boolean accept(File f) {
+<span class="nc" id="L1645">            return f.isDirectory();</span>
+        }
+        private static final long serialVersionUID = 1L;
+    }
+
+    /**
+     * List up files in this directory, just like {@link File#listFiles(FileFilter)}.
+     *
+     * @param filter
+     *      The optional filter used to narrow down the result.
+     *      If non-null, must be {@link Serializable}.
+     *      If this {@link FilePath} represents a remote path,
+     *      the filter object will be executed on the remote machine.
+     */
+    public List&lt;FilePath&gt; list(final FileFilter filter) throws IOException, InterruptedException {
+<span class="nc bnc" id="L1660" title="All 4 branches missed.">        if (filter != null &amp;&amp; !(filter instanceof Serializable)) {</span>
+<span class="nc" id="L1661">            throw new IllegalArgumentException(&quot;Non-serializable filter of &quot; + filter.getClass());</span>
+        }
+<span class="nc" id="L1663">        return act(new SecureFileCallable&lt;List&lt;FilePath&gt;&gt;() {</span>
+            private static final long serialVersionUID = 1L;
+            public List&lt;FilePath&gt; invoke(File f, VirtualChannel channel) throws IOException {
+<span class="nc" id="L1666">                File[] children = reading(f).listFiles(filter);</span>
+<span class="nc bnc" id="L1667" title="All 2 branches missed.">                if(children ==null)     return null;</span>
+
+<span class="nc" id="L1669">                ArrayList&lt;FilePath&gt; r = new ArrayList&lt;FilePath&gt;(children.length);</span>
+<span class="nc bnc" id="L1670" title="All 2 branches missed.">                for (File child : children)</span>
+<span class="nc" id="L1671">                    r.add(new FilePath(child));</span>
+
+<span class="nc" id="L1673">                return r;</span>
+            }
+<span class="nc bnc" id="L1675" title="All 2 branches missed.">        }, (filter!=null?filter:this).getClass().getClassLoader());</span>
+    }
+
+    /**
+     * List up files in this directory that matches the given Ant-style filter.
+     *
+     * @param includes
+     *      See {@link FileSet} for the syntax. String like &quot;foo/*.zip&quot; or &quot;foo/*&amp;#42;/*.xml&quot;
+     * @return
+     *      can be empty but always non-null.
+     */
+    public FilePath[] list(final String includes) throws IOException, InterruptedException {
+<span class="fc" id="L1687">        return list(includes, null);</span>
+    }
+
+    /**
+     * List up files in this directory that matches the given Ant-style filter.
+     *
+     * @param includes
+     * @param excludes
+     *      See {@link FileSet} for the syntax. String like &quot;foo/*.zip&quot; or &quot;foo/*&amp;#42;/*.xml&quot;
+     * @return
+     *      can be empty but always non-null.
+     * @since 1.407
+     */
+    public FilePath[] list(final String includes, final String excludes) throws IOException, InterruptedException {
+<span class="fc" id="L1701">        return list(includes, excludes, true);</span>
+    }
+
+    /**
+     * List up files in this directory that matches the given Ant-style filter.
+     *
+     * @param includes
+     * @param excludes
+     *      See {@link FileSet} for the syntax. String like &quot;foo/*.zip&quot; or &quot;foo/*&amp;#42;/*.xml&quot;
+     * @param defaultExcludes whether to use the ant default excludes
+     * @return
+     *      can be empty but always non-null.
+     * @since 1.465
+     */
+    public FilePath[] list(final String includes, final String excludes, final boolean defaultExcludes) throws IOException, InterruptedException {
+<span class="fc" id="L1716">        return act(new SecureFileCallable&lt;FilePath[]&gt;() {</span>
+            private static final long serialVersionUID = 1L;
+            public FilePath[] invoke(File f, VirtualChannel channel) throws IOException {
+<span class="fc" id="L1719">                String[] files = glob(reading(f), includes, excludes, defaultExcludes);</span>
+
+<span class="fc" id="L1721">                FilePath[] r = new FilePath[files.length];</span>
+<span class="fc bfc" id="L1722" title="All 2 branches covered.">                for( int i=0; i&lt;r.length; i++ )</span>
+<span class="fc" id="L1723">                    r[i] = new FilePath(new File(f,files[i]));</span>
+
+<span class="fc" id="L1725">                return r;</span>
+            }
+        });
+    }
+
+    /**
+     * Runs Ant glob expansion.
+     *
+     * @return
+     *      A set of relative file names from the base directory.
+     */
+    private static String[] glob(File dir, String includes, String excludes, boolean defaultExcludes) throws IOException {
+<span class="pc bpc" id="L1737" title="1 of 2 branches missed.">        if(isAbsolute(includes))</span>
+<span class="nc" id="L1738">            throw new IOException(&quot;Expecting Ant GLOB pattern, but saw '&quot;+includes+&quot;'. See http://ant.apache.org/manual/Types/fileset.html for syntax&quot;);</span>
+<span class="fc" id="L1739">        FileSet fs = Util.createFileSet(dir,includes,excludes);</span>
+<span class="fc" id="L1740">        fs.setDefaultexcludes(defaultExcludes);</span>
+<span class="fc" id="L1741">        DirectoryScanner ds = fs.getDirectoryScanner(new Project());</span>
+<span class="fc" id="L1742">        String[] files = ds.getIncludedFiles();</span>
+<span class="fc" id="L1743">        return files;</span>
+    }
+
+    /**
+     * Reads this file.
+     */
+    public InputStream read() throws IOException, InterruptedException {
+<span class="pc bpc" id="L1750" title="1 of 2 branches missed.">        if(channel==null)</span>
+<span class="fc" id="L1751">            return new FileInputStream(reading(new File(remote)));</span>
+
+<span class="nc" id="L1753">        final Pipe p = Pipe.createRemoteToLocal();</span>
+<span class="nc" id="L1754">        actAsync(new SecureFileCallable&lt;Void&gt;() {</span>
+            private static final long serialVersionUID = 1L;
+
+            @Override
+            public Void invoke(File f, VirtualChannel channel) throws IOException, InterruptedException {
+<span class="nc" id="L1759">                FileInputStream fis = null;</span>
+                try {
+<span class="nc" id="L1761">                    fis = new FileInputStream(reading(f));</span>
+<span class="nc" id="L1762">                    Util.copyStream(fis, p.getOut());</span>
+<span class="nc" id="L1763">                } catch (Exception x) {</span>
+<span class="nc" id="L1764">                    p.error(x);</span>
+<span class="nc" id="L1765">                } finally {</span>
+<span class="nc" id="L1766">                    org.apache.commons.io.IOUtils.closeQuietly(fis);</span>
+<span class="nc" id="L1767">                    org.apache.commons.io.IOUtils.closeQuietly(p.getOut());</span>
+<span class="nc" id="L1768">                }</span>
+<span class="nc" id="L1769">                return null;</span>
+            }
+        });
+
+<span class="nc" id="L1773">        return p.getIn();</span>
+    }
+
+    /**
+     * Reads this file from the specific offset.
+     * @since 1.586
+     */
+    public InputStream readFromOffset(final long offset) throws IOException, InterruptedException {
+<span class="nc bnc" id="L1781" title="All 2 branches missed.">        if(channel ==null) {</span>
+<span class="nc" id="L1782">            final RandomAccessFile raf = new RandomAccessFile(new File(remote), &quot;r&quot;);</span>
+            try {
+<span class="nc" id="L1784">                raf.seek(offset);</span>
+<span class="nc" id="L1785">            } catch (IOException e) {</span>
+                try {
+<span class="nc" id="L1787">                    raf.close();</span>
+<span class="nc" id="L1788">                } catch (IOException e1) {</span>
+                    // ignore
+                }
+<span class="nc" id="L1791">                throw e;</span>
+            }
+<span class="nc" id="L1793">            return new InputStream() {</span>
+                @Override
+                public int read() throws IOException {
+<span class="nc" id="L1796">                    return raf.read();</span>
+                }
+
+                @Override
+                public void close() throws IOException {
+<span class="nc" id="L1801">                    raf.close();</span>
+<span class="nc" id="L1802">                }</span>
+
+                @Override
+                public int read(byte[] b, int off, int len) throws IOException {
+<span class="nc" id="L1806">                    return raf.read(b, off, len);</span>
+                }
+
+                @Override
+                public int read(byte[] b) throws IOException {
+<span class="nc" id="L1811">                    return raf.read(b);</span>
+                }
+            };
+        }
+
+<span class="nc" id="L1816">        final Pipe p = Pipe.createRemoteToLocal();</span>
+<span class="nc" id="L1817">        actAsync(new SecureFileCallable&lt;Void&gt;() {</span>
+            private static final long serialVersionUID = 1L;
+
+            public Void invoke(File f, VirtualChannel channel) throws IOException {
+<span class="nc" id="L1821">                final OutputStream out = new java.util.zip.GZIPOutputStream(p.getOut(), 8192);</span>
+<span class="nc" id="L1822">                RandomAccessFile raf = null;</span>
+                try {
+<span class="nc" id="L1824">                    raf = new RandomAccessFile(reading(f), &quot;r&quot;);</span>
+<span class="nc" id="L1825">                    raf.seek(offset);</span>
+<span class="nc" id="L1826">                    byte[] buf = new byte[8192];</span>
+                    int len;
+<span class="nc bnc" id="L1828" title="All 2 branches missed.">                    while ((len = raf.read(buf)) &gt;= 0) {</span>
+<span class="nc" id="L1829">                        out.write(buf, 0, len);</span>
+                    }
+<span class="nc" id="L1831">                    return null;</span>
+<span class="nc" id="L1832">                } finally {</span>
+<span class="nc" id="L1833">                    IOUtils.closeQuietly(out);</span>
+<span class="nc bnc" id="L1834" title="All 4 branches missed.">                    if (raf != null) {</span>
+                        try {
+<span class="nc" id="L1836">                            raf.close();</span>
+<span class="nc" id="L1837">                        } catch (IOException e) {</span>
+                            // ignore
+                        }
+                    }
+<span class="nc" id="L1841">                }</span>
+            }
+        });
+
+<span class="nc" id="L1845">        return new java.util.zip.GZIPInputStream(p.getIn());</span>
+    }
+
+    /**
+     * Reads this file into a string, by using the current system encoding.
+     */
+    public String readToString() throws IOException, InterruptedException {
+<span class="fc" id="L1852">        InputStream in = read();</span>
+        try {
+<span class="fc" id="L1854">            return org.apache.commons.io.IOUtils.toString(in);</span>
+<span class="nc" id="L1855">        } finally {</span>
+<span class="pc" id="L1856">            in.close();</span>
+<span class="nc" id="L1857">        }</span>
+    }
+
+    /**
+     * Writes to this file.
+     * If this file already exists, it will be overwritten.
+     * If the directory doesn't exist, it will be created.
+     *
+     * &lt;P&gt;
+     * I/O operation to remote {@link FilePath} happens asynchronously, meaning write operations to the returned
+     * {@link OutputStream} will return without receiving a confirmation from the remote that the write happened.
+     * I/O operations also happens asynchronously from the {@link Channel#call(Callable)} operations, so if
+     * you write to a remote file and then execute {@link Channel#call(Callable)} and try to access the newly copied
+     * file, it might not be fully written yet.
+     *
+     * &lt;p&gt;
+     *
+     */
+    public OutputStream write() throws IOException, InterruptedException {
+<span class="fc bfc" id="L1876" title="All 2 branches covered.">        if(channel==null) {</span>
+<span class="fc" id="L1877">            File f = new File(remote).getAbsoluteFile();</span>
+<span class="fc" id="L1878">            mkdirs(f.getParentFile());</span>
+<span class="fc" id="L1879">            return new FileOutputStream(writing(f));</span>
+        }
+
+<span class="fc" id="L1882">        return act(new SecureFileCallable&lt;OutputStream&gt;() {</span>
+            private static final long serialVersionUID = 1L;
+            public OutputStream invoke(File f, VirtualChannel channel) throws IOException, InterruptedException {
+<span class="fc" id="L1885">                f = f.getAbsoluteFile();</span>
+<span class="fc" id="L1886">                mkdirs(f.getParentFile());</span>
+<span class="fc" id="L1887">                FileOutputStream fos = new FileOutputStream(writing(f));</span>
+<span class="fc" id="L1888">                return new RemoteOutputStream(fos);</span>
+            }
+        });
+    }
+
+    /**
+     * Overwrites this file by placing the given String as the content.
+     *
+     * @param encoding
+     *      Null to use the platform default encoding.
+     * @since 1.105
+     */
+    public void write(final String content, final String encoding) throws IOException, InterruptedException {
+<span class="nc" id="L1901">        act(new SecureFileCallable&lt;Void&gt;() {</span>
+            private static final long serialVersionUID = 1L;
+            public Void invoke(File f, VirtualChannel channel) throws IOException {
+<span class="nc" id="L1904">                mkdirs(f.getParentFile());</span>
+<span class="nc" id="L1905">                FileOutputStream fos = new FileOutputStream(writing(f));</span>
+<span class="nc bnc" id="L1906" title="All 2 branches missed.">                Writer w = encoding != null ? new OutputStreamWriter(fos, encoding) : new OutputStreamWriter(fos);</span>
+                try {
+<span class="nc" id="L1908">                    w.write(content);</span>
+<span class="nc" id="L1909">                } finally {</span>
+<span class="nc" id="L1910">                    w.close();</span>
+<span class="nc" id="L1911">                }</span>
+<span class="nc" id="L1912">                return null;</span>
+            }
+        });
+<span class="nc" id="L1915">    }</span>
+
+    /**
+     * Computes the MD5 digest of the file in hex string.
+     * @see Util#getDigestOf(File)
+     */
+    public String digest() throws IOException, InterruptedException {
+<span class="fc" id="L1922">        return act(new SecureFileCallable&lt;String&gt;() {</span>
+            private static final long serialVersionUID = 1L;
+            public String invoke(File f, VirtualChannel channel) throws IOException {
+<span class="fc" id="L1925">                return Util.getDigestOf(reading(f));</span>
+            }
+        });
+    }
+
+    /**
+     * Rename this file/directory to the target filepath.  This FilePath and the target must
+     * be on the some host
+     */
+    public void renameTo(final FilePath target) throws IOException, InterruptedException {
+<span class="nc bnc" id="L1935" title="All 2 branches missed.">    	if(this.channel != target.channel) {</span>
+<span class="nc" id="L1936">    		throw new IOException(&quot;renameTo target must be on the same host&quot;);</span>
+    	}
+<span class="nc" id="L1938">        act(new SecureFileCallable&lt;Void&gt;() {</span>
+            private static final long serialVersionUID = 1L;
+            public Void invoke(File f, VirtualChannel channel) throws IOException {
+<span class="nc" id="L1941">            	reading(f).renameTo(creating(new File(target.remote)));</span>
+<span class="nc" id="L1942">                return null;</span>
+            }
+        });
+<span class="nc" id="L1945">    }</span>
+
+    /**
+     * Moves all the contents of this directory into the specified directory, then delete this directory itself.
+     *
+     * @since 1.308.
+     */
+    public void moveAllChildrenTo(final FilePath target) throws IOException, InterruptedException {
+<span class="pc bpc" id="L1953" title="1 of 2 branches missed.">        if(this.channel != target.channel) {</span>
+<span class="nc" id="L1954">            throw new IOException(&quot;pullUpTo target must be on the same host&quot;);</span>
+        }
+<span class="fc" id="L1956">        act(new SecureFileCallable&lt;Void&gt;() {</span>
+            private static final long serialVersionUID = 1L;
+            public Void invoke(File f, VirtualChannel channel) throws IOException {
+                // JENKINS-16846: if f.getName() is the same as one of the files/directories in f,
+                // then the rename op will fail
+<span class="fc" id="L1961">                File tmp = new File(f.getAbsolutePath()+&quot;.__rename&quot;);</span>
+<span class="pc bpc" id="L1962" title="1 of 2 branches missed.">                if (!f.renameTo(tmp))</span>
+<span class="nc" id="L1963">                    throw new IOException(&quot;Failed to rename &quot;+f+&quot; to &quot;+tmp);</span>
+
+<span class="fc" id="L1965">                File t = new File(target.getRemote());</span>
+                
+<span class="fc bfc" id="L1967" title="All 2 branches covered.">                for(File child : reading(tmp).listFiles()) {</span>
+<span class="fc" id="L1968">                    File target = new File(t, child.getName());</span>
+<span class="pc bpc" id="L1969" title="1 of 2 branches missed.">                    if(!stating(child).renameTo(creating(target)))</span>
+<span class="nc" id="L1970">                        throw new IOException(&quot;Failed to rename &quot;+child+&quot; to &quot;+target);</span>
+                }
+<span class="fc" id="L1972">                deleting(tmp).delete();</span>
+<span class="fc" id="L1973">                return null;</span>
+            }
+        });
+<span class="fc" id="L1976">    }</span>
+
+    /**
+     * Copies this file to the specified target.
+     */
+    public void copyTo(FilePath target) throws IOException, InterruptedException {
+        try {
+<span class="fc" id="L1983">            OutputStream out = target.write();</span>
+            try {
+<span class="fc" id="L1985">                copyTo(out);</span>
+<span class="pc" id="L1986">            } finally {</span>
+<span class="pc" id="L1987">                out.close();</span>
+<span class="nc" id="L1988">            }</span>
+<span class="pc" id="L1989">        } catch (IOException e) {</span>
+<span class="nc" id="L1990">            throw new IOException(&quot;Failed to copy &quot;+this+&quot; to &quot;+target,e);</span>
+        }
+<span class="fc" id="L1992">    }</span>
+
+    /**
+     * Copies this file to the specified target, with file permissions and other meta attributes intact.
+     * @since 1.311
+     */
+    public void copyToWithPermission(FilePath target) throws IOException, InterruptedException {
+<span class="fc" id="L1999">        copyTo(target);</span>
+        // copy file permission
+<span class="fc" id="L2001">        target.chmod(mode());</span>
+<span class="fc" id="L2002">        target.setLastModifiedIfPossible(lastModified());</span>
+<span class="fc" id="L2003">    }</span>
+
+    /**
+     * Sends the contents of this file into the given {@link OutputStream}.
+     */
+    public void copyTo(OutputStream os) throws IOException, InterruptedException {
+<span class="fc" id="L2009">        final OutputStream out = new RemoteOutputStream(os);</span>
+
+<span class="fc" id="L2011">        act(new SecureFileCallable&lt;Void&gt;() {</span>
+            private static final long serialVersionUID = 4088559042349254141L;
+            public Void invoke(File f, VirtualChannel channel) throws IOException {
+<span class="fc" id="L2014">                FileInputStream fis = null;</span>
+                try {
+<span class="fc" id="L2016">                    fis = new FileInputStream(reading(f));</span>
+<span class="fc" id="L2017">                    Util.copyStream(fis,out);</span>
+<span class="fc" id="L2018">                    return null;</span>
+<span class="nc" id="L2019">                } finally {</span>
+<span class="pc" id="L2020">                    org.apache.commons.io.IOUtils.closeQuietly(fis);</span>
+<span class="pc" id="L2021">                    org.apache.commons.io.IOUtils.closeQuietly(out);</span>
+<span class="nc" id="L2022">                }</span>
+            }
+        });
+
+        // make sure the writes fully got delivered to 'os' before we return.
+        // this is needed because I/O operation is asynchronous
+<span class="fc" id="L2028">        syncIO();</span>
+<span class="fc" id="L2029">    }</span>
+
+    /**
+     * With fix to JENKINS-11251 (remoting 2.15), this is no longer necessary.
+     * But I'm keeping it for a while so that users who manually deploy slave.jar has time to deploy new version
+     * before this goes away.
+     */
+    private void syncIO() throws InterruptedException {
+        try {
+<span class="fc bfc" id="L2038" title="All 2 branches covered.">            if (channel!=null)</span>
+<span class="fc" id="L2039">                channel.syncLocalIO();</span>
+<span class="pc" id="L2040">        } catch (AbstractMethodError e) {</span>
+            // legacy slave.jar. Handle this gracefully
+            try {
+<span class="nc" id="L2043">                LOGGER.log(Level.WARNING,&quot;Looks like an old slave.jar. Please update &quot;+ Which.jarFile(Channel.class)+&quot; to the new version&quot;,e);</span>
+<span class="nc" id="L2044">            } catch (IOException _) {</span>
+                // really ignore this time
+            }
+        }
+<span class="fc" id="L2048">    }</span>
+
+    /**
+     * A pointless function to work around what appears to be a HotSpot problem. See JENKINS-5756 and bug 6933067
+     * on BugParade for more details.
+     */
+    private void _syncIO() throws InterruptedException {
+<span class="nc" id="L2055">        channel.syncLocalIO();</span>
+<span class="nc" id="L2056">    }</span>
+
+    /**
+     * Remoting interface used for {@link FilePath#copyRecursiveTo(String, FilePath)}.
+     *
+     * TODO: this might not be the most efficient way to do the copy.
+     */
+    interface RemoteCopier {
+        /**
+         * @param fileName
+         *      relative path name to the output file. Path separator must be '/'.
+         */
+        void open(String fileName) throws IOException;
+        void write(byte[] buf, int len) throws IOException;
+        void close() throws IOException;
+    }
+
+    /**
+     * Copies the contents of this directory recursively into the specified target directory.
+     * 
+     * @return
+     *      the number of files copied.
+     * @since 1.312 
+     */
+    public int copyRecursiveTo(FilePath target) throws IOException, InterruptedException {
+<span class="fc" id="L2081">        return copyRecursiveTo(&quot;**/*&quot;,target);</span>
+    }
+
+    /**
+     * Copies the files that match the given file mask to the specified target node.
+     *
+     * @param fileMask
+     *      Ant GLOB pattern.
+     *      String like &quot;foo/bar/*.xml&quot; Multiple patterns can be separated
+     *      by ',', and whitespace can surround ',' (so that you can write
+     *      &quot;abc, def&quot; and &quot;abc,def&quot; to mean the same thing.
+     * @return
+     *      the number of files copied.
+     */
+    public int copyRecursiveTo(String fileMask, FilePath target) throws IOException, InterruptedException {
+<span class="fc" id="L2096">        return copyRecursiveTo(fileMask,null,target);</span>
+    }
+
+    /**
+     * Copies the files that match the given file mask to the specified target node.
+     *
+     * @param fileMask
+     *      Ant GLOB pattern.
+     *      String like &quot;foo/bar/*.xml&quot; Multiple patterns can be separated
+     *      by ',', and whitespace can surround ',' (so that you can write
+     *      &quot;abc, def&quot; and &quot;abc,def&quot; to mean the same thing.
+     * @param excludes
+     *      Files to be excluded. Can be null.
+     * @return
+     *      the number of files copied.
+     */
+    public int copyRecursiveTo(final String fileMask, final String excludes, final FilePath target) throws IOException, InterruptedException {
+<span class="fc" id="L2113">        return copyRecursiveTo(new DirScanner.Glob(fileMask, excludes), target, fileMask);</span>
+    }
+
+    /**
+     * Copies files according to a specified scanner to a target node.
+     * @param scanner a way of enumerating some files (must be serializable for possible delivery to remote side)
+     * @param target the destination basedir
+     * @param description a description of the fileset, for logging purposes
+     * @return the number of files copied
+     * @since 1.532
+     */
+    public int copyRecursiveTo(final DirScanner scanner, final FilePath target, final String description) throws IOException, InterruptedException {
+<span class="fc bfc" id="L2125" title="All 2 branches covered.">        if(this.channel==target.channel) {</span>
+            // local to local copy.
+<span class="fc" id="L2127">            return act(new SecureFileCallable&lt;Integer&gt;() {</span>
+                private static final long serialVersionUID = 1L;
+                public Integer invoke(File base, VirtualChannel channel) throws IOException {
+<span class="pc bpc" id="L2130" title="1 of 2 branches missed.">                    if(!base.exists())  return 0;</span>
+<span class="pc bpc" id="L2131" title="3 of 4 branches missed.">                    assert target.channel==null;</span>
+<span class="fc" id="L2132">                    final File dest = new File(target.remote);</span>
+<span class="fc" id="L2133">                    final AtomicInteger count = new AtomicInteger();</span>
+<span class="fc" id="L2134">                    scanner.scan(base, reading(new FileVisitor() {</span>
+                        @Override
+                        public void visit(File f, String relativePath) throws IOException {
+<span class="pc bpc" id="L2137" title="1 of 2 branches missed.">                            if (f.isFile()) {</span>
+<span class="fc" id="L2138">                                File target = new File(dest, relativePath);</span>
+<span class="fc" id="L2139">                                mkdirsE(target.getParentFile());</span>
+<span class="fc" id="L2140">                                Util.copyFile(f, writing(target));</span>
+<span class="fc" id="L2141">                                count.incrementAndGet();</span>
+                            }
+<span class="fc" id="L2143">                        }</span>
+
+                        @Override
+                        public boolean understandsSymlink() {
+<span class="fc" id="L2147">                            return true;</span>
+                        }
+
+                        @Override
+                        public void visitSymlink(File link, String target, String relativePath) throws IOException {
+                            try {
+<span class="nc" id="L2153">                                mkdirsE(new File(dest, relativePath).getParentFile());</span>
+<span class="nc" id="L2154">                                writing(new File(dest, target));</span>
+<span class="nc" id="L2155">                                Util.createSymlink(dest, target, relativePath, TaskListener.NULL);</span>
+<span class="nc" id="L2156">                            } catch (InterruptedException x) {</span>
+<span class="nc" id="L2157">                                throw (IOException) new IOException(x.toString()).initCause(x);</span>
+                            }
+<span class="nc" id="L2159">                            count.incrementAndGet();</span>
+<span class="nc" id="L2160">                        }</span>
+                    }));
+<span class="fc" id="L2162">                    return count.get();</span>
+                }
+            });
+        } else
+<span class="pc bpc" id="L2166" title="1 of 2 branches missed.">        if(this.channel==null) {</span>
+            // local -&gt; remote copy
+<span class="fc" id="L2168">            final Pipe pipe = Pipe.createLocalToRemote();</span>
+
+<span class="fc" id="L2170">            Future&lt;Void&gt; future = target.actAsync(new SecureFileCallable&lt;Void&gt;() {</span>
+                private static final long serialVersionUID = 1L;
+                public Void invoke(File f, VirtualChannel channel) throws IOException {
+                    try {
+<span class="fc" id="L2174">                        readFromTar(remote + '/' + description, f,TarCompression.GZIP.extract(pipe.getIn()));</span>
+<span class="fc" id="L2175">                        return null;</span>
+<span class="nc" id="L2176">                    } finally {</span>
+<span class="pc" id="L2177">                        pipe.getIn().close();</span>
+<span class="nc" id="L2178">                    }</span>
+                }
+            });
+<span class="fc" id="L2181">            Future&lt;Integer&gt; future2 = actAsync(new SecureFileCallable&lt;Integer&gt;() {</span>
+                private static final long serialVersionUID = 1L;
+                @Override public Integer invoke(File f, VirtualChannel channel) throws IOException, InterruptedException {
+<span class="fc" id="L2184">                    return writeToTar(new File(remote), scanner, TarCompression.GZIP.compress(pipe.getOut()));</span>
+                }
+            });
+            try {
+                // JENKINS-9540 in case the reading side failed, report that error first
+<span class="fc" id="L2189">                future.get();</span>
+<span class="fc" id="L2190">                return future2.get();</span>
+<span class="nc" id="L2191">            } catch (ExecutionException e) {</span>
+<span class="nc" id="L2192">                throw new IOException(e);</span>
+            }
+        } else {
+            // remote -&gt; local copy
+<span class="nc" id="L2196">            final Pipe pipe = Pipe.createRemoteToLocal();</span>
+
+<span class="nc" id="L2198">            Future&lt;Integer&gt; future = actAsync(new SecureFileCallable&lt;Integer&gt;() {</span>
+                private static final long serialVersionUID = 1L;
+                public Integer invoke(File f, VirtualChannel channel) throws IOException {
+                    try {
+<span class="nc" id="L2202">                        return writeToTar(f, scanner, TarCompression.GZIP.compress(pipe.getOut()));</span>
+<span class="nc" id="L2203">                    } finally {</span>
+<span class="nc" id="L2204">                        pipe.getOut().close();</span>
+<span class="nc" id="L2205">                    }</span>
+                }
+            });
+            try {
+<span class="nc" id="L2209">                readFromTar(remote + '/' + description,new File(target.remote),TarCompression.GZIP.extract(pipe.getIn()));</span>
+<span class="nc" id="L2210">            } catch (IOException e) {// BuildException or IOException</span>
+                try {
+<span class="nc" id="L2212">                    future.get(3,TimeUnit.SECONDS);</span>
+<span class="nc" id="L2213">                    throw e;    // the remote side completed successfully, so the error must be local</span>
+<span class="nc" id="L2214">                } catch (ExecutionException x) {</span>
+                    // report both errors
+<span class="nc" id="L2216">                    throw new IOException(Functions.printThrowable(e),x);</span>
+<span class="nc" id="L2217">                } catch (TimeoutException _) {</span>
+                    // remote is hanging
+<span class="nc" id="L2219">                    throw e;</span>
+                }
+            }
+            try {
+<span class="nc" id="L2223">                return future.get();</span>
+<span class="nc" id="L2224">            } catch (ExecutionException e) {</span>
+<span class="nc" id="L2225">                throw new IOException(e);</span>
+            }
+        }
+    }
+
+
+    /**
+     * Writes files in 'this' directory to a tar stream.
+     *
+     * @param glob
+     *      Ant file pattern mask, like &quot;**&amp;#x2F;*.java&quot;.
+     */
+    public int tar(OutputStream out, final String glob) throws IOException, InterruptedException {
+<span class="fc" id="L2238">        return archive(ArchiverFactory.TAR, out, glob);</span>
+    }
+
+    public int tar(OutputStream out, FileFilter filter) throws IOException, InterruptedException {
+<span class="nc" id="L2242">        return archive(ArchiverFactory.TAR, out, filter);</span>
+    }
+
+    /**
+     * Uses the given scanner on 'this' directory to list up files and then archive it to a tar stream.
+     */
+    public int tar(OutputStream out, DirScanner scanner) throws IOException, InterruptedException {
+<span class="nc" id="L2249">        return archive(ArchiverFactory.TAR, out, scanner);</span>
+    }
+
+    /**
+     * Writes to a tar stream and stores obtained files to the base dir.
+     *
+     * @return
+     *      number of files/directories that are written.
+     */
+    private Integer writeToTar(File baseDir, DirScanner scanner, OutputStream out) throws IOException {
+<span class="fc" id="L2259">        Archiver tw = ArchiverFactory.TAR.create(out);</span>
+        try {
+<span class="fc" id="L2261">            scanner.scan(baseDir,reading(tw));</span>
+<span class="pc" id="L2262">        } finally {</span>
+<span class="pc" id="L2263">            tw.close();</span>
+<span class="nc" id="L2264">        }</span>
+<span class="fc" id="L2265">        return tw.countEntries();</span>
+    }
+
+    /**
+     * Reads from a tar stream and stores obtained files to the base dir.
+     * @since TODO supports large files &gt; 10 GB, migration to commons-compress
+     */
+    private void readFromTar(String name, File baseDir, InputStream in) throws IOException {
+<span class="fc" id="L2273">        TarArchiveInputStream t = new TarArchiveInputStream(in);</span>
+        
+        // TarInputStream t = new TarInputStream(in);
+        try {
+            TarArchiveEntry te;
+<span class="fc bfc" id="L2278" title="All 2 branches covered.">            while ((te = t.getNextTarEntry()) != null) {</span>
+<span class="fc" id="L2279">                File f = new File(baseDir,te.getName());</span>
+<span class="pc bpc" id="L2280" title="1 of 2 branches missed.">                if(te.isDirectory()) {</span>
+<span class="nc" id="L2281">                    mkdirs(f);</span>
+<span class="nc" id="L2282">                } else {</span>
+<span class="fc" id="L2283">                    File parent = f.getParentFile();</span>
+<span class="pc bpc" id="L2284" title="1 of 2 branches missed.">                    if (parent != null) mkdirs(parent);</span>
+<span class="fc" id="L2285">                    writing(f);</span>
+
+<span class="pc bpc" id="L2287" title="1 of 2 branches missed.">                    if (te.isSymbolicLink()) {</span>
+<span class="nc" id="L2288">                        new FilePath(f).symlinkTo(te.getLinkName(), TaskListener.NULL);</span>
+<span class="nc" id="L2289">                    } else {</span>
+<span class="fc" id="L2290">                        IOUtils.copy(t,f);</span>
+
+<span class="fc" id="L2292">                        f.setLastModified(te.getModTime().getTime());</span>
+<span class="fc" id="L2293">                        int mode = te.getMode()&amp;0777;</span>
+<span class="pc bpc" id="L2294" title="2 of 4 branches missed.">                        if(mode!=0 &amp;&amp; !Functions.isWindows()) // be defensive</span>
+<span class="nc" id="L2295">                            _chmod(f,mode);</span>
+                    }
+                }
+            }
+<span class="pc" id="L2299">        } catch(IOException e) {</span>
+<span class="nc" id="L2300">            throw new IOException(&quot;Failed to extract &quot;+name,e);</span>
+<span class="nc" id="L2301">        } catch (InterruptedException e) {</span>
+<span class="nc" id="L2302">            Thread.currentThread().interrupt(); // process this later</span>
+<span class="nc" id="L2303">            throw new IOException(&quot;Failed to extract &quot;+name,e);</span>
+<span class="nc" id="L2304">        } finally {</span>
+<span class="pc" id="L2305">            t.close();</span>
+<span class="nc" id="L2306">        }</span>
+<span class="fc" id="L2307">    }</span>
+
+    /**
+     * Creates a {@link Launcher} for starting processes on the node
+     * that has this file.
+     * @since 1.89
+     */
+    public Launcher createLauncher(TaskListener listener) throws IOException, InterruptedException {
+<span class="nc bnc" id="L2315" title="All 2 branches missed.">        if(channel==null)</span>
+<span class="nc" id="L2316">            return new LocalLauncher(listener);</span>
+        else
+<span class="nc" id="L2318">            return new RemoteLauncher(listener,channel,channel.call(new IsUnix()));</span>
+    }
+
+<span class="nc" id="L2321">    private static final class IsUnix extends MasterToSlaveCallable&lt;Boolean,IOException&gt; {</span>
+        public Boolean call() throws IOException {
+<span class="nc bnc" id="L2323" title="All 2 branches missed.">            return File.pathSeparatorChar==':';</span>
+        }
+        private static final long serialVersionUID = 1L;
+    }
+
+    /**
+     * Validates the ant file mask (like &quot;foo/bar/*.txt, zot/*.jar&quot;)
+     * against this directory, and try to point out the problem.
+     *
+     * &lt;p&gt;
+     * This is useful in conjunction with {@link FormValidation}.
+     *
+     * @return
+     *      null if no error was found. Otherwise returns a human readable error message.
+     * @since 1.90
+     * @see #validateFileMask(FilePath, String)
+     * @deprecated use {@link #validateAntFileMask(String, int)} instead
+     */
+    @Deprecated
+    public String validateAntFileMask(final String fileMasks) throws IOException, InterruptedException {
+<span class="fc" id="L2343">        return validateAntFileMask(fileMasks, Integer.MAX_VALUE);</span>
+    }
+
+    /**
+     * Same as {@link #validateFileMask(String, int, boolean)} with caseSensitive set to true
+     */
+    public String validateAntFileMask(final String fileMasks, final int bound) throws IOException, InterruptedException {
+<span class="fc" id="L2350">        return validateAntFileMask(fileMasks, bound, true);</span>
+    }
+
+    /**
+     * Default bound for {@link #validateAntFileMask(String, int, boolean)}.
+     * @since 1.592
+     */
+<span class="fc" id="L2357">    public static int VALIDATE_ANT_FILE_MASK_BOUND = Integer.getInteger(FilePath.class.getName() + &quot;.VALIDATE_ANT_FILE_MASK_BOUND&quot;, 10000);</span>
+
+    /**
+     * Like {@link #validateAntFileMask(String)} but performing only a bounded number of operations.
+     * &lt;p&gt;Whereas the unbounded overload is appropriate for calling from cancelable, long-running tasks such as build steps,
+     * this overload should be used when an answer is needed quickly, such as for {@link #validateFileMask(String)}
+     * or anything else returning {@link FormValidation}.
+     * &lt;p&gt;If a positive match is found, {@code null} is returned immediately.
+     * A message is returned in case the file pattern can definitely be determined to not match anything in the directory within the alloted time.
+     * If the time runs out without finding a match but without ruling out the possibility that there might be one, {@link InterruptedException} is thrown,
+     * in which case the calling code should give the user the benefit of the doubt and use {@link hudson.util.FormValidation.Kind#OK} (with or without a message).
+     * @param bound a maximum number of negative operations (deliberately left vague) to perform before giving up on a precise answer; try {@link #VALIDATE_ANT_FILE_MASK_BOUND}
+     * @throws InterruptedException not only in case of a channel failure, but also if too many operations were performed without finding any matches
+     * @since 1.484
+     */
+    public String validateAntFileMask(final String fileMasks, final int bound, final boolean caseSensitive) throws IOException, InterruptedException {
+<span class="fc" id="L2373">        return act(new MasterToSlaveFileCallable&lt;String&gt;() {</span>
+            private static final long serialVersionUID = 1;
+            public String invoke(File dir, VirtualChannel channel) throws IOException, InterruptedException {
+<span class="pc bpc" id="L2376" title="1 of 2 branches missed.">                if(fileMasks.startsWith(&quot;~&quot;))</span>
+<span class="nc" id="L2377">                    return Messages.FilePath_TildaDoesntWork();</span>
+
+<span class="fc" id="L2379">                StringTokenizer tokens = new StringTokenizer(fileMasks,&quot;,&quot;);</span>
+
+<span class="fc bfc" id="L2381" title="All 2 branches covered.">                while(tokens.hasMoreTokens()) {</span>
+<span class="fc" id="L2382">                    final String fileMask = tokens.nextToken().trim();</span>
+<span class="fc bfc" id="L2383" title="All 2 branches covered.">                    if(hasMatch(dir,fileMask,caseSensitive))</span>
+<span class="fc" id="L2384">                        continue;   // no error on this portion</span>
+                    
+                    // JENKINS-5253 - if we can get some match in case insensitive mode
+                    // and user requested case sensitive match, notify the user
+<span class="pc bpc" id="L2388" title="2 of 4 branches missed.">                    if (caseSensitive &amp;&amp; hasMatch(dir, fileMask, false)) {</span>
+<span class="nc" id="L2389">                        return Messages.FilePath_validateAntFileMask_matchWithCaseInsensitive(fileMask);</span>
+                    }
+
+                    // in 1.172 we introduced an incompatible change to stop using ' ' as the separator
+                    // so see if we can match by using ' ' as the separator
+<span class="pc bpc" id="L2394" title="1 of 2 branches missed.">                    if(fileMask.contains(&quot; &quot;)) {</span>
+<span class="nc" id="L2395">                        boolean matched = true;</span>
+<span class="nc bnc" id="L2396" title="All 2 branches missed.">                        for (String token : Util.tokenize(fileMask))</span>
+<span class="nc" id="L2397">                            matched &amp;= hasMatch(dir,token,caseSensitive);</span>
+<span class="nc bnc" id="L2398" title="All 2 branches missed.">                        if(matched)</span>
+<span class="nc" id="L2399">                            return Messages.FilePath_validateAntFileMask_whitespaceSeprator();</span>
+                    }
+
+                    // a common mistake is to assume the wrong base dir, and there are two variations
+                    // to this: (1) the user gave us aa/bb/cc/dd where cc/dd was correct
+                    // and (2) the user gave us cc/dd where aa/bb/cc/dd was correct.
+
+                    {// check the (1) above first
+<span class="fc" id="L2407">                        String f=fileMask;</span>
+                        while(true) {
+<span class="fc" id="L2409">                            int idx = findSeparator(f);</span>
+<span class="fc bfc" id="L2410" title="All 2 branches covered.">                            if(idx==-1)     break;</span>
+<span class="fc" id="L2411">                            f=f.substring(idx+1);</span>
+
+<span class="pc bpc" id="L2413" title="1 of 2 branches missed.">                            if(hasMatch(dir,f,caseSensitive))</span>
+<span class="nc" id="L2414">                                return Messages.FilePath_validateAntFileMask_doesntMatchAndSuggest(fileMask,f);</span>
+                        }
+                    }
+
+                    {// check the (2) above next as this is more expensive.
+                        // Try prepending &quot;**/&quot; to see if that results in a match
+<span class="fc" id="L2420">                        FileSet fs = Util.createFileSet(reading(dir),&quot;**/&quot;+fileMask);</span>
+<span class="fc" id="L2421">                        fs.setCaseSensitive(caseSensitive);</span>
+<span class="fc" id="L2422">                        DirectoryScanner ds = fs.getDirectoryScanner(new Project());</span>
+<span class="fc bfc" id="L2423" title="All 2 branches covered.">                        if(ds.getIncludedFilesCount()!=0) {</span>
+                            // try shorter name first so that the suggestion results in least amount of changes
+<span class="fc" id="L2425">                            String[] names = ds.getIncludedFiles();</span>
+<span class="fc" id="L2426">                            Arrays.sort(names,SHORTER_STRING_FIRST);</span>
+<span class="pc bpc" id="L2427" title="1 of 2 branches missed.">                            for( String f : names) {</span>
+                                // now we want to decompose f to the leading portion that matched &quot;**&quot;
+                                // and the trailing portion that matched the file mask, so that
+                                // we can suggest the user error.
+                                //
+                                // this is not a very efficient/clever way to do it, but it's relatively simple
+
+<span class="fc" id="L2434">                                String prefix=&quot;&quot;;</span>
+                                while(true) {
+<span class="fc" id="L2436">                                    int idx = findSeparator(f);</span>
+<span class="pc bpc" id="L2437" title="1 of 2 branches missed.">                                    if(idx==-1)     break;</span>
+
+<span class="fc" id="L2439">                                    prefix+=f.substring(0,idx)+'/';</span>
+<span class="fc" id="L2440">                                    f=f.substring(idx+1);</span>
+<span class="fc bfc" id="L2441" title="All 2 branches covered.">                                    if(hasMatch(dir,prefix+fileMask,caseSensitive))</span>
+<span class="fc" id="L2442">                                        return Messages.FilePath_validateAntFileMask_doesntMatchAndSuggest(fileMask, prefix+fileMask);</span>
+                                }
+                            }
+                        }
+                    }
+
+                    {// finally, see if we can identify any sub portion that's valid. Otherwise bail out
+<span class="fc" id="L2449">                        String previous = null;</span>
+<span class="fc" id="L2450">                        String pattern = fileMask;</span>
+
+<span class="fc" id="L2452">                        while(true) {</span>
+<span class="fc bfc" id="L2453" title="All 2 branches covered.">                            if(hasMatch(dir,pattern,caseSensitive)) {</span>
+                                // found a match
+<span class="pc bpc" id="L2455" title="1 of 2 branches missed.">                                if(previous==null)</span>
+<span class="nc" id="L2456">                                    return Messages.FilePath_validateAntFileMask_portionMatchAndSuggest(fileMask,pattern);</span>
+                                else
+<span class="fc" id="L2458">                                    return Messages.FilePath_validateAntFileMask_portionMatchButPreviousNotMatchAndSuggest(fileMask,pattern,previous);</span>
+                            }
+
+<span class="fc" id="L2461">                            int idx = findSeparator(pattern);</span>
+<span class="fc bfc" id="L2462" title="All 2 branches covered.">                            if(idx&lt;0) {// no more path component left to go back</span>
+<span class="pc bpc" id="L2463" title="1 of 2 branches missed.">                                if(pattern.equals(fileMask))</span>
+<span class="fc" id="L2464">                                    return Messages.FilePath_validateAntFileMask_doesntMatchAnything(fileMask);</span>
+                                else
+<span class="nc" id="L2466">                                    return Messages.FilePath_validateAntFileMask_doesntMatchAnythingAndSuggest(fileMask,pattern);</span>
+                            }
+
+                            // cut off the trailing component and try again
+<span class="fc" id="L2470">                            previous = pattern;</span>
+<span class="fc" id="L2471">                            pattern = pattern.substring(0,idx);</span>
+                        }
+                    }
+                }
+
+<span class="fc" id="L2476">                return null; // no error</span>
+            }
+
+            private boolean hasMatch(File dir, String pattern, boolean bCaseSensitive) throws InterruptedException {
+<span class="fc" id="L2480">                class Cancel extends RuntimeException {}</span>
+<span class="fc bfc" id="L2481" title="All 2 branches covered.">                DirectoryScanner ds = bound == Integer.MAX_VALUE ? new DirectoryScanner() : new DirectoryScanner() {</span>
+                    int ticks;
+<span class="fc" id="L2483">                    long start = System.currentTimeMillis();</span>
+                    @Override public synchronized boolean isCaseSensitive() {
+<span class="pc bpc" id="L2485" title="1 of 8 branches missed.">                        if (!filesIncluded.isEmpty() || !dirsIncluded.isEmpty() || ticks++ &gt; bound || System.currentTimeMillis() - start &gt; 5000) {</span>
+<span class="fc" id="L2486">                            throw new Cancel();</span>
+                        }
+<span class="fc" id="L2488">                        filesNotIncluded.clear();</span>
+<span class="fc" id="L2489">                        dirsNotIncluded.clear();</span>
+                        // notFollowedSymlinks might be large, but probably unusual
+                        // scannedDirs will typically be largish, but seems to be needed
+<span class="fc" id="L2492">                        return super.isCaseSensitive();</span>
+                    }
+                };
+<span class="fc" id="L2495">                ds.setBasedir(reading(dir));</span>
+<span class="fc" id="L2496">                ds.setIncludes(new String[] {pattern});</span>
+<span class="fc" id="L2497">                ds.setCaseSensitive(bCaseSensitive);</span>
+                try {
+<span class="fc" id="L2499">                    ds.scan();</span>
+<span class="fc" id="L2500">                } catch (Cancel c) {</span>
+<span class="fc bfc" id="L2501" title="All 4 branches covered.">                    if (ds.getIncludedFilesCount()!=0 || ds.getIncludedDirsCount()!=0) {</span>
+<span class="fc" id="L2502">                        return true;</span>
+                    } else {
+<span class="fc" id="L2504">                        throw new InterruptedException(&quot;no matches found within &quot; + bound);</span>
+                    }
+                }
+<span class="pc bpc" id="L2507" title="1 of 4 branches missed.">                return ds.getIncludedFilesCount()!=0 || ds.getIncludedDirsCount()!=0;</span>
+            }
+
+            /**
+             * Finds the position of the first path separator.
+             */
+            private int findSeparator(String pattern) {
+<span class="fc" id="L2514">                int idx1 = pattern.indexOf('\\');</span>
+<span class="fc" id="L2515">                int idx2 = pattern.indexOf('/');</span>
+<span class="fc bfc" id="L2516" title="All 2 branches covered.">                if(idx1==-1)    return idx2;</span>
+<span class="pc bpc" id="L2517" title="1 of 2 branches missed.">                if(idx2==-1)    return idx1;</span>
+<span class="nc" id="L2518">                return Math.min(idx1,idx2);</span>
+            }
+        });
+    }
+
+    /**
+     * Short for {@code validateFileMask(path, value, true)}
+     */
+    public static FormValidation validateFileMask(@CheckForNull FilePath path, String value) throws IOException {
+<span class="nc" id="L2527">        return FilePath.validateFileMask(path, value, true);</span>
+    }
+    
+    /**
+     * Shortcut for {@link #validateFileMask(String,true,boolean)} as the left-hand side can be null.
+     */
+    public static FormValidation validateFileMask(@CheckForNull FilePath path, String value, boolean caseSensitive) throws IOException {
+<span class="nc bnc" id="L2534" title="All 2 branches missed.">        if(path==null) return FormValidation.ok();</span>
+<span class="nc" id="L2535">        return path.validateFileMask(value, true, caseSensitive);</span>
+    }
+
+    /**
+     * Short for {@code validateFileMask(value, true, true)} 
+     */
+    public FormValidation validateFileMask(String value) throws IOException {
+<span class="nc" id="L2542">        return validateFileMask(value, true, true);</span>
+    }
+    
+    /**
+     * Short for {@code validateFileMask(value, errorIfNotExist, true)} 
+     */
+    public FormValidation validateFileMask(String value, boolean errorIfNotExist) throws IOException {
+<span class="nc" id="L2549">        return validateFileMask(value, errorIfNotExist, true);</span>
+    }
+
+    /**
+     * Checks the GLOB-style file mask. See {@link #validateAntFileMask(String)}.
+     * Requires configure permission on ancestor AbstractProject object in request,
+     * or admin permission if no such ancestor is found.
+     * @since 1.294
+     */
+    public FormValidation validateFileMask(String value, boolean errorIfNotExist, boolean caseSensitive) throws IOException {
+<span class="nc" id="L2559">        checkPermissionForValidate();</span>
+
+<span class="nc" id="L2561">        value = fixEmpty(value);</span>
+<span class="nc bnc" id="L2562" title="All 2 branches missed.">        if(value==null)</span>
+<span class="nc" id="L2563">            return FormValidation.ok();</span>
+
+        try {
+<span class="nc bnc" id="L2566" title="All 2 branches missed.">            if(!exists()) // no workspace. can't check</span>
+<span class="nc" id="L2567">                return FormValidation.ok();</span>
+
+<span class="nc" id="L2569">            String msg = validateAntFileMask(value, VALIDATE_ANT_FILE_MASK_BOUND, caseSensitive);</span>
+<span class="nc bnc" id="L2570" title="All 2 branches missed.">            if(errorIfNotExist)     return FormValidation.error(msg);</span>
+<span class="nc" id="L2571">            else                    return FormValidation.warning(msg);</span>
+<span class="nc" id="L2572">        } catch (InterruptedException e) {</span>
+<span class="nc" id="L2573">            return FormValidation.ok(Messages.FilePath_did_not_manage_to_validate_may_be_too_sl(value));</span>
+        }
+    }
+
+    /**
+     * Validates a relative file path from this {@link FilePath}.
+     * Requires configure permission on ancestor AbstractProject object in request,
+     * or admin permission if no such ancestor is found.
+     *
+     * @param value
+     *      The relative path being validated.
+     * @param errorIfNotExist
+     *      If true, report an error if the given relative path doesn't exist. Otherwise it's a warning.
+     * @param expectingFile
+     *      If true, we expect the relative path to point to a file.
+     *      Otherwise, the relative path is expected to be pointing to a directory.
+     */
+    public FormValidation validateRelativePath(String value, boolean errorIfNotExist, boolean expectingFile) throws IOException {
+<span class="nc" id="L2591">        checkPermissionForValidate();</span>
+
+<span class="nc" id="L2593">        value = fixEmpty(value);</span>
+
+        // none entered yet, or something is seriously wrong
+<span class="nc bnc" id="L2596" title="All 2 branches missed.">        if(value==null) return FormValidation.ok();</span>
+
+        // a common mistake is to use wildcard
+<span class="nc bnc" id="L2599" title="All 2 branches missed.">        if(value.contains(&quot;*&quot;)) return FormValidation.error(Messages.FilePath_validateRelativePath_wildcardNotAllowed());</span>
+
+        try {
+<span class="nc bnc" id="L2602" title="All 2 branches missed.">            if(!exists())    // no base directory. can't check</span>
+<span class="nc" id="L2603">                return FormValidation.ok();</span>
+
+<span class="nc" id="L2605">            FilePath path = child(value);</span>
+<span class="nc bnc" id="L2606" title="All 2 branches missed.">            if(path.exists()) {</span>
+<span class="nc bnc" id="L2607" title="All 2 branches missed.">                if (expectingFile) {</span>
+<span class="nc bnc" id="L2608" title="All 2 branches missed.">                    if(!path.isDirectory())</span>
+<span class="nc" id="L2609">                        return FormValidation.ok();</span>
+                    else
+<span class="nc" id="L2611">                        return FormValidation.error(Messages.FilePath_validateRelativePath_notFile(value));</span>
+                } else {
+<span class="nc bnc" id="L2613" title="All 2 branches missed.">                    if(path.isDirectory())</span>
+<span class="nc" id="L2614">                        return FormValidation.ok();</span>
+                    else
+<span class="nc" id="L2616">                        return FormValidation.error(Messages.FilePath_validateRelativePath_notDirectory(value));</span>
+                }
+            }
+
+<span class="nc bnc" id="L2620" title="All 2 branches missed.">            String msg = expectingFile ? Messages.FilePath_validateRelativePath_noSuchFile(value) : </span>
+<span class="nc" id="L2621">                Messages.FilePath_validateRelativePath_noSuchDirectory(value);</span>
+<span class="nc bnc" id="L2622" title="All 2 branches missed.">            if(errorIfNotExist)     return FormValidation.error(msg);</span>
+<span class="nc" id="L2623">            else                    return FormValidation.warning(msg);</span>
+<span class="nc" id="L2624">        } catch (InterruptedException e) {</span>
+<span class="nc" id="L2625">            return FormValidation.ok();</span>
+        }
+    }
+
+    private static void checkPermissionForValidate() {
+<span class="nc" id="L2630">        AccessControlled subject = Stapler.getCurrentRequest().findAncestorObject(AbstractProject.class);</span>
+<span class="nc bnc" id="L2631" title="All 2 branches missed.">        if (subject == null)</span>
+<span class="nc" id="L2632">            Jenkins.getInstance().checkPermission(Jenkins.ADMINISTER);</span>
+        else
+<span class="nc" id="L2634">            subject.checkPermission(Item.CONFIGURE);</span>
+<span class="nc" id="L2635">    }</span>
+
+    /**
+     * A convenience method over {@link #validateRelativePath(String, boolean, boolean)}.
+     */
+    public FormValidation validateRelativeDirectory(String value, boolean errorIfNotExist) throws IOException {
+<span class="nc" id="L2641">        return validateRelativePath(value,errorIfNotExist,false);</span>
+    }
+
+    public FormValidation validateRelativeDirectory(String value) throws IOException {
+<span class="nc" id="L2645">        return validateRelativeDirectory(value,true);</span>
+    }
+
+    @Deprecated @Override
+    public String toString() {
+        // to make writing JSPs easily, return local
+<span class="nc" id="L2651">        return remote;</span>
+    }
+
+    public VirtualChannel getChannel() {
+<span class="nc bnc" id="L2655" title="All 2 branches missed.">        if(channel!=null)   return channel;</span>
+<span class="nc" id="L2656">        else                return localChannel;</span>
+    }
+
+    /**
+     * Returns true if this {@link FilePath} represents a remote file. 
+     */
+    public boolean isRemote() {
+<span class="fc bfc" id="L2663" title="All 2 branches covered.">        return channel!=null;</span>
+    }
+
+    private void writeObject(ObjectOutputStream oos) throws IOException {
+<span class="fc" id="L2667">        Channel target = Channel.current();</span>
+
+<span class="pc bpc" id="L2669" title="1 of 4 branches missed.">        if(channel!=null &amp;&amp; channel!=target)</span>
+<span class="nc" id="L2670">            throw new IllegalStateException(&quot;Can't send a remote FilePath to a different remote channel&quot;);</span>
+
+<span class="fc" id="L2672">        oos.defaultWriteObject();</span>
+<span class="fc bfc" id="L2673" title="All 2 branches covered.">        oos.writeBoolean(channel==null);</span>
+<span class="fc" id="L2674">    }</span>
+
+    private void readObject(ObjectInputStream ois) throws IOException, ClassNotFoundException {
+<span class="fc" id="L2677">        Channel channel = Channel.current();</span>
+<span class="pc bpc" id="L2678" title="3 of 4 branches missed.">        assert channel!=null;</span>
+
+<span class="fc" id="L2680">        ois.defaultReadObject();</span>
+<span class="fc bfc" id="L2681" title="All 2 branches covered.">        if(ois.readBoolean()) {</span>
+<span class="fc" id="L2682">            this.channel = channel;</span>
+<span class="fc" id="L2683">            this.filter = null;</span>
+<span class="fc" id="L2684">        } else {</span>
+<span class="fc" id="L2685">            this.channel = null;</span>
+            // If the remote channel wants us to create a FilePath that points to a local file,
+            // we need to make sure the access control takes place.
+            // This covers the immediate case of FileCallables taking FilePath into reference closure implicitly,
+            // but it also covers more general case of FilePath sent as a return value or argument.
+<span class="fc" id="L2690">            this.filter = SoloFilePathFilter.wrap(FilePathFilter.current());</span>
+        }
+<span class="fc" id="L2692">    }</span>
+
+    private static final long serialVersionUID = 1L;
+
+<span class="fc" id="L2696">    public static int SIDE_BUFFER_SIZE = 1024;</span>
+
+<span class="fc" id="L2698">    private static final Logger LOGGER = Logger.getLogger(FilePath.class.getName());</span>
+
+    /**
+     * Adapts {@link FileCallable} to {@link Callable}.
+     */
+    private class FileCallableWrapper&lt;T&gt; implements DelegatingCallable&lt;T,IOException&gt; {
+        private final FileCallable&lt;T&gt; callable;
+        private transient ClassLoader classLoader;
+
+<span class="fc" id="L2707">        public FileCallableWrapper(FileCallable&lt;T&gt; callable) {</span>
+<span class="fc" id="L2708">            this.callable = callable;</span>
+<span class="fc" id="L2709">            this.classLoader = callable.getClass().getClassLoader();</span>
+<span class="fc" id="L2710">        }</span>
+
+<span class="fc" id="L2712">        private FileCallableWrapper(FileCallable&lt;T&gt; callable, ClassLoader classLoader) {</span>
+<span class="fc" id="L2713">            this.callable = callable;</span>
+<span class="fc" id="L2714">            this.classLoader = classLoader;</span>
+<span class="fc" id="L2715">        }</span>
+
+        public T call() throws IOException {
+            try {
+<span class="fc" id="L2719">                return callable.invoke(new File(remote), Channel.current());</span>
+<span class="fc" id="L2720">            } catch (InterruptedException e) {</span>
+<span class="fc" id="L2721">                throw new TunneledInterruptedException(e);</span>
+            }
+        }
+
+        /**
+         * Role check comes from {@link FileCallable}s.
+         */
+        @Override
+        public void checkRoles(RoleChecker checker) throws SecurityException {
+<span class="nc" id="L2730">            callable.checkRoles(checker);</span>
+<span class="nc" id="L2731">        }</span>
+
+        public ClassLoader getClassLoader() {
+<span class="fc" id="L2734">            return classLoader;</span>
+        }
+
+        private static final long serialVersionUID = 1L;
+    }
+
+    /**
+     * Used to tunnel {@link InterruptedException} over a Java signature that only allows {@link IOException}
+     */
+    private static class TunneledInterruptedException extends IOException {
+        private TunneledInterruptedException(InterruptedException cause) {
+<span class="fc" id="L2745">            super(cause);</span>
+<span class="fc" id="L2746">        }</span>
+        private static final long serialVersionUID = 1L;
+    }
+
+<span class="fc" id="L2750">    private static final Comparator&lt;String&gt; SHORTER_STRING_FIRST = new Comparator&lt;String&gt;() {</span>
+        public int compare(String o1, String o2) {
+<span class="nc" id="L2752">            return o1.length()-o2.length();</span>
+        }
+    };
+
+    /**
+     * Gets the {@link FilePath} representation of the &quot;~&quot; directory
+     * (User's home directory in the Unix sense) of the given channel.
+     */
+    public static FilePath getHomeDirectory(VirtualChannel ch) throws InterruptedException, IOException {
+<span class="nc" id="L2761">        return ch.call(new MasterToSlaveCallable&lt;FilePath,IOException&gt;() {</span>
+            public FilePath call() throws IOException {
+<span class="nc" id="L2763">                return new FilePath(new File(System.getProperty(&quot;user.home&quot;)));</span>
+            }
+        });
+    }
+
+    /**
+     * Helper class to make it easy to send an explicit list of files using {@link FilePath} methods.
+     * @since 1.532
+     */
+<span class="nc bnc" id="L2772" title="All 2 branches missed.">    public static final class ExplicitlySpecifiedDirScanner extends DirScanner {</span>
+
+<span class="nc" id="L2774">        private static final long serialVersionUID = 1;</span>
+
+        private final Map&lt;String,String&gt; files;
+
+        /**
+         * Create a “scanner” (it actually does no scanning).
+         * @param files a map from logical relative paths as per {@link FileVisitor#visit}, to actual relative paths within the scanned directory
+         */
+<span class="nc" id="L2782">        public ExplicitlySpecifiedDirScanner(Map&lt;String,String&gt; files) {</span>
+<span class="nc" id="L2783">            this.files = files;</span>
+<span class="nc" id="L2784">        }</span>
+
+        @Override public void scan(File dir, FileVisitor visitor) throws IOException {
+<span class="nc bnc" id="L2787" title="All 2 branches missed.">            for (Map.Entry&lt;String,String&gt; entry : files.entrySet()) {</span>
+<span class="nc" id="L2788">                String archivedPath = entry.getKey();</span>
+<span class="nc bnc" id="L2789" title="All 4 branches missed.">                assert archivedPath.indexOf('\\') == -1;</span>
+<span class="nc" id="L2790">                String workspacePath = entry.getValue();</span>
+<span class="nc bnc" id="L2791" title="All 4 branches missed.">                assert workspacePath.indexOf('\\') == -1;</span>
+<span class="nc" id="L2792">                scanSingle(new File(dir, workspacePath), archivedPath, visitor);</span>
+            }
+<span class="nc" id="L2794">        }</span>
+    }
+
+<span class="fc" id="L2797">    private static final ExecutorService threadPoolForRemoting = new ContextResettingExecutorService(</span>
+<span class="fc" id="L2798">            Executors.newCachedThreadPool(</span>
+<span class="fc" id="L2799">                    new ExceptionCatchingThreadFactory(</span>
+<span class="fc" id="L2800">                            new NamingThreadFactory(new DaemonThreadFactory(), &quot;FilePath.localPool&quot;))</span>
+            ));
+
+<span class="fc" id="L2803">    public static final LocalChannel localChannel = new LocalChannel(threadPoolForRemoting);</span>
+
+    private @Nonnull SoloFilePathFilter filterNonNull() {
+<span class="pc bpc" id="L2806" title="1 of 2 branches missed.">        return filter!=null ? filter : UNRESTRICTED;</span>
+    }
+
+    /**
+     * Wraps {@link FileVisitor} to notify read access to {@link FilePathFilter}.
+     */
+    private FileVisitor reading(final FileVisitor v) {
+<span class="fc" id="L2813">        final FilePathFilter filter = FilePathFilter.current();</span>
+<span class="pc bpc" id="L2814" title="1 of 2 branches missed.">        if (filter==null)    return v;</span>
+
+<span class="nc" id="L2816">        return new FileVisitor() {</span>
+            @Override
+            public void visit(File f, String relativePath) throws IOException {
+<span class="nc" id="L2819">                filter.read(f);</span>
+<span class="nc" id="L2820">                v.visit(f,relativePath);</span>
+<span class="nc" id="L2821">            }</span>
+
+            @Override
+            public void visitSymlink(File link, String target, String relativePath) throws IOException {
+<span class="nc" id="L2825">                filter.read(link);</span>
+<span class="nc" id="L2826">                v.visitSymlink(link, target, relativePath);</span>
+<span class="nc" id="L2827">            }</span>
+
+            @Override
+            public boolean understandsSymlink() {
+<span class="nc" id="L2831">                return v.understandsSymlink();</span>
+            }
+        };
+    }
+
+    /**
+     * Pass through 'f' after ensuring that we can read that file.
+     */
+    private File reading(File f) {
+<span class="fc" id="L2840">        filterNonNull().read(f);</span>
+<span class="fc" id="L2841">        return f;</span>
+    }
+
+    /**
+     * Pass through 'f' after ensuring that we can access the file attributes.
+     */
+    private File stating(File f) {
+<span class="fc" id="L2848">        filterNonNull().stat(f);</span>
+<span class="fc" id="L2849">        return f;</span>
+    }
+
+    /**
+     * Pass through 'f' after ensuring that we can create that file/dir.
+     */
+    private File creating(File f) {
+<span class="fc" id="L2856">        filterNonNull().create(f);</span>
+<span class="fc" id="L2857">        return f;</span>
+    }
+
+    /**
+     * Pass through 'f' after ensuring that we can write to that file.
+     */
+    private File writing(File f) {
+<span class="fc" id="L2864">        FilePathFilter filter = filterNonNull();</span>
+<span class="fc bfc" id="L2865" title="All 2 branches covered.">        if (!f.exists())</span>
+<span class="fc" id="L2866">            filter.create(f);</span>
+<span class="fc" id="L2867">        filter.write(f);</span>
+<span class="fc" id="L2868">        return f;</span>
+    }
+
+    /**
+     * Pass through 'f' after ensuring that we can create that symlink.
+     */
+    private File symlinking(File f) {
+<span class="nc" id="L2875">        FilePathFilter filter = filterNonNull();</span>
+<span class="nc bnc" id="L2876" title="All 2 branches missed.">        if (!f.exists())</span>
+<span class="nc" id="L2877">            filter.create(f);</span>
+<span class="nc" id="L2878">        filter.symlink(f);</span>
+<span class="nc" id="L2879">        return f;</span>
+    }
+
+    /**
+     * Pass through 'f' after ensuring that we can delete that file.
+     */
+    private File deleting(File f) {
+<span class="fc" id="L2886">        filterNonNull().delete(f);</span>
+<span class="fc" id="L2887">        return f;</span>
+    }
+
+    private boolean mkdirs(File dir) {
+<span class="fc bfc" id="L2891" title="All 2 branches covered.">        if (dir.exists())   return false;</span>
+
+<span class="fc" id="L2893">        filterNonNull().mkdirs(dir);</span>
+<span class="fc" id="L2894">        return dir.mkdirs();</span>
+    }
+
+    private File mkdirsE(File dir) throws IOException {
+<span class="pc bpc" id="L2898" title="1 of 2 branches missed.">        if (dir.exists()) {</span>
+<span class="fc" id="L2899">            return dir;</span>
+        }
+<span class="nc" id="L2901">        filterNonNull().mkdirs(dir);</span>
+<span class="nc" id="L2902">        return IOUtils.mkdirs(dir);</span>
+    }
+
+<span class="fc" id="L2905">    private static final SoloFilePathFilter UNRESTRICTED = SoloFilePathFilter.wrap(FilePathFilter.UNRESTRICTED);</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

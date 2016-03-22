@@ -1,0 +1,730 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>HudsonPrivateSecurityRealm.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.security</a> &gt; <span class="el_source">HudsonPrivateSecurityRealm.java</span></div><h1>HudsonPrivateSecurityRealm.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">/*</span>
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2010, Sun Microsystems, Inc., Kohsuke Kawaguchi, David Calavera, Seiji Sogabe
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.security;
+
+import com.thoughtworks.xstream.converters.UnmarshallingContext;
+import hudson.Extension;
+import hudson.ExtensionList;
+import hudson.Util;
+import hudson.diagnosis.OldDataMonitor;
+import hudson.model.Descriptor;
+import jenkins.model.Jenkins;
+import hudson.model.ManagementLink;
+import hudson.model.ModelObject;
+import hudson.model.User;
+import hudson.model.UserProperty;
+import hudson.model.UserPropertyDescriptor;
+import hudson.security.FederatedLoginService.FederatedIdentity;
+import hudson.security.captcha.CaptchaSupport;
+import hudson.util.PluginServletFilter;
+import hudson.util.Protector;
+import hudson.util.Scrambler;
+import hudson.util.XStream2;
+import net.sf.json.JSONObject;
+import org.acegisecurity.Authentication;
+import org.acegisecurity.AuthenticationException;
+import org.acegisecurity.BadCredentialsException;
+import org.acegisecurity.GrantedAuthority;
+import org.acegisecurity.context.SecurityContextHolder;
+import org.acegisecurity.providers.UsernamePasswordAuthenticationToken;
+import org.acegisecurity.providers.encoding.PasswordEncoder;
+import org.acegisecurity.providers.encoding.ShaPasswordEncoder;
+import org.acegisecurity.userdetails.UserDetails;
+import org.acegisecurity.userdetails.UsernameNotFoundException;
+import org.kohsuke.stapler.DataBoundConstructor;
+import org.kohsuke.stapler.ForwardToView;
+import org.kohsuke.stapler.HttpResponse;
+import org.kohsuke.stapler.HttpResponses;
+import org.kohsuke.stapler.Stapler;
+import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.StaplerResponse;
+import org.mindrot.jbcrypt.BCrypt;
+import org.springframework.dao.DataAccessException;
+
+import javax.servlet.Filter;
+import javax.servlet.FilterChain;
+import javax.servlet.FilterConfig;
+import javax.servlet.ServletException;
+import javax.servlet.ServletRequest;
+import javax.servlet.ServletResponse;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+import static javax.servlet.http.HttpServletResponse.SC_UNAUTHORIZED;
+import java.io.IOException;
+import java.lang.reflect.Constructor;
+import java.security.SecureRandom;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.MissingResourceException;
+import java.util.ResourceBundle;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
+
+/**
+ * {@link SecurityRealm} that performs authentication by looking up {@link User}.
+ *
+ * &lt;p&gt;
+ * Implements {@link AccessControlled} to satisfy view rendering, but in reality the access control
+ * is done against the {@link jenkins.model.Jenkins} object.
+ *
+ * @author Kohsuke Kawaguchi
+ */
+public class HudsonPrivateSecurityRealm extends AbstractPasswordBasedSecurityRealm implements ModelObject, AccessControlled {
+    /**
+     * If true, sign up is not allowed.
+     * &lt;p&gt;
+     * This is a negative switch so that the default value 'false' remains compatible with older installations. 
+     */
+    private final boolean disableSignup;
+
+    /**
+     * If true, captcha will be enabled.
+     */
+    private final boolean enableCaptcha;
+
+    @Deprecated
+    public HudsonPrivateSecurityRealm(boolean allowsSignup) {
+<span class="nc" id="L111">        this(allowsSignup, false, (CaptchaSupport) null);</span>
+<span class="nc" id="L112">    }</span>
+
+    @DataBoundConstructor
+<span class="nc" id="L115">    public HudsonPrivateSecurityRealm(boolean allowsSignup, boolean enableCaptcha, CaptchaSupport captchaSupport) {</span>
+<span class="nc bnc" id="L116" title="All 2 branches missed.">        this.disableSignup = !allowsSignup;</span>
+<span class="nc" id="L117">        this.enableCaptcha = enableCaptcha;</span>
+<span class="nc" id="L118">        setCaptchaSupport(captchaSupport);</span>
+<span class="nc bnc" id="L119" title="All 4 branches missed.">        if(!allowsSignup &amp;&amp; !hasSomeUser()) {</span>
+            // if Hudson is newly set up with the security realm and there's no user account created yet,
+            // insert a filter that asks the user to create one
+            try {
+<span class="nc" id="L123">                PluginServletFilter.addFilter(CREATE_FIRST_USER_FILTER);</span>
+<span class="nc" id="L124">            } catch (ServletException e) {</span>
+<span class="nc" id="L125">                throw new AssertionError(e); // never happen because our Filter.init is no-op</span>
+            }
+        }
+<span class="nc" id="L128">    }</span>
+
+    @Override
+    public boolean allowsSignup() {
+<span class="nc bnc" id="L132" title="All 2 branches missed.">        return !disableSignup;</span>
+    }
+
+    @Restricted(NoExternalUse.class) // Jelly
+    public boolean getAllowsSignup() {
+<span class="nc" id="L137">        return allowsSignup();</span>
+    }
+
+    /**
+     * Checks if captcha is enabled on user signup.
+     *
+     * @return true if captcha is enabled on signup.
+     */
+    public boolean isEnableCaptcha() {
+<span class="nc" id="L146">        return enableCaptcha;</span>
+    }
+
+    /**
+     * Computes if this Hudson has some user accounts configured.
+     *
+     * &lt;p&gt;
+     * This is used to check for the initial
+     */
+    private static boolean hasSomeUser() {
+<span class="nc bnc" id="L156" title="All 2 branches missed.">        for (User u : User.getAll())</span>
+<span class="nc bnc" id="L157" title="All 2 branches missed.">            if(u.getProperty(Details.class)!=null)</span>
+<span class="nc" id="L158">                return true;</span>
+<span class="nc" id="L159">        return false;</span>
+    }
+
+    /**
+     * This implementation doesn't support groups.
+     */
+    @Override
+    public GroupDetails loadGroupByGroupname(String groupname) throws UsernameNotFoundException, DataAccessException {
+<span class="nc" id="L167">        throw new UsernameNotFoundException(groupname);</span>
+    }
+
+    @Override
+    public Details loadUserByUsername(String username) throws UsernameNotFoundException, DataAccessException {
+<span class="nc" id="L172">        User u = User.get(username,false);</span>
+<span class="nc bnc" id="L173" title="All 2 branches missed.">        Details p = u!=null ? u.getProperty(Details.class) : null;</span>
+<span class="nc bnc" id="L174" title="All 2 branches missed.">        if(p==null)</span>
+<span class="nc" id="L175">            throw new UsernameNotFoundException(&quot;Password is not set: &quot;+username);</span>
+<span class="nc bnc" id="L176" title="All 2 branches missed.">        if(p.getUser()==null)</span>
+<span class="nc" id="L177">            throw new AssertionError();</span>
+<span class="nc" id="L178">        return p;</span>
+    }
+
+    @Override
+    protected Details authenticate(String username, String password) throws AuthenticationException {
+<span class="nc" id="L183">        Details u = loadUserByUsername(username);</span>
+<span class="nc bnc" id="L184" title="All 2 branches missed.">        if (!u.isPasswordCorrect(password)) {</span>
+            String message;
+            try {
+<span class="nc" id="L187">                message = ResourceBundle.getBundle(&quot;org.acegisecurity.messages&quot;).getString(&quot;AbstractUserDetailsAuthenticationProvider.badCredentials&quot;);</span>
+<span class="nc" id="L188">            } catch (MissingResourceException x) {</span>
+<span class="nc" id="L189">                message = &quot;Bad credentials&quot;;</span>
+            }
+<span class="nc" id="L191">            throw new BadCredentialsException(message);</span>
+        }
+<span class="nc" id="L193">        return u;</span>
+    }
+
+    /**
+     * Show the sign up page with the data from the identity.
+     */
+    @Override
+    public HttpResponse commenceSignup(final FederatedIdentity identity) {
+        // store the identity in the session so that we can use this later
+<span class="nc" id="L202">        Stapler.getCurrentRequest().getSession().setAttribute(FEDERATED_IDENTITY_SESSION_KEY,identity);</span>
+<span class="nc" id="L203">        return new ForwardToView(this,&quot;signupWithFederatedIdentity.jelly&quot;) {</span>
+            @Override
+            public void generateResponse(StaplerRequest req, StaplerResponse rsp, Object node) throws IOException, ServletException {
+<span class="nc" id="L206">                SignupInfo si = new SignupInfo(identity);</span>
+<span class="nc" id="L207">                si.errorMessage = Messages.HudsonPrivateSecurityRealm_WouldYouLikeToSignUp(identity.getPronoun(),identity.getIdentifier());</span>
+<span class="nc" id="L208">                req.setAttribute(&quot;data&quot;, si);</span>
+<span class="nc" id="L209">                super.generateResponse(req, rsp, node);</span>
+<span class="nc" id="L210">            }</span>
+        };
+    }
+
+    /**
+     * Creates an account and associates that with the given identity. Used in conjunction
+     * with {@link #commenceSignup}.
+     */
+    public User doCreateAccountWithFederatedIdentity(StaplerRequest req, StaplerResponse rsp) throws IOException, ServletException {
+<span class="nc" id="L219">        User u = _doCreateAccount(req,rsp,&quot;signupWithFederatedIdentity.jelly&quot;);</span>
+<span class="nc bnc" id="L220" title="All 2 branches missed.">        if (u!=null)</span>
+<span class="nc" id="L221">            ((FederatedIdentity)req.getSession().getAttribute(FEDERATED_IDENTITY_SESSION_KEY)).addTo(u);</span>
+<span class="nc" id="L222">        return u;</span>
+    }
+
+<span class="nc" id="L225">    private static final String FEDERATED_IDENTITY_SESSION_KEY = HudsonPrivateSecurityRealm.class.getName()+&quot;.federatedIdentity&quot;;</span>
+
+    /**
+     * Creates an user account. Used for self-registration.
+     */
+    public User doCreateAccount(StaplerRequest req, StaplerResponse rsp) throws IOException, ServletException {
+<span class="nc" id="L231">        return _doCreateAccount(req, rsp, &quot;signup.jelly&quot;);</span>
+    }
+
+    private User _doCreateAccount(StaplerRequest req, StaplerResponse rsp, String formView) throws ServletException, IOException {
+<span class="nc bnc" id="L235" title="All 2 branches missed.">        if(!allowsSignup())</span>
+<span class="nc" id="L236">            throw HttpResponses.error(SC_UNAUTHORIZED,new Exception(&quot;User sign up is prohibited&quot;));</span>
+
+<span class="nc bnc" id="L238" title="All 2 branches missed.">        boolean firstUser = !hasSomeUser();</span>
+<span class="nc" id="L239">        User u = createAccount(req, rsp, enableCaptcha, formView);</span>
+<span class="nc bnc" id="L240" title="All 2 branches missed.">        if(u!=null) {</span>
+<span class="nc bnc" id="L241" title="All 2 branches missed.">            if(firstUser)</span>
+<span class="nc" id="L242">                tryToMakeAdmin(u);  // the first user should be admin, or else there's a risk of lock out</span>
+<span class="nc" id="L243">            loginAndTakeBack(req, rsp, u);</span>
+        }
+<span class="nc" id="L245">        return u;</span>
+    }
+
+    /**
+     * Lets the current user silently login as the given user and report back accordingly.
+     */
+    @SuppressWarnings(&quot;ACL.impersonate&quot;)
+    private void loginAndTakeBack(StaplerRequest req, StaplerResponse rsp, User u) throws ServletException, IOException {
+        // ... and let him login
+<span class="nc" id="L254">        Authentication a = new UsernamePasswordAuthenticationToken(u.getId(),req.getParameter(&quot;password1&quot;));</span>
+<span class="nc" id="L255">        a = this.getSecurityComponents().manager.authenticate(a);</span>
+<span class="nc" id="L256">        SecurityContextHolder.getContext().setAuthentication(a);</span>
+
+        // then back to top
+<span class="nc" id="L259">        req.getView(this,&quot;success.jelly&quot;).forward(req,rsp);</span>
+<span class="nc" id="L260">    }</span>
+
+    /**
+     * Creates an user account. Used by admins.
+     *
+     * This version behaves differently from {@link #doCreateAccount(StaplerRequest, StaplerResponse)} in that
+     * this is someone creating another user.
+     */
+    public void doCreateAccountByAdmin(StaplerRequest req, StaplerResponse rsp) throws IOException, ServletException {
+<span class="nc" id="L269">        checkPermission(Jenkins.ADMINISTER);</span>
+<span class="nc bnc" id="L270" title="All 2 branches missed.">        if(createAccount(req, rsp, false, &quot;addUser.jelly&quot;)!=null) {</span>
+<span class="nc" id="L271">            rsp.sendRedirect(&quot;.&quot;);  // send the user back to the listing page</span>
+        }
+<span class="nc" id="L273">    }</span>
+
+    /**
+     * Creates a first admin user account.
+     *
+     * &lt;p&gt;
+     * This can be run by anyone, but only to create the very first user account.
+     */
+    public void doCreateFirstAccount(StaplerRequest req, StaplerResponse rsp) throws IOException, ServletException {
+<span class="nc bnc" id="L282" title="All 2 branches missed.">        if(hasSomeUser()) {</span>
+<span class="nc" id="L283">            rsp.sendError(SC_UNAUTHORIZED,&quot;First user was already created&quot;);</span>
+<span class="nc" id="L284">            return;</span>
+        }
+<span class="nc" id="L286">        User u = createAccount(req, rsp, false, &quot;firstUser.jelly&quot;);</span>
+<span class="nc bnc" id="L287" title="All 2 branches missed.">        if (u!=null) {</span>
+<span class="nc" id="L288">            tryToMakeAdmin(u);</span>
+<span class="nc" id="L289">            loginAndTakeBack(req, rsp, u);</span>
+        }
+<span class="nc" id="L291">    }</span>
+
+    /**
+     * Try to make this user a super-user
+     */
+    private void tryToMakeAdmin(User u) {
+<span class="nc" id="L297">        AuthorizationStrategy as = Jenkins.getInstance().getAuthorizationStrategy();</span>
+<span class="nc bnc" id="L298" title="All 2 branches missed.">        for (PermissionAdder adder : ExtensionList.lookup(PermissionAdder.class)) {</span>
+<span class="nc bnc" id="L299" title="All 2 branches missed.">            if (adder.add(as, u, Jenkins.ADMINISTER)) {</span>
+<span class="nc" id="L300">                return;</span>
+            }
+        }
+<span class="nc" id="L303">    }</span>
+
+    /**
+     * @return
+     *      null if failed. The browser is already redirected to retry by the time this method returns.
+     *      a valid {@link User} object if the user creation was successful.
+     */
+    private User createAccount(StaplerRequest req, StaplerResponse rsp, boolean selfRegistration, String formView) throws ServletException, IOException {
+        // form field validation
+        // this pattern needs to be generalized and moved to stapler
+<span class="nc" id="L313">        SignupInfo si = new SignupInfo(req);</span>
+
+<span class="nc bnc" id="L315" title="All 4 branches missed.">        if(selfRegistration &amp;&amp; !validateCaptcha(si.captcha))</span>
+<span class="nc" id="L316">            si.errorMessage = Messages.HudsonPrivateSecurityRealm_CreateAccount_TextNotMatchWordInImage();</span>
+
+<span class="nc bnc" id="L318" title="All 4 branches missed.">        if(si.password1 != null &amp;&amp; !si.password1.equals(si.password2))</span>
+<span class="nc" id="L319">            si.errorMessage = Messages.HudsonPrivateSecurityRealm_CreateAccount_PasswordNotMatch();</span>
+
+<span class="nc bnc" id="L321" title="All 4 branches missed.">        if(!(si.password1 != null &amp;&amp; si.password1.length() != 0))</span>
+<span class="nc" id="L322">            si.errorMessage = Messages.HudsonPrivateSecurityRealm_CreateAccount_PasswordRequired();</span>
+
+<span class="nc bnc" id="L324" title="All 4 branches missed.">        if(si.username==null || si.username.length()==0)</span>
+<span class="nc" id="L325">            si.errorMessage = Messages.HudsonPrivateSecurityRealm_CreateAccount_UserNameRequired();</span>
+        else {
+<span class="nc" id="L327">            User user = User.get(si.username, false);</span>
+<span class="nc bnc" id="L328" title="All 2 branches missed.">            if (null != user)</span>
+                // Allow sign up. SCM people has no such property.
+<span class="nc bnc" id="L330" title="All 2 branches missed.">                if (user.getProperty(Details.class) != null)</span>
+<span class="nc" id="L331">                    si.errorMessage = Messages.HudsonPrivateSecurityRealm_CreateAccount_UserNameAlreadyTaken();</span>
+        }
+
+<span class="nc bnc" id="L334" title="All 4 branches missed.">        if(si.fullname==null || si.fullname.length()==0)</span>
+<span class="nc" id="L335">            si.fullname = si.username;</span>
+
+<span class="nc bnc" id="L337" title="All 4 branches missed.">        if(si.email==null || !si.email.contains(&quot;@&quot;))</span>
+<span class="nc" id="L338">            si.errorMessage = Messages.HudsonPrivateSecurityRealm_CreateAccount_InvalidEmailAddress();</span>
+
+<span class="nc bnc" id="L340" title="All 2 branches missed.">        if (! User.isIdOrFullnameAllowed(si.username)) {</span>
+<span class="nc" id="L341">            si.errorMessage = hudson.model.Messages.User_IllegalUsername(si.username);</span>
+        }
+
+<span class="nc bnc" id="L344" title="All 2 branches missed.">        if (! User.isIdOrFullnameAllowed(si.fullname)) {</span>
+<span class="nc" id="L345">            si.errorMessage = hudson.model.Messages.User_IllegalFullname(si.fullname);</span>
+        }
+
+<span class="nc bnc" id="L348" title="All 2 branches missed.">        if(si.errorMessage!=null) {</span>
+            // failed. ask the user to try again.
+<span class="nc" id="L350">            req.setAttribute(&quot;data&quot;,si);</span>
+<span class="nc" id="L351">            req.getView(this, formView).forward(req,rsp);</span>
+<span class="nc" id="L352">            return null;</span>
+        }
+
+        // register the user
+<span class="nc" id="L356">        User user = createAccount(si.username,si.password1);</span>
+<span class="nc" id="L357">        user.setFullName(si.fullname);</span>
+        try {
+            // legacy hack. mail support has moved out to a separate plugin
+<span class="nc" id="L360">            Class&lt;?&gt; up = Jenkins.getInstance().pluginManager.uberClassLoader.loadClass(&quot;hudson.tasks.Mailer$UserProperty&quot;);</span>
+<span class="nc" id="L361">            Constructor&lt;?&gt; c = up.getDeclaredConstructor(String.class);</span>
+<span class="nc" id="L362">            user.addProperty((UserProperty)c.newInstance(si.email));</span>
+<span class="nc" id="L363">        } catch (RuntimeException e) {</span>
+<span class="nc" id="L364">            throw e;</span>
+<span class="nc" id="L365">        } catch (Exception e) {</span>
+<span class="nc" id="L366">            LOGGER.log(Level.WARNING, &quot;Failed to set the e-mail address&quot;,e);</span>
+        }
+<span class="nc" id="L368">        user.save();</span>
+<span class="nc" id="L369">        return user;</span>
+    }
+
+    /**
+     * Creates a new user account by registering a password to the user.
+     */
+    public User createAccount(String userName, String password) throws IOException {
+<span class="nc" id="L376">        User user = User.get(userName);</span>
+<span class="nc" id="L377">        user.addProperty(Details.fromPlainPassword(password));</span>
+<span class="nc" id="L378">        return user;</span>
+    }
+
+    /**
+     * This is used primarily when the object is listed in the breadcrumb, in the user management screen.
+     */
+    public String getDisplayName() {
+<span class="nc" id="L385">        return Messages.HudsonPrivateSecurityRealm_DisplayName();</span>
+    }
+
+    public ACL getACL() {
+<span class="nc" id="L389">        return Jenkins.getInstance().getACL();</span>
+    }
+
+    public void checkPermission(Permission permission) {
+<span class="nc" id="L393">        Jenkins.getInstance().checkPermission(permission);</span>
+<span class="nc" id="L394">    }</span>
+
+    public boolean hasPermission(Permission permission) {
+<span class="nc" id="L397">        return Jenkins.getInstance().hasPermission(permission);</span>
+    }
+
+
+    /**
+     * All users who can login to the system.
+     */
+    public List&lt;User&gt; getAllUsers() {
+<span class="nc" id="L405">        List&lt;User&gt; r = new ArrayList&lt;User&gt;();</span>
+<span class="nc bnc" id="L406" title="All 2 branches missed.">        for (User u : User.getAll()) {</span>
+<span class="nc bnc" id="L407" title="All 2 branches missed.">            if(u.getProperty(Details.class)!=null)</span>
+<span class="nc" id="L408">                r.add(u);</span>
+        }
+<span class="nc" id="L410">        Collections.sort(r);</span>
+<span class="nc" id="L411">        return r;</span>
+    }
+
+    /**
+     * This is to map users under the security realm URL.
+     * This in turn helps us set up the right navigation breadcrumb.
+     */
+    public User getUser(String id) {
+<span class="nc" id="L419">        return User.get(id);</span>
+    }
+
+    // TODO
+<span class="nc" id="L423">    private static final GrantedAuthority[] TEST_AUTHORITY = {AUTHENTICATED_AUTHORITY};</span>
+
+    public static final class SignupInfo {
+        public String username,password1,password2,fullname,email,captcha;
+
+        /**
+         * To display an error message, set it here.
+         */
+        public String errorMessage;
+
+<span class="nc" id="L433">        public SignupInfo() {</span>
+<span class="nc" id="L434">        }</span>
+
+<span class="nc" id="L436">        public SignupInfo(StaplerRequest req) {</span>
+<span class="nc" id="L437">            req.bindParameters(this);</span>
+<span class="nc" id="L438">        }</span>
+
+<span class="nc" id="L440">        public SignupInfo(FederatedIdentity i) {</span>
+<span class="nc" id="L441">            this.username = i.getNickname();</span>
+<span class="nc" id="L442">            this.fullname = i.getFullName();</span>
+<span class="nc" id="L443">            this.email = i.getEmailAddress();</span>
+<span class="nc" id="L444">        }</span>
+    }
+
+    /**
+     * {@link UserProperty} that provides the {@link UserDetails} view of the User object.
+     *
+     * &lt;p&gt;
+     * When a {@link User} object has this property on it, it means the user is configured
+     * for log-in.
+     *
+     * &lt;p&gt;
+     * When a {@link User} object is re-configured via the UI, the password
+     * is sent to the hidden input field by using {@link Protector}, so that
+     * the same password can be retained but without leaking information to the browser.
+     */
+    public static final class Details extends UserProperty implements InvalidatableUserDetails {
+        /**
+         * Hashed password.
+         */
+        private /*almost final*/ String passwordHash;
+
+        /**
+         * @deprecated Scrambled password.
+         * Field kept here to load old (pre 1.283) user records,
+         * but now marked transient so field is no longer saved.
+         */
+        @Deprecated
+        private transient String password;
+
+<span class="nc" id="L473">        private Details(String passwordHash) {</span>
+<span class="nc" id="L474">            this.passwordHash = passwordHash;</span>
+<span class="nc" id="L475">        }</span>
+
+        static Details fromHashedPassword(String hashed) {
+<span class="nc" id="L478">            return new Details(hashed);</span>
+        }
+
+        static Details fromPlainPassword(String rawPassword) {
+<span class="nc" id="L482">            return new Details(PASSWORD_ENCODER.encodePassword(rawPassword,null));</span>
+        }
+
+        public GrantedAuthority[] getAuthorities() {
+            // TODO
+<span class="nc" id="L487">            return TEST_AUTHORITY;</span>
+        }
+
+        public String getPassword() {
+<span class="nc" id="L491">            return passwordHash;</span>
+        }
+
+        public boolean isPasswordCorrect(String candidate) {
+<span class="nc" id="L495">            return PASSWORD_ENCODER.isPasswordValid(getPassword(),candidate,null);</span>
+        }
+
+        public String getProtectedPassword() {
+            // put session Id in it to prevent a replay attack.
+<span class="nc" id="L500">            return Protector.protect(Stapler.getCurrentRequest().getSession().getId()+':'+getPassword());</span>
+        }
+
+        public String getUsername() {
+<span class="nc" id="L504">            return user.getId();</span>
+        }
+
+        /*package*/ User getUser() {
+<span class="nc" id="L508">            return user;</span>
+        }
+
+        public boolean isAccountNonExpired() {
+<span class="nc" id="L512">            return true;</span>
+        }
+
+        public boolean isAccountNonLocked() {
+<span class="nc" id="L516">            return true;</span>
+        }
+
+        public boolean isCredentialsNonExpired() {
+<span class="nc" id="L520">            return true;</span>
+        }
+
+        public boolean isEnabled() {
+<span class="nc" id="L524">            return true;</span>
+        }
+
+        public boolean isInvalid() {
+<span class="nc bnc" id="L528" title="All 2 branches missed.">            return user==null;</span>
+        }
+
+        public static class ConverterImpl extends XStream2.PassthruConverter&lt;Details&gt; {
+<span class="nc" id="L532">            public ConverterImpl(XStream2 xstream) { super(xstream); }</span>
+            @Override protected void callback(Details d, UnmarshallingContext context) {
+                // Convert to hashed password and report to monitor if we load old data
+<span class="nc bnc" id="L535" title="All 4 branches missed.">                if (d.password!=null &amp;&amp; d.passwordHash==null) {</span>
+<span class="nc" id="L536">                    d.passwordHash = PASSWORD_ENCODER.encodePassword(Scrambler.descramble(d.password),null);</span>
+<span class="nc" id="L537">                    OldDataMonitor.report(context, &quot;1.283&quot;);</span>
+                }
+<span class="nc" id="L539">            }</span>
+        }
+
+        @Extension
+<span class="nc" id="L543">        public static final class DescriptorImpl extends UserPropertyDescriptor {</span>
+            @Override
+            public String getDisplayName() {
+<span class="nc" id="L546">                return Messages.HudsonPrivateSecurityRealm_Details_DisplayName();</span>
+            }
+
+            @Override
+            public Details newInstance(StaplerRequest req, JSONObject formData) throws FormException {
+<span class="nc" id="L551">                String pwd = Util.fixEmpty(req.getParameter(&quot;user.password&quot;));</span>
+<span class="nc" id="L552">                String pwd2= Util.fixEmpty(req.getParameter(&quot;user.password2&quot;));</span>
+
+<span class="nc bnc" id="L554" title="All 2 branches missed.">                if(!Util.fixNull(pwd).equals(Util.fixNull(pwd2)))</span>
+<span class="nc" id="L555">                    throw new FormException(&quot;Please confirm the password by typing it twice&quot;,&quot;user.password2&quot;);</span>
+
+<span class="nc" id="L557">                String data = Protector.unprotect(pwd);</span>
+<span class="nc bnc" id="L558" title="All 2 branches missed.">                if(data!=null) {</span>
+<span class="nc" id="L559">                    String prefix = Stapler.getCurrentRequest().getSession().getId() + ':';</span>
+<span class="nc bnc" id="L560" title="All 2 branches missed.">                    if(data.startsWith(prefix))</span>
+<span class="nc" id="L561">                        return Details.fromHashedPassword(data.substring(prefix.length()));</span>
+                }
+<span class="nc" id="L563">                return Details.fromPlainPassword(Util.fixNull(pwd));</span>
+            }
+
+            @Override
+            public boolean isEnabled() {
+                // this feature is only when HudsonPrivateSecurityRealm is enabled
+<span class="nc" id="L569">                return Jenkins.getInstance().getSecurityRealm() instanceof HudsonPrivateSecurityRealm;</span>
+            }
+
+            public UserProperty newInstance(User user) {
+<span class="nc" id="L573">                return null;</span>
+            }
+        }
+    }
+
+    /**
+     * Displays &quot;manage users&quot; link in the system config if {@link HudsonPrivateSecurityRealm}
+     * is in effect.
+     */
+    @Extension
+<span class="nc" id="L583">    public static final class ManageUserLinks extends ManagementLink {</span>
+        public String getIconFileName() {
+<span class="nc bnc" id="L585" title="All 2 branches missed.">            if(Jenkins.getInstance().getSecurityRealm() instanceof HudsonPrivateSecurityRealm)</span>
+<span class="nc" id="L586">                return &quot;user.png&quot;;</span>
+            else
+<span class="nc" id="L588">                return null;    // not applicable now</span>
+        }
+
+        public String getUrlName() {
+<span class="nc" id="L592">            return &quot;securityRealm/&quot;;</span>
+        }
+
+        public String getDisplayName() {
+<span class="nc" id="L596">            return Messages.HudsonPrivateSecurityRealm_ManageUserLinks_DisplayName();</span>
+        }
+
+        @Override
+        public String getDescription() {
+<span class="nc" id="L601">            return Messages.HudsonPrivateSecurityRealm_ManageUserLinks_Description();</span>
+        }
+    }
+
+    /**
+     * {@link PasswordEncoder} based on SHA-256 and random salt generation.
+     *
+     * &lt;p&gt;
+     * The salt is prepended to the hashed password and returned. So the encoded password is of the form
+     * &lt;tt&gt;SALT ':' hash(PASSWORD,SALT)&lt;/tt&gt;.
+     *
+     * &lt;p&gt;
+     * This abbreviates the need to store the salt separately, which in turn allows us to hide the salt handling
+     * in this little class. The rest of the Acegi thinks that we are not using salt.
+     */
+<span class="nc" id="L616">    /*package*/ static final PasswordEncoder CLASSIC = new PasswordEncoder() {</span>
+<span class="nc" id="L617">        private final PasswordEncoder passwordEncoder = new ShaPasswordEncoder(256);</span>
+
+        public String encodePassword(String rawPass, Object _) throws DataAccessException {
+<span class="nc" id="L620">            return hash(rawPass);</span>
+        }
+
+        public boolean isPasswordValid(String encPass, String rawPass, Object _) throws DataAccessException {
+            // pull out the sale from the encoded password
+<span class="nc" id="L625">            int i = encPass.indexOf(':');</span>
+<span class="nc bnc" id="L626" title="All 2 branches missed.">            if(i&lt;0) return false;</span>
+<span class="nc" id="L627">            String salt = encPass.substring(0,i);</span>
+<span class="nc" id="L628">            return encPass.substring(i+1).equals(passwordEncoder.encodePassword(rawPass,salt));</span>
+        }
+
+        /**
+         * Creates a hashed password by generating a random salt.
+         */
+        private String hash(String password) {
+<span class="nc" id="L635">            String salt = generateSalt();</span>
+<span class="nc" id="L636">            return salt+':'+passwordEncoder.encodePassword(password,salt);</span>
+        }
+
+        /**
+         * Generates random salt.
+         */
+        private String generateSalt() {
+<span class="nc" id="L643">            StringBuilder buf = new StringBuilder();</span>
+<span class="nc" id="L644">            SecureRandom sr = new SecureRandom();</span>
+<span class="nc bnc" id="L645" title="All 2 branches missed.">            for( int i=0; i&lt;6; i++ ) {// log2(52^6)=34.20... so, this is about 32bit strong.</span>
+<span class="nc" id="L646">                boolean upper = sr.nextBoolean();</span>
+<span class="nc" id="L647">                char ch = (char)(sr.nextInt(26) + 'a');</span>
+<span class="nc bnc" id="L648" title="All 2 branches missed.">                if(upper)   ch=Character.toUpperCase(ch);</span>
+<span class="nc" id="L649">                buf.append(ch);</span>
+            }
+<span class="nc" id="L651">            return buf.toString();</span>
+        }
+    };
+
+    /**
+     * {@link PasswordEncoder} that uses jBCrypt.
+     */
+<span class="nc" id="L658">    private static final PasswordEncoder JBCRYPT_ENCODER = new PasswordEncoder() {</span>
+        public String encodePassword(String rawPass, Object _) throws DataAccessException {
+<span class="nc" id="L660">            return BCrypt.hashpw(rawPass,BCrypt.gensalt());</span>
+        }
+
+        public boolean isPasswordValid(String encPass, String rawPass, Object _) throws DataAccessException {
+<span class="nc" id="L664">            return BCrypt.checkpw(rawPass,encPass);</span>
+        }
+    };
+
+    /**
+     * Combines {@link #JBCRYPT_ENCODER} and {@link #CLASSIC} into one so that we can continue
+     * to accept {@link #CLASSIC} format but new encoding will always done via {@link #JBCRYPT_ENCODER}.
+     */
+<span class="nc" id="L672">    public static final PasswordEncoder PASSWORD_ENCODER = new PasswordEncoder() {</span>
+        /*
+            CLASSIC encoder outputs &quot;salt:hash&quot; where salt is [a-z]+, so we use unique prefix '#jbcyrpt&quot;
+            to designate JBCRYPT-format hash.
+
+            '#' is neither in base64 nor hex, which makes it a good choice.
+         */
+        public String encodePassword(String rawPass, Object salt) throws DataAccessException {
+<span class="nc" id="L680">            return JBCRYPT_HEADER+JBCRYPT_ENCODER.encodePassword(rawPass,salt);</span>
+        }
+
+        public boolean isPasswordValid(String encPass, String rawPass, Object salt) throws DataAccessException {
+<span class="nc bnc" id="L684" title="All 2 branches missed.">            if (encPass.startsWith(JBCRYPT_HEADER))</span>
+<span class="nc" id="L685">                return JBCRYPT_ENCODER.isPasswordValid(encPass.substring(JBCRYPT_HEADER.length()),rawPass,salt);</span>
+            else
+<span class="nc" id="L687">                return CLASSIC.isPasswordValid(encPass,rawPass,salt);</span>
+        }
+
+        private static final String JBCRYPT_HEADER = &quot;#jbcrypt:&quot;;
+    };
+
+    @Extension
+<span class="nc" id="L694">    public static final class DescriptorImpl extends Descriptor&lt;SecurityRealm&gt; {</span>
+        public String getDisplayName() {
+<span class="nc" id="L696">            return Messages.HudsonPrivateSecurityRealm_DisplayName();</span>
+        }
+    }
+
+<span class="nc" id="L700">    private static final Filter CREATE_FIRST_USER_FILTER = new Filter() {</span>
+        public void init(FilterConfig config) throws ServletException {
+<span class="nc" id="L702">        }</span>
+
+        public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain) throws IOException, ServletException {
+<span class="nc" id="L705">            HttpServletRequest req = (HttpServletRequest) request;</span>
+
+            /* allow signup from the Jenkins home page, or /manage, which is where a /configureSecurity form redirects to */
+<span class="nc bnc" id="L708" title="All 4 branches missed.">            if(req.getRequestURI().equals(req.getContextPath()+&quot;/&quot;) || req.getRequestURI().equals(req.getContextPath() + &quot;/manage&quot;)) {</span>
+<span class="nc bnc" id="L709" title="All 2 branches missed.">                if (needsToCreateFirstUser()) {</span>
+<span class="nc" id="L710">                    ((HttpServletResponse)response).sendRedirect(&quot;securityRealm/firstUser&quot;);</span>
+<span class="nc" id="L711">                } else {// the first user already created. the role of this filter is over.</span>
+<span class="nc" id="L712">                    PluginServletFilter.removeFilter(this);</span>
+<span class="nc" id="L713">                    chain.doFilter(request,response);</span>
+                }
+<span class="nc" id="L715">            } else</span>
+<span class="nc" id="L716">                chain.doFilter(request,response);</span>
+<span class="nc" id="L717">        }</span>
+
+        private boolean needsToCreateFirstUser() {
+<span class="nc bnc" id="L720" title="All 2 branches missed.">            return !hasSomeUser()</span>
+<span class="nc bnc" id="L721" title="All 2 branches missed.">                &amp;&amp; Jenkins.getInstance().getSecurityRealm() instanceof HudsonPrivateSecurityRealm;</span>
+        }
+
+        public void destroy() {
+<span class="nc" id="L725">        }</span>
+    };
+
+<span class="nc" id="L728">    private static final Logger LOGGER = Logger.getLogger(HudsonPrivateSecurityRealm.class.getName());</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

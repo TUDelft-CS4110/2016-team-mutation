@@ -1,0 +1,607 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>CLICommand.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.cli</a> &gt; <span class="el_source">CLICommand.java</span></div><h1>CLICommand.java</h1><pre class="source lang-java linenums">/*
+ * The MIT License
+ *
+ * Copyright (c) 2004-2010, Sun Microsystems, Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.cli;
+
+import hudson.AbortException;
+import hudson.Extension;
+import hudson.ExtensionList;
+import hudson.ExtensionPoint;
+import hudson.cli.declarative.CLIMethod;
+import hudson.ExtensionPoint.LegacyInstancesAreScopedToHudson;
+import hudson.cli.declarative.OptionHandlerExtension;
+import jenkins.model.Jenkins;
+import hudson.remoting.Callable;
+import hudson.remoting.Channel;
+import hudson.remoting.ChannelProperty;
+import hudson.security.CliAuthenticator;
+import hudson.security.SecurityRealm;
+import jenkins.security.MasterToSlaveCallable;
+import org.acegisecurity.AccessDeniedException;
+import org.acegisecurity.Authentication;
+import org.acegisecurity.BadCredentialsException;
+import org.acegisecurity.context.SecurityContext;
+import org.acegisecurity.context.SecurityContextHolder;
+import org.apache.commons.discovery.ResourceClassIterator;
+import org.apache.commons.discovery.ResourceNameIterator;
+import org.apache.commons.discovery.resource.ClassLoaders;
+import org.apache.commons.discovery.resource.classes.DiscoverClasses;
+import org.apache.commons.discovery.resource.names.DiscoverServiceNames;
+import org.jvnet.hudson.annotation_indexer.Index;
+import org.jvnet.tiger_types.Types;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
+import org.kohsuke.args4j.ClassParser;
+import org.kohsuke.args4j.CmdLineException;
+import org.kohsuke.args4j.CmdLineParser;
+import org.kohsuke.args4j.spi.OptionHandler;
+
+import java.io.BufferedInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.PrintStream;
+import java.lang.reflect.Type;
+import java.nio.charset.Charset;
+import java.nio.charset.UnsupportedCharsetException;
+import java.util.List;
+import java.util.Locale;
+import java.util.UUID;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+/**
+ * Base class for Hudson CLI.
+ *
+ * &lt;h2&gt;How does a CLI command work&lt;/h2&gt;
+ * &lt;p&gt;
+ * The users starts {@linkplain CLI the &quot;CLI agent&quot;} on a remote system, by specifying arguments, like
+ * &lt;tt&gt;&quot;java -jar jenkins-cli.jar command arg1 arg2 arg3&quot;&lt;/tt&gt;. The CLI agent creates
+ * a remoting channel with the server, and it sends the entire arguments to the server, along with
+ * the remoted stdin/out/err.
+ *
+ * &lt;p&gt;
+ * The Hudson master then picks the right {@link CLICommand} to execute, clone it, and
+ * calls {@link #main(List, Locale, InputStream, PrintStream, PrintStream)} method.
+ *
+ * &lt;h2&gt;Note for CLI command implementor&lt;/h2&gt;
+ * Start with &lt;a href=&quot;http://wiki.jenkins-ci.org/display/JENKINS/Writing+CLI+commands&quot;&gt;this document&lt;/a&gt;
+ * to get the general idea of CLI.
+ *
+ * &lt;ul&gt;
+ * &lt;li&gt;
+ * Put {@link Extension} on your implementation to have it discovered by Hudson.
+ *
+ * &lt;li&gt;
+ * Use &lt;a href=&quot;https://github.com/kohsuke/args4j&quot;&gt;args4j&lt;/a&gt; annotation on your implementation to define
+ * options and arguments (however, if you don't like that, you could override
+ * the {@link #main(List, Locale, InputStream, PrintStream, PrintStream)} method directly.
+ *
+ * &lt;li&gt;
+ * stdin, stdout, stderr are remoted, so proper buffering is necessary for good user experience.
+ *
+ * &lt;li&gt;
+ * Send {@link Callable} to a CLI agent by using {@link #channel} to get local interaction,
+ * such as uploading a file, asking for a password, etc.
+ *
+ * &lt;/ul&gt;
+ *
+ * @author Kohsuke Kawaguchi
+ * @since 1.302
+ * @see CLIMethod
+ */
+@LegacyInstancesAreScopedToHudson
+<span class="nc" id="L114">public abstract class CLICommand implements ExtensionPoint, Cloneable {</span>
+    /**
+     * Connected to stdout and stderr of the CLI agent that initiated the session.
+     * IOW, if you write to these streams, the person who launched the CLI command
+     * will see the messages in his terminal.
+     *
+     * &lt;p&gt;
+     * (In contrast, calling {@code System.out.println(...)} would print out
+     * the message to the server log file, which is probably not what you want.
+     */
+    public transient PrintStream stdout,stderr;
+
+    /**
+     * Connected to stdin of the CLI agent.
+     *
+     * &lt;p&gt;
+     * This input stream is buffered to hide the latency in the remoting.
+     */
+    public transient InputStream stdin;
+
+    /**
+     * {@link Channel} that represents the CLI JVM. You can use this to
+     * execute {@link Callable} on the CLI JVM, among other things.
+     *
+     * &lt;p&gt;
+     * Starting 1.445, CLI transports are not required to provide a channel
+     * (think of sshd, telnet, etc), so in such a case this field is null.
+     * 
+     * &lt;p&gt;
+     * See {@link #checkChannel()} to get a channel and throw an user-friendly
+     * exception
+     */
+    public transient Channel channel;
+
+    /**
+     * The locale of the client. Messages should be formatted with this resource.
+     */
+    public transient Locale locale;
+
+    /**
+     * Set by the caller of the CLI system if the transport already provides
+     * authentication. Due to the compatibility issue, we still allow the user
+     * to use command line switches to authenticate as other users.
+     */
+    private transient Authentication transportAuth;
+
+    /**
+     * Gets the command name.
+     *
+     * &lt;p&gt;
+     * For example, if the CLI is invoked as &lt;tt&gt;java -jar cli.jar foo arg1 arg2 arg4&lt;/tt&gt;,
+     * on the server side {@link CLICommand} that returns &quot;foo&quot; from {@link #getName()}
+     * will be invoked.
+     *
+     * &lt;p&gt;
+     * By default, this method creates &quot;foo-bar-zot&quot; from &quot;FooBarZotCommand&quot;.
+     */
+    public String getName() {
+<span class="nc" id="L172">        String name = getClass().getName();</span>
+<span class="nc" id="L173">        name = name.substring(name.lastIndexOf('.') + 1); // short name</span>
+<span class="nc" id="L174">        name = name.substring(name.lastIndexOf('$')+1);</span>
+<span class="nc bnc" id="L175" title="All 2 branches missed.">        if(name.endsWith(&quot;Command&quot;))</span>
+<span class="nc" id="L176">            name = name.substring(0,name.length()-7); // trim off the command</span>
+
+        // convert &quot;FooBarZot&quot; into &quot;foo-bar-zot&quot;
+        // Locale is fixed so that &quot;CreateInstance&quot; always become &quot;create-instance&quot; no matter where this is run.
+<span class="nc" id="L180">        return name.replaceAll(&quot;([a-z0-9])([A-Z])&quot;,&quot;$1-$2&quot;).toLowerCase(Locale.ENGLISH);</span>
+    }
+
+    /**
+     * Gets the quick summary of what this command does.
+     * Used by the help command to generate the list of commands.
+     */
+    public abstract String getShortDescription();
+
+    /**
+     * Entry point to the CLI command.
+     * 
+     * &lt;p&gt;
+     * The default implementation uses args4j to parse command line arguments and call {@link #run()},
+     * but if that processing is undesirable, subtypes can directly override this method and leave {@link #run()}
+     * to an empty method.
+     * You would however then have to consider {@link CliAuthenticator} and {@link #getTransportAuthentication},
+     * so this is not really recommended.
+     *
+     * @param args
+     *      Arguments to the sub command. For example, if the CLI is invoked like &quot;java -jar cli.jar foo bar zot&quot;,
+     *      then &quot;foo&quot; is the sub-command and the argument list is [&quot;bar&quot;,&quot;zot&quot;].
+     * @param locale
+     *      Locale of the client (which can be different from that of the server.) Good behaving command implementation
+     *      would use this locale for formatting messages.
+     * @param stdin
+     *      Connected to the stdin of the CLI client.
+     * @param stdout
+     *      Connected to the stdout of the CLI client.
+     * @param stderr
+     *      Connected to the stderr of the CLI client.
+     * @return
+     *      Exit code from the CLI command execution
+     *
+     *      &lt;p&gt;
+     *      Jenkins standard exit codes from CLI:
+     *      0 means everything went well.
+     *      1 means further unspecified exception is thrown while performing the command.
+     *      2 means CmdLineException is thrown while performing the command.
+     *      3 means IllegalArgumentException is thrown while performing the command.
+     *      4 mean IllegalStateException is thrown while performing the command.
+     *      5 means AbortException is thrown while performing the command.
+     *      6 means AccessDeniedException is thrown while performing the command.
+     *      7 means BadCredentialsException is thrown while performing the command.
+     *      8-15 are reserved for future usage
+     *      16+ mean a custom CLI exit error code (meaning defined by the CLI command itself)
+     *
+     *      &lt;p&gt;
+     *      Note: For details - see JENKINS-32273
+     */
+    public int main(List&lt;String&gt; args, Locale locale, InputStream stdin, PrintStream stdout, PrintStream stderr) {
+<span class="nc" id="L231">        this.stdin = new BufferedInputStream(stdin);</span>
+<span class="nc" id="L232">        this.stdout = stdout;</span>
+<span class="nc" id="L233">        this.stderr = stderr;</span>
+<span class="nc" id="L234">        this.locale = locale;</span>
+<span class="nc" id="L235">        registerOptionHandlers();</span>
+<span class="nc" id="L236">        CmdLineParser p = getCmdLineParser();</span>
+
+        // add options from the authenticator
+<span class="nc" id="L239">        SecurityContext sc = null;</span>
+<span class="nc" id="L240">        Authentication old = null;</span>
+        try {
+<span class="nc" id="L242">            sc = SecurityContextHolder.getContext();</span>
+<span class="nc" id="L243">            old = sc.getAuthentication();</span>
+
+<span class="nc" id="L245">            CliAuthenticator authenticator = Jenkins.getActiveInstance().getSecurityRealm().createCliAuthenticator(this);</span>
+<span class="nc" id="L246">            sc.setAuthentication(getTransportAuthentication());</span>
+<span class="nc" id="L247">            new ClassParser().parse(authenticator,p);</span>
+
+<span class="nc" id="L249">            p.parseArgument(args.toArray(new String[args.size()]));</span>
+<span class="nc" id="L250">            Authentication auth = authenticator.authenticate();</span>
+<span class="nc bnc" id="L251" title="All 2 branches missed.">            if (auth==Jenkins.ANONYMOUS)</span>
+<span class="nc" id="L252">                auth = loadStoredAuthentication();</span>
+<span class="nc" id="L253">            sc.setAuthentication(auth); // run the CLI with the right credential</span>
+<span class="nc bnc" id="L254" title="All 4 branches missed.">            if (!(this instanceof LoginCommand || this instanceof HelpCommand))</span>
+<span class="nc" id="L255">                Jenkins.getActiveInstance().checkPermission(Jenkins.READ);</span>
+<span class="nc" id="L256">            return run();</span>
+<span class="nc" id="L257">        } catch (CmdLineException e) {</span>
+<span class="nc" id="L258">            stderr.println(&quot;&quot;);</span>
+<span class="nc" id="L259">            stderr.println(&quot;ERROR: &quot; + e.getMessage());</span>
+<span class="nc" id="L260">            printUsage(stderr, p);</span>
+<span class="nc" id="L261">            return 2;</span>
+<span class="nc" id="L262">        } catch (IllegalStateException e) {</span>
+<span class="nc" id="L263">            stderr.println(&quot;&quot;);</span>
+<span class="nc" id="L264">            stderr.println(&quot;ERROR: &quot; + e.getMessage());</span>
+<span class="nc" id="L265">            return 4;</span>
+<span class="nc" id="L266">        } catch (IllegalArgumentException e) {</span>
+<span class="nc" id="L267">            stderr.println(&quot;&quot;);</span>
+<span class="nc" id="L268">            stderr.println(&quot;ERROR: &quot; + e.getMessage());</span>
+<span class="nc" id="L269">            return 3;</span>
+<span class="nc" id="L270">        } catch (AbortException e) {</span>
+            // signals an error without stack trace
+<span class="nc" id="L272">            stderr.println(&quot;&quot;);</span>
+<span class="nc" id="L273">            stderr.println(&quot;ERROR: &quot; + e.getMessage());</span>
+<span class="nc" id="L274">            return 5;</span>
+<span class="nc" id="L275">        } catch (AccessDeniedException e) {</span>
+<span class="nc" id="L276">            stderr.println(&quot;&quot;);</span>
+<span class="nc" id="L277">            stderr.println(&quot;ERROR: &quot; + e.getMessage());</span>
+<span class="nc" id="L278">            return 6;</span>
+<span class="nc" id="L279">        } catch (BadCredentialsException e) {</span>
+            // to the caller, we can't reveal whether the user didn't exist or the password didn't match.
+            // do that to the server log instead
+<span class="nc" id="L282">            String id = UUID.randomUUID().toString();</span>
+<span class="nc" id="L283">            LOGGER.log(Level.INFO, &quot;CLI login attempt failed: &quot; + id, e);</span>
+<span class="nc" id="L284">            stderr.println(&quot;&quot;);</span>
+<span class="nc" id="L285">            stderr.println(&quot;ERROR: Bad Credentials. Search the server log for &quot; + id + &quot; for more details.&quot;);</span>
+<span class="nc" id="L286">            return 7;</span>
+<span class="nc" id="L287">        } catch (Throwable e) {</span>
+<span class="nc" id="L288">            final String errorMsg = String.format(&quot;Unexpected exception occurred while performing %s command.&quot;,</span>
+<span class="nc" id="L289">                    getName());</span>
+<span class="nc" id="L290">            stderr.println(&quot;&quot;);</span>
+<span class="nc" id="L291">            stderr.println(&quot;ERROR: &quot; + errorMsg);</span>
+<span class="nc" id="L292">            LOGGER.log(Level.WARNING, errorMsg, e);</span>
+<span class="nc" id="L293">            e.printStackTrace(stderr);</span>
+<span class="nc" id="L294">            return 1;</span>
+<span class="nc" id="L295">        } finally {</span>
+<span class="nc bnc" id="L296" title="All 18 branches missed.">            if(sc != null)</span>
+<span class="nc" id="L297">                sc.setAuthentication(old); // restore</span>
+<span class="nc" id="L298">        }</span>
+    }
+
+    /**
+     * Get parser for this command.
+     *
+     * Exposed to be overridden by {@link hudson.cli.declarative.CLIRegisterer}.
+     * @since 1.538
+     */
+    protected CmdLineParser getCmdLineParser() {
+<span class="nc" id="L308">        return new CmdLineParser(this);</span>
+    }
+    
+    public Channel checkChannel() throws AbortException {
+<span class="nc bnc" id="L312" title="All 2 branches missed.">        if (channel==null)</span>
+<span class="nc" id="L313">            throw new AbortException(&quot;This command can only run with Jenkins CLI. See https://wiki.jenkins-ci.org/display/JENKINS/Jenkins+CLI&quot;);</span>
+<span class="nc" id="L314">        return channel;</span>
+    }
+
+    /**
+     * Loads the persisted authentication information from {@link ClientAuthenticationCache}
+     * if the current transport provides {@link Channel}.
+     */
+    protected Authentication loadStoredAuthentication() throws InterruptedException {
+        try {
+<span class="nc bnc" id="L323" title="All 2 branches missed.">            if (channel!=null)</span>
+<span class="nc" id="L324">                return new ClientAuthenticationCache(channel).get();</span>
+<span class="nc" id="L325">        } catch (IOException e) {</span>
+<span class="nc" id="L326">            stderr.println(&quot;Failed to access the stored credential&quot;);</span>
+<span class="nc" id="L327">            e.printStackTrace(stderr);  // recover</span>
+        }
+<span class="nc" id="L329">        return Jenkins.ANONYMOUS;</span>
+    }
+
+    /**
+     * Determines if the user authentication is attempted through CLI before running this command.
+     *
+     * &lt;p&gt;
+     * If your command doesn't require any authentication whatsoever, and if you don't even want to let the user
+     * authenticate, then override this method to always return false &amp;mdash; doing so will result in all the commands
+     * running as anonymous user credential.
+     *
+     * &lt;p&gt;
+     * Note that even if this method returns true, the user can still skip aut 
+     *
+     * @param auth
+     *      Always non-null.
+     *      If the underlying transport had already performed authentication, this object is something other than
+     *      {@link jenkins.model.Jenkins#ANONYMOUS}.
+     */
+    protected boolean shouldPerformAuthentication(Authentication auth) {
+<span class="nc bnc" id="L349" title="All 2 branches missed.">        return auth== Jenkins.ANONYMOUS;</span>
+    }
+
+    /**
+     * Returns the identity of the client as determined at the CLI transport level.
+     *
+     * &lt;p&gt;
+     * When the CLI connection to the server is tunneled over HTTP, that HTTP connection
+     * can authenticate the client, just like any other HTTP connections to the server
+     * can authenticate the client. This method returns that information, if one is available.
+     * By generalizing it, this method returns the identity obtained at the transport-level authentication.
+     *
+     * &lt;p&gt;
+     * For example, imagine if the current {@link SecurityRealm} is doing Kerberos authentication,
+     * then this method can return a valid identity of the client.
+     *
+     * &lt;p&gt;
+     * If the transport doesn't do authentication, this method returns {@link jenkins.model.Jenkins#ANONYMOUS}.
+     */
+    public Authentication getTransportAuthentication() {
+<span class="nc" id="L369">        Authentication a = transportAuth; </span>
+<span class="nc bnc" id="L370" title="All 2 branches missed.">        if (a==null)    a = Jenkins.ANONYMOUS;</span>
+<span class="nc" id="L371">        return a;</span>
+    }
+
+    public void setTransportAuth(Authentication transportAuth) {
+<span class="nc" id="L375">        this.transportAuth = transportAuth;</span>
+<span class="nc" id="L376">    }</span>
+
+    /**
+     * Executes the command, and return the exit code.
+     * 
+     * &lt;p&gt;
+     * This is an internal contract between {@link CLICommand} and its subtype.
+     * To execute CLI method from outside, use {@link #main(List, Locale, InputStream, PrintStream, PrintStream)}
+     *
+     * @return
+     *      0 to indicate a success, otherwise a custom error code.
+     *      Error codes 1-15 shouldn;t be used in {@link #run()} as a custom error code.
+     * @throws Exception
+     *      If a further unspecified exception is thrown; means: Unknown and/or unexpected issue occurred
+     * @throws CmdLineException
+     *      If a wrong parameter specified, input value can't be decoded etc.
+     * @throws IllegalArgumentException
+     *      If the execution can't continue due to wrong input parameter (job doesn't exist etc.)
+     * @throws IllegalStateException
+     *      If the execution can't continue due to an incorect state of Jenkins, job, build etc.
+     * @throws AbortException
+     *      If the execution can't continue due to an other (rare, but foreseeable) issue
+     * @throws AccessDeniedException
+     *      If the caller doesn't have sufficent rights for requested action
+     * @throws BadCredentialsException
+     *      If bad credentials were provided to CLI
+     */
+    protected abstract int run() throws Exception;
+
+    protected void printUsage(PrintStream stderr, CmdLineParser p) {
+<span class="nc" id="L406">        stderr.print(&quot;java -jar jenkins-cli.jar &quot; + getName());</span>
+<span class="nc" id="L407">        p.printSingleLineUsage(stderr);</span>
+<span class="nc" id="L408">        stderr.println();</span>
+<span class="nc" id="L409">        printUsageSummary(stderr);</span>
+<span class="nc" id="L410">        p.printUsage(stderr);</span>
+<span class="nc" id="L411">    }</span>
+
+    /**
+     * Get single line summary as a string.
+     */
+    @Restricted(NoExternalUse.class)
+    public final String getSingleLineSummary() {
+<span class="nc" id="L418">        ByteArrayOutputStream out = new ByteArrayOutputStream();</span>
+<span class="nc" id="L419">        getCmdLineParser().printSingleLineUsage(out);</span>
+<span class="nc" id="L420">        return out.toString();</span>
+    }
+
+    /**
+     * Get usage as a string.
+     */
+    @Restricted(NoExternalUse.class)
+    public final String getUsage() {
+<span class="nc" id="L428">        ByteArrayOutputStream out = new ByteArrayOutputStream();</span>
+<span class="nc" id="L429">        getCmdLineParser().printUsage(out);</span>
+<span class="nc" id="L430">        return out.toString();</span>
+    }
+
+    /**
+     * Get long description as a string.
+     */
+    @Restricted(NoExternalUse.class)
+    public final String getLongDescription() {
+<span class="nc" id="L438">        ByteArrayOutputStream out = new ByteArrayOutputStream();</span>
+<span class="nc" id="L439">        PrintStream ps = new PrintStream(out);</span>
+
+<span class="nc" id="L441">        printUsageSummary(ps);</span>
+<span class="nc" id="L442">        ps.close();</span>
+<span class="nc" id="L443">        return out.toString();</span>
+    }
+
+    /**
+     * Called while producing usage. This is a good method to override
+     * to render the general description of the command that goes beyond
+     * a single-line summary. 
+     */
+    protected void printUsageSummary(PrintStream stderr) {
+<span class="nc" id="L452">        stderr.println(getShortDescription());</span>
+<span class="nc" id="L453">    }</span>
+
+    /**
+     * Convenience method for subtypes to obtain the system property of the client.
+     */
+    protected String getClientSystemProperty(String name) throws IOException, InterruptedException {
+<span class="nc" id="L459">        return checkChannel().call(new GetSystemProperty(name));</span>
+    }
+
+    private static final class GetSystemProperty extends MasterToSlaveCallable&lt;String, IOException&gt; {
+        private final String name;
+
+<span class="nc" id="L465">        private GetSystemProperty(String name) {</span>
+<span class="nc" id="L466">            this.name = name;</span>
+<span class="nc" id="L467">        }</span>
+
+        public String call() throws IOException {
+<span class="nc" id="L470">            return System.getProperty(name);</span>
+        }
+
+        private static final long serialVersionUID = 1L;
+    }
+
+    protected Charset getClientCharset() throws IOException, InterruptedException {
+<span class="nc bnc" id="L477" title="All 2 branches missed.">        if (channel==null)</span>
+            // for SSH, assume the platform default encoding
+            // this is in-line with the standard SSH behavior
+<span class="nc" id="L480">            return Charset.defaultCharset();</span>
+
+<span class="nc" id="L482">        String charsetName = checkChannel().call(new GetCharset());</span>
+        try {
+<span class="nc" id="L484">            return Charset.forName(charsetName);</span>
+<span class="nc" id="L485">        } catch (UnsupportedCharsetException e) {</span>
+<span class="nc" id="L486">            LOGGER.log(Level.FINE,&quot;Server doesn't have charset &quot;+charsetName);</span>
+<span class="nc" id="L487">            return Charset.defaultCharset();</span>
+        }
+    }
+
+<span class="nc" id="L491">    private static final class GetCharset extends MasterToSlaveCallable&lt;String, IOException&gt; {</span>
+        public String call() throws IOException {
+<span class="nc" id="L493">            return Charset.defaultCharset().name();</span>
+        }
+
+        private static final long serialVersionUID = 1L;
+    }
+
+    /**
+     * Convenience method for subtypes to obtain environment variables of the client.
+     */
+    protected String getClientEnvironmentVariable(String name) throws IOException, InterruptedException {
+<span class="nc" id="L503">        return checkChannel().call(new GetEnvironmentVariable(name));</span>
+    }
+
+    private static final class GetEnvironmentVariable extends MasterToSlaveCallable&lt;String, IOException&gt; {
+        private final String name;
+
+<span class="nc" id="L509">        private GetEnvironmentVariable(String name) {</span>
+<span class="nc" id="L510">            this.name = name;</span>
+<span class="nc" id="L511">        }</span>
+
+        public String call() throws IOException {
+<span class="nc" id="L514">            return System.getenv(name);</span>
+        }
+
+        private static final long serialVersionUID = 1L;
+    }
+
+    /**
+     * Creates a clone to be used to execute a command.
+     */
+    protected CLICommand createClone() {
+        try {
+<span class="nc" id="L525">            return getClass().newInstance();</span>
+<span class="nc" id="L526">        } catch (IllegalAccessException e) {</span>
+<span class="nc" id="L527">            throw new AssertionError(e);</span>
+<span class="nc" id="L528">        } catch (InstantiationException e) {</span>
+<span class="nc" id="L529">            throw new AssertionError(e);</span>
+        }
+    }
+
+    /**
+     * Auto-discovers {@link OptionHandler}s and add them to the given command line parser.
+     */
+    protected void registerOptionHandlers() {
+        try {
+<span class="nc bnc" id="L538" title="All 2 branches missed.">            for (Class c : Index.list(OptionHandlerExtension.class, Jenkins.getActiveInstance().pluginManager.uberClassLoader,Class.class)) {</span>
+<span class="nc" id="L539">                Type t = Types.getBaseClass(c, OptionHandler.class);</span>
+<span class="nc" id="L540">                CmdLineParser.registerHandler(Types.erasure(Types.getTypeArgument(t,0)), c);</span>
+            }
+<span class="nc" id="L542">        } catch (IOException e) {</span>
+<span class="nc" id="L543">            throw new Error(e);</span>
+        }
+<span class="nc" id="L545">    }</span>
+
+    /**
+     * Returns all the registered {@link CLICommand}s.
+     */
+    public static ExtensionList&lt;CLICommand&gt; all() {
+<span class="nc" id="L551">        return ExtensionList.lookup(CLICommand.class);</span>
+    }
+
+    /**
+     * Obtains a copy of the command for invocation.
+     */
+    public static CLICommand clone(String name) {
+<span class="nc bnc" id="L558" title="All 2 branches missed.">        for (CLICommand cmd : all())</span>
+<span class="nc bnc" id="L559" title="All 2 branches missed.">            if(name.equals(cmd.getName()))</span>
+<span class="nc" id="L560">                return cmd.createClone();</span>
+<span class="nc" id="L561">        return null;</span>
+    }
+
+<span class="nc" id="L564">    private static final Logger LOGGER = Logger.getLogger(CLICommand.class.getName());</span>
+
+    /**
+     * Key for {@link Channel#getProperty(Object)} that links to the {@link Authentication} object
+     * which captures the identity of the client given by the transport layer.
+     */
+<span class="nc" id="L570">    public static final ChannelProperty&lt;Authentication&gt; TRANSPORT_AUTHENTICATION = new ChannelProperty&lt;Authentication&gt;(Authentication.class,&quot;transportAuthentication&quot;);</span>
+
+<span class="nc" id="L572">    private static final ThreadLocal&lt;CLICommand&gt; CURRENT_COMMAND = new ThreadLocal&lt;CLICommand&gt;();</span>
+
+    /*package*/ static CLICommand setCurrent(CLICommand cmd) {
+<span class="nc" id="L575">        CLICommand old = getCurrent();</span>
+<span class="nc" id="L576">        CURRENT_COMMAND.set(cmd);</span>
+<span class="nc" id="L577">        return old;</span>
+    }
+
+    /**
+     * If the calling thread is in the middle of executing a CLI command, return it. Otherwise null.
+     */
+    public static CLICommand getCurrent() {
+<span class="nc" id="L584">        return CURRENT_COMMAND.get();</span>
+    }
+
+    static {
+        // register option handlers that are defined
+<span class="nc" id="L589">        ClassLoaders cls = new ClassLoaders();</span>
+<span class="nc" id="L590">        Jenkins j = Jenkins.getActiveInstance();</span>
+<span class="nc bnc" id="L591" title="All 2 branches missed.">        if (j!=null) {// only when running on the master</span>
+<span class="nc" id="L592">            cls.put(j.getPluginManager().uberClassLoader);</span>
+
+<span class="nc" id="L594">            ResourceNameIterator servicesIter =</span>
+<span class="nc" id="L595">                new DiscoverServiceNames(cls).findResourceNames(OptionHandler.class.getName());</span>
+<span class="nc" id="L596">            final ResourceClassIterator itr =</span>
+<span class="nc" id="L597">                new DiscoverClasses(cls).findResourceClasses(servicesIter);</span>
+
+<span class="nc bnc" id="L599" title="All 2 branches missed.">            while(itr.hasNext()) {</span>
+<span class="nc" id="L600">                Class h = itr.nextResourceClass().loadClass();</span>
+<span class="nc" id="L601">                Class c = Types.erasure(Types.getTypeArgument(Types.getBaseClass(h, OptionHandler.class), 0));</span>
+<span class="nc" id="L602">                CmdLineParser.registerHandler(c,h);</span>
+            }
+        }
+<span class="nc" id="L605">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

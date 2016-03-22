@@ -1,0 +1,2294 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>AbstractProject.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.model</a> &gt; <span class="el_source">AbstractProject.java</span></div><h1>AbstractProject.java</h1><pre class="source lang-java linenums"><span class="pc" id="L1">/*</span>
+ * The MIT License
+ *
+ * Copyright (c) 2004-2011, Sun Microsystems, Inc., Kohsuke Kawaguchi,
+ * Brian Westrich, Erik Ramfelt, Ertan Deniz, Jean-Baptiste Quenot,
+ * Luca Domenico Milanesio, R. Tyler Ballance, Stephen Connolly, Tom Huybrechts,
+ * id:cactusman, Yahoo! Inc., Andrew Bayer, Manufacture Francaise des Pneumatiques
+ * Michelin, Romain Seguy
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.model;
+
+import antlr.ANTLRException;
+import com.infradna.tool.bridge_method_injector.WithBridgeMethods;
+import hudson.AbortException;
+import hudson.CopyOnWrite;
+import hudson.EnvVars;
+import hudson.ExtensionList;
+import hudson.ExtensionPoint;
+import hudson.FeedAdapter;
+import hudson.FilePath;
+import hudson.Functions;
+import hudson.Launcher;
+import hudson.Util;
+import hudson.cli.declarative.CLIMethod;
+import hudson.cli.declarative.CLIResolver;
+import hudson.model.Cause.LegacyCodeCause;
+import hudson.model.Descriptor.FormException;
+import hudson.model.Fingerprint.RangeSet;
+import hudson.model.Node.Mode;
+import hudson.model.Queue.Executable;
+import hudson.model.Queue.Task;
+import hudson.model.labels.LabelAtom;
+import hudson.model.labels.LabelExpression;
+import hudson.model.listeners.ItemListener;
+import hudson.model.listeners.SCMPollListener;
+import hudson.model.queue.CauseOfBlockage;
+import hudson.model.queue.QueueTaskFuture;
+import hudson.model.queue.SubTask;
+import hudson.model.queue.SubTaskContributor;
+import hudson.scm.ChangeLogSet;
+import hudson.scm.ChangeLogSet.Entry;
+import hudson.scm.NullSCM;
+import hudson.scm.PollingResult;
+
+import static hudson.scm.PollingResult.*;
+import hudson.scm.SCM;
+import hudson.scm.SCMRevisionState;
+import hudson.scm.SCMS;
+import hudson.search.SearchIndexBuilder;
+import hudson.security.ACL;
+import hudson.security.Permission;
+import hudson.slaves.Cloud;
+import hudson.slaves.WorkspaceList;
+import hudson.tasks.BuildStep;
+import hudson.tasks.BuildStepDescriptor;
+import hudson.tasks.BuildTrigger;
+import hudson.tasks.BuildWrapperDescriptor;
+import hudson.tasks.Publisher;
+import hudson.triggers.SCMTrigger;
+import hudson.triggers.Trigger;
+import hudson.triggers.TriggerDescriptor;
+import hudson.util.AlternativeUiTextProvider;
+import hudson.util.AlternativeUiTextProvider.Message;
+import hudson.util.DescribableList;
+import hudson.util.FormValidation;
+import hudson.util.TimeUnit2;
+import hudson.widgets.HistoryWidget;
+import java.io.File;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Calendar;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.SortedMap;
+import java.util.TreeMap;
+import java.util.Vector;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import javax.annotation.CheckForNull;
+import javax.annotation.Nonnull;
+import javax.servlet.ServletException;
+import jenkins.model.BlockedBecauseOfBuildInProgress;
+import jenkins.model.Jenkins;
+import jenkins.model.JenkinsLocationConfiguration;
+import jenkins.model.ParameterizedJobMixIn;
+import jenkins.model.Uptime;
+import jenkins.model.lazy.LazyBuildMixIn;
+import jenkins.scm.DefaultSCMCheckoutStrategyImpl;
+import jenkins.scm.SCMCheckoutStrategy;
+import jenkins.scm.SCMCheckoutStrategyDescriptor;
+import jenkins.util.TimeDuration;
+import net.sf.json.JSONObject;
+import org.acegisecurity.Authentication;
+import org.jenkinsci.bytecode.AdaptField;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.DoNotUse;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
+import org.kohsuke.args4j.Argument;
+import org.kohsuke.args4j.CmdLineException;
+import org.kohsuke.stapler.AncestorInPath;
+import org.kohsuke.stapler.ForwardToView;
+import org.kohsuke.stapler.HttpRedirect;
+import org.kohsuke.stapler.HttpResponse;
+import org.kohsuke.stapler.QueryParameter;
+import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.StaplerResponse;
+import org.kohsuke.stapler.export.Exported;
+import org.kohsuke.stapler.interceptor.RequirePOST;
+
+/**
+ * Base implementation of {@link Job}s that build software.
+ *
+ * For now this is primarily the common part of {@link Project} and MavenModule.
+ *
+ * @author Kohsuke Kawaguchi
+ * @see AbstractBuild
+ */
+@SuppressWarnings(&quot;rawtypes&quot;)
+public abstract class AbstractProject&lt;P extends AbstractProject&lt;P,R&gt;,R extends AbstractBuild&lt;P,R&gt;&gt; extends Job&lt;P,R&gt; implements BuildableItem, LazyBuildMixIn.LazyLoadingJob&lt;P,R&gt;, ParameterizedJobMixIn.ParameterizedJob {
+
+    /**
+     * {@link SCM} associated with the project.
+     * To allow derived classes to link {@link SCM} config to elsewhere,
+     * access to this variable should always go through {@link #getScm()}.
+     */
+<span class="nc" id="L152">    private volatile SCM scm = new NullSCM();</span>
+
+    /**
+     * Controls how the checkout is done.
+     */
+    private volatile SCMCheckoutStrategy scmCheckoutStrategy;
+
+    /**
+     * State returned from {@link SCM#poll(AbstractProject, Launcher, FilePath, TaskListener, SCMRevisionState)}.
+     */
+<span class="nc" id="L162">    private volatile transient SCMRevisionState pollingBaseline = null;</span>
+
+    private transient LazyBuildMixIn&lt;P,R&gt; buildMixIn;
+
+    /**
+     * All the builds keyed by their build number.
+     * Kept here for binary compatibility only; otherwise use {@link #buildMixIn}.
+     * External code should use {@link #getBuildByNumber(int)} or {@link #getLastBuild()} and traverse via
+     * {@link Run#getPreviousBuild()}
+     */
+    @Restricted(NoExternalUse.class)
+    protected transient RunMap&lt;R&gt; builds;
+
+    /**
+     * The quiet period. Null to delegate to the system default.
+     */
+<span class="nc" id="L178">    private volatile Integer quietPeriod = null;</span>
+
+    /**
+     * The retry count. Null to delegate to the system default.
+     */
+<span class="nc" id="L183">    private volatile Integer scmCheckoutRetryCount = null;</span>
+
+    /**
+     * If this project is configured to be only built on a certain label,
+     * this value will be set to that label.
+     *
+     * For historical reasons, this is called 'assignedNode'. Also for
+     * a historical reason, null to indicate the affinity
+     * with the master node.
+     *
+     * @see #canRoam
+     */
+    private String assignedNode;
+
+    /**
+     * True if this project can be built on any node.
+     *
+     * &lt;p&gt;
+     * This somewhat ugly flag combination is so that we can migrate
+     * existing Hudson installations nicely.
+     */
+    private volatile boolean canRoam;
+
+    /**
+     * True to suspend new builds.
+     */
+    protected volatile boolean disabled;
+
+    /**
+     * True to keep builds of this project in queue when downstream projects are
+     * building. False by default to keep from breaking existing behavior.
+     */
+<span class="nc" id="L215">    protected volatile boolean blockBuildWhenDownstreamBuilding = false;</span>
+
+    /**
+     * True to keep builds of this project in queue when upstream projects are
+     * building. False by default to keep from breaking existing behavior.
+     */
+<span class="nc" id="L221">    protected volatile boolean blockBuildWhenUpstreamBuilding = false;</span>
+
+    /**
+     * Identifies {@link JDK} to be used.
+     * Null if no explicit configuration is required.
+     *
+     * &lt;p&gt;
+     * Can't store {@link JDK} directly because {@link Jenkins} and {@link Project}
+     * are saved independently.
+     *
+     * @see Jenkins#getJDK(String)
+     */
+    private volatile String jdk;
+
+<span class="nc" id="L235">    private volatile BuildAuthorizationToken authToken = null;</span>
+
+    /**
+     * List of all {@link Trigger}s for this project.
+     */
+    @AdaptField(was=List.class)
+<span class="nc" id="L241">    protected volatile DescribableList&lt;Trigger&lt;?&gt;,TriggerDescriptor&gt; triggers = new DescribableList&lt;Trigger&lt;?&gt;,TriggerDescriptor&gt;(this);</span>
+<span class="fc" id="L242">    private static final AtomicReferenceFieldUpdater&lt;AbstractProject,DescribableList&gt; triggersUpdater</span>
+<span class="fc" id="L243">            = AtomicReferenceFieldUpdater.newUpdater(AbstractProject.class,DescribableList.class,&quot;triggers&quot;);</span>
+
+    /**
+     * {@link Action}s contributed from subsidiary objects associated with
+     * {@link AbstractProject}, such as from triggers, builders, publishers, etc.
+     *
+     * We don't want to persist them separately, and these actions
+     * come and go as configuration change, so it's kept separate.
+     */
+    @CopyOnWrite
+<span class="nc" id="L253">    protected transient volatile List&lt;Action&gt; transientActions = new Vector&lt;Action&gt;();</span>
+
+    private boolean concurrentBuild;
+
+    /**
+     * See {@link #setCustomWorkspace(String)}.
+     *
+     * @since 1.410
+     */
+    private String customWorkspace;
+
+    protected AbstractProject(ItemGroup parent, String name) {
+<span class="nc" id="L265">        super(parent,name);</span>
+<span class="nc" id="L266">        buildMixIn = createBuildMixIn();</span>
+<span class="nc" id="L267">        builds = buildMixIn.getRunMap();</span>
+
+<span class="nc" id="L269">        final Jenkins j = Jenkins.getInstance();</span>
+<span class="nc bnc" id="L270" title="All 2 branches missed.">        final List&lt;Node&gt; nodes = j != null ? j.getNodes() : null;</span>
+<span class="nc bnc" id="L271" title="All 4 branches missed.">        if(nodes!=null &amp;&amp; !nodes.isEmpty()) {</span>
+            // if a new job is configured with Hudson that already has slave nodes
+            // make it roamable by default
+<span class="nc" id="L274">            canRoam = true;</span>
+        }
+<span class="nc" id="L276">    }</span>
+
+    private LazyBuildMixIn&lt;P,R&gt; createBuildMixIn() {
+<span class="nc" id="L279">        return new LazyBuildMixIn&lt;P,R&gt;() {</span>
+            @SuppressWarnings(&quot;unchecked&quot;) // untypable
+            @Override protected P asJob() {
+<span class="nc" id="L282">                return (P) AbstractProject.this;</span>
+            }
+            @Override protected Class&lt;R&gt; getBuildClass() {
+<span class="nc" id="L285">                return AbstractProject.this.getBuildClass();</span>
+            }
+        };
+    }
+
+    @Override public LazyBuildMixIn&lt;P,R&gt; getLazyBuildMixIn() {
+<span class="nc" id="L291">        return buildMixIn;</span>
+    }
+
+    private ParameterizedJobMixIn&lt;P,R&gt; getParameterizedJobMixIn() {
+<span class="nc" id="L295">        return new ParameterizedJobMixIn&lt;P,R&gt;() {</span>
+            @SuppressWarnings(&quot;unchecked&quot;) // untypable
+            @Override protected P asJob() {
+<span class="nc" id="L298">                return (P) AbstractProject.this;</span>
+            }
+        };
+    }
+
+    @Override
+    public synchronized void save() throws IOException {
+<span class="nc" id="L305">        super.save();</span>
+<span class="nc" id="L306">        updateTransientActions();</span>
+<span class="nc" id="L307">    }</span>
+
+    @Override
+    public void onCreatedFromScratch() {
+<span class="nc" id="L311">        super.onCreatedFromScratch();</span>
+<span class="nc" id="L312">        buildMixIn.onCreatedFromScratch();</span>
+<span class="nc" id="L313">        builds = buildMixIn.getRunMap();</span>
+        // solicit initial contributions, especially from TransientProjectActionFactory
+<span class="nc" id="L315">        updateTransientActions();</span>
+<span class="nc" id="L316">    }</span>
+
+    @Override
+    public void onLoad(ItemGroup&lt;? extends Item&gt; parent, String name) throws IOException {
+<span class="nc" id="L320">        super.onLoad(parent, name);</span>
+<span class="nc bnc" id="L321" title="All 2 branches missed.">        if (buildMixIn == null) {</span>
+<span class="nc" id="L322">            buildMixIn = createBuildMixIn();</span>
+        }
+<span class="nc" id="L324">        buildMixIn.onLoad(parent, name);</span>
+<span class="nc" id="L325">        builds = buildMixIn.getRunMap();</span>
+<span class="nc" id="L326">        triggers().setOwner(this);</span>
+<span class="nc bnc" id="L327" title="All 2 branches missed.">        for (Trigger t : triggers()) {</span>
+            try {
+<span class="nc" id="L329">                t.start(this, Items.currentlyUpdatingByXml());</span>
+<span class="nc" id="L330">            } catch (Throwable e) {</span>
+<span class="nc" id="L331">                LOGGER.log(Level.WARNING, &quot;could not start trigger while loading project '&quot; + getFullName() + &quot;'&quot;, e);</span>
+            }
+        }
+<span class="nc bnc" id="L334" title="All 2 branches missed.">        if(scm==null)</span>
+<span class="nc" id="L335">            scm = new NullSCM(); // perhaps it was pointing to a plugin that no longer exists.</span>
+
+<span class="nc bnc" id="L337" title="All 2 branches missed.">        if(transientActions==null)</span>
+<span class="nc" id="L338">            transientActions = new Vector&lt;Action&gt;();    // happens when loaded from disk</span>
+<span class="nc" id="L339">        updateTransientActions();</span>
+<span class="nc" id="L340">    }</span>
+
+    @WithBridgeMethods(List.class)
+    protected DescribableList&lt;Trigger&lt;?&gt;,TriggerDescriptor&gt; triggers() {
+<span class="nc bnc" id="L344" title="All 2 branches missed.">        if (triggers == null) {</span>
+<span class="nc" id="L345">            triggersUpdater.compareAndSet(this,null,new DescribableList&lt;Trigger&lt;?&gt;,TriggerDescriptor&gt;(this));</span>
+        }
+<span class="nc" id="L347">        return triggers;</span>
+    }
+
+    @Override
+    public EnvVars getEnvironment(Node node, TaskListener listener) throws IOException, InterruptedException {
+<span class="nc" id="L352">        EnvVars env =  super.getEnvironment(node, listener);</span>
+
+<span class="nc" id="L354">        JDK jdkTool = getJDK();</span>
+<span class="nc bnc" id="L355" title="All 2 branches missed.">        if (jdkTool != null) {</span>
+<span class="nc bnc" id="L356" title="All 2 branches missed.">            if (node != null) { // just in case were not in a build</span>
+<span class="nc" id="L357">                jdkTool = jdkTool.forNode(node, listener);</span>
+            }
+<span class="nc" id="L359">            jdkTool.buildEnvVars(env);</span>
+<span class="nc bnc" id="L360" title="All 2 branches missed.">        } else if (!JDK.isDefaultName(jdk)) {</span>
+<span class="nc" id="L361">            listener.getLogger().println(&quot;No JDK named ‘&quot; + jdk + &quot;’ found&quot;);</span>
+        }
+
+<span class="nc" id="L364">        return env;</span>
+    }
+
+    @Override
+    protected void performDelete() throws IOException, InterruptedException {
+        // prevent a new build while a delete operation is in progress
+<span class="nc" id="L370">        makeDisabled(true);</span>
+<span class="nc" id="L371">        FilePath ws = getWorkspace();</span>
+<span class="nc bnc" id="L372" title="All 2 branches missed.">        if(ws!=null) {</span>
+<span class="nc" id="L373">            Node on = getLastBuiltOn();</span>
+<span class="nc" id="L374">            getScm().processWorkspaceBeforeDeletion(this, ws, on);</span>
+<span class="nc bnc" id="L375" title="All 2 branches missed.">            if(on!=null)</span>
+<span class="nc" id="L376">                on.getFileSystemProvisioner().discardWorkspace(this,ws);</span>
+        }
+<span class="nc" id="L378">        super.performDelete();</span>
+<span class="nc" id="L379">    }</span>
+
+    /**
+     * Does this project perform concurrent builds?
+     * @since 1.319
+     */
+    @Exported
+    public boolean isConcurrentBuild() {
+<span class="nc" id="L387">        return concurrentBuild;</span>
+    }
+
+    public void setConcurrentBuild(boolean b) throws IOException {
+<span class="nc" id="L391">        concurrentBuild = b;</span>
+<span class="nc" id="L392">        save();</span>
+<span class="nc" id="L393">    }</span>
+
+    /**
+     * If this project is configured to be always built on this node,
+     * return that {@link Node}. Otherwise null.
+     */
+    public @CheckForNull Label getAssignedLabel() {
+<span class="nc bnc" id="L400" title="All 2 branches missed.">        if(canRoam)</span>
+<span class="nc" id="L401">            return null;</span>
+
+<span class="nc bnc" id="L403" title="All 2 branches missed.">        if(assignedNode==null)</span>
+<span class="nc" id="L404">            return Jenkins.getInstance().getSelfLabel();</span>
+<span class="nc" id="L405">        return Jenkins.getInstance().getLabel(assignedNode);</span>
+    }
+
+    /**
+     * Set of labels relevant to this job.
+     *
+     * This method is used to determine what slaves are relevant to jobs, for example by {@link View}s.
+     * It does not affect the scheduling. This information is informational and the best-effort basis.
+     *
+     * @since 1.456
+     * @return
+     *      Minimally it should contain {@link #getAssignedLabel()}. The set can contain null element
+     *      to correspond to the null return value from {@link #getAssignedLabel()}.
+     */
+    public Set&lt;Label&gt; getRelevantLabels() {
+<span class="nc" id="L420">        return Collections.singleton(getAssignedLabel());</span>
+    }
+
+    /**
+     * Gets the textual representation of the assigned label as it was entered by the user.
+     */
+    public String getAssignedLabelString() {
+<span class="nc bnc" id="L427" title="All 4 branches missed.">        if (canRoam || assignedNode==null)    return null;</span>
+        try {
+<span class="nc" id="L429">            LabelExpression.parseExpression(assignedNode);</span>
+<span class="nc" id="L430">            return assignedNode;</span>
+<span class="nc" id="L431">        } catch (ANTLRException e) {</span>
+            // must be old label or host name that includes whitespace or other unsafe chars
+<span class="nc" id="L433">            return LabelAtom.escape(assignedNode);</span>
+        }
+    }
+
+    /**
+     * Sets the assigned label.
+     */
+    public void setAssignedLabel(Label l) throws IOException {
+<span class="nc bnc" id="L441" title="All 2 branches missed.">        if(l==null) {</span>
+<span class="nc" id="L442">            canRoam = true;</span>
+<span class="nc" id="L443">            assignedNode = null;</span>
+<span class="nc" id="L444">        } else {</span>
+<span class="nc" id="L445">            canRoam = false;</span>
+<span class="nc bnc" id="L446" title="All 2 branches missed.">            if(l== Jenkins.getInstance().getSelfLabel())  assignedNode = null;</span>
+<span class="nc" id="L447">            else                                        assignedNode = l.getExpression();</span>
+        }
+<span class="nc" id="L449">        save();</span>
+<span class="nc" id="L450">    }</span>
+
+    /**
+     * Assigns this job to the given node. A convenience method over {@link #setAssignedLabel(Label)}.
+     */
+    public void setAssignedNode(Node l) throws IOException {
+<span class="nc" id="L456">        setAssignedLabel(l.getSelfLabel());</span>
+<span class="nc" id="L457">    }</span>
+
+    /**
+     * Get the term used in the UI to represent this kind of {@link AbstractProject}.
+     * Must start with a capital letter.
+     */
+    @Override
+    public String getPronoun() {
+<span class="nc" id="L465">        return AlternativeUiTextProvider.get(PRONOUN, this,Messages.AbstractProject_Pronoun());</span>
+    }
+
+    /**
+     * Gets the human readable display name to be rendered in the &quot;Build Now&quot; link.
+     *
+     * @since 1.401
+     */
+    public String getBuildNowText() {
+        // For compatibility, still use the deprecated replacer if specified.
+<span class="nc" id="L475">        return AlternativeUiTextProvider.get(BUILD_NOW_TEXT, this, getParameterizedJobMixIn().getBuildNowText());</span>
+    }
+
+    /**
+     * Gets the nearest ancestor {@link TopLevelItem} that's also an {@link AbstractProject}.
+     *
+     * &lt;p&gt;
+     * Some projects (such as matrix projects, Maven projects, or promotion processes) form a tree of jobs
+     * that acts as a single unit. This method can be used to find the top most dominating job that
+     * covers such a tree.
+     *
+     * @return never null.
+     * @see AbstractBuild#getRootBuild()
+     */
+    public AbstractProject&lt;?,?&gt; getRootProject() {
+<span class="nc bnc" id="L490" title="All 2 branches missed.">        if (this instanceof TopLevelItem) {</span>
+<span class="nc" id="L491">            return this;</span>
+        } else {
+<span class="nc" id="L493">            ItemGroup p = this.getParent();</span>
+<span class="nc bnc" id="L494" title="All 2 branches missed.">            if (p instanceof AbstractProject)</span>
+<span class="nc" id="L495">                return ((AbstractProject) p).getRootProject();</span>
+<span class="nc" id="L496">            return this;</span>
+        }
+    }
+
+    /**
+     * Gets the directory where the module is checked out.
+     *
+     * @return
+     *      null if the workspace is on a slave that's not connected.
+     * @deprecated as of 1.319
+     *      To support concurrent builds of the same project, this method is moved to {@link AbstractBuild}.
+     *      For backward compatibility, this method returns the right {@link AbstractBuild#getWorkspace()} if called
+     *      from {@link Executor}, and otherwise the workspace of the last build.
+     *
+     *      &lt;p&gt;
+     *      If you are calling this method during a build from an executor, switch it to {@link AbstractBuild#getWorkspace()}.
+     *      If you are calling this method to serve a file from the workspace, doing a form validation, etc., then
+     *      use {@link #getSomeWorkspace()}
+     */
+    @Deprecated
+    public final FilePath getWorkspace() {
+<span class="nc" id="L517">        AbstractBuild b = getBuildForDeprecatedMethods();</span>
+<span class="nc bnc" id="L518" title="All 2 branches missed.">        return b != null ? b.getWorkspace() : null;</span>
+
+    }
+
+    /**
+     * Various deprecated methods in this class all need the 'current' build.  This method returns
+     * the build suitable for that purpose.
+     *
+     * @return An AbstractBuild for deprecated methods to use.
+     */
+    private AbstractBuild getBuildForDeprecatedMethods() {
+<span class="nc" id="L529">        Executor e = Executor.currentExecutor();</span>
+<span class="nc bnc" id="L530" title="All 2 branches missed.">        if(e!=null) {</span>
+<span class="nc" id="L531">            Executable exe = e.getCurrentExecutable();</span>
+<span class="nc bnc" id="L532" title="All 2 branches missed.">            if (exe instanceof AbstractBuild) {</span>
+<span class="nc" id="L533">                AbstractBuild b = (AbstractBuild) exe;</span>
+<span class="nc bnc" id="L534" title="All 2 branches missed.">                if(b.getProject()==this)</span>
+<span class="nc" id="L535">                    return b;</span>
+            }
+        }
+<span class="nc" id="L538">        R lb = getLastBuild();</span>
+<span class="nc bnc" id="L539" title="All 2 branches missed.">        if(lb!=null)    return lb;</span>
+<span class="nc" id="L540">        return null;</span>
+    }
+
+    /**
+     * Gets a workspace for some build of this project.
+     *
+     * &lt;p&gt;
+     * This is useful for obtaining a workspace for the purpose of form field validation, where exactly
+     * which build the workspace belonged is less important. The implementation makes a cursory effort
+     * to find some workspace.
+     *
+     * @return
+     *      null if there's no available workspace.
+     * @since 1.319
+     */
+    public final @CheckForNull FilePath getSomeWorkspace() {
+<span class="nc" id="L556">        R b = getSomeBuildWithWorkspace();</span>
+<span class="nc bnc" id="L557" title="All 2 branches missed.">        if (b!=null) return b.getWorkspace();</span>
+<span class="nc bnc" id="L558" title="All 2 branches missed.">        for (WorkspaceBrowser browser : ExtensionList.lookup(WorkspaceBrowser.class)) {</span>
+<span class="nc" id="L559">            FilePath f = browser.getWorkspace(this);</span>
+<span class="nc bnc" id="L560" title="All 2 branches missed.">            if (f != null) return f;</span>
+        }
+<span class="nc" id="L562">        return null;</span>
+    }
+
+    /**
+     * Gets some build that has a live workspace.
+     *
+     * @return null if no such build exists.
+     */
+    public final R getSomeBuildWithWorkspace() {
+<span class="nc" id="L571">        int cnt=0;</span>
+<span class="nc bnc" id="L572" title="All 4 branches missed.">        for (R b = getLastBuild(); cnt&lt;5 &amp;&amp; b!=null; b=b.getPreviousBuild()) {</span>
+<span class="nc" id="L573">            FilePath ws = b.getWorkspace();</span>
+<span class="nc bnc" id="L574" title="All 2 branches missed.">            if (ws!=null)   return b;</span>
+        }
+<span class="nc" id="L576">        return null;</span>
+    }
+
+    private R getSomeBuildWithExistingWorkspace() throws IOException, InterruptedException {
+<span class="nc" id="L580">        int cnt=0;</span>
+<span class="nc bnc" id="L581" title="All 4 branches missed.">        for (R b = getLastBuild(); cnt&lt;5 &amp;&amp; b!=null; b=b.getPreviousBuild()) {</span>
+<span class="nc" id="L582">            FilePath ws = b.getWorkspace();</span>
+<span class="nc bnc" id="L583" title="All 4 branches missed.">            if (ws!=null &amp;&amp; ws.exists())   return b;</span>
+        }
+<span class="nc" id="L585">        return null;</span>
+    }
+
+    /**
+     * Returns the root directory of the checked-out module.
+     * &lt;p&gt;
+     * This is usually where &lt;tt&gt;pom.xml&lt;/tt&gt;, &lt;tt&gt;build.xml&lt;/tt&gt;
+     * and so on exists.
+     *
+     * @deprecated as of 1.319
+     *      See {@link #getWorkspace()} for a migration strategy.
+     */
+    @Deprecated
+    public FilePath getModuleRoot() {
+<span class="nc" id="L599">        AbstractBuild b = getBuildForDeprecatedMethods();</span>
+<span class="nc bnc" id="L600" title="All 2 branches missed.">        return b != null ? b.getModuleRoot() : null;</span>
+    }
+
+    /**
+     * Returns the root directories of all checked-out modules.
+     * &lt;p&gt;
+     * Some SCMs support checking out multiple modules into the same workspace.
+     * In these cases, the returned array will have a length greater than one.
+     * @return The roots of all modules checked out from the SCM.
+     *
+     * @deprecated as of 1.319
+     *      See {@link #getWorkspace()} for a migration strategy.
+     */
+    @Deprecated
+    public FilePath[] getModuleRoots() {
+<span class="nc" id="L615">        AbstractBuild b = getBuildForDeprecatedMethods();</span>
+<span class="nc bnc" id="L616" title="All 2 branches missed.">        return b != null ? b.getModuleRoots() : null;</span>
+    }
+
+    public int getQuietPeriod() {
+<span class="nc bnc" id="L620" title="All 2 branches missed.">        return quietPeriod!=null ? quietPeriod : Jenkins.getInstance().getQuietPeriod();</span>
+    }
+
+    public SCMCheckoutStrategy getScmCheckoutStrategy() {
+<span class="nc bnc" id="L624" title="All 2 branches missed.">        return scmCheckoutStrategy == null ? new DefaultSCMCheckoutStrategyImpl() : scmCheckoutStrategy;</span>
+    }
+
+    public void setScmCheckoutStrategy(SCMCheckoutStrategy scmCheckoutStrategy) throws IOException {
+<span class="nc" id="L628">        this.scmCheckoutStrategy = scmCheckoutStrategy;</span>
+<span class="nc" id="L629">        save();</span>
+<span class="nc" id="L630">    }</span>
+
+
+    public int getScmCheckoutRetryCount() {
+<span class="nc bnc" id="L634" title="All 2 branches missed.">        return scmCheckoutRetryCount !=null ? scmCheckoutRetryCount : Jenkins.getInstance().getScmCheckoutRetryCount();</span>
+    }
+
+    // ugly name because of EL
+    public boolean getHasCustomQuietPeriod() {
+<span class="nc bnc" id="L639" title="All 2 branches missed.">        return quietPeriod!=null;</span>
+    }
+
+    /**
+     * Sets the custom quiet period of this project, or revert to the global default if null is given.
+     */
+    public void setQuietPeriod(Integer seconds) throws IOException {
+<span class="nc" id="L646">        this.quietPeriod = seconds;</span>
+<span class="nc" id="L647">        save();</span>
+<span class="nc" id="L648">    }</span>
+
+    public boolean hasCustomScmCheckoutRetryCount(){
+<span class="nc bnc" id="L651" title="All 2 branches missed.">        return scmCheckoutRetryCount != null;</span>
+    }
+
+    @Override
+    public boolean isBuildable() {
+<span class="nc bnc" id="L656" title="All 4 branches missed.">        return !isDisabled() &amp;&amp; !isHoldOffBuildUntilSave();</span>
+    }
+
+    /**
+     * Used in &lt;tt&gt;sidepanel.jelly&lt;/tt&gt; to decide whether to display
+     * the config/delete/build links.
+     */
+    public boolean isConfigurable() {
+<span class="nc" id="L664">        return true;</span>
+    }
+
+    public boolean blockBuildWhenDownstreamBuilding() {
+<span class="nc" id="L668">        return blockBuildWhenDownstreamBuilding;</span>
+    }
+
+    public void setBlockBuildWhenDownstreamBuilding(boolean b) throws IOException {
+<span class="nc" id="L672">        blockBuildWhenDownstreamBuilding = b;</span>
+<span class="nc" id="L673">        save();</span>
+<span class="nc" id="L674">    }</span>
+
+    public boolean blockBuildWhenUpstreamBuilding() {
+<span class="nc" id="L677">        return blockBuildWhenUpstreamBuilding;</span>
+    }
+
+    public void setBlockBuildWhenUpstreamBuilding(boolean b) throws IOException {
+<span class="nc" id="L681">        blockBuildWhenUpstreamBuilding = b;</span>
+<span class="nc" id="L682">        save();</span>
+<span class="nc" id="L683">    }</span>
+
+    public boolean isDisabled() {
+<span class="nc" id="L686">        return disabled;</span>
+    }
+
+    /**
+     * Validates the retry count Regex
+     */
+    public FormValidation doCheckRetryCount(@QueryParameter String value)throws IOException,ServletException{
+        // retry count is optional so this is ok
+<span class="nc bnc" id="L694" title="All 4 branches missed.">        if(value == null || value.trim().equals(&quot;&quot;))</span>
+<span class="nc" id="L695">            return FormValidation.ok();</span>
+<span class="nc bnc" id="L696" title="All 2 branches missed.">        if (!value.matches(&quot;[0-9]*&quot;)) {</span>
+<span class="nc" id="L697">            return FormValidation.error(&quot;Invalid retry count&quot;);</span>
+        }
+<span class="nc" id="L699">        return FormValidation.ok();</span>
+    }
+
+    /**
+     * Marks the build as disabled.
+     * The method will ignore the disable command if {@link #supportsMakeDisabled()}
+     * returns false. The enable command will be executed in any case.
+     * @param b true - disable, false - enable
+     * @since 1.585 Do not disable projects if {@link #supportsMakeDisabled()} returns false
+     */
+    public void makeDisabled(boolean b) throws IOException {
+<span class="nc bnc" id="L710" title="All 2 branches missed.">        if(disabled==b)     return; // noop</span>
+<span class="nc bnc" id="L711" title="All 4 branches missed.">        if (b &amp;&amp; !supportsMakeDisabled()) return; // do nothing if the disabling is unsupported</span>
+<span class="nc" id="L712">        this.disabled = b;</span>
+<span class="nc bnc" id="L713" title="All 2 branches missed.">        if(b)</span>
+<span class="nc" id="L714">            Jenkins.getInstance().getQueue().cancel(this);</span>
+
+<span class="nc" id="L716">        save();</span>
+<span class="nc" id="L717">        ItemListener.fireOnUpdated(this);</span>
+<span class="nc" id="L718">    }</span>
+
+    /**
+     * Specifies whether this project may be disabled by the user.
+     * By default, it can be only if this is a {@link TopLevelItem};
+     * would be false for matrix configurations, etc.
+     * @return true if the GUI should allow {@link #doDisable} and the like
+     * @since 1.475
+     */
+    public boolean supportsMakeDisabled() {
+<span class="nc" id="L728">        return this instanceof TopLevelItem;</span>
+    }
+
+    public void disable() throws IOException {
+<span class="nc" id="L732">        makeDisabled(true);</span>
+<span class="nc" id="L733">    }</span>
+
+    public void enable() throws IOException {
+<span class="nc" id="L736">        makeDisabled(false);</span>
+<span class="nc" id="L737">    }</span>
+
+    @Override
+    public BallColor getIconColor() {
+<span class="nc bnc" id="L741" title="All 2 branches missed.">        if(isDisabled())</span>
+<span class="nc bnc" id="L742" title="All 2 branches missed.">            return isBuilding() ? BallColor.DISABLED_ANIME : BallColor.DISABLED;</span>
+        else
+<span class="nc" id="L744">            return super.getIconColor();</span>
+    }
+
+    /**
+     * effectively deprecated. Since using updateTransientActions correctly
+     * under concurrent environment requires a lock that can too easily cause deadlocks.
+     *
+     * &lt;p&gt;
+     * Override {@link #createTransientActions()} instead.
+     */
+    protected void updateTransientActions() {
+<span class="nc" id="L755">        transientActions = createTransientActions();</span>
+<span class="nc" id="L756">    }</span>
+
+    protected List&lt;Action&gt; createTransientActions() {
+<span class="nc" id="L759">        Vector&lt;Action&gt; ta = new Vector&lt;Action&gt;();</span>
+
+<span class="nc bnc" id="L761" title="All 2 branches missed.">        for (JobProperty&lt;? super P&gt; p : Util.fixNull(properties))</span>
+<span class="nc" id="L762">            ta.addAll(p.getJobActions((P)this));</span>
+
+<span class="nc bnc" id="L764" title="All 2 branches missed.">        for (TransientProjectActionFactory tpaf : TransientProjectActionFactory.all()) {</span>
+            try {
+<span class="nc" id="L766">                ta.addAll(Util.fixNull(tpaf.createFor(this))); // be defensive against null</span>
+<span class="nc" id="L767">            } catch (Exception e) {</span>
+<span class="nc" id="L768">                LOGGER.log(Level.SEVERE, &quot;Could not load actions from &quot; + tpaf + &quot; for &quot; + this, e);</span>
+            }
+        }
+<span class="nc" id="L771">        return ta;</span>
+    }
+
+    /**
+     * Returns the live list of all {@link Publisher}s configured for this project.
+     *
+     * &lt;p&gt;
+     * This method couldn't be called &lt;tt&gt;getPublishers()&lt;/tt&gt; because existing methods
+     * in sub-classes return different inconsistent types.
+     */
+    public abstract DescribableList&lt;Publisher,Descriptor&lt;Publisher&gt;&gt; getPublishersList();
+
+    @Override
+    public void addProperty(JobProperty&lt;? super P&gt; jobProp) throws IOException {
+<span class="nc" id="L785">        super.addProperty(jobProp);</span>
+<span class="nc" id="L786">        updateTransientActions();</span>
+<span class="nc" id="L787">    }</span>
+
+    public List&lt;ProminentProjectAction&gt; getProminentActions() {
+<span class="nc" id="L790">        return getActions(ProminentProjectAction.class);</span>
+    }
+
+    @Override
+    public void doConfigSubmit( StaplerRequest req, StaplerResponse rsp ) throws IOException, ServletException, FormException {
+<span class="nc" id="L795">        super.doConfigSubmit(req,rsp);</span>
+
+<span class="nc" id="L797">        updateTransientActions();</span>
+
+        // notify the queue as the project might be now tied to different node
+<span class="nc" id="L800">        Jenkins.getInstance().getQueue().scheduleMaintenance();</span>
+
+        // this is to reflect the upstream build adjustments done above
+<span class="nc" id="L803">        Jenkins.getInstance().rebuildDependencyGraphAsync();</span>
+<span class="nc" id="L804">    }</span>
+
+    /**
+	 * @deprecated
+	 *    Use {@link #scheduleBuild(Cause)}.  Since 1.283
+	 */
+    @Deprecated
+    public boolean scheduleBuild() {
+<span class="nc" id="L812">    	return getParameterizedJobMixIn().scheduleBuild();</span>
+    }
+
+	/**
+	 * @deprecated
+	 *    Use {@link #scheduleBuild(int, Cause)}.  Since 1.283
+	 */
+    @Deprecated
+    public boolean scheduleBuild(int quietPeriod) {
+<span class="nc" id="L821">    	return getParameterizedJobMixIn().scheduleBuild(quietPeriod);</span>
+    }
+
+    /**
+     * Schedules a build of this project.
+     *
+     * @return
+     *      true if the project is added to the queue.
+     *      false if the task was rejected from the queue (such as when the system is being shut down.)
+     */
+    public boolean scheduleBuild(Cause c) {
+<span class="nc" id="L832">        return getParameterizedJobMixIn().scheduleBuild(c);</span>
+    }
+
+    public boolean scheduleBuild(int quietPeriod, Cause c) {
+<span class="nc" id="L836">        return getParameterizedJobMixIn().scheduleBuild(quietPeriod, c);</span>
+    }
+
+    /**
+     * Schedules a build.
+     *
+     * Important: the actions should be persistable without outside references (e.g. don't store
+     * references to this project). To provide parameters for a parameterized project, add a ParametersAction. If
+     * no ParametersAction is provided for such a project, one will be created with the default parameter values.
+     *
+     * @param quietPeriod the quiet period to observer
+     * @param c the cause for this build which should be recorded
+     * @param actions a list of Actions that will be added to the build
+     * @return whether the build was actually scheduled
+     */
+    public boolean scheduleBuild(int quietPeriod, Cause c, Action... actions) {
+<span class="nc bnc" id="L852" title="All 2 branches missed.">        return scheduleBuild2(quietPeriod,c,actions)!=null;</span>
+    }
+
+    /**
+     * Schedules a build of this project, and returns a {@link Future} object
+     * to wait for the completion of the build.
+     *
+     * @param actions
+     *      For the convenience of the caller, this array can contain null, and those will be silently ignored.
+     */
+    @WithBridgeMethods(Future.class)
+    public QueueTaskFuture&lt;R&gt; scheduleBuild2(int quietPeriod, Cause c, Action... actions) {
+<span class="nc" id="L864">        return scheduleBuild2(quietPeriod,c,Arrays.asList(actions));</span>
+    }
+
+    /**
+     * Schedules a build of this project, and returns a {@link Future} object
+     * to wait for the completion of the build.
+     *
+     * @param actions
+     *      For the convenience of the caller, this collection can contain null, and those will be silently ignored.
+     * @since 1.383
+     */
+    @SuppressWarnings(&quot;unchecked&quot;)
+    @WithBridgeMethods(Future.class)
+    public QueueTaskFuture&lt;R&gt; scheduleBuild2(int quietPeriod, Cause c, Collection&lt;? extends Action&gt; actions) {
+<span class="nc" id="L878">        List&lt;Action&gt; queueActions = new ArrayList&lt;Action&gt;(actions);</span>
+<span class="nc bnc" id="L879" title="All 2 branches missed.">        if (c != null) {</span>
+<span class="nc" id="L880">            queueActions.add(new CauseAction(c));</span>
+        }
+<span class="nc" id="L882">        return getParameterizedJobMixIn().scheduleBuild2(quietPeriod, queueActions.toArray(new Action[queueActions.size()]));</span>
+    }
+
+    /**
+     * Schedules a build, and returns a {@link Future} object
+     * to wait for the completion of the build.
+     *
+     * &lt;p&gt;
+     * Production code shouldn't be using this, but for tests this is very convenient, so this isn't marked
+     * as deprecated.
+     */
+    @SuppressWarnings(&quot;deprecation&quot;)
+    @WithBridgeMethods(Future.class)
+    public QueueTaskFuture&lt;R&gt; scheduleBuild2(int quietPeriod) {
+<span class="nc" id="L896">        return scheduleBuild2(quietPeriod, new LegacyCodeCause());</span>
+    }
+
+    /**
+     * Schedules a build of this project, and returns a {@link Future} object
+     * to wait for the completion of the build.
+     */
+    @WithBridgeMethods(Future.class)
+    public QueueTaskFuture&lt;R&gt; scheduleBuild2(int quietPeriod, Cause c) {
+<span class="nc" id="L905">        return scheduleBuild2(quietPeriod, c, new Action[0]);</span>
+    }
+
+    /**
+     * Schedules a polling of this project.
+     */
+    public boolean schedulePolling() {
+<span class="nc bnc" id="L912" title="All 2 branches missed.">        if(isDisabled())    return false;</span>
+<span class="nc" id="L913">        SCMTrigger scmt = getTrigger(SCMTrigger.class);</span>
+<span class="nc bnc" id="L914" title="All 2 branches missed.">        if(scmt==null)      return false;</span>
+<span class="nc" id="L915">        scmt.run();</span>
+<span class="nc" id="L916">        return true;</span>
+    }
+
+    /**
+     * Returns true if the build is in the queue.
+     */
+    @Override
+    public boolean isInQueue() {
+<span class="nc" id="L924">        return Jenkins.getInstance().getQueue().contains(this);</span>
+    }
+
+    @Override
+    public Queue.Item getQueueItem() {
+<span class="nc" id="L929">        return Jenkins.getInstance().getQueue().getItem(this);</span>
+    }
+
+    /**
+     * Gets the JDK that this project is configured with, or null.
+     */
+    public JDK getJDK() {
+<span class="nc" id="L936">        return Jenkins.getInstance().getJDK(jdk);</span>
+    }
+
+    /**
+     * Overwrites the JDK setting.
+     */
+    public void setJDK(JDK jdk) throws IOException {
+<span class="nc" id="L943">        this.jdk = jdk.getName();</span>
+<span class="nc" id="L944">        save();</span>
+<span class="nc" id="L945">    }</span>
+
+    public BuildAuthorizationToken getAuthToken() {
+<span class="nc" id="L948">        return authToken;</span>
+    }
+
+    @Override
+    public RunMap&lt;R&gt; _getRuns() {
+<span class="nc" id="L953">        return buildMixIn._getRuns();</span>
+    }
+
+    @Override
+    public void removeRun(R run) {
+<span class="nc" id="L958">        buildMixIn.removeRun(run);</span>
+<span class="nc" id="L959">    }</span>
+
+    /**
+     * {@inheritDoc}
+     *
+     * More efficient implementation.
+     */
+    @Override
+    public R getBuild(String id) {
+<span class="nc" id="L968">        return buildMixIn.getBuild(id);</span>
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * More efficient implementation.
+     */
+    @Override
+    public R getBuildByNumber(int n) {
+<span class="nc" id="L978">        return buildMixIn.getBuildByNumber(n);</span>
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * More efficient implementation.
+     */
+    @Override
+    public R getFirstBuild() {
+<span class="nc" id="L988">        return buildMixIn.getFirstBuild();</span>
+    }
+
+    @Override
+    public @CheckForNull R getLastBuild() {
+<span class="nc" id="L993">        return buildMixIn.getLastBuild();</span>
+    }
+
+    @Override
+    public R getNearestBuild(int n) {
+<span class="nc" id="L998">        return buildMixIn.getNearestBuild(n);</span>
+    }
+
+    @Override
+    public R getNearestOldBuild(int n) {
+<span class="nc" id="L1003">        return buildMixIn.getNearestOldBuild(n);</span>
+    }
+
+    /**
+     * Type token for the corresponding build type.
+     * The build class must have two constructors:
+     * one taking this project type;
+     * and one taking this project type, then {@link File}.
+     */
+    protected abstract Class&lt;R&gt; getBuildClass();
+
+    /**
+     * Creates a new build of this project for immediate execution.
+     */
+    protected synchronized R newBuild() throws IOException {
+<span class="nc" id="L1018">        return buildMixIn.newBuild();</span>
+    }
+
+    /**
+     * Loads an existing build record from disk.
+     */
+    protected R loadBuild(File dir) throws IOException {
+<span class="nc" id="L1025">        return buildMixIn.loadBuild(dir);</span>
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * &lt;p&gt;
+     * Note that this method returns a read-only view of {@link Action}s.
+     * {@link BuildStep}s and others who want to add a project action
+     * should do so by implementing {@link BuildStep#getProjectActions(AbstractProject)}.
+     *
+     * @see TransientProjectActionFactory
+     */
+    @SuppressWarnings(&quot;deprecation&quot;)
+    @Override
+    public List&lt;Action&gt; getActions() {
+        // add all the transient actions, too
+<span class="nc" id="L1042">        List&lt;Action&gt; actions = new Vector&lt;Action&gt;(super.getActions());</span>
+<span class="nc" id="L1043">        actions.addAll(transientActions);</span>
+        // return the read only list to cause a failure on plugins who try to add an action here
+<span class="nc" id="L1045">        return Collections.unmodifiableList(actions);</span>
+    }
+
+    /**
+     * Gets the {@link Node} where this project was last built on.
+     *
+     * @return
+     *      null if no information is available (for example,
+     *      if no build was done yet.)
+     */
+    public Node getLastBuiltOn() {
+        // where was it built on?
+<span class="nc" id="L1057">        AbstractBuild b = getLastBuild();</span>
+<span class="nc bnc" id="L1058" title="All 2 branches missed.">        if(b==null)</span>
+<span class="nc" id="L1059">            return null;</span>
+        else
+<span class="nc" id="L1061">            return b.getBuiltOn();</span>
+    }
+
+    public Object getSameNodeConstraint() {
+<span class="nc" id="L1065">        return this; // in this way, any member that wants to run with the main guy can nominate the project itself</span>
+    }
+
+    public final Task getOwnerTask() {
+<span class="nc" id="L1069">        return this;</span>
+    }
+
+    @Nonnull
+    public Authentication getDefaultAuthentication() {
+        // backward compatible behaviour.
+<span class="nc" id="L1075">        return ACL.SYSTEM;</span>
+    }
+
+    @Nonnull
+    @Override
+    public Authentication getDefaultAuthentication(Queue.Item item) {
+<span class="nc" id="L1081">        return getDefaultAuthentication();</span>
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * &lt;p&gt;
+     * A project must be blocked if its own previous build is in progress,
+     * or if the blockBuildWhenUpstreamBuilding option is true and an upstream
+     * project is building, but derived classes can also check other conditions.
+     */
+    @Override
+    public boolean isBuildBlocked() {
+<span class="nc bnc" id="L1094" title="All 2 branches missed.">        return getCauseOfBlockage()!=null;</span>
+    }
+
+    public String getWhyBlocked() {
+<span class="nc" id="L1098">        CauseOfBlockage cb = getCauseOfBlockage();</span>
+<span class="nc bnc" id="L1099" title="All 2 branches missed.">        return cb!=null ? cb.getShortDescription() : null;</span>
+    }
+
+    /**
+     * @deprecated use {@link BlockedBecauseOfBuildInProgress} instead.
+     */
+    @Deprecated
+    public static class BecauseOfBuildInProgress extends BlockedBecauseOfBuildInProgress {
+        public BecauseOfBuildInProgress(AbstractBuild&lt;?, ?&gt; build) {
+<span class="nc" id="L1108">            super(build);</span>
+<span class="nc" id="L1109">        }</span>
+    }
+
+    /**
+     * Because the downstream build is in progress, and we are configured to wait for that.
+     */
+    public static class BecauseOfDownstreamBuildInProgress extends CauseOfBlockage {
+        public final AbstractProject&lt;?,?&gt; up;
+
+<span class="nc" id="L1118">        public BecauseOfDownstreamBuildInProgress(AbstractProject&lt;?,?&gt; up) {</span>
+<span class="nc" id="L1119">            this.up = up;</span>
+<span class="nc" id="L1120">        }</span>
+
+        @Override
+        public String getShortDescription() {
+<span class="nc" id="L1124">            return Messages.AbstractProject_DownstreamBuildInProgress(up.getName());</span>
+        }
+    }
+
+    /**
+     * Because the upstream build is in progress, and we are configured to wait for that.
+     */
+    public static class BecauseOfUpstreamBuildInProgress extends CauseOfBlockage {
+        public final AbstractProject&lt;?,?&gt; up;
+
+<span class="nc" id="L1134">        public BecauseOfUpstreamBuildInProgress(AbstractProject&lt;?,?&gt; up) {</span>
+<span class="nc" id="L1135">            this.up = up;</span>
+<span class="nc" id="L1136">        }</span>
+
+        @Override
+        public String getShortDescription() {
+<span class="nc" id="L1140">            return Messages.AbstractProject_UpstreamBuildInProgress(up.getName());</span>
+        }
+    }
+
+    @Override
+    public CauseOfBlockage getCauseOfBlockage() {
+        // Block builds until they are done with post-production
+<span class="nc bnc" id="L1147" title="All 4 branches missed.">        if (isLogUpdated() &amp;&amp; !isConcurrentBuild()) {</span>
+<span class="nc" id="L1148">            return new BlockedBecauseOfBuildInProgress(getLastBuild());</span>
+        }
+<span class="nc bnc" id="L1150" title="All 2 branches missed.">        if (blockBuildWhenDownstreamBuilding()) {</span>
+<span class="nc" id="L1151">            AbstractProject&lt;?,?&gt; bup = getBuildingDownstream();</span>
+<span class="nc bnc" id="L1152" title="All 2 branches missed.">            if (bup!=null)</span>
+<span class="nc" id="L1153">                return new BecauseOfDownstreamBuildInProgress(bup);</span>
+        }
+<span class="nc bnc" id="L1155" title="All 2 branches missed.">        if (blockBuildWhenUpstreamBuilding()) {</span>
+<span class="nc" id="L1156">            AbstractProject&lt;?,?&gt; bup = getBuildingUpstream();</span>
+<span class="nc bnc" id="L1157" title="All 2 branches missed.">            if (bup!=null)</span>
+<span class="nc" id="L1158">                return new BecauseOfUpstreamBuildInProgress(bup);</span>
+        }
+<span class="nc" id="L1160">        return null;</span>
+    }
+
+    /**
+     * Returns the project if any of the downstream project is either
+     * building, waiting, pending or buildable.
+     * &lt;p&gt;
+     * This means eventually there will be an automatic triggering of
+     * the given project (provided that all builds went smoothly.)
+     */
+    public AbstractProject getBuildingDownstream() {
+<span class="nc" id="L1171">        Set&lt;Task&gt; unblockedTasks = Jenkins.getInstance().getQueue().getUnblockedTasks();</span>
+
+<span class="nc bnc" id="L1173" title="All 2 branches missed.">        for (AbstractProject tup : getTransitiveDownstreamProjects()) {</span>
+<span class="nc bnc" id="L1174" title="All 6 branches missed.">			if (tup!=this &amp;&amp; (tup.isBuilding() || unblockedTasks.contains(tup)))</span>
+<span class="nc" id="L1175">                return tup;</span>
+        }
+<span class="nc" id="L1177">        return null;</span>
+    }
+
+    /**
+     * Returns the project if any of the upstream project is either
+     * building or is in the queue.
+     * &lt;p&gt;
+     * This means eventually there will be an automatic triggering of
+     * the given project (provided that all builds went smoothly.)
+     */
+    public AbstractProject getBuildingUpstream() {
+<span class="nc" id="L1188">        Set&lt;Task&gt; unblockedTasks = Jenkins.getInstance().getQueue().getUnblockedTasks();</span>
+
+<span class="nc bnc" id="L1190" title="All 2 branches missed.">        for (AbstractProject tup : getTransitiveUpstreamProjects()) {</span>
+<span class="nc bnc" id="L1191" title="All 6 branches missed.">			if (tup!=this &amp;&amp; (tup.isBuilding() || unblockedTasks.contains(tup)))</span>
+<span class="nc" id="L1192">                return tup;</span>
+        }
+<span class="nc" id="L1194">        return null;</span>
+    }
+
+    public List&lt;SubTask&gt; getSubTasks() {
+<span class="nc" id="L1198">        List&lt;SubTask&gt; r = new ArrayList&lt;SubTask&gt;();</span>
+<span class="nc" id="L1199">        r.add(this);</span>
+<span class="nc bnc" id="L1200" title="All 2 branches missed.">        for (SubTaskContributor euc : SubTaskContributor.all())</span>
+<span class="nc" id="L1201">            r.addAll(euc.forProject(this));</span>
+<span class="nc bnc" id="L1202" title="All 2 branches missed.">        for (JobProperty&lt;? super P&gt; p : properties)</span>
+<span class="nc" id="L1203">            r.addAll(p.getSubTasks());</span>
+<span class="nc" id="L1204">        return r;</span>
+    }
+
+    public @CheckForNull R createExecutable() throws IOException {
+<span class="nc bnc" id="L1208" title="All 2 branches missed.">        if(isDisabled())    return null;</span>
+<span class="nc" id="L1209">        return newBuild();</span>
+    }
+
+    public void checkAbortPermission() {
+<span class="nc" id="L1213">        checkPermission(CANCEL);</span>
+<span class="nc" id="L1214">    }</span>
+
+    public boolean hasAbortPermission() {
+<span class="nc" id="L1217">        return hasPermission(CANCEL);</span>
+    }
+
+    /**
+     * Gets the {@link Resource} that represents the workspace of this project.
+     * Useful for locking and mutual exclusion control.
+     *
+     * @deprecated as of 1.319
+     *      Projects no longer have a fixed workspace, ands builds will find an available workspace via
+     *      {@link WorkspaceList} for each build (furthermore, that happens after a build is started.)
+     *      So a {@link Resource} representation for a workspace at the project level no longer makes sense.
+     *
+     *      &lt;p&gt;
+     *      If you need to lock a workspace while you do some computation, see the source code of
+     *      {@link #pollSCMChanges(TaskListener)} for how to obtain a lock of a workspace through {@link WorkspaceList}.
+     */
+    @Deprecated
+    public Resource getWorkspaceResource() {
+<span class="nc" id="L1235">        return new Resource(getFullDisplayName()+&quot; workspace&quot;);</span>
+    }
+
+    /**
+     * List of necessary resources to perform the build of this project.
+     */
+    public ResourceList getResourceList() {
+<span class="nc" id="L1242">        final Set&lt;ResourceActivity&gt; resourceActivities = getResourceActivities();</span>
+<span class="nc" id="L1243">        final List&lt;ResourceList&gt; resourceLists = new ArrayList&lt;ResourceList&gt;(1 + resourceActivities.size());</span>
+<span class="nc bnc" id="L1244" title="All 2 branches missed.">        for (ResourceActivity activity : resourceActivities) {</span>
+<span class="nc bnc" id="L1245" title="All 4 branches missed.">            if (activity != this &amp;&amp; activity != null) {</span>
+                // defensive infinite recursion and null check
+<span class="nc" id="L1247">                resourceLists.add(activity.getResourceList());</span>
+            }
+        }
+<span class="nc" id="L1250">        return ResourceList.union(resourceLists);</span>
+    }
+
+    /**
+     * Set of child resource activities of the build of this project (override in child projects).
+     * @return The set of child resource activities of the build of this project.
+     */
+    protected Set&lt;ResourceActivity&gt; getResourceActivities() {
+<span class="nc" id="L1258">        return Collections.emptySet();</span>
+    }
+
+    public boolean checkout(AbstractBuild build, Launcher launcher, BuildListener listener, File changelogFile) throws IOException, InterruptedException {
+<span class="nc" id="L1262">        SCM scm = getScm();</span>
+<span class="nc bnc" id="L1263" title="All 2 branches missed.">        if(scm==null)</span>
+<span class="nc" id="L1264">            return true;    // no SCM</span>
+
+<span class="nc" id="L1266">        FilePath workspace = build.getWorkspace();</span>
+<span class="nc" id="L1267">        workspace.mkdirs();</span>
+
+<span class="nc" id="L1269">        boolean r = scm.checkout(build, launcher, workspace, listener, changelogFile);</span>
+<span class="nc bnc" id="L1270" title="All 2 branches missed.">        if (r) {</span>
+            // Only calcRevisionsFromBuild if checkout was successful. Note that modern SCM implementations
+            // won't reach this line anyway, as they throw AbortExceptions on checkout failure.
+<span class="nc" id="L1273">            calcPollingBaseline(build, launcher, listener);</span>
+        }
+<span class="nc" id="L1275">        return r;</span>
+    }
+
+    /**
+     * Pushes the baseline up to the newly checked out revision.
+     */
+    private void calcPollingBaseline(AbstractBuild build, Launcher launcher, TaskListener listener) throws IOException, InterruptedException {
+<span class="nc" id="L1282">        SCMRevisionState baseline = build.getAction(SCMRevisionState.class);</span>
+<span class="nc bnc" id="L1283" title="All 2 branches missed.">        if (baseline==null) {</span>
+            try {
+<span class="nc" id="L1285">                baseline = getScm().calcRevisionsFromBuild(build, launcher, listener);</span>
+<span class="nc" id="L1286">            } catch (AbstractMethodError e) {</span>
+<span class="nc" id="L1287">                baseline = SCMRevisionState.NONE; // pre-1.345 SCM implementations, which doesn't use the baseline in polling</span>
+            }
+<span class="nc bnc" id="L1289" title="All 2 branches missed.">            if (baseline!=null)</span>
+<span class="nc" id="L1290">                build.addAction(baseline);</span>
+        }
+<span class="nc" id="L1292">        pollingBaseline = baseline;</span>
+<span class="nc" id="L1293">    }</span>
+
+    /**
+     * Checks if there's any update in SCM, and returns true if any is found.
+     *
+     * @deprecated as of 1.346
+     *      Use {@link #poll(TaskListener)} instead.
+     */
+    @Deprecated
+    public boolean pollSCMChanges( TaskListener listener ) {
+<span class="nc" id="L1303">        return poll(listener).hasChanges();</span>
+    }
+
+    /**
+     * Checks if there's any update in SCM, and returns true if any is found.
+     *
+     * &lt;p&gt;
+     * The implementation is responsible for ensuring mutual exclusion between polling and builds
+     * if necessary.
+     *
+     * @since 1.345
+     */
+    public PollingResult poll( TaskListener listener ) {
+<span class="nc" id="L1316">        SCM scm = getScm();</span>
+<span class="nc bnc" id="L1317" title="All 2 branches missed.">        if (scm==null) {</span>
+<span class="nc" id="L1318">            listener.getLogger().println(Messages.AbstractProject_NoSCM());</span>
+<span class="nc" id="L1319">            return NO_CHANGES;</span>
+        }
+<span class="nc bnc" id="L1321" title="All 2 branches missed.">        if (!isBuildable()) {</span>
+<span class="nc" id="L1322">            listener.getLogger().println(Messages.AbstractProject_Disabled());</span>
+<span class="nc" id="L1323">            return NO_CHANGES;</span>
+        }
+
+<span class="nc" id="L1326">        R lb = getLastBuild();</span>
+<span class="nc bnc" id="L1327" title="All 2 branches missed.">        if (lb==null) {</span>
+<span class="nc" id="L1328">            listener.getLogger().println(Messages.AbstractProject_NoBuilds());</span>
+<span class="nc bnc" id="L1329" title="All 2 branches missed.">            return isInQueue() ? NO_CHANGES : BUILD_NOW;</span>
+        }
+
+<span class="nc bnc" id="L1332" title="All 2 branches missed.">        if (pollingBaseline==null) {</span>
+<span class="nc" id="L1333">            R success = getLastSuccessfulBuild(); // if we have a persisted baseline, we'll find it by this</span>
+<span class="nc bnc" id="L1334" title="All 2 branches missed.">            for (R r=lb; r!=null; r=r.getPreviousBuild()) {</span>
+<span class="nc" id="L1335">                SCMRevisionState s = r.getAction(SCMRevisionState.class);</span>
+<span class="nc bnc" id="L1336" title="All 2 branches missed.">                if (s!=null) {</span>
+<span class="nc" id="L1337">                    pollingBaseline = s;</span>
+<span class="nc" id="L1338">                    break;</span>
+                }
+<span class="nc bnc" id="L1340" title="All 2 branches missed.">                if (r==success) break;  // searched far enough</span>
+            }
+            // NOTE-NO-BASELINE:
+            // if we don't have baseline yet, it means the data is built by old Hudson that doesn't set the baseline
+            // as action, so we need to compute it. This happens later.
+        }
+
+        try {
+<span class="nc" id="L1348">            SCMPollListener.fireBeforePolling(this, listener);</span>
+<span class="nc" id="L1349">            PollingResult r = _poll(listener, scm);</span>
+<span class="nc" id="L1350">            SCMPollListener.firePollingSuccess(this,listener, r);</span>
+<span class="nc" id="L1351">            return r;</span>
+<span class="nc" id="L1352">        } catch (AbortException e) {</span>
+<span class="nc" id="L1353">            listener.getLogger().println(e.getMessage());</span>
+<span class="nc" id="L1354">            listener.fatalError(Messages.AbstractProject_Aborted());</span>
+<span class="nc" id="L1355">            LOGGER.log(Level.FINE, &quot;Polling &quot;+this+&quot; aborted&quot;,e);</span>
+<span class="nc" id="L1356">            SCMPollListener.firePollingFailed(this, listener,e);</span>
+<span class="nc" id="L1357">            return NO_CHANGES;</span>
+<span class="nc" id="L1358">        } catch (IOException e) {</span>
+<span class="nc" id="L1359">            e.printStackTrace(listener.fatalError(e.getMessage()));</span>
+<span class="nc" id="L1360">            SCMPollListener.firePollingFailed(this, listener,e);</span>
+<span class="nc" id="L1361">            return NO_CHANGES;</span>
+<span class="nc" id="L1362">        } catch (InterruptedException e) {</span>
+<span class="nc" id="L1363">            e.printStackTrace(listener.fatalError(Messages.AbstractProject_PollingABorted()));</span>
+<span class="nc" id="L1364">            SCMPollListener.firePollingFailed(this, listener,e);</span>
+<span class="nc" id="L1365">            return NO_CHANGES;</span>
+<span class="nc" id="L1366">        } catch (RuntimeException e) {</span>
+<span class="nc" id="L1367">            SCMPollListener.firePollingFailed(this, listener,e);</span>
+<span class="nc" id="L1368">            throw e;</span>
+<span class="nc" id="L1369">        } catch (Error e) {</span>
+<span class="nc" id="L1370">            SCMPollListener.firePollingFailed(this, listener,e);</span>
+<span class="nc" id="L1371">            throw e;</span>
+        }
+    }
+
+    /**
+     * {@link #poll(TaskListener)} method without the try/catch block that does listener notification and .
+     */
+    private PollingResult _poll(TaskListener listener, SCM scm) throws IOException, InterruptedException {
+<span class="nc bnc" id="L1379" title="All 2 branches missed.">        if (scm.requiresWorkspaceForPolling()) {</span>
+<span class="nc" id="L1380">            R b = getSomeBuildWithExistingWorkspace();</span>
+<span class="nc bnc" id="L1381" title="All 2 branches missed.">            if (b == null) b = getLastBuild();</span>
+            // lock the workspace for the given build
+<span class="nc" id="L1383">            FilePath ws=b.getWorkspace();</span>
+
+<span class="nc" id="L1385">            WorkspaceOfflineReason workspaceOfflineReason = workspaceOffline( b );</span>
+<span class="nc bnc" id="L1386" title="All 2 branches missed.">            if ( workspaceOfflineReason != null ) {</span>
+                // workspace offline
+<span class="nc bnc" id="L1388" title="All 2 branches missed.">                for (WorkspaceBrowser browser : ExtensionList.lookup(WorkspaceBrowser.class)) {</span>
+<span class="nc" id="L1389">                    ws = browser.getWorkspace(this);</span>
+<span class="nc bnc" id="L1390" title="All 2 branches missed.">                    if (ws != null) {</span>
+<span class="nc" id="L1391">                        return pollWithWorkspace(listener, scm, b, ws, browser.getWorkspaceList());</span>
+                    }
+                }
+
+                // At this point we start thinking about triggering a build just to get a workspace,
+                // because otherwise there's no way we can detect changes.
+                // However, first there are some conditions in which we do not want to do so.
+                // give time for slaves to come online if we are right after reconnection (JENKINS-8408)
+<span class="nc" id="L1399">                long running = Jenkins.getInstance().getInjector().getInstance(Uptime.class).getUptime();</span>
+<span class="nc" id="L1400">                long remaining = TimeUnit2.MINUTES.toMillis(10)-running;</span>
+<span class="nc bnc" id="L1401" title="All 4 branches missed.">                if (remaining&gt;0 &amp;&amp; /* this logic breaks tests of polling */!Functions.getIsUnitTest()) {</span>
+<span class="nc" id="L1402">                    listener.getLogger().print(Messages.AbstractProject_AwaitingWorkspaceToComeOnline(remaining/1000));</span>
+<span class="nc" id="L1403">                    listener.getLogger().println( &quot; (&quot; + workspaceOfflineReason.name() + &quot;)&quot;);</span>
+<span class="nc" id="L1404">                    return NO_CHANGES;</span>
+                }
+
+                // Do not trigger build, if no suitable slave is online
+<span class="nc bnc" id="L1408" title="All 2 branches missed.">                if (workspaceOfflineReason.equals(WorkspaceOfflineReason.all_suitable_nodes_are_offline)) {</span>
+                    // No suitable executor is online
+<span class="nc" id="L1410">                    listener.getLogger().print(Messages.AbstractProject_AwaitingWorkspaceToComeOnline(running/1000));</span>
+<span class="nc" id="L1411">                    listener.getLogger().println( &quot; (&quot; + workspaceOfflineReason.name() + &quot;)&quot;);</span>
+<span class="nc" id="L1412">                    return NO_CHANGES;</span>
+                }
+
+<span class="nc" id="L1415">                Label label = getAssignedLabel();</span>
+<span class="nc bnc" id="L1416" title="All 4 branches missed.">                if (label != null &amp;&amp; label.isSelfLabel()) {</span>
+                    // if the build is fixed on a node, then attempting a build will do us
+                    // no good. We should just wait for the slave to come back.
+<span class="nc" id="L1419">                    listener.getLogger().print(Messages.AbstractProject_NoWorkspace());</span>
+<span class="nc" id="L1420">                    listener.getLogger().println( &quot; (&quot; + workspaceOfflineReason.name() + &quot;)&quot;);</span>
+<span class="nc" id="L1421">                    return NO_CHANGES;</span>
+                }
+
+<span class="nc bnc" id="L1424" title="All 2 branches missed.">                listener.getLogger().println( ws==null</span>
+<span class="nc" id="L1425">                    ? Messages.AbstractProject_WorkspaceOffline()</span>
+<span class="nc" id="L1426">                    : Messages.AbstractProject_NoWorkspace());</span>
+<span class="nc bnc" id="L1427" title="All 2 branches missed.">                if (isInQueue()) {</span>
+<span class="nc" id="L1428">                    listener.getLogger().println(Messages.AbstractProject_AwaitingBuildForWorkspace());</span>
+<span class="nc" id="L1429">                    return NO_CHANGES;</span>
+                }
+
+                // build now, or nothing will ever be built
+<span class="nc" id="L1433">                listener.getLogger().print(Messages.AbstractProject_NewBuildForWorkspace());</span>
+<span class="nc" id="L1434">                listener.getLogger().println( &quot; (&quot; + workspaceOfflineReason.name() + &quot;)&quot;);</span>
+<span class="nc" id="L1435">                return BUILD_NOW;</span>
+            } else {
+<span class="nc" id="L1437">                WorkspaceList l = b.getBuiltOn().toComputer().getWorkspaceList();</span>
+<span class="nc" id="L1438">                return pollWithWorkspace(listener, scm, b, ws, l);</span>
+            }
+
+        } else {
+            // polling without workspace
+<span class="nc" id="L1443">            LOGGER.fine(&quot;Polling SCM changes of &quot; + getName());</span>
+<span class="nc bnc" id="L1444" title="All 2 branches missed.">            if (pollingBaseline==null) // see NOTE-NO-BASELINE above</span>
+<span class="nc" id="L1445">                calcPollingBaseline(getLastBuild(),null,listener);</span>
+<span class="nc" id="L1446">            PollingResult r = scm.poll(this, null, null, listener, pollingBaseline);</span>
+<span class="nc" id="L1447">            pollingBaseline = r.remote;</span>
+<span class="nc" id="L1448">            return r;</span>
+        }
+    }
+
+    private PollingResult pollWithWorkspace(TaskListener listener, SCM scm, R lb, @Nonnull FilePath ws, WorkspaceList l) throws InterruptedException, IOException {
+        // if doing non-concurrent build, acquire a workspace in a way that causes builds to block for this workspace.
+        // this prevents multiple workspaces of the same job --- the behavior of Hudson &lt; 1.319.
+        //
+        // OTOH, if a concurrent build is chosen, the user is willing to create a multiple workspace,
+        // so better throughput is achieved over time (modulo the initial cost of creating that many workspaces)
+        // by having multiple workspaces
+<span class="nc" id="L1459">        Node node = lb.getBuiltOn();</span>
+<span class="nc" id="L1460">        Launcher launcher = ws.createLauncher(listener).decorateByEnv(getEnvironment(node,listener));</span>
+<span class="nc bnc" id="L1461" title="All 2 branches missed.">        WorkspaceList.Lease lease = l.acquire(ws, !concurrentBuild);</span>
+        try {
+<span class="nc bnc" id="L1463" title="All 2 branches missed.">            String nodeName = node != null ? node.getSelfLabel().getName() : &quot;[node_unavailable]&quot;;</span>
+<span class="nc" id="L1464">            listener.getLogger().println(&quot;Polling SCM changes on &quot; + nodeName);</span>
+<span class="nc" id="L1465">            LOGGER.fine(&quot;Polling SCM changes of &quot; + getName());</span>
+<span class="nc bnc" id="L1466" title="All 2 branches missed.">            if (pollingBaseline==null) // see NOTE-NO-BASELINE above</span>
+<span class="nc" id="L1467">                calcPollingBaseline(lb,launcher,listener);</span>
+<span class="nc" id="L1468">            PollingResult r = scm.poll(this, launcher, ws, listener, pollingBaseline);</span>
+<span class="nc" id="L1469">            pollingBaseline = r.remote;</span>
+<span class="nc" id="L1470">            return r;</span>
+<span class="nc" id="L1471">        } finally {</span>
+<span class="nc" id="L1472">            lease.release();</span>
+<span class="nc" id="L1473">        }</span>
+    }
+
+<span class="nc" id="L1476">    enum WorkspaceOfflineReason {</span>
+<span class="nc" id="L1477">        nonexisting_workspace,</span>
+<span class="nc" id="L1478">        builton_node_gone,</span>
+<span class="nc" id="L1479">        builton_node_no_executors,</span>
+<span class="nc" id="L1480">        all_suitable_nodes_are_offline,</span>
+<span class="nc" id="L1481">        use_ondemand_slave</span>
+    }
+
+    /**
+     * Returns true if all suitable nodes for the job are offline.
+     *
+     */
+    private boolean isAllSuitableNodesOffline(R build) {
+<span class="nc" id="L1489">        Label label = getAssignedLabel();</span>
+<span class="nc" id="L1490">        List&lt;Node&gt; allNodes = Jenkins.getInstance().getNodes();</span>
+
+<span class="nc bnc" id="L1492" title="All 2 branches missed.">        if (label != null) {</span>
+            //Invalid label. Put in queue to make administrator fix
+<span class="nc bnc" id="L1494" title="All 2 branches missed.">            if(label.getNodes().isEmpty()) {</span>
+<span class="nc" id="L1495">                return false;</span>
+            }
+            //Returns true, if all suitable nodes are offline
+<span class="nc" id="L1498">            return label.isOffline();</span>
+        } else {
+<span class="nc bnc" id="L1500" title="All 2 branches missed.">            if(canRoam) {</span>
+<span class="nc bnc" id="L1501" title="All 2 branches missed.">                for (Node n : Jenkins.getInstance().getNodes()) {</span>
+<span class="nc" id="L1502">                    Computer c = n.toComputer();</span>
+<span class="nc bnc" id="L1503" title="All 8 branches missed.">                    if (c != null &amp;&amp; c.isOnline() &amp;&amp; c.isAcceptingTasks() &amp;&amp; n.getMode() == Mode.NORMAL) {</span>
+                        // Some executor is online that  is ready and this job can run anywhere
+<span class="nc" id="L1505">                        return false;</span>
+                    }
+                }
+                //We can roam, check that the master is set to be used as much as possible, and not tied jobs only.
+<span class="nc bnc" id="L1509" title="All 2 branches missed.">                if(Jenkins.getInstance().getMode() == Mode.EXCLUSIVE) {</span>
+<span class="nc" id="L1510">                    return true;</span>
+                } else {
+<span class="nc" id="L1512">                    return false;</span>
+                }
+            }
+        }
+<span class="nc" id="L1516">        return true;</span>
+    }
+
+    private WorkspaceOfflineReason workspaceOffline(R build) throws IOException, InterruptedException {
+<span class="nc" id="L1520">        FilePath ws = build.getWorkspace();</span>
+<span class="nc" id="L1521">        Label label = getAssignedLabel();</span>
+
+<span class="nc bnc" id="L1523" title="All 2 branches missed.">        if (isAllSuitableNodesOffline(build)) {</span>
+<span class="nc bnc" id="L1524" title="All 2 branches missed.">            Collection&lt;Cloud&gt; applicableClouds = label == null ? Jenkins.getInstance().clouds : label.getClouds();</span>
+<span class="nc bnc" id="L1525" title="All 2 branches missed.">            return applicableClouds.isEmpty() ? WorkspaceOfflineReason.all_suitable_nodes_are_offline : WorkspaceOfflineReason.use_ondemand_slave;</span>
+        }
+
+<span class="nc bnc" id="L1528" title="All 4 branches missed.">        if (ws==null || !ws.exists()) {</span>
+<span class="nc" id="L1529">            return WorkspaceOfflineReason.nonexisting_workspace;</span>
+        }
+
+<span class="nc" id="L1532">        Node builtOn = build.getBuiltOn();</span>
+<span class="nc bnc" id="L1533" title="All 2 branches missed.">        if (builtOn == null) { // node built-on doesn't exist anymore</span>
+<span class="nc" id="L1534">            return WorkspaceOfflineReason.builton_node_gone;</span>
+        }
+
+<span class="nc bnc" id="L1537" title="All 2 branches missed.">        if (builtOn.toComputer() == null) { // node still exists, but has 0 executors - o.s.l.t.</span>
+<span class="nc" id="L1538">            return WorkspaceOfflineReason.builton_node_no_executors;</span>
+        }
+
+<span class="nc" id="L1541">        return null;</span>
+    }
+
+    /**
+     * Returns true if this user has made a commit to this project.
+     *
+     * @since 1.191
+     */
+    public boolean hasParticipant(User user) {
+<span class="nc bnc" id="L1550" title="All 2 branches missed.">        for( R build = getLastBuild(); build!=null; build=build.getPreviousBuild())</span>
+<span class="nc bnc" id="L1551" title="All 2 branches missed.">            if(build.hasParticipant(user))</span>
+<span class="nc" id="L1552">                return true;</span>
+<span class="nc" id="L1553">        return false;</span>
+    }
+
+    @Exported
+    public SCM getScm() {
+<span class="nc" id="L1558">        return scm;</span>
+    }
+
+    public void setScm(SCM scm) throws IOException {
+<span class="nc" id="L1562">        this.scm = scm;</span>
+<span class="nc" id="L1563">        save();</span>
+<span class="nc" id="L1564">    }</span>
+
+    /**
+     * Adds a new {@link Trigger} to this {@link Project} if not active yet.
+     */
+    public void addTrigger(Trigger&lt;?&gt; trigger) throws IOException {
+<span class="nc" id="L1570">        addToList(trigger,triggers());</span>
+<span class="nc" id="L1571">    }</span>
+
+    public void removeTrigger(TriggerDescriptor trigger) throws IOException {
+<span class="nc" id="L1574">        removeFromList(trigger,triggers());</span>
+<span class="nc" id="L1575">    }</span>
+
+    protected final synchronized &lt;T extends Describable&lt;T&gt;&gt;
+    void addToList( T item, List&lt;T&gt; collection ) throws IOException {
+        //No support to replace item in position, remove then add
+<span class="nc" id="L1580">        removeFromList(item.getDescriptor(), collection);</span>
+<span class="nc" id="L1581">        collection.add(item);</span>
+<span class="nc" id="L1582">        save();</span>
+<span class="nc" id="L1583">        updateTransientActions();</span>
+<span class="nc" id="L1584">    }</span>
+
+    protected final synchronized &lt;T extends Describable&lt;T&gt;&gt;
+    void removeFromList(Descriptor&lt;T&gt; item, List&lt;T&gt; collection) throws IOException {
+<span class="nc" id="L1588">        final Iterator&lt;T&gt; iCollection = collection.iterator();</span>
+<span class="nc bnc" id="L1589" title="All 2 branches missed.">        while(iCollection.hasNext()) {</span>
+<span class="nc" id="L1590">            final T next = iCollection.next();</span>
+<span class="nc bnc" id="L1591" title="All 2 branches missed.">            if(next.getDescriptor()==item) {</span>
+                // found it
+<span class="nc" id="L1593">                iCollection.remove();</span>
+<span class="nc" id="L1594">                save();</span>
+<span class="nc" id="L1595">                updateTransientActions();</span>
+<span class="nc" id="L1596">                return;</span>
+            }
+        }
+<span class="nc" id="L1599">    }</span>
+
+    @SuppressWarnings(&quot;unchecked&quot;)
+    @Override public Map&lt;TriggerDescriptor,Trigger&lt;?&gt;&gt; getTriggers() {
+<span class="nc" id="L1603">        return triggers().toMap();</span>
+    }
+
+    /**
+     * Gets the specific trigger, or null if the propert is not configured for this job.
+     */
+    public &lt;T extends Trigger&gt; T getTrigger(Class&lt;T&gt; clazz) {
+<span class="nc bnc" id="L1610" title="All 2 branches missed.">        for (Trigger p : triggers()) {</span>
+<span class="nc bnc" id="L1611" title="All 2 branches missed.">            if(clazz.isInstance(p))</span>
+<span class="nc" id="L1612">                return clazz.cast(p);</span>
+        }
+<span class="nc" id="L1614">        return null;</span>
+    }
+
+//
+//
+// fingerprint related
+//
+//
+    /**
+     * True if the builds of this project produces {@link Fingerprint} records.
+     */
+    public abstract boolean isFingerprintConfigured();
+
+    /**
+     * Gets the other {@link AbstractProject}s that should be built
+     * when a build of this project is completed.
+     */
+    @Exported
+    public final List&lt;AbstractProject&gt; getDownstreamProjects() {
+<span class="nc" id="L1633">        return Jenkins.getInstance().getDependencyGraph().getDownstream(this);</span>
+    }
+
+    @Exported
+    public final List&lt;AbstractProject&gt; getUpstreamProjects() {
+<span class="nc" id="L1638">        return Jenkins.getInstance().getDependencyGraph().getUpstream(this);</span>
+    }
+
+    /**
+     * Returns only those upstream projects that defines {@link BuildTrigger} to this project.
+     * This is a subset of {@link #getUpstreamProjects()}
+     * &lt;p&gt;No longer used in the UI.
+     * @return A List of upstream projects that has a {@link BuildTrigger} to this project.
+     */
+    public final List&lt;AbstractProject&gt; getBuildTriggerUpstreamProjects() {
+<span class="nc" id="L1648">        ArrayList&lt;AbstractProject&gt; result = new ArrayList&lt;AbstractProject&gt;();</span>
+<span class="nc bnc" id="L1649" title="All 2 branches missed.">        for (AbstractProject&lt;?,?&gt; ap : getUpstreamProjects()) {</span>
+<span class="nc" id="L1650">            BuildTrigger buildTrigger = ap.getPublishersList().get(BuildTrigger.class);</span>
+<span class="nc bnc" id="L1651" title="All 2 branches missed.">            if (buildTrigger != null)</span>
+<span class="nc bnc" id="L1652" title="All 2 branches missed.">                if (buildTrigger.getChildProjects(ap).contains(this))</span>
+<span class="nc" id="L1653">                    result.add(ap);</span>
+        }
+<span class="nc" id="L1655">        return result;</span>
+    }
+
+    /**
+     * Gets all the upstream projects including transitive upstream projects.
+     *
+     * @since 1.138
+     */
+    public final Set&lt;AbstractProject&gt; getTransitiveUpstreamProjects() {
+<span class="nc" id="L1664">        return Jenkins.getInstance().getDependencyGraph().getTransitiveUpstream(this);</span>
+    }
+
+    /**
+     * Gets all the downstream projects including transitive downstream projects.
+     *
+     * @since 1.138
+     */
+    public final Set&lt;AbstractProject&gt; getTransitiveDownstreamProjects() {
+<span class="nc" id="L1673">        return Jenkins.getInstance().getDependencyGraph().getTransitiveDownstream(this);</span>
+    }
+
+    /**
+     * Gets the dependency relationship map between this project (as the source)
+     * and that project (as the sink.)
+     *
+     * @return
+     *      can be empty but not null. build number of this project to the build
+     *      numbers of that project.
+     */
+    public SortedMap&lt;Integer, RangeSet&gt; getRelationship(AbstractProject that) {
+<span class="nc" id="L1685">        TreeMap&lt;Integer,RangeSet&gt; r = new TreeMap&lt;Integer,RangeSet&gt;(REVERSE_INTEGER_COMPARATOR);</span>
+
+<span class="nc" id="L1687">        checkAndRecord(that, r, this.getBuilds());</span>
+        // checkAndRecord(that, r, that.getBuilds());
+
+<span class="nc" id="L1690">        return r;</span>
+    }
+
+    /**
+     * Helper method for getDownstreamRelationship.
+     *
+     * For each given build, find the build number range of the given project and put that into the map.
+     */
+    private void checkAndRecord(AbstractProject that, TreeMap&lt;Integer, RangeSet&gt; r, Collection&lt;R&gt; builds) {
+<span class="nc bnc" id="L1699" title="All 2 branches missed.">        for (R build : builds) {</span>
+<span class="nc" id="L1700">            RangeSet rs = build.getDownstreamRelationship(that);</span>
+<span class="nc bnc" id="L1701" title="All 4 branches missed.">            if(rs==null || rs.isEmpty())</span>
+<span class="nc" id="L1702">                continue;</span>
+
+<span class="nc" id="L1704">            int n = build.getNumber();</span>
+
+<span class="nc" id="L1706">            RangeSet value = r.get(n);</span>
+<span class="nc bnc" id="L1707" title="All 2 branches missed.">            if(value==null)</span>
+<span class="nc" id="L1708">                r.put(n,rs);</span>
+            else
+<span class="nc" id="L1710">                value.add(rs);</span>
+        }
+<span class="nc" id="L1712">    }</span>
+
+    /**
+     * Builds the dependency graph.
+     * Since 1.558, not abstract and by default includes dependencies contributed by {@link #triggers()}.
+     */
+    protected void buildDependencyGraph(DependencyGraph graph) {
+<span class="nc" id="L1719">        triggers().buildDependencyGraph(this, graph);</span>
+<span class="nc" id="L1720">    }</span>
+
+    @Override
+    protected SearchIndexBuilder makeSearchIndex() {
+<span class="nc" id="L1724">        return getParameterizedJobMixIn().extendSearchIndex(super.makeSearchIndex());</span>
+    }
+
+    @Override
+    protected HistoryWidget createHistoryWidget() {
+<span class="nc" id="L1729">        return buildMixIn.createHistoryWidget();</span>
+    }
+
+    public boolean isParameterized() {
+<span class="nc" id="L1733">        return getParameterizedJobMixIn().isParameterized();</span>
+    }
+
+//
+//
+// actions
+//
+//
+    /**
+     * Schedules a new build command.
+     */
+    public void doBuild( StaplerRequest req, StaplerResponse rsp, @QueryParameter TimeDuration delay ) throws IOException, ServletException {
+<span class="nc" id="L1745">        getParameterizedJobMixIn().doBuild(req, rsp, delay);</span>
+<span class="nc" id="L1746">    }</span>
+
+    /** @deprecated use {@link #doBuild(StaplerRequest, StaplerResponse, TimeDuration)} */
+    @Deprecated
+    public void doBuild(StaplerRequest req, StaplerResponse rsp) throws IOException, ServletException {
+<span class="nc" id="L1751">        doBuild(req, rsp, TimeDuration.fromString(req.getParameter(&quot;delay&quot;)));</span>
+<span class="nc" id="L1752">    }</span>
+
+    /**
+     * Computes the delay by taking the default value and the override in the request parameter into the account.
+     *
+     * @deprecated as of 1.489
+     *      Inject {@link TimeDuration}.
+     */
+    @Deprecated
+    public int getDelay(StaplerRequest req) throws ServletException {
+<span class="nc" id="L1762">        String delay = req.getParameter(&quot;delay&quot;);</span>
+<span class="nc bnc" id="L1763" title="All 2 branches missed.">        if (delay==null)    return getQuietPeriod();</span>
+
+        try {
+            // TODO: more unit handling
+<span class="nc bnc" id="L1767" title="All 2 branches missed.">            if(delay.endsWith(&quot;sec&quot;))   delay=delay.substring(0,delay.length()-3);</span>
+<span class="nc bnc" id="L1768" title="All 2 branches missed.">            if(delay.endsWith(&quot;secs&quot;))  delay=delay.substring(0,delay.length()-4);</span>
+<span class="nc" id="L1769">            return Integer.parseInt(delay);</span>
+<span class="nc" id="L1770">        } catch (NumberFormatException e) {</span>
+<span class="nc" id="L1771">            throw new ServletException(&quot;Invalid delay parameter value: &quot;+delay);</span>
+        }
+    }
+
+    /**
+     * Supports build trigger with parameters via an HTTP GET or POST.
+     * Currently only String parameters are supported.
+     */
+    public void doBuildWithParameters(StaplerRequest req, StaplerResponse rsp, @QueryParameter TimeDuration delay) throws IOException, ServletException {
+<span class="nc" id="L1780">        getParameterizedJobMixIn().doBuildWithParameters(req, rsp, delay);</span>
+<span class="nc" id="L1781">    }</span>
+
+    /** @deprecated use {@link #doBuildWithParameters(StaplerRequest, StaplerResponse, TimeDuration)} */
+    @Deprecated
+    public void doBuildWithParameters(StaplerRequest req, StaplerResponse rsp) throws IOException, ServletException {
+<span class="nc" id="L1786">        doBuildWithParameters(req, rsp, TimeDuration.fromString(req.getParameter(&quot;delay&quot;)));</span>
+<span class="nc" id="L1787">    }</span>
+
+    /**
+     * Schedules a new SCM polling command.
+     */
+    public void doPolling( StaplerRequest req, StaplerResponse rsp ) throws IOException, ServletException {
+<span class="nc" id="L1793">        BuildAuthorizationToken.checkPermission((Job) this, authToken, req, rsp);</span>
+<span class="nc" id="L1794">        schedulePolling();</span>
+<span class="nc" id="L1795">        rsp.sendRedirect(&quot;.&quot;);</span>
+<span class="nc" id="L1796">    }</span>
+
+    /**
+     * Cancels a scheduled build.
+     */
+    @RequirePOST
+    public void doCancelQueue( StaplerRequest req, StaplerResponse rsp ) throws IOException, ServletException {
+<span class="nc" id="L1803">        getParameterizedJobMixIn().doCancelQueue(req, rsp);</span>
+<span class="nc" id="L1804">    }</span>
+
+    @Override
+    protected void submit(StaplerRequest req, StaplerResponse rsp) throws IOException, ServletException, FormException {
+<span class="nc" id="L1808">        super.submit(req,rsp);</span>
+<span class="nc" id="L1809">        JSONObject json = req.getSubmittedForm();</span>
+
+<span class="nc" id="L1811">        makeDisabled(json.optBoolean(&quot;disable&quot;));</span>
+
+<span class="nc" id="L1813">        jdk = json.optString(&quot;jdk&quot;, null);</span>
+
+<span class="nc bnc" id="L1815" title="All 2 branches missed.">        if(json.optBoolean(&quot;hasCustomQuietPeriod&quot;, json.has(&quot;quiet_period&quot;))) {</span>
+<span class="nc" id="L1816">            quietPeriod = json.optInt(&quot;quiet_period&quot;);</span>
+<span class="nc" id="L1817">        } else {</span>
+<span class="nc" id="L1818">            quietPeriod = null;</span>
+        }
+
+<span class="nc bnc" id="L1821" title="All 2 branches missed.">        if(json.optBoolean(&quot;hasCustomScmCheckoutRetryCount&quot;, json.has(&quot;scmCheckoutRetryCount&quot;))) {</span>
+<span class="nc" id="L1822">            scmCheckoutRetryCount = json.optInt(&quot;scmCheckoutRetryCount&quot;);</span>
+<span class="nc" id="L1823">        } else {</span>
+<span class="nc" id="L1824">            scmCheckoutRetryCount = null;</span>
+        }
+
+<span class="nc" id="L1827">        blockBuildWhenDownstreamBuilding = json.optBoolean(&quot;blockBuildWhenDownstreamBuilding&quot;);</span>
+<span class="nc" id="L1828">        blockBuildWhenUpstreamBuilding = json.optBoolean(&quot;blockBuildWhenUpstreamBuilding&quot;);</span>
+
+<span class="nc bnc" id="L1830" title="All 2 branches missed.">        if(req.hasParameter(&quot;customWorkspace.directory&quot;)) {</span>
+            // Workaround for JENKINS-25221 while plugins are being updated.
+<span class="nc" id="L1832">            LOGGER.log(Level.WARNING, &quot;label assignment is using legacy 'customWorkspace.directory'&quot;);</span>
+<span class="nc" id="L1833">            customWorkspace = Util.fixEmptyAndTrim(req.getParameter(&quot;customWorkspace.directory&quot;));</span>
+<span class="nc bnc" id="L1834" title="All 2 branches missed.">        } else if(json.optBoolean(&quot;hasCustomWorkspace&quot;, json.has(&quot;customWorkspace&quot;))) {</span>
+<span class="nc" id="L1835">            customWorkspace = Util.fixEmptyAndTrim(json.optString(&quot;customWorkspace&quot;));</span>
+<span class="nc" id="L1836">        } else {</span>
+<span class="nc" id="L1837">            customWorkspace = null;</span>
+        }
+
+<span class="nc bnc" id="L1840" title="All 2 branches missed.">        if (json.has(&quot;scmCheckoutStrategy&quot;))</span>
+<span class="nc" id="L1841">            scmCheckoutStrategy = req.bindJSON(SCMCheckoutStrategy.class,</span>
+<span class="nc" id="L1842">                json.getJSONObject(&quot;scmCheckoutStrategy&quot;));</span>
+        else
+<span class="nc" id="L1844">            scmCheckoutStrategy = null;</span>
+
+<span class="nc bnc" id="L1846" title="All 2 branches missed.">        if(json.optBoolean(&quot;hasSlaveAffinity&quot;, json.has(&quot;label&quot;))) {</span>
+<span class="nc" id="L1847">            assignedNode = Util.fixEmptyAndTrim(json.optString(&quot;label&quot;));</span>
+<span class="nc bnc" id="L1848" title="All 2 branches missed.">        } else if(req.hasParameter(&quot;_.assignedLabelString&quot;)) {</span>
+            // Workaround for JENKINS-25372 while plugin is being updated.
+            // Keep this condition second for JENKINS-25533
+<span class="nc" id="L1851">            LOGGER.log(Level.WARNING, &quot;label assignment is using legacy '_.assignedLabelString'&quot;);</span>
+<span class="nc" id="L1852">            assignedNode = Util.fixEmptyAndTrim(req.getParameter(&quot;_.assignedLabelString&quot;));</span>
+<span class="nc" id="L1853">        } else  {</span>
+<span class="nc" id="L1854">            assignedNode = null;</span>
+        }
+<span class="nc bnc" id="L1856" title="All 2 branches missed.">        canRoam = assignedNode==null;</span>
+
+<span class="nc" id="L1858">        keepDependencies = json.has(&quot;keepDependencies&quot;);</span>
+
+<span class="nc" id="L1860">        concurrentBuild = json.optBoolean(&quot;concurrentBuild&quot;);</span>
+
+<span class="nc" id="L1862">        authToken = BuildAuthorizationToken.create(req);</span>
+
+<span class="nc" id="L1864">        setScm(SCMS.parseSCM(req,this));</span>
+
+<span class="nc bnc" id="L1866" title="All 2 branches missed.">        for (Trigger t : triggers())</span>
+<span class="nc" id="L1867">            t.stop();</span>
+<span class="nc" id="L1868">        triggers.replaceBy(buildDescribable(req, Trigger.for_(this)));</span>
+<span class="nc bnc" id="L1869" title="All 2 branches missed.">        for (Trigger t : triggers())</span>
+<span class="nc" id="L1870">            t.start(this,true);</span>
+<span class="nc" id="L1871">    }</span>
+
+    /**
+     * @deprecated
+     *      As of 1.261. Use {@link #buildDescribable(StaplerRequest, List)} instead.
+     */
+    @Deprecated
+    protected final &lt;T extends Describable&lt;T&gt;&gt; List&lt;T&gt; buildDescribable(StaplerRequest req, List&lt;? extends Descriptor&lt;T&gt;&gt; descriptors, String prefix) throws FormException, ServletException {
+<span class="nc" id="L1879">        return buildDescribable(req,descriptors);</span>
+    }
+
+    protected final &lt;T extends Describable&lt;T&gt;&gt; List&lt;T&gt; buildDescribable(StaplerRequest req, List&lt;? extends Descriptor&lt;T&gt;&gt; descriptors)
+        throws FormException, ServletException {
+
+<span class="nc" id="L1885">        JSONObject data = req.getSubmittedForm();</span>
+<span class="nc" id="L1886">        List&lt;T&gt; r = new Vector&lt;T&gt;();</span>
+<span class="nc bnc" id="L1887" title="All 2 branches missed.">        for (Descriptor&lt;T&gt; d : descriptors) {</span>
+<span class="nc" id="L1888">            String safeName = d.getJsonSafeClassName();</span>
+<span class="nc bnc" id="L1889" title="All 2 branches missed.">            if (req.getParameter(safeName) != null) {</span>
+<span class="nc" id="L1890">                T instance = d.newInstance(req, data.getJSONObject(safeName));</span>
+<span class="nc" id="L1891">                r.add(instance);</span>
+            }
+        }
+<span class="nc" id="L1894">        return r;</span>
+    }
+
+    /**
+     * Serves the workspace files.
+     */
+    public DirectoryBrowserSupport doWs( StaplerRequest req, StaplerResponse rsp ) throws IOException, ServletException, InterruptedException {
+<span class="nc" id="L1901">        checkPermission(Item.WORKSPACE);</span>
+<span class="nc" id="L1902">        FilePath ws = getSomeWorkspace();</span>
+<span class="nc bnc" id="L1903" title="All 4 branches missed.">        if ((ws == null) || (!ws.exists())) {</span>
+            // if there's no workspace, report a nice error message
+            // Would be good if when asked for *plain*, do something else!
+            // (E.g. return 404, or send empty doc.)
+            // Not critical; client can just check if content type is not text/plain,
+            // which also serves to detect old versions of Hudson.
+<span class="nc" id="L1909">            req.getView(this,&quot;noWorkspace.jelly&quot;).forward(req,rsp);</span>
+<span class="nc" id="L1910">            return null;</span>
+        } else {
+<span class="nc" id="L1912">            Computer c = ws.toComputer();</span>
+            String title;
+<span class="nc bnc" id="L1914" title="All 2 branches missed.">            if (c == null) {</span>
+<span class="nc" id="L1915">                title = Messages.AbstractProject_WorkspaceTitle(getDisplayName());</span>
+<span class="nc" id="L1916">            } else {</span>
+<span class="nc" id="L1917">                title = Messages.AbstractProject_WorkspaceTitleOnComputer(getDisplayName(), c.getDisplayName());</span>
+            }
+<span class="nc" id="L1919">            return new DirectoryBrowserSupport(this, ws, title, &quot;folder.png&quot;, true);</span>
+        }
+    }
+
+    /**
+     * Wipes out the workspace.
+     */
+    @RequirePOST
+    public HttpResponse doDoWipeOutWorkspace() throws IOException, ServletException, InterruptedException {
+<span class="nc bnc" id="L1928" title="All 2 branches missed.">        checkPermission(Functions.isWipeOutPermissionEnabled() ? WIPEOUT : BUILD);</span>
+<span class="nc" id="L1929">        R b = getSomeBuildWithWorkspace();</span>
+<span class="nc bnc" id="L1930" title="All 2 branches missed.">        FilePath ws = b!=null ? b.getWorkspace() : null;</span>
+<span class="nc bnc" id="L1931" title="All 4 branches missed.">        if (ws!=null &amp;&amp; getScm().processWorkspaceBeforeDeletion(this, ws, b.getBuiltOn())) {</span>
+<span class="nc" id="L1932">            ws.deleteRecursive();</span>
+<span class="nc bnc" id="L1933" title="All 2 branches missed.">            for (WorkspaceListener wl : WorkspaceListener.all()) {</span>
+<span class="nc" id="L1934">                wl.afterDelete(this);</span>
+            }
+<span class="nc" id="L1936">            return new HttpRedirect(&quot;.&quot;);</span>
+        } else {
+            // If we get here, that means the SCM blocked the workspace deletion.
+<span class="nc" id="L1939">            return new ForwardToView(this,&quot;wipeOutWorkspaceBlocked.jelly&quot;);</span>
+        }
+    }
+
+    @CLIMethod(name=&quot;disable-job&quot;)
+    @RequirePOST
+    public HttpResponse doDisable() throws IOException, ServletException {
+<span class="nc" id="L1946">        checkPermission(CONFIGURE);</span>
+<span class="nc" id="L1947">        makeDisabled(true);</span>
+<span class="nc" id="L1948">        return new HttpRedirect(&quot;.&quot;);</span>
+    }
+
+    @CLIMethod(name=&quot;enable-job&quot;)
+    @RequirePOST
+    public HttpResponse doEnable() throws IOException, ServletException {
+<span class="nc" id="L1954">        checkPermission(CONFIGURE);</span>
+<span class="nc" id="L1955">        makeDisabled(false);</span>
+<span class="nc" id="L1956">        return new HttpRedirect(&quot;.&quot;);</span>
+    }
+
+
+    /**
+     * RSS feed for changes in this project.
+     */
+    public void doRssChangelog(  StaplerRequest req, StaplerResponse rsp  ) throws IOException, ServletException {
+        class FeedItem {
+            ChangeLogSet.Entry e;
+            int idx;
+
+<span class="nc" id="L1968">            public FeedItem(Entry e, int idx) {</span>
+<span class="nc" id="L1969">                this.e = e;</span>
+<span class="nc" id="L1970">                this.idx = idx;</span>
+<span class="nc" id="L1971">            }</span>
+
+            AbstractBuild&lt;?,?&gt; getBuild() {
+<span class="nc" id="L1974">                return e.getParent().build;</span>
+            }
+        }
+
+<span class="nc" id="L1978">        List&lt;FeedItem&gt; entries = new ArrayList&lt;FeedItem&gt;();</span>
+
+<span class="nc bnc" id="L1980" title="All 2 branches missed.">        for(R r=getLastBuild(); r!=null; r=r.getPreviousBuild()) {</span>
+<span class="nc" id="L1981">            int idx=0;</span>
+<span class="nc bnc" id="L1982" title="All 2 branches missed.">            for( ChangeLogSet.Entry e : r.getChangeSet())</span>
+<span class="nc" id="L1983">                entries.add(new FeedItem(e,idx++));</span>
+        }
+
+<span class="nc" id="L1986">        RSS.forwardToRss(</span>
+<span class="nc" id="L1987">            getDisplayName()+' '+getScm().getDescriptor().getDisplayName()+&quot; changes&quot;,</span>
+<span class="nc" id="L1988">            getUrl()+&quot;changes&quot;,</span>
+<span class="nc" id="L1989">            entries, new FeedAdapter&lt;FeedItem&gt;() {</span>
+                public String getEntryTitle(FeedItem item) {
+<span class="nc" id="L1991">                    return &quot;#&quot;+item.getBuild().number+' '+item.e.getMsg()+&quot; (&quot;+item.e.getAuthor()+&quot;)&quot;;</span>
+                }
+
+                public String getEntryUrl(FeedItem item) {
+<span class="nc" id="L1995">                    return item.getBuild().getUrl()+&quot;changes#detail&quot;+item.idx;</span>
+                }
+
+                public String getEntryID(FeedItem item) {
+<span class="nc" id="L1999">                    return getEntryUrl(item);</span>
+                }
+
+                public String getEntryDescription(FeedItem item) {
+<span class="nc" id="L2003">                    StringBuilder buf = new StringBuilder();</span>
+<span class="nc bnc" id="L2004" title="All 2 branches missed.">                    for(String path : item.e.getAffectedPaths())</span>
+<span class="nc" id="L2005">                        buf.append(path).append('\n');</span>
+<span class="nc" id="L2006">                    return buf.toString();</span>
+                }
+
+                public Calendar getEntryTimestamp(FeedItem item) {
+<span class="nc" id="L2010">                    return item.getBuild().getTimestamp();</span>
+                }
+
+                public String getEntryAuthor(FeedItem entry) {
+<span class="nc" id="L2014">                    return JenkinsLocationConfiguration.get().getAdminAddress();</span>
+                }
+            },
+<span class="nc" id="L2017">            req, rsp );</span>
+<span class="nc" id="L2018">    }</span>
+
+    /**
+     * {@link AbstractProject} subtypes should implement this base class as a descriptor.
+     *
+     * @since 1.294
+     */
+<span class="nc" id="L2025">    public static abstract class AbstractProjectDescriptor extends TopLevelItemDescriptor {</span>
+        /**
+         * {@link AbstractProject} subtypes can override this method to veto some {@link Descriptor}s
+         * from showing up on their configuration screen. This is often useful when you are building
+         * a workflow/company specific project type, where you want to limit the number of choices
+         * given to the users.
+         *
+         * &lt;p&gt;
+         * Some {@link Descriptor}s define their own schemes for controlling applicability
+         * (such as {@link BuildStepDescriptor#isApplicable(Class)}),
+         * This method works like AND in conjunction with them;
+         * Both this method and that method need to return true in order for a given {@link Descriptor}
+         * to show up for the given {@link Project}.
+         *
+         * &lt;p&gt;
+         * The default implementation returns true for everything.
+         *
+         * @see BuildStepDescriptor#isApplicable(Class)
+         * @see BuildWrapperDescriptor#isApplicable(AbstractProject)
+         * @see TriggerDescriptor#isApplicable(Item)
+         */
+        @Override
+        public boolean isApplicable(Descriptor descriptor) {
+<span class="nc" id="L2048">            return true;</span>
+        }
+
+        @Restricted(DoNotUse.class)
+        public FormValidation doCheckAssignedLabelString(@AncestorInPath AbstractProject&lt;?,?&gt; project,
+                                                         @QueryParameter String value) {
+          // Provide a legacy interface in case plugins are not going through p:config-assignedLabel
+          // see: JENKINS-25372
+<span class="nc" id="L2056">          LOGGER.log(Level.WARNING, &quot;checking label via legacy '_.assignedLabelString'&quot;);</span>
+<span class="nc" id="L2057">          return doCheckLabel(project, value);</span>
+        }
+
+        public FormValidation doCheckLabel(@AncestorInPath AbstractProject&lt;?,?&gt; project,
+                                           @QueryParameter String value) {
+<span class="nc" id="L2062">            return validateLabelExpression(value, project);</span>
+        }
+
+        /**
+         * Validate label expression string.
+         *
+         * @param project May be specified to perform project specific validation.
+         * @since 1.590
+         */
+        public static @Nonnull FormValidation validateLabelExpression(String value, @CheckForNull AbstractProject&lt;?, ?&gt; project) {
+<span class="nc bnc" id="L2072" title="All 2 branches missed.">            if (Util.fixEmpty(value)==null)</span>
+<span class="nc" id="L2073">                return FormValidation.ok(); // nothing typed yet</span>
+            try {
+<span class="nc" id="L2075">                Label.parseExpression(value);</span>
+<span class="nc" id="L2076">            } catch (ANTLRException e) {</span>
+<span class="nc" id="L2077">                return FormValidation.error(e,</span>
+<span class="nc" id="L2078">                        Messages.AbstractProject_AssignedLabelString_InvalidBooleanExpression(e.getMessage()));</span>
+            }
+<span class="nc" id="L2080">            Jenkins j = Jenkins.getInstance();</span>
+<span class="nc bnc" id="L2081" title="All 2 branches missed.">            if (j == null) {</span>
+<span class="nc" id="L2082">                return FormValidation.ok(); // ?</span>
+            }
+<span class="nc" id="L2084">            Label l = j.getLabel(value);</span>
+<span class="nc bnc" id="L2085" title="All 2 branches missed.">            if (l.isEmpty()) {</span>
+<span class="nc bnc" id="L2086" title="All 2 branches missed.">                for (LabelAtom a : l.listAtoms()) {</span>
+<span class="nc bnc" id="L2087" title="All 2 branches missed.">                    if (a.isEmpty()) {</span>
+<span class="nc" id="L2088">                        LabelAtom nearest = LabelAtom.findNearest(a.getName());</span>
+<span class="nc" id="L2089">                        return FormValidation.warning(Messages.AbstractProject_AssignedLabelString_NoMatch_DidYouMean(a.getName(),nearest.getDisplayName()));</span>
+                    }
+                }
+<span class="nc" id="L2092">                return FormValidation.warning(Messages.AbstractProject_AssignedLabelString_NoMatch());</span>
+            }
+<span class="nc bnc" id="L2094" title="All 2 branches missed.">            if (project != null) {</span>
+<span class="nc bnc" id="L2095" title="All 2 branches missed.">                for (AbstractProject.LabelValidator v : j</span>
+<span class="nc" id="L2096">                        .getExtensionList(AbstractProject.LabelValidator.class)) {</span>
+<span class="nc" id="L2097">                    FormValidation result = v.check(project, l);</span>
+<span class="nc bnc" id="L2098" title="All 2 branches missed.">                    if (!FormValidation.Kind.OK.equals(result.kind)) {</span>
+<span class="nc" id="L2099">                        return result;</span>
+                    }
+                }
+            }
+<span class="nc" id="L2103">            return FormValidation.okWithMarkup(Messages.AbstractProject_LabelLink(</span>
+<span class="nc" id="L2104">                    j.getRootUrl(), l.getUrl(), l.getNodes().size(), l.getClouds().size())</span>
+            );
+        }
+
+        public FormValidation doCheckCustomWorkspace(@QueryParameter String customWorkspace){
+<span class="nc bnc" id="L2109" title="All 2 branches missed.">        	if(Util.fixEmptyAndTrim(customWorkspace)==null)</span>
+<span class="nc" id="L2110">        		return FormValidation.error(Messages.AbstractProject_CustomWorkspaceEmpty());</span>
+        	else
+<span class="nc" id="L2112">        		return FormValidation.ok();</span>
+        }
+
+        public AutoCompletionCandidates doAutoCompleteUpstreamProjects(@QueryParameter String value) {
+<span class="nc" id="L2116">            AutoCompletionCandidates candidates = new AutoCompletionCandidates();</span>
+<span class="nc" id="L2117">            List&lt;Job&gt; jobs = Jenkins.getInstance().getItems(Job.class);</span>
+<span class="nc bnc" id="L2118" title="All 2 branches missed.">            for (Job job: jobs) {</span>
+<span class="nc bnc" id="L2119" title="All 2 branches missed.">                if (job.getFullName().startsWith(value)) {</span>
+<span class="nc bnc" id="L2120" title="All 2 branches missed.">                    if (job.hasPermission(Item.READ)) {</span>
+<span class="nc" id="L2121">                        candidates.add(job.getFullName());</span>
+                    }
+                }
+            }
+<span class="nc" id="L2125">            return candidates;</span>
+        }
+
+        @Restricted(DoNotUse.class)
+        public AutoCompletionCandidates doAutoCompleteAssignedLabelString(@QueryParameter String value) {
+          // Provide a legacy interface in case plugins are not going through p:config-assignedLabel
+          // see: JENKINS-25372
+<span class="nc" id="L2132">          LOGGER.log(Level.WARNING, &quot;autocompleting label via legacy '_.assignedLabelString'&quot;);</span>
+<span class="nc" id="L2133">          return doAutoCompleteLabel(value);</span>
+        }
+
+        public AutoCompletionCandidates doAutoCompleteLabel(@QueryParameter String value) {
+<span class="nc" id="L2137">            AutoCompletionCandidates c = new AutoCompletionCandidates();</span>
+<span class="nc" id="L2138">            Set&lt;Label&gt; labels = Jenkins.getInstance().getLabels();</span>
+<span class="nc" id="L2139">            List&lt;String&gt; queries = new AutoCompleteSeeder(value).getSeeds();</span>
+
+<span class="nc bnc" id="L2141" title="All 2 branches missed.">            for (String term : queries) {</span>
+<span class="nc bnc" id="L2142" title="All 2 branches missed.">                for (Label l : labels) {</span>
+<span class="nc bnc" id="L2143" title="All 2 branches missed.">                    if (l.getName().startsWith(term)) {</span>
+<span class="nc" id="L2144">                        c.add(l.getName());</span>
+                    }
+                }
+            }
+<span class="nc" id="L2148">            return c;</span>
+        }
+
+        public List&lt;SCMCheckoutStrategyDescriptor&gt; getApplicableSCMCheckoutStrategyDescriptors(AbstractProject p) {
+<span class="nc" id="L2152">            return SCMCheckoutStrategyDescriptor._for(p);</span>
+        }
+
+        /**
+        * Utility class for taking the current input value and computing a list
+        * of potential terms to match against the list of defined labels.
+         */
+        static class AutoCompleteSeeder {
+            private String source;
+
+<span class="fc" id="L2162">            AutoCompleteSeeder(String source) {</span>
+<span class="fc" id="L2163">                this.source = source;</span>
+<span class="fc" id="L2164">            }</span>
+
+            List&lt;String&gt; getSeeds() {
+<span class="fc" id="L2167">                ArrayList&lt;String&gt; terms = new ArrayList&lt;String&gt;();</span>
+<span class="fc" id="L2168">                boolean trailingQuote = source.endsWith(&quot;\&quot;&quot;);</span>
+<span class="fc" id="L2169">                boolean leadingQuote = source.startsWith(&quot;\&quot;&quot;);</span>
+<span class="fc" id="L2170">                boolean trailingSpace = source.endsWith(&quot; &quot;);</span>
+
+<span class="fc bfc" id="L2172" title="All 6 branches covered.">                if (trailingQuote || (trailingSpace &amp;&amp; !leadingQuote)) {</span>
+<span class="fc" id="L2173">                    terms.add(&quot;&quot;);</span>
+<span class="fc" id="L2174">                } else {</span>
+<span class="fc bfc" id="L2175" title="All 2 branches covered.">                    if (leadingQuote) {</span>
+<span class="fc" id="L2176">                        int quote = source.lastIndexOf('&quot;');</span>
+<span class="fc bfc" id="L2177" title="All 2 branches covered.">                        if (quote == 0) {</span>
+<span class="fc" id="L2178">                            terms.add(source.substring(1));</span>
+<span class="fc" id="L2179">                        } else {</span>
+<span class="fc" id="L2180">                            terms.add(&quot;&quot;);</span>
+                        }
+<span class="fc" id="L2182">                    } else {</span>
+<span class="fc" id="L2183">                        int space = source.lastIndexOf(' ');</span>
+<span class="fc bfc" id="L2184" title="All 2 branches covered.">                        if (space &gt; -1) {</span>
+<span class="fc" id="L2185">                            terms.add(source.substring(space+1));</span>
+<span class="fc" id="L2186">                        } else {</span>
+<span class="fc" id="L2187">                            terms.add(source);</span>
+                        }
+                    }
+                }
+
+<span class="fc" id="L2192">                return terms;</span>
+            }
+        }
+    }
+
+    /**
+     * Finds a {@link AbstractProject} that has the name closest to the given name.
+     * @see Items#findNearest
+     */
+    public static @CheckForNull AbstractProject findNearest(String name) {
+<span class="nc" id="L2202">        return findNearest(name,Jenkins.getInstance());</span>
+    }
+
+    /**
+     * Finds a {@link AbstractProject} whose name (when referenced from the specified context) is closest to the given name.
+     *
+     * @since 1.419
+     * @see Items#findNearest
+     */
+    public static @CheckForNull AbstractProject findNearest(String name, ItemGroup context) {
+<span class="nc" id="L2212">        return Items.findNearest(AbstractProject.class, name, context);</span>
+    }
+
+<span class="fc" id="L2215">    private static final Comparator&lt;Integer&gt; REVERSE_INTEGER_COMPARATOR = new Comparator&lt;Integer&gt;() {</span>
+        public int compare(Integer o1, Integer o2) {
+<span class="nc" id="L2217">            return o2-o1;</span>
+        }
+    };
+
+<span class="fc" id="L2221">    private static final Logger LOGGER = Logger.getLogger(AbstractProject.class.getName());</span>
+
+    /**
+     * @deprecated Just use {@link #CANCEL}.
+     */
+    @Deprecated
+<span class="fc" id="L2227">    public static final Permission ABORT = CANCEL;</span>
+
+    /**
+     * @deprecated Use {@link ParameterizedJobMixIn#BUILD_NOW_TEXT}.
+     */
+    @Deprecated
+<span class="fc" id="L2233">    public static final Message&lt;AbstractProject&gt; BUILD_NOW_TEXT = new Message&lt;AbstractProject&gt;();</span>
+
+    /**
+     * Used for CLI binding.
+     */
+    @CLIResolver
+    public static AbstractProject resolveForCLI(
+            @Argument(required=true,metaVar=&quot;NAME&quot;,usage=&quot;Job name&quot;) String name) throws CmdLineException {
+<span class="nc" id="L2241">        AbstractProject item = Jenkins.getInstance().getItemByFullName(name, AbstractProject.class);</span>
+<span class="nc bnc" id="L2242" title="All 2 branches missed.">        if (item==null) {</span>
+<span class="nc" id="L2243">            AbstractProject project = AbstractProject.findNearest(name);</span>
+<span class="nc bnc" id="L2244" title="All 2 branches missed.">            throw new CmdLineException(null, project == null ? Messages.AbstractItem_NoSuchJobExistsWithoutSuggestion(name)</span>
+<span class="nc" id="L2245">                    : Messages.AbstractItem_NoSuchJobExists(name, project.getFullName()));</span>
+        }
+<span class="nc" id="L2247">        return item;</span>
+    }
+
+    public String getCustomWorkspace() {
+<span class="nc" id="L2251">        return customWorkspace;</span>
+    }
+
+    /**
+     * User-specified workspace directory, or null if it's up to Jenkins.
+     *
+     * &lt;p&gt;
+     * Normally a project uses the workspace location assigned by its parent container,
+     * but sometimes people have builds that have hard-coded paths.
+     *
+     * &lt;p&gt;
+     * This is not {@link File} because it may have to hold a path representation on another OS.
+     *
+     * &lt;p&gt;
+     * If this path is relative, it's resolved against {@link Node#getRootPath()} on the node where this workspace
+     * is prepared.
+     *
+     * @since 1.410
+     */
+    public void setCustomWorkspace(String customWorkspace) throws IOException {
+<span class="nc" id="L2271">        this.customWorkspace= Util.fixEmptyAndTrim(customWorkspace);</span>
+<span class="nc" id="L2272">        save();</span>
+<span class="nc" id="L2273">    }</span>
+
+    /**
+     * Plugins may want to contribute additional restrictions on the use of specific labels for specific projects.
+     * This extension point allows such restrictions.
+     *
+     * @since 1.540
+     */
+<span class="nc" id="L2281">    public static abstract class LabelValidator implements ExtensionPoint {</span>
+        /**
+         * Check the use of the label within the specified context.
+         *
+         * @param project the project that wants to restrict itself to the specified label.
+         * @param label   the label that the project wants to restrict itself to.
+         * @return the {@link FormValidation} result.
+         */
+        @Nonnull
+        public abstract FormValidation check(@Nonnull AbstractProject&lt;?, ?&gt; project, @Nonnull Label label);
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

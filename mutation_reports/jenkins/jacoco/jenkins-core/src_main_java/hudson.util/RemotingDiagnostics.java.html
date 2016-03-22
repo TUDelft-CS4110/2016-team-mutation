@@ -1,0 +1,213 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>RemotingDiagnostics.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.util</a> &gt; <span class="el_source">RemotingDiagnostics.java</span></div><h1>RemotingDiagnostics.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">/*</span>
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2010, Sun Microsystems, Inc., Kohsuke Kawaguchi, CloudBees, Inc.
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.util;
+
+import groovy.lang.Binding;
+import groovy.lang.GroovyShell;
+import hudson.FilePath;
+import hudson.Functions;
+import jenkins.model.Jenkins;
+import hudson.remoting.AsyncFutureImpl;
+import hudson.remoting.DelegatingCallable;
+import hudson.remoting.Future;
+import hudson.remoting.VirtualChannel;
+import hudson.security.AccessControlled;
+import jenkins.security.MasterToSlaveCallable;
+
+import org.codehaus.groovy.control.CompilerConfiguration;
+import org.codehaus.groovy.control.customizers.ImportCustomizer;
+import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.StaplerResponse;
+import org.kohsuke.stapler.WebMethod;
+
+import javax.annotation.Nonnull;
+import javax.management.JMException;
+import javax.management.MBeanServer;
+import javax.management.ObjectName;
+
+import java.io.File;
+import java.io.IOException;
+import java.io.PrintWriter;
+import java.io.StringWriter;
+import java.lang.management.ManagementFactory;
+import java.lang.management.ThreadInfo;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.TreeMap;
+
+/**
+ * Various remoting operations related to diagnostics.
+ *
+ * &lt;p&gt;
+ * These code are useful wherever {@link VirtualChannel} is used, such as master, slaves, Maven JVMs, etc.
+ *
+ * @author Kohsuke Kawaguchi
+ * @since 1.175
+ */
+<span class="nc" id="L69">public final class RemotingDiagnostics {</span>
+    public static Map&lt;Object,Object&gt; getSystemProperties(VirtualChannel channel) throws IOException, InterruptedException {
+<span class="nc bnc" id="L71" title="All 2 branches missed.">        if(channel==null)</span>
+<span class="nc" id="L72">            return Collections.&lt;Object,Object&gt;singletonMap(&quot;N/A&quot;,&quot;N/A&quot;);</span>
+<span class="nc" id="L73">        return channel.call(new GetSystemProperties());</span>
+    }
+
+<span class="nc" id="L76">    private static final class GetSystemProperties extends MasterToSlaveCallable&lt;Map&lt;Object,Object&gt;,RuntimeException&gt; {</span>
+        public Map&lt;Object,Object&gt; call() {
+<span class="nc" id="L78">            return new TreeMap&lt;Object,Object&gt;(System.getProperties());</span>
+        }
+        private static final long serialVersionUID = 1L;
+    }
+
+    public static Map&lt;String,String&gt; getThreadDump(VirtualChannel channel) throws IOException, InterruptedException {
+<span class="nc bnc" id="L84" title="All 2 branches missed.">        if(channel==null)</span>
+<span class="nc" id="L85">            return Collections.singletonMap(&quot;N/A&quot;,&quot;N/A&quot;);</span>
+<span class="nc" id="L86">        return channel.call(new GetThreadDump());</span>
+    }
+
+    public static Future&lt;Map&lt;String,String&gt;&gt; getThreadDumpAsync(VirtualChannel channel) throws IOException, InterruptedException {
+<span class="nc bnc" id="L90" title="All 2 branches missed.">        if(channel==null)</span>
+<span class="nc" id="L91">            return new AsyncFutureImpl&lt;Map&lt;String, String&gt;&gt;(Collections.singletonMap(&quot;N/A&quot;,&quot;offline&quot;));</span>
+<span class="nc" id="L92">        return channel.callAsync(new GetThreadDump());</span>
+    }
+
+<span class="nc" id="L95">    private static final class GetThreadDump extends MasterToSlaveCallable&lt;Map&lt;String,String&gt;,RuntimeException&gt; {</span>
+        public Map&lt;String,String&gt; call() {
+<span class="nc" id="L97">            Map&lt;String,String&gt; r = new LinkedHashMap&lt;String,String&gt;();</span>
+<span class="nc" id="L98">                ThreadInfo[] data = Functions.getThreadInfos();</span>
+<span class="nc" id="L99">                Functions.ThreadGroupMap map = Functions.sortThreadsAndGetGroupMap(data);</span>
+<span class="nc bnc" id="L100" title="All 2 branches missed.">                for (ThreadInfo ti : data)</span>
+<span class="nc" id="L101">                    r.put(ti.getThreadName(),Functions.dumpThreadInfo(ti,map));</span>
+<span class="nc" id="L102">            return r;</span>
+        }
+        private static final long serialVersionUID = 1L;
+    }
+
+    /**
+     * Executes Groovy script remotely.
+     */
+    public static String executeGroovy(String script, @Nonnull VirtualChannel channel) throws IOException, InterruptedException {
+<span class="nc" id="L111">        return channel.call(new Script(script));</span>
+    }
+
+    private static final class Script extends MasterToSlaveCallable&lt;String,RuntimeException&gt; implements DelegatingCallable&lt;String,RuntimeException&gt; {
+        private final String script;
+        private transient ClassLoader cl;
+
+<span class="nc" id="L118">        private Script(String script) {</span>
+<span class="nc" id="L119">            this.script = script;</span>
+<span class="nc" id="L120">            cl = getClassLoader();</span>
+<span class="nc" id="L121">        }</span>
+
+        public ClassLoader getClassLoader() {
+<span class="nc" id="L124">            return Jenkins.getInstance().getPluginManager().uberClassLoader;</span>
+        }
+
+        public String call() throws RuntimeException {
+            // if we run locally, cl!=null. Otherwise the delegating classloader will be available as context classloader.
+<span class="nc bnc" id="L129" title="All 2 branches missed.">            if (cl==null)       cl = Thread.currentThread().getContextClassLoader();</span>
+<span class="nc" id="L130">            CompilerConfiguration cc = new CompilerConfiguration();</span>
+<span class="nc" id="L131">            cc.addCompilationCustomizers(new ImportCustomizer().addStarImports(</span>
+<span class="nc" id="L132">                    &quot;jenkins&quot;,</span>
+<span class="nc" id="L133">                    &quot;jenkins.model&quot;,</span>
+<span class="nc" id="L134">                    &quot;hudson&quot;,</span>
+<span class="nc" id="L135">                    &quot;hudson.model&quot;));</span>
+<span class="nc" id="L136">            GroovyShell shell = new GroovyShell(cl,new Binding(),cc);</span>
+
+<span class="nc" id="L138">            StringWriter out = new StringWriter();</span>
+<span class="nc" id="L139">            PrintWriter pw = new PrintWriter(out);</span>
+<span class="nc" id="L140">            shell.setVariable(&quot;out&quot;, pw);</span>
+            try {
+<span class="nc" id="L142">                Object output = shell.evaluate(script);</span>
+<span class="nc bnc" id="L143" title="All 2 branches missed.">                if(output!=null)</span>
+<span class="nc" id="L144">                pw.println(&quot;Result: &quot;+output);</span>
+<span class="nc" id="L145">            } catch (Throwable t) {</span>
+<span class="nc" id="L146">                t.printStackTrace(pw);</span>
+            }
+<span class="nc" id="L148">            return out.toString();</span>
+        }
+    }
+
+    /**
+     * Obtains the heap dump in an HPROF file.
+     */
+    public static FilePath getHeapDump(VirtualChannel channel) throws IOException, InterruptedException {
+<span class="nc" id="L156">        return channel.call(new MasterToSlaveCallable&lt;FilePath, IOException&gt;() {</span>
+            public FilePath call() throws IOException {
+<span class="nc" id="L158">                final File hprof = File.createTempFile(&quot;hudson-heapdump&quot;, &quot;hprof&quot;);</span>
+<span class="nc" id="L159">                hprof.delete();</span>
+                try {
+<span class="nc" id="L161">                    MBeanServer server = ManagementFactory.getPlatformMBeanServer();</span>
+<span class="nc" id="L162">                    server.invoke(new ObjectName(&quot;com.sun.management:type=HotSpotDiagnostic&quot;), &quot;dumpHeap&quot;,</span>
+<span class="nc" id="L163">                            new Object[]{hprof.getAbsolutePath(), true}, new String[]{String.class.getName(), boolean.class.getName()});</span>
+
+<span class="nc" id="L165">                    return new FilePath(hprof);</span>
+<span class="nc" id="L166">                } catch (JMException e) {</span>
+<span class="nc" id="L167">                    throw new IOException(e);</span>
+                }
+            }
+
+            private static final long serialVersionUID = 1L;
+        });
+    }
+
+    /**
+     * Heap dump, exposable to URL via Stapler.
+     *
+     */
+    public static class HeapDump {
+        private final AccessControlled owner;
+        private final VirtualChannel channel;
+
+<span class="nc" id="L183">        public HeapDump(AccessControlled owner, VirtualChannel channel) {</span>
+<span class="nc" id="L184">            this.owner = owner;</span>
+<span class="nc" id="L185">            this.channel = channel;</span>
+<span class="nc" id="L186">        }</span>
+
+        /**
+         * Obtains the heap dump.
+         */
+        public void doIndex(StaplerResponse rsp) throws IOException {
+<span class="nc" id="L192">            rsp.sendRedirect(&quot;heapdump.hprof&quot;);</span>
+<span class="nc" id="L193">        }</span>
+
+        @WebMethod(name=&quot;heapdump.hprof&quot;)
+        public void doHeapDump(StaplerRequest req, StaplerResponse rsp) throws IOException, InterruptedException {
+<span class="nc" id="L197">            owner.checkPermission(Jenkins.RUN_SCRIPTS);</span>
+<span class="nc" id="L198">            rsp.setContentType(&quot;application/octet-stream&quot;);</span>
+
+<span class="nc" id="L200">            FilePath dump = obtain();</span>
+            try {
+<span class="nc" id="L202">                dump.copyTo(rsp.getCompressedOutputStream(req));</span>
+<span class="nc" id="L203">            } finally {</span>
+<span class="nc" id="L204">                dump.delete();</span>
+<span class="nc" id="L205">            }</span>
+<span class="nc" id="L206">        }</span>
+
+        public FilePath obtain() throws IOException, InterruptedException {
+<span class="nc" id="L209">            return RemotingDiagnostics.getHeapDump(channel);</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

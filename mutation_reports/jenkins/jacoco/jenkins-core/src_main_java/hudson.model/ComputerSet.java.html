@@ -1,0 +1,463 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>ComputerSet.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.model</a> &gt; <span class="el_source">ComputerSet.java</span></div><h1>ComputerSet.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">/*</span>
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc., Kohsuke Kawaguchi, Stephen Connolly, Thomas J. Black
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.model;
+
+import hudson.BulkChange;
+import hudson.DescriptorExtensionList;
+import hudson.Extension;
+import hudson.Util;
+import hudson.XmlFile;
+import hudson.init.Initializer;
+import hudson.model.Descriptor.FormException;
+import hudson.model.listeners.SaveableListener;
+import hudson.node_monitors.NodeMonitor;
+import hudson.slaves.NodeDescriptor;
+import hudson.triggers.SafeTimerTask;
+import hudson.util.DescribableList;
+import hudson.util.FormApply;
+import hudson.util.FormValidation;
+import jenkins.model.Jenkins;
+import jenkins.model.ModelObjectWithChildren;
+import jenkins.model.ModelObjectWithContextMenu.ContextMenu;
+import jenkins.util.Timer;
+import org.kohsuke.stapler.HttpResponse;
+import org.kohsuke.stapler.QueryParameter;
+import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.StaplerResponse;
+import org.kohsuke.stapler.export.Exported;
+import org.kohsuke.stapler.export.ExportedBean;
+import org.kohsuke.stapler.interceptor.RequirePOST;
+
+import javax.servlet.ServletException;
+import java.io.File;
+import java.io.IOException;
+import java.util.AbstractList;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import net.sf.json.JSONObject;
+
+import static hudson.init.InitMilestone.JOB_LOADED;
+
+/**
+ * Serves as the top of {@link Computer}s in the URL hierarchy.
+ * &lt;p&gt;
+ * Getter methods are prefixed with '_' to avoid collision with computer names.
+ *
+ * @author Kohsuke Kawaguchi
+ */
+@ExportedBean
+<span class="nc" id="L75">public final class ComputerSet extends AbstractModelObject implements Describable&lt;ComputerSet&gt;, ModelObjectWithChildren {</span>
+    /**
+     * This is the owner that persists {@link #monitors}.
+     */
+<span class="nc" id="L79">    private static final Saveable MONITORS_OWNER = new Saveable() {</span>
+        public void save() throws IOException {
+<span class="nc" id="L81">            getConfigFile().write(monitors);</span>
+<span class="nc" id="L82">            SaveableListener.fireOnChange(this, getConfigFile());</span>
+<span class="nc" id="L83">        }</span>
+    };
+
+<span class="nc" id="L86">    private static final DescribableList&lt;NodeMonitor,Descriptor&lt;NodeMonitor&gt;&gt; monitors</span>
+<span class="nc" id="L87">            = new DescribableList&lt;NodeMonitor, Descriptor&lt;NodeMonitor&gt;&gt;(MONITORS_OWNER);</span>
+
+    @Exported
+    public String getDisplayName() {
+<span class="nc" id="L91">        return Messages.ComputerSet_DisplayName();</span>
+    }
+
+    /**
+     * @deprecated as of 1.301
+     *      Use {@link #getMonitors()}.
+     */
+    @Deprecated
+    public static List&lt;NodeMonitor&gt; get_monitors() {
+<span class="nc" id="L100">        return monitors.toList();</span>
+    }
+
+    @Exported(name=&quot;computer&quot;,inline=true)
+    public Computer[] get_all() {
+<span class="nc" id="L105">        return Jenkins.getInstance().getComputers();</span>
+    }
+
+    public ContextMenu doChildrenContextMenu(StaplerRequest request, StaplerResponse response) throws Exception {
+<span class="nc" id="L109">        ContextMenu m = new ContextMenu();</span>
+<span class="nc bnc" id="L110" title="All 2 branches missed.">        for (Computer c : get_all()) {</span>
+<span class="nc" id="L111">            m.add(c);</span>
+        }
+<span class="nc" id="L113">        return m;</span>
+    }
+
+    /**
+     * Exposing {@link NodeMonitor#all()} for Jelly binding.
+     */
+    public DescriptorExtensionList&lt;NodeMonitor,Descriptor&lt;NodeMonitor&gt;&gt; getNodeMonitorDescriptors() {
+<span class="nc" id="L120">        return NodeMonitor.all();</span>
+    }
+
+    public static DescribableList&lt;NodeMonitor,Descriptor&lt;NodeMonitor&gt;&gt; getMonitors() {
+<span class="nc" id="L124">        return monitors;</span>
+    }
+
+    /**
+     * Returns a subset pf {@link #getMonitors()} that are {@linkplain NodeMonitor#isIgnored() not ignored}.
+     */
+    public static Map&lt;Descriptor&lt;NodeMonitor&gt;,NodeMonitor&gt; getNonIgnoredMonitors() {
+<span class="nc" id="L131">        Map&lt;Descriptor&lt;NodeMonitor&gt;,NodeMonitor&gt; r = new HashMap&lt;Descriptor&lt;NodeMonitor&gt;, NodeMonitor&gt;();</span>
+<span class="nc bnc" id="L132" title="All 2 branches missed.">        for (NodeMonitor m : monitors) {</span>
+<span class="nc bnc" id="L133" title="All 2 branches missed.">            if(!m.isIgnored())</span>
+<span class="nc" id="L134">                r.put(m.getDescriptor(),m);</span>
+        }
+<span class="nc" id="L136">        return r;</span>
+    }
+
+    /**
+     * Gets all the slave names.
+     */
+    public List&lt;String&gt; get_slaveNames() {
+<span class="nc" id="L143">        return new AbstractList&lt;String&gt;() {</span>
+<span class="nc" id="L144">            final List&lt;Node&gt; nodes = Jenkins.getInstance().getNodes();</span>
+
+            public String get(int index) {
+<span class="nc" id="L147">                return nodes.get(index).getNodeName();</span>
+            }
+
+            public int size() {
+<span class="nc" id="L151">                return nodes.size();</span>
+            }
+        };
+    }
+
+    /**
+     * Number of total {@link Executor}s that belong to this label that are functioning.
+     * &lt;p&gt;
+     * This excludes executors that belong to offline nodes.
+     */
+    @Exported
+    public int getTotalExecutors() {
+<span class="nc" id="L163">        int r=0;</span>
+<span class="nc bnc" id="L164" title="All 2 branches missed.">        for (Computer c : get_all()) {</span>
+<span class="nc bnc" id="L165" title="All 2 branches missed.">            if(c.isOnline())</span>
+<span class="nc" id="L166">                r += c.countExecutors();</span>
+        }
+<span class="nc" id="L168">        return r;</span>
+    }
+
+    /**
+     * Number of busy {@link Executor}s that are carrying out some work right now.
+     */
+    @Exported
+    public int getBusyExecutors() {
+<span class="nc" id="L176">        int r=0;</span>
+<span class="nc bnc" id="L177" title="All 2 branches missed.">        for (Computer c : get_all()) {</span>
+<span class="nc bnc" id="L178" title="All 2 branches missed.">            if(c.isOnline())</span>
+<span class="nc" id="L179">                r += c.countBusy();</span>
+        }
+<span class="nc" id="L181">        return r;</span>
+    }
+
+    /**
+     * {@code getTotalExecutors()-getBusyExecutors()}, plus executors that are being brought online.
+     */
+    public int getIdleExecutors() {
+<span class="nc" id="L188">        int r=0;</span>
+<span class="nc bnc" id="L189" title="All 2 branches missed.">        for (Computer c : get_all())</span>
+<span class="nc bnc" id="L190" title="All 6 branches missed.">            if((c.isOnline() || c.isConnecting()) &amp;&amp; c.isAcceptingTasks())</span>
+<span class="nc" id="L191">                r += c.countIdle();</span>
+<span class="nc" id="L192">        return r;</span>
+    }
+
+    public String getSearchUrl() {
+<span class="nc" id="L196">        return &quot;/computers/&quot;;</span>
+    }
+
+    public Computer getDynamic(String token, StaplerRequest req, StaplerResponse rsp) {
+<span class="nc" id="L200">        return Jenkins.getInstance().getComputer(token);</span>
+    }
+
+    public void do_launchAll(StaplerRequest req, StaplerResponse rsp) throws IOException {
+<span class="nc" id="L204">        Jenkins.getInstance().checkPermission(Jenkins.ADMINISTER);</span>
+
+<span class="nc bnc" id="L206" title="All 2 branches missed.">        for(Computer c : get_all()) {</span>
+<span class="nc bnc" id="L207" title="All 2 branches missed.">            if(c.isLaunchSupported())</span>
+<span class="nc" id="L208">                c.connect(true);</span>
+        }
+<span class="nc" id="L210">        rsp.sendRedirect(&quot;.&quot;);</span>
+<span class="nc" id="L211">    }</span>
+
+    /**
+     * Triggers the schedule update now.
+     *
+     * TODO: ajax on the client side to wait until the update completion might be nice.
+     */
+    public void doUpdateNow( StaplerRequest req, StaplerResponse rsp ) throws IOException, ServletException {
+<span class="nc" id="L219">        Jenkins.getInstance().checkPermission(Jenkins.ADMINISTER);</span>
+        
+<span class="nc bnc" id="L221" title="All 2 branches missed.">        for (NodeMonitor nodeMonitor : NodeMonitor.getAll()) {</span>
+<span class="nc" id="L222">            Thread t = nodeMonitor.triggerUpdate();</span>
+<span class="nc" id="L223">            String columnCaption = nodeMonitor.getColumnCaption();</span>
+<span class="nc bnc" id="L224" title="All 2 branches missed.">            if (columnCaption != null) {</span>
+<span class="nc" id="L225">                t.setName(columnCaption);</span>
+            }
+        }
+<span class="nc" id="L228">        rsp.forwardToPreviousPage(req);</span>
+<span class="nc" id="L229">    }</span>
+
+    /**
+     * First check point in creating a new slave.
+     */
+    public synchronized void doCreateItem( StaplerRequest req, StaplerResponse rsp,
+                                           @QueryParameter String name, @QueryParameter String mode,
+                                           @QueryParameter String from ) throws IOException, ServletException {
+<span class="nc" id="L237">        final Jenkins app = Jenkins.getInstance();</span>
+<span class="nc" id="L238">        app.checkPermission(Computer.CREATE);</span>
+
+<span class="nc bnc" id="L240" title="All 4 branches missed.">        if(mode!=null &amp;&amp; mode.equals(&quot;copy&quot;)) {</span>
+<span class="nc" id="L241">            name = checkName(name);</span>
+
+<span class="nc" id="L243">            Node src = app.getNode(from);</span>
+<span class="nc bnc" id="L244" title="All 2 branches missed.">            if(src==null) {</span>
+<span class="nc bnc" id="L245" title="All 2 branches missed.">                if (Util.fixEmpty(from) == null) {</span>
+<span class="nc" id="L246">                    throw new Failure(Messages.ComputerSet_SpecifySlaveToCopy());</span>
+                } else {
+<span class="nc" id="L248">                    throw new Failure(Messages.ComputerSet_NoSuchSlave(from));</span>
+                }
+            }
+
+            // copy through XStream
+<span class="nc" id="L253">            String xml = Jenkins.XSTREAM.toXML(src);</span>
+<span class="nc" id="L254">            Node result = (Node) Jenkins.XSTREAM.fromXML(xml);</span>
+<span class="nc" id="L255">            result.setNodeName(name);</span>
+<span class="nc bnc" id="L256" title="All 2 branches missed.">            if(result instanceof Slave){ //change userId too</span>
+<span class="nc" id="L257">                User user = User.current();</span>
+<span class="nc bnc" id="L258" title="All 2 branches missed.">                ((Slave)result).setUserId(user==null ? &quot;anonymous&quot; : user.getId());</span>
+             }
+<span class="nc" id="L260">            result.holdOffLaunchUntilSave = true;</span>
+
+<span class="nc" id="L262">            app.addNode(result);</span>
+
+            // send the browser to the config page
+<span class="nc" id="L265">            rsp.sendRedirect2(result.getNodeName()+&quot;/configure&quot;);</span>
+<span class="nc" id="L266">        } else {</span>
+            // proceed to step 2
+<span class="nc bnc" id="L268" title="All 2 branches missed.">            if (mode == null) {</span>
+<span class="nc" id="L269">                throw new Failure(&quot;No mode given&quot;);</span>
+            }
+
+<span class="nc" id="L272">            NodeDescriptor d = NodeDescriptor.all().findByName(mode);</span>
+<span class="nc bnc" id="L273" title="All 2 branches missed.">            if (d == null) {</span>
+<span class="nc" id="L274">                throw new Failure(&quot;No node type ‘&quot; + mode + &quot;’ is known&quot;);</span>
+            }
+<span class="nc" id="L276">            d.handleNewNodePage(this,name,req,rsp);</span>
+        }
+<span class="nc" id="L278">    }</span>
+
+    /**
+     * Really creates a new slave.
+     */
+    public synchronized void doDoCreateItem( StaplerRequest req, StaplerResponse rsp,
+                                           @QueryParameter String name,
+                                           @QueryParameter String type ) throws IOException, ServletException, FormException {
+<span class="nc" id="L286">        final Jenkins app = Jenkins.getInstance();</span>
+<span class="nc" id="L287">        app.checkPermission(Computer.CREATE);</span>
+<span class="nc" id="L288">        String fixedName = Util.fixEmptyAndTrim(name);</span>
+<span class="nc" id="L289">        checkName(fixedName);</span>
+
+<span class="nc" id="L291">        JSONObject formData = req.getSubmittedForm();</span>
+<span class="nc" id="L292">        formData.put(&quot;name&quot;, fixedName);</span>
+        
+        // TODO type is probably NodeDescriptor.id but confirm
+<span class="nc" id="L295">        Node result = NodeDescriptor.all().find(type).newInstance(req, formData);</span>
+<span class="nc" id="L296">        app.addNode(result);</span>
+
+        // take the user back to the slave list top page
+<span class="nc" id="L299">        rsp.sendRedirect2(&quot;.&quot;);</span>
+<span class="nc" id="L300">    }</span>
+
+    /**
+     * Makes sure that the given name is good as a slave name.
+     * @return trimmed name if valid; throws ParseException if not
+     */
+    public String checkName(String name) throws Failure {
+<span class="nc bnc" id="L307" title="All 2 branches missed.">        if(name==null)</span>
+<span class="nc" id="L308">            throw new Failure(&quot;Query parameter 'name' is required&quot;);</span>
+
+<span class="nc" id="L310">        name = name.trim();</span>
+<span class="nc" id="L311">        Jenkins.checkGoodName(name);</span>
+
+<span class="nc bnc" id="L313" title="All 2 branches missed.">        if(Jenkins.getInstance().getNode(name)!=null)</span>
+<span class="nc" id="L314">            throw new Failure(Messages.ComputerSet_SlaveAlreadyExists(name));</span>
+
+        // looks good
+<span class="nc" id="L317">        return name;</span>
+    }
+
+    /**
+     * Makes sure that the given name is good as a slave name.
+     */
+    public FormValidation doCheckName(@QueryParameter String value) throws IOException, ServletException {
+<span class="nc" id="L324">        Jenkins.getInstance().checkPermission(Computer.CREATE);</span>
+
+<span class="nc bnc" id="L326" title="All 2 branches missed.">        if(Util.fixEmpty(value)==null)</span>
+<span class="nc" id="L327">            return FormValidation.ok();</span>
+        
+        try {
+<span class="nc" id="L330">            checkName(value);</span>
+<span class="nc" id="L331">            return FormValidation.ok();</span>
+<span class="nc" id="L332">        } catch (Failure e) {</span>
+<span class="nc" id="L333">            return FormValidation.error(e.getMessage());</span>
+        }
+    }
+    
+    /**
+     * Accepts submission from the configuration page.
+     */
+    @RequirePOST
+    public synchronized HttpResponse doConfigSubmit( StaplerRequest req) throws IOException, ServletException, FormException {
+<span class="nc" id="L342">        BulkChange bc = new BulkChange(MONITORS_OWNER);</span>
+        try {
+<span class="nc" id="L344">            Jenkins.getInstance().checkPermission(Jenkins.ADMINISTER);</span>
+<span class="nc" id="L345">            monitors.rebuild(req,req.getSubmittedForm(),getNodeMonitorDescriptors());</span>
+
+            // add in the rest of instances are ignored instances
+<span class="nc bnc" id="L348" title="All 2 branches missed.">            for (Descriptor&lt;NodeMonitor&gt; d : NodeMonitor.all())</span>
+<span class="nc bnc" id="L349" title="All 2 branches missed.">                if(monitors.get(d)==null) {</span>
+<span class="nc" id="L350">                    NodeMonitor i = createDefaultInstance(d, true);</span>
+<span class="nc bnc" id="L351" title="All 2 branches missed.">                    if(i!=null)</span>
+<span class="nc" id="L352">                        monitors.add(i);</span>
+                }
+
+            // recompute the data
+<span class="nc bnc" id="L356" title="All 2 branches missed.">            for (NodeMonitor nm : monitors) {</span>
+<span class="nc" id="L357">                nm.triggerUpdate();</span>
+            }
+
+<span class="nc" id="L360">            return FormApply.success(&quot;.&quot;);</span>
+<span class="nc" id="L361">        } finally {</span>
+<span class="nc" id="L362">            bc.commit();</span>
+<span class="nc" id="L363">        }</span>
+    }
+
+    /**
+     * {@link NodeMonitor}s are persisted in this file.
+     */
+    private static XmlFile getConfigFile() {
+<span class="nc" id="L370">        return new XmlFile(new File(Jenkins.getInstance().getRootDir(),&quot;nodeMonitors.xml&quot;));</span>
+    }
+
+    public Api getApi() {
+<span class="nc" id="L374">        return new Api(this);</span>
+    }
+
+    public Descriptor&lt;ComputerSet&gt; getDescriptor() {
+<span class="nc" id="L378">        return Jenkins.getInstance().getDescriptorOrDie(ComputerSet.class);</span>
+    }
+
+    @Extension
+<span class="nc" id="L382">    public static class DescriptorImpl extends Descriptor&lt;ComputerSet&gt; {</span>
+        /**
+         * Auto-completion for the &quot;copy from&quot; field in the new job page.
+         */
+        public AutoCompletionCandidates doAutoCompleteCopyNewItemFrom(@QueryParameter final String value) {
+<span class="nc" id="L387">            final AutoCompletionCandidates r = new AutoCompletionCandidates();</span>
+
+<span class="nc bnc" id="L389" title="All 2 branches missed.">            for (Node n : Jenkins.getInstance().getNodes()) {</span>
+<span class="nc bnc" id="L390" title="All 2 branches missed.">                if (n.getNodeName().startsWith(value))</span>
+<span class="nc" id="L391">                    r.add(n.getNodeName());</span>
+            }
+
+<span class="nc" id="L394">            return r;</span>
+        }
+    }
+
+    /**
+     * Just to force the execution of the static initializer.
+     */
+<span class="nc" id="L401">    public static void initialize() {}</span>
+
+    @Initializer(after= JOB_LOADED)
+    public static void init() {
+        // start monitoring nodes, although there's no hurry.
+<span class="nc" id="L406">        Timer.get().schedule(new SafeTimerTask() {</span>
+            public void doRun() {
+<span class="nc" id="L408">                ComputerSet.initialize();</span>
+<span class="nc" id="L409">            }</span>
+<span class="nc" id="L410">        }, 10, TimeUnit.SECONDS);</span>
+<span class="nc" id="L411">    }</span>
+
+<span class="nc" id="L413">    private static final Logger LOGGER = Logger.getLogger(ComputerSet.class.getName());</span>
+
+    static {
+        try {
+<span class="nc" id="L417">            DescribableList&lt;NodeMonitor,Descriptor&lt;NodeMonitor&gt;&gt; r</span>
+<span class="nc" id="L418">                    = new DescribableList&lt;NodeMonitor, Descriptor&lt;NodeMonitor&gt;&gt;(Saveable.NOOP);</span>
+
+            // load persisted monitors
+<span class="nc" id="L421">            XmlFile xf = getConfigFile();</span>
+<span class="nc bnc" id="L422" title="All 2 branches missed.">            if(xf.exists()) {</span>
+<span class="nc" id="L423">                DescribableList&lt;NodeMonitor,Descriptor&lt;NodeMonitor&gt;&gt; persisted =</span>
+<span class="nc" id="L424">                        (DescribableList&lt;NodeMonitor,Descriptor&lt;NodeMonitor&gt;&gt;) xf.read();</span>
+<span class="nc" id="L425">                List&lt;NodeMonitor&gt; sanitized = new ArrayList&lt;NodeMonitor&gt;();</span>
+<span class="nc bnc" id="L426" title="All 2 branches missed.">                for (NodeMonitor nm : persisted) {</span>
+                    try {
+<span class="nc" id="L428">                        nm.getDescriptor();</span>
+<span class="nc" id="L429">                        sanitized.add(nm);</span>
+<span class="nc" id="L430">                    } catch (Throwable e) {</span>
+                        // the descriptor didn't load? see JENKINS-15869
+                    }
+                }
+<span class="nc" id="L434">                r.replaceBy(sanitized);</span>
+            }
+
+            // if we have any new monitors, let's add them
+<span class="nc bnc" id="L438" title="All 2 branches missed.">            for (Descriptor&lt;NodeMonitor&gt; d : NodeMonitor.all())</span>
+<span class="nc bnc" id="L439" title="All 2 branches missed.">                if(r.get(d)==null) {</span>
+<span class="nc" id="L440">                    NodeMonitor i = createDefaultInstance(d,false);</span>
+<span class="nc bnc" id="L441" title="All 2 branches missed.">                    if(i!=null)</span>
+<span class="nc" id="L442">                        r.add(i);</span>
+                }
+<span class="nc" id="L444">            monitors.replaceBy(r.toList());</span>
+<span class="nc" id="L445">        } catch (Throwable x) {</span>
+<span class="nc" id="L446">            LOGGER.log(Level.WARNING, &quot;Failed to instantiate NodeMonitors&quot;, x);</span>
+        }
+<span class="nc" id="L448">    }</span>
+
+    private static NodeMonitor createDefaultInstance(Descriptor&lt;NodeMonitor&gt; d, boolean ignored) {
+        try {
+<span class="nc" id="L452">            NodeMonitor nm = d.clazz.newInstance();</span>
+<span class="nc" id="L453">            nm.setIgnored(ignored);</span>
+<span class="nc" id="L454">            return nm;</span>
+<span class="nc" id="L455">        } catch (InstantiationException e) {</span>
+<span class="nc" id="L456">            LOGGER.log(Level.SEVERE, &quot;Failed to instanciate &quot;+d.clazz,e);</span>
+<span class="nc" id="L457">        } catch (IllegalAccessException e) {</span>
+<span class="nc" id="L458">            LOGGER.log(Level.SEVERE, &quot;Failed to instanciate &quot;+d.clazz,e);</span>
+        }
+<span class="nc" id="L460">        return null;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

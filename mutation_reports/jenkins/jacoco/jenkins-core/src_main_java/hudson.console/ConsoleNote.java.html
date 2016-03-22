@@ -1,0 +1,319 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>ConsoleNote.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.console</a> &gt; <span class="el_source">ConsoleNote.java</span></div><h1>ConsoleNote.java</h1><pre class="source lang-java linenums">/*
+ * The MIT License
+ *
+ * Copyright (c) 2004-2010, Sun Microsystems, Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.console;
+
+import hudson.ExtensionPoint;
+import hudson.Functions;
+import hudson.MarkupText;
+import hudson.model.Describable;
+import jenkins.model.Jenkins;
+import hudson.model.Run;
+import hudson.remoting.ObjectInputStreamEx;
+import hudson.util.IOUtils;
+import hudson.util.UnbufferedBase64InputStream;
+import org.apache.commons.codec.binary.Base64OutputStream;
+import org.apache.commons.io.output.ByteArrayOutputStream;
+import org.apache.tools.ant.BuildListener;
+
+import java.io.ByteArrayInputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
+import java.io.OutputStream;
+import java.io.Serializable;
+import java.io.Writer;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.List;
+import com.jcraft.jzlib.GZIPInputStream;
+import com.jcraft.jzlib.GZIPOutputStream;
+
+/**
+ * Data that hangs off from a console output.
+ *
+ * &lt;p&gt;
+ * A {@link ConsoleNote} can be put into a console output while it's being written, and it represents
+ * a machine readable information about a particular position of the console output.
+ *
+ * &lt;p&gt;
+ * When Hudson is reading back a console output for display, a {@link ConsoleNote} is used
+ * to trigger {@link ConsoleAnnotator}, which in turn uses the information in the note to
+ * generate markup. In this way, we can overlay richer information on top of the console output.
+ *
+ * &lt;h2&gt;Comparison with {@link ConsoleAnnotatorFactory}&lt;/h2&gt;
+ * &lt;p&gt;
+ * Compared to {@link ConsoleAnnotatorFactory}, the main advantage of {@link ConsoleNote} is that
+ * it can be emitted into the output by the producer of the output (or by a filter), which can
+ * have a much better knowledge about the context of what's being executed.
+ *
+ * &lt;ol&gt;
+ * &lt;li&gt;
+ * For example, when your plugin is about to report an error message, you can emit a {@link ConsoleNote}
+ * that indicates an error, instead of printing an error message as plain text. The {@link #annotate(Object, MarkupText, int)}
+ * method will then generate the proper error message, with all the HTML markup that makes error message
+ * more user friendly.
+ *
+ * &lt;li&gt;
+ * Or consider annotating output from Ant. A modified {@link BuildListener} can place a {@link ConsoleNote}
+ * every time a new target execution starts. These notes can be then later used to build the outline
+ * that shows what targets are executed, hyperlinked to their corresponding locations in the build output.
+ * &lt;/ol&gt;
+ *
+ * &lt;p&gt;
+ * Doing these things by {@link ConsoleAnnotatorFactory} would be a lot harder, as they can only rely
+ * on the pattern matching of the output.
+ *
+ * &lt;h2&gt;Persistence&lt;/h2&gt;
+ * &lt;p&gt;
+ * {@link ConsoleNote}s are serialized and gzip compressed into a byte sequence and then embedded into the
+ * console output text file, with a bit of preamble/postamble to allow tools to ignore them. In this way
+ * {@link ConsoleNote} always sticks to a particular point in the console output.
+ *
+ * &lt;p&gt;
+ * This design allows descendant processes of Hudson to emit {@link ConsoleNote}s. For example, Ant forked
+ * by a shell forked by Hudson can put an encoded note in its stdout, and Hudson will correctly understands that.
+ * The preamble and postamble includes a certain ANSI escape sequence designed in such a way to minimize garbage
+ * if this output is observed by a human being directly.
+ *
+ * &lt;p&gt;
+ * Because of this persistence mechanism, {@link ConsoleNote}s need to be serializable, and care should be taken
+ * to reduce footprint of the notes, if you are putting a lot of notes. Serialization format compatibility
+ * is also important, although {@link ConsoleNote}s that failed to deserialize will be simply ignored, so the
+ * worst thing that can happen is that you just lose some notes.
+ *
+ * &lt;h2&gt;Behaviour, JavaScript, and CSS&lt;/h2&gt;
+ * &lt;p&gt;
+ * {@link ConsoleNote} can have associated &lt;tt&gt;script.js&lt;/tt&gt; and &lt;tt&gt;style.css&lt;/tt&gt; (put them
+ * in the same resource directory that you normally put Jelly scripts), which will be loaded into
+ * the HTML page whenever the console notes are used. This allows you to use minimal markup in
+ * code generation, and do the styling in CSS and perform the rest of the interesting work as a CSS behaviour/JavaScript.
+ *
+ * @param &lt;T&gt;
+ *      Contextual model object that this console is associated with, such as {@link Run}.
+ *
+ * @author Kohsuke Kawaguchi
+ * @see ConsoleAnnotationDescriptor
+ * @see Functions#generateConsoleAnnotationScriptAndStylesheet()
+ * @since 1.349
+ */
+<span class="fc" id="L123">public abstract class ConsoleNote&lt;T&gt; implements Serializable, Describable&lt;ConsoleNote&lt;?&gt;&gt;, ExtensionPoint {</span>
+    /**
+     * When the line of a console output that this annotation is attached is read by someone,
+     * a new {@link ConsoleNote} is de-serialized and this method is invoked to annotate that line.
+     *
+     * @param context
+     *      The object that owns the console output in question.
+     * @param text
+     *      Represents a line of the console output being annotated.
+     * @param charPos
+     *      The character position in 'text' where this annotation is attached.
+     *
+     * @return
+     *      if non-null value is returned, this annotator will handle the next line.
+     *      this mechanism can be used to annotate multiple lines starting at the annotated position. 
+     */
+    public abstract ConsoleAnnotator annotate(T context, MarkupText text, int charPos);
+
+    public ConsoleAnnotationDescriptor getDescriptor() {
+<span class="nc" id="L142">        return (ConsoleAnnotationDescriptor) Jenkins.getInstance().getDescriptorOrDie(getClass());</span>
+    }
+
+    /**
+     * Prints this note into a stream.
+     *
+     * &lt;p&gt;
+     * The most typical use of this is {@code n.encodedTo(System.out)} where stdout is connected to Hudson.
+     * The encoded form doesn't include any new line character to work better in the line-oriented nature
+     * of {@link ConsoleAnnotator}.
+     */
+    public void encodeTo(OutputStream out) throws IOException {
+        // atomically write to the final output, to minimize the chance of something else getting in between the output.
+        // even with this, it is still technically possible to get such a mix-up to occur (for example,
+        // if Java program is reading stdout/stderr separately and copying them into the same final stream.)
+<span class="fc" id="L157">        out.write(encodeToBytes().toByteArray());</span>
+<span class="fc" id="L158">    }</span>
+
+    /**
+     * Prints this note into a writer.
+     *
+     * &lt;p&gt;
+     * Technically, this method only works if the {@link Writer} to {@link OutputStream}
+     * encoding is ASCII compatible.
+     */
+    public void encodeTo(Writer out) throws IOException {
+<span class="nc" id="L168">        out.write(encodeToBytes().toString());</span>
+<span class="nc" id="L169">    }</span>
+
+    private ByteArrayOutputStream encodeToBytes() throws IOException {
+<span class="fc" id="L172">        ByteArrayOutputStream buf = new ByteArrayOutputStream();</span>
+<span class="fc" id="L173">        ObjectOutputStream oos = new ObjectOutputStream(new GZIPOutputStream(buf));</span>
+        try {
+<span class="fc" id="L175">            oos.writeObject(this);</span>
+<span class="pc" id="L176">        } finally {</span>
+<span class="pc" id="L177">            oos.close();</span>
+<span class="nc" id="L178">        }</span>
+
+<span class="fc" id="L180">        ByteArrayOutputStream buf2 = new ByteArrayOutputStream();</span>
+
+<span class="fc" id="L182">        DataOutputStream dos = new DataOutputStream(new Base64OutputStream(buf2,true,-1,null));</span>
+        try {
+<span class="fc" id="L184">            buf2.write(PREAMBLE);</span>
+<span class="fc" id="L185">            dos.writeInt(buf.size());</span>
+<span class="fc" id="L186">            buf.writeTo(dos);</span>
+<span class="pc" id="L187">        } finally {</span>
+<span class="pc" id="L188">            dos.close();</span>
+<span class="nc" id="L189">        }</span>
+<span class="fc" id="L190">        buf2.write(POSTAMBLE);</span>
+<span class="fc" id="L191">        return buf2;</span>
+    }
+
+    /**
+     * Works like {@link #encodeTo(Writer)} but obtain the result as a string.
+     */
+    public String encode() throws IOException {
+<span class="nc" id="L198">        return encodeToBytes().toString();</span>
+    }
+
+    /**
+     * Reads a note back from {@linkplain #encodeTo(OutputStream) its encoded form}.
+     *
+     * @param in
+     *      Must point to the beginning of a preamble.
+     *
+     * @return null if the encoded form is malformed.
+     */
+    public static ConsoleNote readFrom(DataInputStream in) throws IOException, ClassNotFoundException {
+        try {
+<span class="nc" id="L211">            byte[] preamble = new byte[PREAMBLE.length];</span>
+<span class="nc" id="L212">            in.readFully(preamble);</span>
+<span class="nc bnc" id="L213" title="All 2 branches missed.">            if (!Arrays.equals(preamble,PREAMBLE))</span>
+<span class="nc" id="L214">                return null;    // not a valid preamble</span>
+
+<span class="nc" id="L216">            DataInputStream decoded = new DataInputStream(new UnbufferedBase64InputStream(in));</span>
+<span class="nc" id="L217">            int sz = decoded.readInt();</span>
+<span class="nc" id="L218">            byte[] buf = new byte[sz];</span>
+<span class="nc" id="L219">            decoded.readFully(buf);</span>
+
+<span class="nc" id="L221">            byte[] postamble = new byte[POSTAMBLE.length];</span>
+<span class="nc" id="L222">            in.readFully(postamble);</span>
+<span class="nc bnc" id="L223" title="All 2 branches missed.">            if (!Arrays.equals(postamble,POSTAMBLE))</span>
+<span class="nc" id="L224">                return null;    // not a valid postamble</span>
+
+<span class="nc" id="L226">            ObjectInputStream ois = new ObjectInputStreamEx(</span>
+<span class="nc" id="L227">                    new GZIPInputStream(new ByteArrayInputStream(buf)), Jenkins.getInstance().pluginManager.uberClassLoader);</span>
+            try {
+<span class="nc" id="L229">                return (ConsoleNote) ois.readObject();</span>
+<span class="nc" id="L230">            } finally {</span>
+<span class="nc" id="L231">                ois.close();</span>
+<span class="nc" id="L232">            }</span>
+<span class="nc" id="L233">        } catch (Error e) {</span>
+            // for example, bogus 'sz' can result in OutOfMemoryError.
+            // package that up as IOException so that the caller won't fatally die.
+<span class="nc" id="L236">            throw new IOException(e);</span>
+        }
+    }
+
+    /**
+     * Skips the encoded console note.
+     */
+    public static void skip(DataInputStream in) throws IOException {
+<span class="fc" id="L244">        byte[] preamble = new byte[PREAMBLE.length];</span>
+<span class="fc" id="L245">        in.readFully(preamble);</span>
+<span class="pc bpc" id="L246" title="1 of 2 branches missed.">        if (!Arrays.equals(preamble,PREAMBLE))</span>
+<span class="nc" id="L247">            return;    // not a valid preamble</span>
+
+<span class="fc" id="L249">        DataInputStream decoded = new DataInputStream(new UnbufferedBase64InputStream(in));</span>
+<span class="fc" id="L250">        int sz = decoded.readInt();</span>
+<span class="fc" id="L251">        IOUtils.skip(decoded,sz);</span>
+
+<span class="fc" id="L253">        byte[] postamble = new byte[POSTAMBLE.length];</span>
+<span class="fc" id="L254">        in.readFully(postamble);</span>
+<span class="fc" id="L255">    }</span>
+
+    private static final long serialVersionUID = 1L;
+
+    public static final String PREAMBLE_STR = &quot;\u001B[8mha:&quot;;
+    public static final String POSTAMBLE_STR = &quot;\u001B[0m&quot;;
+
+    /**
+     * Preamble of the encoded form. ANSI escape sequence to stop echo back
+     * plus a few magic characters.
+     */
+<span class="fc" id="L266">    public static final byte[] PREAMBLE = PREAMBLE_STR.getBytes();</span>
+    /**
+     * Post amble is the ANSI escape sequence that brings back the echo.
+     */
+<span class="fc" id="L270">    public static final byte[] POSTAMBLE = POSTAMBLE_STR.getBytes();</span>
+
+    /**
+     * Locates the preamble in the given buffer.
+     */
+    public static int findPreamble(byte[] buf, int start, int len) {
+<span class="fc" id="L276">        int e = start + len - PREAMBLE.length + 1;</span>
+
+        OUTER:
+<span class="fc bfc" id="L279" title="All 2 branches covered.">        for (int i=start; i&lt;e; i++) {</span>
+<span class="fc bfc" id="L280" title="All 2 branches covered.">            if (buf[i]==PREAMBLE[0]) {</span>
+                // check for the rest of the match
+<span class="fc bfc" id="L282" title="All 2 branches covered.">                for (int j=1; j&lt;PREAMBLE.length; j++) {</span>
+<span class="pc bpc" id="L283" title="1 of 2 branches missed.">                    if (buf[i+j]!=PREAMBLE[j])</span>
+<span class="nc" id="L284">                        continue OUTER;</span>
+                }
+<span class="fc" id="L286">                return i; // found it</span>
+            }
+        }
+<span class="fc" id="L289">        return -1; // not found</span>
+    }
+
+    /**
+     * Removes the embedded console notes in the given log lines.
+     *
+     * @since 1.350
+     */
+    public static List&lt;String&gt; removeNotes(Collection&lt;String&gt; logLines) {
+<span class="nc" id="L298">        List&lt;String&gt; r = new ArrayList&lt;String&gt;(logLines.size());</span>
+<span class="nc bnc" id="L299" title="All 2 branches missed.">        for (String l : logLines)</span>
+<span class="nc" id="L300">            r.add(removeNotes(l));</span>
+<span class="nc" id="L301">        return r;</span>
+    }
+
+    /**
+     * Removes the embedded console notes in the given log line.
+     *
+     * @since 1.350
+     */
+    public static String removeNotes(String line) {
+<span class="nc" id="L310">        while (true) {</span>
+<span class="nc" id="L311">            int idx = line.indexOf(PREAMBLE_STR);</span>
+<span class="nc bnc" id="L312" title="All 2 branches missed.">            if (idx&lt;0)  return line;</span>
+<span class="nc" id="L313">            int e = line.indexOf(POSTAMBLE_STR,idx);</span>
+<span class="nc bnc" id="L314" title="All 2 branches missed.">            if (e&lt;0)    return line;</span>
+<span class="nc" id="L315">            line = line.substring(0,idx)+line.substring(e+POSTAMBLE_STR.length());</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

@@ -1,0 +1,1253 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>Launcher.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson</a> &gt; <span class="el_source">Launcher.java</span></div><h1>Launcher.java</h1><pre class="source lang-java linenums"><span class="pc" id="L1">/*</span>
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc., Kohsuke Kawaguchi, Stephen Connolly, CloudBees, Inc.
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson;
+
+import hudson.Proc.LocalProc;
+import hudson.model.Computer;
+import hudson.util.QuotedStringTokenizer;
+import jenkins.model.Jenkins;
+import hudson.model.TaskListener;
+import hudson.model.Node;
+import hudson.remoting.Channel;
+import hudson.remoting.Pipe;
+import hudson.remoting.RemoteInputStream;
+import hudson.remoting.RemoteOutputStream;
+import hudson.remoting.VirtualChannel;
+import hudson.util.StreamCopyThread;
+import hudson.util.ArgumentListBuilder;
+import hudson.util.ProcessTree;
+import jenkins.security.MasterToSlaveCallable;
+import org.apache.commons.io.input.NullInputStream;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
+
+import java.io.BufferedOutputStream;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InterruptedIOException;
+import java.io.OutputStream;
+import java.io.Serializable;
+import java.util.Arrays;
+import java.util.Map;
+import java.util.List;
+import java.util.ArrayList;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+import static org.apache.commons.io.output.NullOutputStream.NULL_OUTPUT_STREAM;
+
+/**
+ * Starts a process.
+ *
+ * &lt;p&gt;
+ * This hides the difference between running programs locally vs remotely.
+ *
+ *
+ * &lt;h2&gt;'env' parameter&lt;/h2&gt;
+ * &lt;p&gt;
+ * To allow important environment variables to be copied over to the remote machine,
+ * the 'env' parameter shouldn't contain default inherited environment variables
+ * (which often contains machine-specific information, like PATH, TIMEZONE, etc.)
+ *
+ * &lt;p&gt;
+ * {@link Launcher} is responsible for inheriting environment variables.
+ *
+ *
+ * @author Kohsuke Kawaguchi
+ * @see FilePath#createLauncher(TaskListener) 
+ */
+<span class="pc bpc" id="L81" title="1 of 2 branches missed.">public abstract class Launcher {</span>
+
+    protected final TaskListener listener;
+
+    protected final VirtualChannel channel;
+
+<span class="fc" id="L87">    public Launcher(TaskListener listener, VirtualChannel channel) {</span>
+<span class="fc" id="L88">        this.listener = listener;</span>
+<span class="fc" id="L89">        this.channel = channel;</span>
+<span class="fc" id="L90">    }</span>
+
+    /**
+     * Constructor for a decorator.
+     */
+    protected Launcher(Launcher launcher) {
+<span class="fc" id="L96">        this(launcher.listener, launcher.channel);</span>
+<span class="fc" id="L97">    }</span>
+
+    /**
+     * Gets the channel that can be used to run a program remotely.
+     *
+     * @return
+     *      null if the target node is not configured to support this.
+     *      this is a transitional measure.
+     *      Note that a launcher for the master is always non-null.
+     */
+    public VirtualChannel getChannel() {
+<span class="nc" id="L108">        return channel;</span>
+    }
+
+    /**
+     * Gets the {@link TaskListener} that this launcher uses to
+     * report the commands that it's executing.
+     */
+    public TaskListener getListener() {
+<span class="nc" id="L116">        return listener;</span>
+    }
+
+    /**
+     * If this {@link Launcher} is encapsulating an execution on a specific {@link Computer},
+     * return it.
+     *
+     * &lt;p&gt;
+     * Because of the way internal Hudson abstractions are set up (that is, {@link Launcher} only
+     * needs a {@link VirtualChannel} to do its job and isn't really required that the channel
+     * comes from an existing {@link Computer}), this method may not always the right {@link Computer} instance.
+     *
+     * @return
+     *      null if this launcher is not created from a {@link Computer} object.
+     * @deprecated since 2008-11-16.
+     *      See the javadoc for why this is inherently unreliable. If you are trying to
+     *      figure out the current {@link Computer} from within a build, use
+     *      {@link Computer#currentComputer()}  
+     */
+    @Deprecated
+    public Computer getComputer() {
+<span class="nc bnc" id="L137" title="All 2 branches missed.">        for( Computer c : Jenkins.getInstance().getComputers() )</span>
+<span class="nc bnc" id="L138" title="All 2 branches missed.">            if(c.getChannel()==channel)</span>
+<span class="nc" id="L139">                return c;</span>
+<span class="nc" id="L140">        return null;</span>
+    }
+
+    /**
+     * Builder pattern for configuring a process to launch.
+     * @since 1.311
+     */
+<span class="fc" id="L147">    public final class ProcStarter {</span>
+        protected List&lt;String&gt; commands;
+        protected boolean[] masks;
+        private boolean quiet;
+        protected FilePath pwd;
+<span class="fc" id="L152">        protected OutputStream stdout = NULL_OUTPUT_STREAM, stderr;</span>
+<span class="fc" id="L153">        protected InputStream stdin = NULL_INPUT_STREAM;</span>
+        protected String[] envs;
+        /**
+         * True to reverse the I/O direction.
+         *
+         * For example, if {@link #reverseStdout}==true, then we expose
+         * {@link InputStream} from {@link Proc} and expect the client to read from it,
+         * whereas normally we take {@link OutputStream} via {@link #stdout(OutputStream)}
+         * and feed stdout into that output.
+         *
+         * @since 1.399
+         */
+        protected boolean reverseStdin, reverseStdout, reverseStderr;
+
+        /**
+         * Passes a white-space separated single-string command (like &quot;cat abc def&quot;) and parse them
+         * as a command argument. This method also handles quotes.
+         */
+        public ProcStarter cmdAsSingleString(String s) {
+<span class="nc" id="L172">            return cmds(QuotedStringTokenizer.tokenize(s));</span>
+        }
+
+        public ProcStarter cmds(String... args) {
+<span class="fc" id="L176">            return cmds(Arrays.asList(args));</span>
+        }
+
+        public ProcStarter cmds(File program, String... args) {
+<span class="nc" id="L180">            commands = new ArrayList&lt;String&gt;(args.length+1);</span>
+<span class="nc" id="L181">            commands.add(program.getPath());</span>
+<span class="nc" id="L182">            commands.addAll(Arrays.asList(args));</span>
+<span class="nc" id="L183">            return this;</span>
+        }
+
+        public ProcStarter cmds(List&lt;String&gt; args) {
+<span class="fc" id="L187">            commands = new ArrayList&lt;String&gt;(args);</span>
+<span class="fc" id="L188">            return this;</span>
+        }
+
+        public ProcStarter cmds(ArgumentListBuilder args) {
+<span class="nc" id="L192">            commands = args.toList();</span>
+<span class="nc" id="L193">            masks = args.toMaskArray();</span>
+<span class="nc" id="L194">            return this;</span>
+        }
+
+        public List&lt;String&gt; cmds() {
+<span class="nc" id="L198">            return commands;</span>
+        }
+
+        /**
+         * Hide parts of the command line from being printed to the log.
+         * @param masks true for each position in {@link #cmds(String[])} which should be masked, false to print
+         * @return this
+         * @see ArgumentListBuilder#add(String, boolean)
+         * @see #maskedPrintCommandLine(List, boolean[], FilePath)
+         */
+        public ProcStarter masks(boolean... masks) {
+<span class="nc" id="L209">            this.masks = masks;</span>
+<span class="nc" id="L210">            return this;</span>
+        }
+
+        public boolean[] masks() {
+<span class="nc" id="L214">            return masks;</span>
+        }
+
+        /**
+         * Allows {@link #maskedPrintCommandLine(List, boolean[], FilePath)} to be suppressed from {@link hudson.Launcher.LocalLauncher#launch(hudson.Launcher.ProcStarter)}.
+         * Useful when the actual command being printed is noisy and unreadable and the caller would rather print diagnostic information in a customized way.
+         * @param quiet to suppress printing the command line when starting the process; false to keep default behavior of printing
+         * @return this
+         * @since 1.576
+         */
+        public ProcStarter quiet(boolean quiet) {
+<span class="nc" id="L225">            this.quiet = quiet;</span>
+<span class="nc" id="L226">            return this;</span>
+        }
+
+        /**
+         * @since 1.576
+         */
+        public boolean quiet() {
+<span class="nc" id="L233">            return quiet;</span>
+        }
+
+        public ProcStarter pwd(FilePath workDir) {
+<span class="nc" id="L237">            this.pwd = workDir;</span>
+<span class="nc" id="L238">            return this;</span>
+        }
+
+        public ProcStarter pwd(File workDir) {
+<span class="nc" id="L242">            return pwd(new FilePath(workDir));</span>
+        }
+
+        public ProcStarter pwd(String workDir) {
+<span class="nc" id="L246">            return pwd(new File(workDir));</span>
+        }
+
+        public FilePath pwd() {
+<span class="nc" id="L250">            return pwd;</span>
+        }
+
+        public ProcStarter stdout(OutputStream out) {
+<span class="fc" id="L254">            this.stdout = out;</span>
+<span class="fc" id="L255">            return this;</span>
+        }
+
+        /**
+         * Sends the stdout to the given {@link TaskListener}.
+         */
+        public ProcStarter stdout(TaskListener out) {
+<span class="fc" id="L262">            return stdout(out.getLogger());</span>
+        }
+
+        public OutputStream stdout() {
+<span class="nc" id="L266">            return stdout;</span>
+        }
+
+        /**
+         * Controls where the stderr of the process goes.
+         * By default, it's bundled into stdout.
+         */
+        public ProcStarter stderr(OutputStream err) {
+<span class="nc" id="L274">            this.stderr =  err;</span>
+<span class="nc" id="L275">            return this;</span>
+        }
+
+        public OutputStream stderr() {
+<span class="nc" id="L279">            return stderr;</span>
+        }
+
+        /**
+         * Controls where the stdin of the process comes from.
+         * By default, &lt;tt&gt;/dev/null&lt;/tt&gt;.
+         */
+        public ProcStarter stdin(InputStream in) {
+<span class="nc" id="L287">            this.stdin = in;</span>
+<span class="nc" id="L288">            return this;</span>
+        }
+
+        public InputStream stdin() {
+<span class="nc" id="L292">            return stdin;</span>
+        }
+
+        /**
+         * Sets the environment variable overrides.
+         *
+         * &lt;p&gt;
+         * In adition to what the current process
+         * is inherited (if this is going to be launched from a slave agent, that
+         * becomes the &quot;current&quot; process), these variables will be also set.
+         */
+        public ProcStarter envs(Map&lt;String, String&gt; overrides) {
+<span class="nc" id="L304">            this.envs = Util.mapToEnv(overrides);</span>
+<span class="nc" id="L305">            return this;</span>
+        }
+
+        /**
+         * @param overrides
+         *      List of &quot;VAR=VALUE&quot;. See {@link #envs(Map)} for the semantics.
+         */
+        public ProcStarter envs(String... overrides) {
+<span class="pc bpc" id="L313" title="1 of 2 branches missed.">            if (overrides != null) {</span>
+<span class="fc bfc" id="L314" title="All 2 branches covered.">                for (String override : overrides) {</span>
+<span class="pc bpc" id="L315" title="1 of 2 branches missed.">                    if (override.indexOf('=') == -1) {</span>
+<span class="nc" id="L316">                        throw new IllegalArgumentException(override);</span>
+                    }
+                }
+            }
+<span class="fc" id="L320">            this.envs = overrides;</span>
+<span class="fc" id="L321">            return this;</span>
+        }
+
+        /**
+         * Gets a list of environment variables to be set.
+         * Returns an empty array if envs field has not been initialized.
+         * @return If initialized, returns a copy of internal envs array. Otherwise - a new empty array.
+         */
+        public String[] envs() {
+<span class="nc bnc" id="L330" title="All 2 branches missed.">            return envs != null ? envs.clone() : new String[0];</span>
+        }
+
+        /**
+         * Indicates that the caller will pump {@code stdout} from the child process
+         * via {@link Proc#getStdout()} (whereas by default you call {@link #stdout(OutputStream)}
+         * and let Jenkins pump stdout into your {@link OutputStream} of choosing.
+         *
+         * &lt;p&gt;
+         * When this method is called, {@link Proc#getStdout()} will read the combined output
+         * of {@code stdout/stderr} from the child process, unless {@link #readStderr()} is called
+         * separately, which lets the caller read those two streams separately.
+         *
+         * @since 1.399
+         */
+        public ProcStarter readStdout() {
+<span class="nc" id="L346">            reverseStdout = true;</span>
+<span class="nc" id="L347">            stdout = stderr = null;</span>
+<span class="nc" id="L348">            return this;</span>
+        }
+
+        /**
+         * In addition to the effect of {@link #readStdout()}, indicate that the caller will pump {@code stderr}
+         * from the child process separately from {@code stdout}. The stderr will be readable from
+         * {@link Proc#getStderr()} while {@link Proc#getStdout()} reads from stdout.
+         *
+         * @since 1.399
+         */
+        public ProcStarter readStderr() {
+<span class="nc" id="L359">            reverseStdout = true;</span>
+<span class="nc" id="L360">            reverseStderr = true;</span>
+<span class="nc" id="L361">            return this;</span>
+        }
+
+        /**
+         * Indicates that the caller will directly write to the child process {@link #stdin()} via {@link Proc#getStdin()}.
+         * (Whereas by default you call {@link #stdin(InputStream)}
+         * and let Jenkins pump your {@link InputStream} of choosing to stdin.)
+         * @since 1.399
+         */
+        public ProcStarter writeStdin() {
+<span class="nc" id="L371">            reverseStdin = true;</span>
+<span class="nc" id="L372">            stdin = null;</span>
+<span class="nc" id="L373">            return this;</span>
+        }
+
+
+        /**
+         * Starts the new process as configured.
+         */
+        public Proc start() throws IOException {
+<span class="fc" id="L381">            return launch(this);</span>
+        }
+
+        /**
+         * Starts the process and waits for its completion.
+         */
+        public int join() throws IOException, InterruptedException {
+<span class="fc" id="L388">            return start().join();</span>
+        }
+
+        /**
+         * Copies a {@link ProcStarter}.
+         */
+        public ProcStarter copy() {
+<span class="nc" id="L395">            ProcStarter rhs = new ProcStarter().cmds(commands).pwd(pwd).masks(masks).stdin(stdin).stdout(stdout).stderr(stderr).envs(envs).quiet(quiet);</span>
+<span class="nc" id="L396">            rhs.reverseStdin  = this.reverseStdin;</span>
+<span class="nc" id="L397">            rhs.reverseStderr = this.reverseStderr;</span>
+<span class="nc" id="L398">            rhs.reverseStdout = this.reverseStdout;</span>
+<span class="nc" id="L399">            return rhs;</span>
+        }
+    }
+
+    /**
+     * Launches a process by using a {@linkplain ProcStarter builder-pattern} to configure
+     * the parameters.
+     */
+    public final ProcStarter launch() {
+<span class="fc" id="L408">        return new ProcStarter();</span>
+    }
+
+    /**
+     * @deprecated as of 1.311
+     *      Use {@link #launch()} and its associated builder pattern
+     */
+    @Deprecated
+    public final Proc launch(String cmd, Map&lt;String,String&gt; env, OutputStream out, FilePath workDir) throws IOException {
+<span class="nc" id="L417">        return launch(cmd,Util.mapToEnv(env),out,workDir);</span>
+    }
+
+    /**
+     * @deprecated as of 1.311
+     *      Use {@link #launch()} and its associated builder pattern
+     */
+    @Deprecated
+    public final Proc launch(String[] cmd, Map&lt;String, String&gt; env, OutputStream out, FilePath workDir) throws IOException {
+<span class="nc" id="L426">        return launch(cmd, Util.mapToEnv(env), out, workDir);</span>
+    }
+
+    /**
+     * @deprecated as of 1.311
+     *      Use {@link #launch()} and its associated builder pattern
+     */
+    @Deprecated
+    public final Proc launch(String[] cmd, Map&lt;String, String&gt; env, InputStream in, OutputStream out) throws IOException {
+<span class="nc" id="L435">        return launch(cmd, Util.mapToEnv(env), in, out);</span>
+    }
+
+    /**
+     * Launch a command with optional censoring of arguments from the listener (Note: &lt;strong&gt;The censored portions will
+     * remain visible through /proc, pargs, process explorer, etc. i.e. people logged in on the same machine&lt;/strong&gt;
+     * This version of the launch command just ensures that it is not visible from a build log which is exposed via the
+     * web)
+     *
+     * @param cmd     The command and all it's arguments.
+     * @param mask    Which of the command and arguments should be masked from the listener
+     * @param env     Environment variable overrides.
+     * @param out     stdout and stderr of the process will be sent to this stream. the stream won't be closed.
+     * @param workDir null if the working directory could be anything.
+     * @return The process of the command.
+     * @throws IOException When there are IO problems.
+     *
+     * @deprecated as of 1.311
+     *      Use {@link #launch()} and its associated builder pattern
+     */
+    @Deprecated
+    public final Proc launch(String[] cmd, boolean[] mask, Map&lt;String, String&gt; env, OutputStream out, FilePath workDir) throws IOException {
+<span class="nc" id="L457">        return launch(cmd, mask, Util.mapToEnv(env), out, workDir);</span>
+    }
+
+    /**
+     * Launch a command with optional censoring of arguments from the listener (Note: &lt;strong&gt;The censored portions will
+     * remain visible through /proc, pargs, process explorer, etc. i.e. people logged in on the same machine&lt;/strong&gt;
+     * This version of the launch command just ensures that it is not visible from a build log which is exposed via the
+     * web)
+     *
+     * @param cmd     The command and all it's arguments.
+     * @param mask    Which of the command and arguments should be masked from the listener
+     * @param env     Environment variable overrides.
+     * @param in      null if there's no input.
+     * @param out     stdout and stderr of the process will be sent to this stream. the stream won't be closed.
+     * @return The process of the command.
+     * @throws IOException When there are IO problems.
+     *
+     * @deprecated as of 1.311
+     *      Use {@link #launch()} and its associated builder pattern
+     */
+    @Deprecated
+    public final Proc launch(String[] cmd, boolean[] mask, Map&lt;String, String&gt; env, InputStream in, OutputStream out) throws IOException {
+<span class="nc" id="L479">        return launch(cmd, mask, Util.mapToEnv(env), in, out);</span>
+    }
+
+    /**
+     * @deprecated as of 1.311
+     *      Use {@link #launch()} and its associated builder pattern
+     */
+    @Deprecated
+    public final Proc launch(String cmd,String[] env,OutputStream out, FilePath workDir) throws IOException {
+<span class="nc" id="L488">        return launch(Util.tokenize(cmd),env,out,workDir);</span>
+    }
+
+    /**
+     * @deprecated as of 1.311
+     *      Use {@link #launch()} and its associated builder pattern
+     */
+    @Deprecated
+    public final Proc launch(String[] cmd, String[] env, OutputStream out, FilePath workDir) throws IOException {
+<span class="nc" id="L497">        return launch(cmd, env, null, out, workDir);</span>
+    }
+
+    /**
+     * @deprecated as of 1.311
+     *      Use {@link #launch()} and its associated builder pattern
+     */
+    @Deprecated
+    public final Proc launch(String[] cmd, String[] env, InputStream in, OutputStream out) throws IOException {
+<span class="nc" id="L506">        return launch(cmd, env, in, out, null);</span>
+    }
+
+    /**
+     * Launch a command with optional censoring of arguments from the listener (Note: &lt;strong&gt;The censored portions will
+     * remain visible through /proc, pargs, process explorer, etc. i.e. people logged in on the same machine&lt;/strong&gt;
+     * This version of the launch command just ensures that it is not visible from a build log which is exposed via the
+     * web)
+     *
+     * @param cmd     The command and all it's arguments.
+     * @param mask    Which of the command and arguments should be masked from the listener
+     * @param env     Environment variable overrides.
+     * @param out     stdout and stderr of the process will be sent to this stream. the stream won't be closed.
+     * @param workDir null if the working directory could be anything.
+     * @return The process of the command.
+     * @throws IOException When there are IO problems.
+     *
+     * @deprecated as of 1.311
+     *      Use {@link #launch()} and its associated builder pattern
+     */
+    @Deprecated
+    public final Proc launch(String[] cmd, boolean[] mask, String[] env, OutputStream out, FilePath workDir) throws IOException {
+<span class="nc" id="L528">        return launch(cmd, mask, env, null, out, workDir);</span>
+    }
+
+    /**
+     * Launch a command with optional censoring of arguments from the listener (Note: &lt;strong&gt;The censored portions will
+     * remain visible through /proc, pargs, process explorer, etc. i.e. people logged in on the same machine&lt;/strong&gt;
+     * This version of the launch command just ensures that it is not visible from a build log which is exposed via the
+     * web)
+     *
+     * @param cmd     The command and all it's arguments.
+     * @param mask    Which of the command and arguments should be masked from the listener
+     * @param env     Environment variable overrides.
+     * @param in      null if there's no input.
+     * @param out     stdout and stderr of the process will be sent to this stream. the stream won't be closed.
+     * @return The process of the command.
+     * @throws IOException When there are IO problems.
+     *
+     * @deprecated as of 1.311
+     *      Use {@link #launch()} and its associated builder pattern
+     */
+    @Deprecated
+    public final Proc launch(String[] cmd, boolean[] mask, String[] env, InputStream in, OutputStream out) throws IOException {
+<span class="nc" id="L550">        return launch(cmd, mask, env, in, out, null);</span>
+    }
+
+    /**
+     * @param env
+     *      Environment variable overrides.
+     * @param in
+     *      null if there's no input.
+     * @param workDir
+     *      null if the working directory could be anything.
+     * @param out
+     *      stdout and stderr of the process will be sent to this stream.
+     *      the stream won't be closed.
+     *
+     * @deprecated as of 1.311
+     *      Use {@link #launch()} and its associated builder pattern
+     */
+    @Deprecated
+    public Proc launch(String[] cmd, String[] env, InputStream in, OutputStream out, FilePath workDir) throws IOException {
+<span class="nc" id="L569">        return launch(launch().cmds(cmd).envs(env).stdin(in).stdout(out).pwd(workDir));</span>
+    }
+
+    /**
+     * Launch a command with optional censoring of arguments from the listener (Note: &lt;strong&gt;The censored portions will
+     * remain visible through /proc, pargs, process explorer, etc. i.e. people logged in on the same machine&lt;/strong&gt;
+     * This version of the launch command just ensures that it is not visible from a build log which is exposed via the
+     * web)
+     *
+     * @param cmd     The command and all it's arguments.
+     * @param mask    Which of the command and arguments should be masked from the listener
+     * @param env     Environment variable overrides.
+     * @param in      null if there's no input.
+     * @param out     stdout and stderr of the process will be sent to this stream. the stream won't be closed.
+     * @param workDir null if the working directory could be anything.
+     * @return The process of the command.
+     * @throws IOException When there are IO problems.
+     *
+     * @deprecated as of 1.311
+     *      Use {@link #launch()} and its associated builder pattern
+     */
+    @Deprecated
+    public Proc launch(String[] cmd, boolean[] mask, String[] env, InputStream in, OutputStream out, FilePath workDir) throws IOException {
+<span class="nc" id="L592">        return launch(launch().cmds(cmd).masks(mask).envs(env).stdin(in).stdout(out).pwd(workDir));</span>
+    }
+
+    /**
+     * Primarily invoked from {@link ProcStarter#start()} to start a process with a specific launcher.
+     */
+    public abstract Proc launch(ProcStarter starter) throws IOException;
+
+    /**
+     * Launches a specified process and connects its input/output to a {@link Channel}, then
+     * return it.
+     *
+     * &lt;p&gt;
+     * When the returned channel is terminated, the process will be killed.
+     *
+     * @param out
+     *      Where the stderr from the launched process will be sent.
+     * @param workDir
+     *      The working directory of the new process, or null to inherit
+     *      from the current process
+     * @param envVars
+     *      Environment variable overrides. In addition to what the current process
+     *      is inherited (if this is going to be launched from a slave agent, that
+     *      becomes the &quot;current&quot; process), these variables will be also set.
+     */
+    public abstract Channel launchChannel(String[] cmd, OutputStream out, FilePath workDir, Map&lt;String,String&gt; envVars) throws IOException, InterruptedException;
+
+    /**
+     * Returns true if this {@link Launcher} is going to launch on Unix.
+     */
+    public boolean isUnix() {
+<span class="nc bnc" id="L623" title="All 2 branches missed.">        return File.pathSeparatorChar==':';</span>
+    }
+
+    /**
+     * Calls {@link ProcessTree#killAll(Map)} to kill processes.
+     */
+    public abstract void kill(Map&lt;String,String&gt; modelEnvVars) throws IOException, InterruptedException;
+
+    /**
+     * Prints out the command line to the listener so that users know what we are doing.
+     */
+    protected final void printCommandLine(String[] cmd, FilePath workDir) {
+<span class="fc" id="L635">        StringBuilder buf = new StringBuilder();</span>
+<span class="pc bpc" id="L636" title="1 of 2 branches missed.">        if (workDir != null) {</span>
+<span class="nc" id="L637">            buf.append('[');</span>
+<span class="nc bnc" id="L638" title="All 2 branches missed.">            if(showFullPath)</span>
+<span class="nc" id="L639">                buf.append(workDir.getRemote());</span>
+            else
+<span class="nc" id="L641">                buf.append(workDir.getRemote().replaceFirst(&quot;^.+[/\\\\]&quot;, &quot;&quot;));</span>
+<span class="nc" id="L642">            buf.append(&quot;] &quot;);</span>
+        }
+<span class="fc" id="L644">        buf.append('$');</span>
+<span class="fc bfc" id="L645" title="All 2 branches covered.">        for (String c : cmd) {</span>
+<span class="fc" id="L646">            buf.append(' ');</span>
+<span class="fc bfc" id="L647" title="All 2 branches covered.">            if(c.indexOf(' ')&gt;=0) {</span>
+<span class="pc bpc" id="L648" title="1 of 2 branches missed.">                if(c.indexOf('&quot;')&gt;=0)</span>
+<span class="nc" id="L649">                    buf.append('\'').append(c).append('\'');</span>
+                else
+<span class="fc" id="L651">                    buf.append('&quot;').append(c).append('&quot;');</span>
+<span class="fc" id="L652">            } else</span>
+<span class="fc" id="L653">                buf.append(c);</span>
+        }
+<span class="fc" id="L655">        listener.getLogger().println(buf.toString());</span>
+<span class="fc" id="L656">    }</span>
+
+    /**
+     * Prints out the command line to the listener with some portions masked to prevent sensitive information from being
+     * recorded on the listener.
+     *
+     * @param cmd     The commands
+     * @param mask    An array of booleans which control whether a cmd element should be masked (&lt;code&gt;true&lt;/code&gt;) or
+     *                remain unmasked (&lt;code&gt;false&lt;/code&gt;).
+     * @param workDir The work dir.
+     */
+    protected final void maskedPrintCommandLine(List&lt;String&gt; cmd, boolean[] mask, FilePath workDir) {
+<span class="pc bpc" id="L668" title="1 of 2 branches missed.">        if(mask==null) {</span>
+<span class="fc" id="L669">            printCommandLine(cmd.toArray(new String[cmd.size()]),workDir);</span>
+<span class="fc" id="L670">            return;</span>
+        }
+        
+<span class="nc bnc" id="L673" title="All 4 branches missed.">        assert mask.length == cmd.size();</span>
+<span class="nc" id="L674">        final String[] masked = new String[cmd.size()];</span>
+<span class="nc bnc" id="L675" title="All 2 branches missed.">        for (int i = 0; i &lt; cmd.size(); i++) {</span>
+<span class="nc bnc" id="L676" title="All 2 branches missed.">            if (mask[i]) {</span>
+<span class="nc" id="L677">                masked[i] = &quot;********&quot;;</span>
+<span class="nc" id="L678">            } else {</span>
+<span class="nc" id="L679">                masked[i] = cmd.get(i);</span>
+            }
+        }
+<span class="nc" id="L682">        printCommandLine(masked, workDir);</span>
+<span class="nc" id="L683">    }</span>
+    protected final void maskedPrintCommandLine(String[] cmd, boolean[] mask, FilePath workDir) {
+<span class="nc" id="L685">        maskedPrintCommandLine(Arrays.asList(cmd),mask,workDir);</span>
+<span class="nc" id="L686">    }</span>
+
+    /**
+     * Returns a decorated {@link Launcher} for the given node.
+     */
+    public final Launcher decorateFor(Node node) {
+<span class="nc" id="L692">        Launcher l = this;</span>
+<span class="nc bnc" id="L693" title="All 2 branches missed.">        for (LauncherDecorator d : LauncherDecorator.all())</span>
+<span class="nc" id="L694">            l = d.decorate(l,node);</span>
+<span class="nc" id="L695">        return l;</span>
+    }
+
+    /**
+     * Returns a decorated {@link Launcher} that puts the given set of arguments as a prefix to any commands
+     * that it invokes.
+     *
+     * @since 1.299
+     */
+    public final Launcher decorateByPrefix(final String... prefix) {
+<span class="fc" id="L705">        final Launcher outer = this;</span>
+<span class="fc" id="L706">        return new Launcher(outer) {</span>
+            @Override
+            public boolean isUnix() {
+<span class="fc" id="L709">                return outer.isUnix();</span>
+            }
+ 
+            @Override
+            public Proc launch(ProcStarter starter) throws IOException {
+<span class="nc" id="L714">                starter.commands.addAll(0,Arrays.asList(prefix));</span>
+<span class="nc bnc" id="L715" title="All 2 branches missed.">                if (starter.masks != null) {</span>
+<span class="nc" id="L716">                    starter.masks = prefix(starter.masks);</span>
+                }
+<span class="nc" id="L718">                return outer.launch(starter);</span>
+            }
+
+            @Override
+            public Channel launchChannel(String[] cmd, OutputStream out, FilePath workDir, Map&lt;String, String&gt; envVars) throws IOException, InterruptedException {
+<span class="nc" id="L723">                return outer.launchChannel(prefix(cmd),out,workDir,envVars);</span>
+            }
+
+            @Override
+            public void kill(Map&lt;String, String&gt; modelEnvVars) throws IOException, InterruptedException {
+<span class="nc" id="L728">                outer.kill(modelEnvVars);</span>
+<span class="nc" id="L729">            }</span>
+
+            private String[] prefix(String[] args) {
+<span class="nc" id="L732">                String[] newArgs = new String[args.length+prefix.length];</span>
+<span class="nc" id="L733">                System.arraycopy(prefix,0,newArgs,0,prefix.length);</span>
+<span class="nc" id="L734">                System.arraycopy(args,0,newArgs,prefix.length,args.length);</span>
+<span class="nc" id="L735">                return newArgs;</span>
+            }
+
+            private boolean[] prefix(boolean[] args) {
+<span class="nc" id="L739">                boolean[] newArgs = new boolean[args.length+prefix.length];</span>
+<span class="nc" id="L740">                System.arraycopy(args,0,newArgs,prefix.length,args.length);</span>
+<span class="nc" id="L741">                return newArgs;</span>
+            }
+        };
+    }
+
+    /**
+     * Returns a decorated {@link Launcher} that automatically adds the specified environment
+     * variables.
+     *
+     * Those that are specified in {@link ProcStarter#envs(String...)} will take precedence over
+     * what's specified here.
+     *
+     * @since 1.489
+     */
+    public final Launcher decorateByEnv(EnvVars _env) {
+<span class="fc" id="L756">        final EnvVars env = new EnvVars(_env);</span>
+<span class="fc" id="L757">        final Launcher outer = this;</span>
+<span class="fc" id="L758">        return new Launcher(outer) {</span>
+            @Override
+            public boolean isUnix() {
+<span class="fc" id="L761">                return outer.isUnix();</span>
+            }
+
+            @Override
+            public Proc launch(ProcStarter starter) throws IOException {
+<span class="fc" id="L766">                EnvVars e = new EnvVars(env);</span>
+<span class="pc bpc" id="L767" title="1 of 2 branches missed.">                if (starter.envs!=null) {</span>
+<span class="fc bfc" id="L768" title="All 2 branches covered.">                    for (String env : starter.envs) {</span>
+<span class="fc" id="L769">                        e.addLine(env);</span>
+                    }
+                }
+<span class="fc" id="L772">                starter.envs = Util.mapToEnv(e);</span>
+<span class="fc" id="L773">                return outer.launch(starter);</span>
+            }
+
+            @Override
+            public Channel launchChannel(String[] cmd, OutputStream out, FilePath workDir, Map&lt;String, String&gt; envVars) throws IOException, InterruptedException {
+<span class="nc" id="L778">                EnvVars e = new EnvVars(env);</span>
+<span class="nc" id="L779">                e.putAll(envVars);</span>
+<span class="nc" id="L780">                return outer.launchChannel(cmd,out,workDir,e);</span>
+            }
+
+            @Override
+            public void kill(Map&lt;String, String&gt; modelEnvVars) throws IOException, InterruptedException {
+<span class="nc" id="L785">                outer.kill(modelEnvVars);</span>
+<span class="nc" id="L786">            }</span>
+        };
+    }
+
+    /**
+     * {@link Launcher} that launches process locally.
+     */
+    public static class LocalLauncher extends Launcher {
+        public LocalLauncher(TaskListener listener) {
+<span class="fc" id="L795">            this(listener, FilePath.localChannel);</span>
+<span class="fc" id="L796">        }</span>
+
+        public LocalLauncher(TaskListener listener, VirtualChannel channel) {
+<span class="fc" id="L799">            super(listener, channel);</span>
+<span class="fc" id="L800">        }</span>
+
+        @Override
+        public Proc launch(ProcStarter ps) throws IOException {
+<span class="pc bpc" id="L804" title="1 of 2 branches missed.">            if (!ps.quiet) {</span>
+<span class="fc" id="L805">                maskedPrintCommandLine(ps.commands, ps.masks, ps.pwd);</span>
+            }
+
+<span class="fc" id="L808">            EnvVars jobEnv = inherit(ps.envs);</span>
+
+            // replace variables in command line
+<span class="fc" id="L811">            String[] jobCmd = new String[ps.commands.size()];</span>
+<span class="fc bfc" id="L812" title="All 2 branches covered.">            for ( int idx = 0 ; idx &lt; jobCmd.length; idx++ )</span>
+<span class="fc" id="L813">            	jobCmd[idx] = jobEnv.expand(ps.commands.get(idx));</span>
+
+<span class="fc" id="L815">            return new LocalProc(jobCmd, Util.mapToEnv(jobEnv),</span>
+<span class="pc bpc" id="L816" title="1 of 2 branches missed.">                    ps.reverseStdin ?LocalProc.SELFPUMP_INPUT:ps.stdin,</span>
+<span class="pc bpc" id="L817" title="1 of 2 branches missed.">                    ps.reverseStdout?LocalProc.SELFPUMP_OUTPUT:ps.stdout,</span>
+<span class="pc bpc" id="L818" title="1 of 2 branches missed.">                    ps.reverseStderr?LocalProc.SELFPUMP_OUTPUT:ps.stderr,</span>
+<span class="fc" id="L819">                    toFile(ps.pwd));</span>
+        }
+
+        private File toFile(FilePath f) {
+<span class="pc bpc" id="L823" title="1 of 2 branches missed.">            return f==null ? null : new File(f.getRemote());</span>
+        }
+
+        public Channel launchChannel(String[] cmd, OutputStream out, FilePath workDir, Map&lt;String,String&gt; envVars) throws IOException {
+<span class="nc" id="L827">            printCommandLine(cmd, workDir);</span>
+
+<span class="nc" id="L829">            ProcessBuilder pb = new ProcessBuilder(cmd);</span>
+<span class="nc" id="L830">            pb.directory(toFile(workDir));</span>
+<span class="nc bnc" id="L831" title="All 2 branches missed.">            if (envVars!=null) pb.environment().putAll(envVars);</span>
+
+<span class="nc" id="L833">            return launchChannel(out, pb);</span>
+        }
+
+        @Override
+        public void kill(Map&lt;String, String&gt; modelEnvVars) throws InterruptedException {
+<span class="nc" id="L838">            ProcessTree.get().killAll(modelEnvVars);</span>
+<span class="nc" id="L839">        }</span>
+
+        /**
+         * @param out
+         *      Where the stderr from the launched process will be sent.
+         */
+        public Channel launchChannel(OutputStream out, ProcessBuilder pb) throws IOException {
+<span class="nc" id="L846">            final EnvVars cookie = EnvVars.createCookie();</span>
+<span class="nc" id="L847">            pb.environment().putAll(cookie);</span>
+
+<span class="nc" id="L849">            final Process proc = pb.start();</span>
+
+<span class="nc" id="L851">            final Thread t2 = new StreamCopyThread(pb.command()+&quot;: stderr copier&quot;, proc.getErrorStream(), out);</span>
+<span class="nc" id="L852">            t2.start();</span>
+
+<span class="nc" id="L854">            return new Channel(&quot;locally launched channel on &quot;+ pb.command(),</span>
+<span class="nc" id="L855">                Computer.threadPoolForRemoting, proc.getInputStream(), proc.getOutputStream(), out) {</span>
+
+                /**
+                 * Kill the process when the channel is severed.
+                 */
+                @Override
+                public synchronized void terminate(IOException e) {
+<span class="nc" id="L862">                    super.terminate(e);</span>
+<span class="nc" id="L863">                    ProcessTree pt = ProcessTree.get();</span>
+                    try {
+<span class="nc" id="L865">                        pt.killAll(proc,cookie);</span>
+<span class="nc" id="L866">                    } catch (InterruptedException x) {</span>
+<span class="nc" id="L867">                        LOGGER.log(Level.INFO, &quot;Interrupted&quot;, x);</span>
+                    }
+<span class="nc" id="L869">                }</span>
+
+                @Override
+                public synchronized void close() throws IOException {
+<span class="nc" id="L873">                    super.close();</span>
+                    // wait for all the output from the process to be picked up
+                    try {
+<span class="nc" id="L876">                        t2.join();</span>
+<span class="nc" id="L877">                    } catch (InterruptedException e) {</span>
+                        // process the interrupt later
+<span class="nc" id="L879">                        Thread.currentThread().interrupt();</span>
+                    }
+<span class="nc" id="L881">                }</span>
+            };
+        }
+    }
+
+    @Restricted(NoExternalUse.class)
+    public static class DummyLauncher extends Launcher {
+
+        public DummyLauncher(TaskListener listener) {
+<span class="nc" id="L890">            super(listener, null);</span>
+<span class="nc" id="L891">        }</span>
+
+        @Override
+        public Proc launch(ProcStarter starter) throws IOException {
+<span class="nc" id="L895">            throw new IOException(&quot;Can not call launch on a dummy launcher.&quot;);</span>
+        }
+
+        @Override
+        public Channel launchChannel(String[] cmd, OutputStream out, FilePath workDir, Map&lt;String, String&gt; envVars) throws IOException, InterruptedException {
+<span class="nc" id="L900">            throw new IOException(&quot;Can not call launchChannel on a dummy launcher.&quot;);</span>
+        }
+
+        @Override
+        public void kill(Map&lt;String, String&gt; modelEnvVars) throws IOException, InterruptedException {
+            // Kill method should do nothing.
+<span class="nc" id="L906">        }</span>
+    }
+
+
+    /**
+     * Launches processes remotely by using the given channel.
+     */
+    public static class RemoteLauncher extends Launcher {
+        private final boolean isUnix;
+
+        public RemoteLauncher(TaskListener listener, VirtualChannel channel, boolean isUnix) {
+<span class="fc" id="L917">            super(listener, channel);</span>
+<span class="fc" id="L918">            this.isUnix = isUnix;</span>
+<span class="fc" id="L919">        }</span>
+
+        public Proc launch(ProcStarter ps) throws IOException {
+<span class="nc bnc" id="L922" title="All 2 branches missed.">            final OutputStream out = ps.stdout == null ? null : new RemoteOutputStream(new CloseProofOutputStream(ps.stdout));</span>
+<span class="nc bnc" id="L923" title="All 2 branches missed.">            final OutputStream err = ps.stderr==null ? null : new RemoteOutputStream(new CloseProofOutputStream(ps.stderr));</span>
+<span class="nc bnc" id="L924" title="All 4 branches missed.">            final InputStream  in  = (ps.stdin==null || ps.stdin==NULL_INPUT_STREAM) ? null : new RemoteInputStream(ps.stdin,false);</span>
+<span class="nc bnc" id="L925" title="All 2 branches missed.">            final String workDir = ps.pwd==null ? null : ps.pwd.getRemote();</span>
+
+            try {
+<span class="nc" id="L928">                return new ProcImpl(getChannel().call(new RemoteLaunchCallable(ps.commands, ps.masks, ps.envs, in, ps.reverseStdin, out, ps.reverseStdout, err, ps.reverseStderr, ps.quiet, workDir, listener)));</span>
+<span class="nc" id="L929">            } catch (InterruptedException e) {</span>
+<span class="nc" id="L930">                throw (IOException)new InterruptedIOException().initCause(e);</span>
+            }
+        }
+
+        public Channel launchChannel(String[] cmd, OutputStream err, FilePath _workDir, Map&lt;String,String&gt; envOverrides) throws IOException, InterruptedException {
+<span class="nc" id="L935">            printCommandLine(cmd, _workDir);</span>
+
+<span class="nc" id="L937">            Pipe out = Pipe.createRemoteToLocal();</span>
+<span class="nc bnc" id="L938" title="All 2 branches missed.">            final String workDir = _workDir==null ? null : _workDir.getRemote();</span>
+
+<span class="nc" id="L940">            OutputStream os = getChannel().call(new RemoteChannelLaunchCallable(cmd, out, err, workDir, envOverrides));</span>
+
+<span class="nc" id="L942">            return new Channel(&quot;remotely launched channel on &quot;+channel,</span>
+<span class="nc" id="L943">                Computer.threadPoolForRemoting, out.getIn(), new BufferedOutputStream(os));</span>
+        }
+
+        @Override
+        public boolean isUnix() {
+<span class="fc" id="L948">            return isUnix;</span>
+        }
+
+        @Override
+        public void kill(final Map&lt;String,String&gt; modelEnvVars) throws IOException, InterruptedException {
+<span class="nc" id="L953">            getChannel().call(new KillTask(modelEnvVars));</span>
+<span class="nc" id="L954">        }</span>
+
+        private static final class KillTask extends MasterToSlaveCallable&lt;Void,RuntimeException&gt; {
+            private final Map&lt;String, String&gt; modelEnvVars;
+
+<span class="nc" id="L959">            public KillTask(Map&lt;String, String&gt; modelEnvVars) {</span>
+<span class="nc" id="L960">                this.modelEnvVars = modelEnvVars;</span>
+<span class="nc" id="L961">            }</span>
+
+            public Void call() throws RuntimeException {
+                try {
+<span class="nc" id="L965">                    ProcessTree.get().killAll(modelEnvVars);</span>
+<span class="nc" id="L966">                } catch (InterruptedException e) {</span>
+                    // we are asked to terminate early by the caller, so no need to do anything
+                }
+<span class="nc" id="L969">                return null;</span>
+            }
+
+            private static final long serialVersionUID = 1L;
+        }
+
+        public static final class ProcImpl extends Proc {
+            private final RemoteProcess process;
+            private final IOTriplet io;
+
+<span class="nc" id="L979">            public ProcImpl(RemoteProcess process) {</span>
+<span class="nc" id="L980">                this.process = process;</span>
+<span class="nc" id="L981">                this.io = process.getIOtriplet();</span>
+<span class="nc" id="L982">            }</span>
+
+            @Override
+            public void kill() throws IOException, InterruptedException {
+<span class="nc" id="L986">                process.kill();</span>
+<span class="nc" id="L987">            }</span>
+
+            @Override
+            public int join() throws IOException, InterruptedException {
+<span class="nc" id="L991">                return process.join();</span>
+            }
+
+            @Override
+            public boolean isAlive() throws IOException, InterruptedException {
+<span class="nc" id="L996">                return process.isAlive();</span>
+            }
+
+            @Override
+            public InputStream getStdout() {
+<span class="nc" id="L1001">                return io.stdout;</span>
+            }
+
+            @Override
+            public InputStream getStderr() {
+<span class="nc" id="L1006">                return io.stderr;</span>
+            }
+
+            @Override
+            public OutputStream getStdin() {
+<span class="nc" id="L1011">                return io.stdin;</span>
+            }
+        }
+    }
+    
+    /**
+     * A launcher which delegates to a provided inner launcher. 
+     * Allows subclasses to only implement methods they want to override.
+     * Originally, this launcher has been implemented in 
+     * &lt;a href=&quot;https://wiki.jenkins-ci.org/display/JENKINS/Custom+Tools+Plugin&quot;&gt;
+     * Custom Tools Plugin&lt;/a&gt;.
+     * 
+     * @author rcampbell
+     * @author Oleg Nenashev, Synopsys Inc.
+     * @since 1.568
+     */
+    public static class DecoratedLauncher extends Launcher {
+
+<span class="nc" id="L1029">        private Launcher inner = null;</span>
+
+        public DecoratedLauncher(Launcher inner) {
+<span class="nc" id="L1032">            super(inner);</span>
+<span class="nc" id="L1033">            this.inner = inner;</span>
+<span class="nc" id="L1034">        }</span>
+
+        @Override
+        public Proc launch(ProcStarter starter) throws IOException {
+<span class="nc" id="L1038">            return inner.launch(starter);</span>
+        }
+
+        @Override
+        public Channel launchChannel(String[] cmd, OutputStream out,
+                FilePath workDir, Map&lt;String, String&gt; envVars) throws IOException,
+                InterruptedException {
+<span class="nc" id="L1045">            return inner.launchChannel(cmd, out, workDir, envVars);</span>
+        }
+
+        @Override
+        public void kill(Map&lt;String, String&gt; modelEnvVars) throws IOException,
+                InterruptedException {
+<span class="nc" id="L1051">            inner.kill(modelEnvVars);</span>
+<span class="nc" id="L1052">        }</span>
+
+        @Override
+        public boolean isUnix() {
+<span class="nc" id="L1056">            return inner.isUnix();</span>
+        }
+
+        @Override
+        public Proc launch(String[] cmd, boolean[] mask, String[] env, InputStream in, OutputStream out, FilePath workDir) throws IOException {
+<span class="nc" id="L1061">            return inner.launch(cmd, mask, env, in, out, workDir);</span>
+        }
+
+        @Override
+        public Computer getComputer() {
+<span class="nc" id="L1066">            return inner.getComputer();</span>
+        }
+
+        @Override
+        public TaskListener getListener() {
+<span class="nc" id="L1071">            return inner.getListener();</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="nc" id="L1076">            return super.toString() + &quot;; decorates &quot; + inner.toString();</span>
+        }
+
+        @Override
+        public VirtualChannel getChannel() {
+<span class="nc" id="L1081">            return inner.getChannel();</span>
+        }
+
+        @Override
+        public Proc launch(String[] cmd, String[] env, InputStream in, OutputStream out, FilePath workDir) throws IOException {
+<span class="nc" id="L1086">            return inner.launch(cmd, env, in, out, workDir); </span>
+        }
+   
+        /**
+         * Gets nested launcher.
+         * @return Inner launcher
+         */
+        public Launcher getInner() {
+<span class="nc" id="L1094">            return inner;</span>
+        }    
+    }
+
+<span class="nc" id="L1098">    public static class IOTriplet implements Serializable {</span>
+        InputStream stdout,stderr;
+        OutputStream stdin;
+        private static final long serialVersionUID = 1L;
+    }
+    /**
+     * Remoting interface of a remote process
+     */
+    public interface RemoteProcess {
+        int join() throws InterruptedException, IOException;
+        void kill() throws IOException, InterruptedException;
+        boolean isAlive() throws IOException, InterruptedException;
+        IOTriplet getIOtriplet();
+    }
+
+    private static class RemoteLaunchCallable extends MasterToSlaveCallable&lt;RemoteProcess,IOException&gt; {
+        private final List&lt;String&gt; cmd;
+        private final boolean[] masks;
+        private final String[] env;
+        private final InputStream in;
+        private final OutputStream out;
+        private final OutputStream err;
+        private final String workDir;
+        private final TaskListener listener;
+        private final boolean reverseStdin, reverseStdout, reverseStderr;
+        private final boolean quiet;
+
+<span class="nc" id="L1125">        RemoteLaunchCallable(List&lt;String&gt; cmd, boolean[] masks, String[] env, InputStream in, boolean reverseStdin, OutputStream out, boolean reverseStdout, OutputStream err, boolean reverseStderr, boolean quiet, String workDir, TaskListener listener) {</span>
+<span class="nc" id="L1126">            this.cmd = new ArrayList&lt;String&gt;(cmd);</span>
+<span class="nc" id="L1127">            this.masks = masks;</span>
+<span class="nc" id="L1128">            this.env = env;</span>
+<span class="nc" id="L1129">            this.in = in;</span>
+<span class="nc" id="L1130">            this.out = out;</span>
+<span class="nc" id="L1131">            this.err = err;</span>
+<span class="nc" id="L1132">            this.workDir = workDir;</span>
+<span class="nc" id="L1133">            this.listener = listener;</span>
+<span class="nc" id="L1134">            this.reverseStdin = reverseStdin;</span>
+<span class="nc" id="L1135">            this.reverseStdout = reverseStdout;</span>
+<span class="nc" id="L1136">            this.reverseStderr = reverseStderr;</span>
+<span class="nc" id="L1137">            this.quiet = quiet;</span>
+<span class="nc" id="L1138">        }</span>
+
+        public RemoteProcess call() throws IOException {
+<span class="nc" id="L1141">            Launcher.ProcStarter ps = new LocalLauncher(listener).launch();</span>
+<span class="nc" id="L1142">            ps.cmds(cmd).masks(masks).envs(env).stdin(in).stdout(out).stderr(err).quiet(quiet);</span>
+<span class="nc bnc" id="L1143" title="All 2 branches missed.">            if(workDir!=null)   ps.pwd(workDir);</span>
+<span class="nc bnc" id="L1144" title="All 2 branches missed.">            if (reverseStdin)   ps.writeStdin();</span>
+<span class="nc bnc" id="L1145" title="All 2 branches missed.">            if (reverseStdout)  ps.readStdout();</span>
+<span class="nc bnc" id="L1146" title="All 2 branches missed.">            if (reverseStderr)  ps.readStderr();</span>
+
+<span class="nc" id="L1148">            final Proc p = ps.start();</span>
+
+<span class="nc" id="L1150">            return Channel.current().export(RemoteProcess.class,new RemoteProcess() {</span>
+                public int join() throws InterruptedException, IOException {
+                    try {
+<span class="nc" id="L1153">                        return p.join();</span>
+<span class="nc" id="L1154">                    } finally {</span>
+                        // make sure I/O is delivered to the remote before we return
+                        try {
+<span class="nc" id="L1157">                            Channel.current().syncIO();</span>
+<span class="nc" id="L1158">                        } catch (Throwable _) {</span>
+                            // this includes a failure to sync, slave.jar too old, etc
+                        }
+<span class="nc" id="L1161">                    }</span>
+                }
+
+                public void kill() throws IOException, InterruptedException {
+<span class="nc" id="L1165">                    p.kill();</span>
+<span class="nc" id="L1166">                }</span>
+
+                public boolean isAlive() throws IOException, InterruptedException {
+<span class="nc" id="L1169">                    return p.isAlive();</span>
+                }
+
+                public IOTriplet getIOtriplet() {
+<span class="nc" id="L1173">                    IOTriplet r = new IOTriplet();</span>
+<span class="nc bnc" id="L1174" title="All 2 branches missed.">                    if (reverseStdout)  r.stdout = new RemoteInputStream(p.getStdout());</span>
+<span class="nc bnc" id="L1175" title="All 2 branches missed.">                    if (reverseStderr)  r.stderr = new RemoteInputStream(p.getStderr());</span>
+<span class="nc bnc" id="L1176" title="All 2 branches missed.">                    if (reverseStdin)   r.stdin  = new RemoteOutputStream(p.getStdin());</span>
+<span class="nc" id="L1177">                    return r;</span>
+                }
+            });
+        }
+
+        private static final long serialVersionUID = 1L;
+    }
+
+    private static class RemoteChannelLaunchCallable extends MasterToSlaveCallable&lt;OutputStream,IOException&gt; {
+        private final String[] cmd;
+        private final Pipe out;
+        private final String workDir;
+        private final OutputStream err;
+        private final Map&lt;String,String&gt; envOverrides;
+
+<span class="nc" id="L1192">        public RemoteChannelLaunchCallable(String[] cmd, Pipe out, OutputStream err, String workDir, Map&lt;String,String&gt; envOverrides) {</span>
+<span class="nc" id="L1193">            this.cmd = cmd;</span>
+<span class="nc" id="L1194">            this.out = out;</span>
+<span class="nc" id="L1195">            this.err = new RemoteOutputStream(err);</span>
+<span class="nc" id="L1196">            this.workDir = workDir;</span>
+<span class="nc" id="L1197">            this.envOverrides = envOverrides;</span>
+<span class="nc" id="L1198">        }</span>
+
+        public OutputStream call() throws IOException {
+<span class="nc" id="L1201">            Process p = Runtime.getRuntime().exec(cmd,</span>
+<span class="nc" id="L1202">                Util.mapToEnv(inherit(envOverrides)),</span>
+<span class="nc bnc" id="L1203" title="All 2 branches missed.">                workDir == null ? null : new File(workDir));</span>
+
+<span class="nc" id="L1205">            List&lt;String&gt; cmdLines = Arrays.asList(cmd);</span>
+<span class="nc" id="L1206">            new StreamCopyThread(&quot;stdin copier for remote agent on &quot;+cmdLines,</span>
+<span class="nc" id="L1207">                p.getInputStream(), out.getOut()).start();</span>
+<span class="nc" id="L1208">            new StreamCopyThread(&quot;stderr copier for remote agent on &quot;+cmdLines,</span>
+<span class="nc" id="L1209">                p.getErrorStream(), err).start();</span>
+
+            // TODO: don't we need to join?
+
+<span class="nc" id="L1213">            return new RemoteOutputStream(p.getOutputStream());</span>
+        }
+
+        private static final long serialVersionUID = 1L;
+    }
+
+    /**
+     * Expands the list of environment variables by inheriting current env variables.
+     */
+    private static EnvVars inherit(String[] env) {
+        // convert String[] to Map first
+<span class="fc" id="L1224">        EnvVars m = new EnvVars();</span>
+<span class="pc bpc" id="L1225" title="1 of 2 branches missed.">        if(env!=null) {</span>
+<span class="fc bfc" id="L1226" title="All 2 branches covered.">            for (String e : env) {</span>
+<span class="fc" id="L1227">                int index = e.indexOf('=');</span>
+<span class="fc" id="L1228">                m.put(e.substring(0,index), e.substring(index+1));</span>
+            }
+        }
+        // then do the inheritance
+<span class="fc" id="L1232">        return inherit(m);</span>
+    }
+
+    /**
+     * Expands the list of environment variables by inheriting current env variables.
+     */
+    private static EnvVars inherit(Map&lt;String,String&gt; overrides) {
+<span class="fc" id="L1239">        EnvVars m = new EnvVars(EnvVars.masterEnvVars);</span>
+<span class="fc" id="L1240">        m.overrideExpandingAll(overrides);</span>
+<span class="fc" id="L1241">        return m;</span>
+    }
+    
+    /**
+     * Debug option to display full current path instead of just the last token.
+     */
+<span class="fc" id="L1247">    public static boolean showFullPath = false;</span>
+
+<span class="fc" id="L1249">    private static final NullInputStream NULL_INPUT_STREAM = new NullInputStream(0);</span>
+
+<span class="fc" id="L1251">    private static final Logger LOGGER = Logger.getLogger(Launcher.class.getName());</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

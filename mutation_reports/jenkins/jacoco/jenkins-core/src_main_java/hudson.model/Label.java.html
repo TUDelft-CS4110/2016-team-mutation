@@ -1,0 +1,658 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>Label.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.model</a> &gt; <span class="el_source">Label.java</span></div><h1>Label.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">/*</span>
+ * The MIT License
+ *
+ * Copyright (c) 2004-2010, Sun Microsystems, Inc., Kohsuke Kawaguchi, Tom Huybrechts
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.model;
+
+import antlr.ANTLRException;
+import static hudson.Util.fixNull;
+
+import hudson.model.labels.LabelAtom;
+import hudson.model.labels.LabelExpression;
+import hudson.model.labels.LabelExpression.And;
+import hudson.model.labels.LabelExpression.Binary;
+import hudson.model.labels.LabelExpression.Iff;
+import hudson.model.labels.LabelExpression.Implies;
+import hudson.model.labels.LabelExpression.Not;
+import hudson.model.labels.LabelExpression.Or;
+import hudson.model.labels.LabelExpression.Paren;
+import hudson.model.labels.LabelExpressionLexer;
+import hudson.model.labels.LabelExpressionParser;
+import hudson.model.labels.LabelOperatorPrecedence;
+import hudson.model.labels.LabelVisitor;
+import hudson.model.queue.SubTask;
+import hudson.security.ACL;
+import hudson.slaves.NodeProvisioner;
+import hudson.slaves.Cloud;
+import hudson.util.QuotedStringTokenizer;
+import hudson.util.VariableResolver;
+import jenkins.model.Jenkins;
+import jenkins.model.ModelObjectWithChildren;
+import org.acegisecurity.context.SecurityContext;
+import org.acegisecurity.context.SecurityContextHolder;
+import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.StaplerResponse;
+import org.kohsuke.stapler.export.Exported;
+import org.kohsuke.stapler.export.ExportedBean;
+
+import java.io.StringReader;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.Collection;
+import java.util.Stack;
+import java.util.TreeSet;
+
+import com.thoughtworks.xstream.converters.Converter;
+import com.thoughtworks.xstream.converters.MarshallingContext;
+import com.thoughtworks.xstream.converters.UnmarshallingContext;
+import com.thoughtworks.xstream.io.HierarchicalStreamWriter;
+import com.thoughtworks.xstream.io.HierarchicalStreamReader;
+
+/**
+ * Group of {@link Node}s.
+ *
+ * @author Kohsuke Kawaguchi
+ * @see Jenkins#getLabels()
+ * @see Jenkins#getLabel(String)
+ */
+@ExportedBean
+public abstract class Label extends Actionable implements Comparable&lt;Label&gt;, ModelObjectWithChildren {
+    /**
+     * Display name of this label.
+     */
+    protected transient final String name;
+    private transient volatile Set&lt;Node&gt; nodes;
+    private transient volatile Set&lt;Cloud&gt; clouds;
+    private transient volatile int tiedJobsCount;
+
+    @Exported
+    public transient final LoadStatistics loadStatistics;
+    public transient final NodeProvisioner nodeProvisioner;
+
+<span class="nc" id="L94">    public Label(String name) {</span>
+<span class="nc" id="L95">        this.name = name;</span>
+         // passing these causes an infinite loop - getTotalExecutors(),getBusyExecutors());
+<span class="nc" id="L97">        this.loadStatistics = new LoadStatistics(0,0) {</span>
+            @Override
+            public int computeIdleExecutors() {
+<span class="nc" id="L100">                return Label.this.getIdleExecutors();</span>
+            }
+
+            @Override
+            public int computeTotalExecutors() {
+<span class="nc" id="L105">                return Label.this.getTotalExecutors();</span>
+            }
+
+            @Override
+            public int computeQueueLength() {
+<span class="nc" id="L110">                return Jenkins.getInstance().getQueue().countBuildableItemsFor(Label.this);</span>
+            }
+
+            @Override
+            protected Set&lt;Node&gt; getNodes() {
+<span class="nc" id="L115">                return Label.this.getNodes();</span>
+            }
+
+            @Override
+            protected boolean matches(Queue.Item item, SubTask subTask) {
+<span class="nc" id="L120">                final Label l = item.getAssignedLabelFor(subTask);</span>
+<span class="nc bnc" id="L121" title="All 4 branches missed.">                return l != null &amp;&amp; Label.this.matches(l.name);</span>
+            }
+        };
+<span class="nc" id="L124">        this.nodeProvisioner = new NodeProvisioner(this, loadStatistics);</span>
+<span class="nc" id="L125">    }</span>
+
+    /**
+     * Alias for {@link #getDisplayName()}.
+     */
+    @Exported
+    public final String getName() {
+<span class="nc" id="L132">        return getDisplayName();</span>
+    }
+
+    /**
+     * Returns a human-readable text that represents this label.
+     */
+    public String getDisplayName() {
+<span class="nc" id="L139">        return name;</span>
+    }
+
+    /**
+     * Returns a label expression that represents this label.
+     */
+    public abstract String getExpression();
+
+    /**
+     * Relative URL from the context path, that ends with '/'.
+     */
+    public String getUrl() {
+<span class="nc" id="L151">        return &quot;label/&quot;+name+'/';</span>
+    }
+
+    public String getSearchUrl() {
+<span class="nc" id="L155">        return getUrl();</span>
+    }
+
+    /**
+     * Returns true iff this label is an atom.
+     *
+     * @since 1.580
+     */
+<span class="nc" id="L163">    public boolean isAtom() { return false; }</span>
+
+    /**
+     * Evaluates whether the label expression is true given the specified value assignment.
+     * IOW, returns true if the assignment provided by the resolver matches this label expression.
+     */
+    public abstract boolean matches(VariableResolver&lt;Boolean&gt; resolver);
+
+    /**
+     * Evaluates whether the label expression is true when an entity owns the given set of
+     * {@link LabelAtom}s.
+     */
+    public final boolean matches(final Collection&lt;LabelAtom&gt; labels) {
+<span class="nc" id="L176">        return matches(new VariableResolver&lt;Boolean&gt;() {</span>
+            public Boolean resolve(String name) {
+<span class="nc bnc" id="L178" title="All 2 branches missed.">                for (LabelAtom a : labels)</span>
+<span class="nc bnc" id="L179" title="All 2 branches missed.">                    if (a.getName().equals(name))</span>
+<span class="nc" id="L180">                        return true;</span>
+<span class="nc" id="L181">                return false;</span>
+            }
+        });
+    }
+
+    public final boolean matches(Node n) {
+<span class="nc" id="L187">        return matches(n.getAssignedLabels());</span>
+    }
+
+    /**
+     * Returns true if this label is a &quot;self label&quot;,
+     * which means the label is the name of a {@link Node}.
+     */
+    public boolean isSelfLabel() {
+<span class="nc" id="L195">        Set&lt;Node&gt; nodes = getNodes();</span>
+<span class="nc bnc" id="L196" title="All 4 branches missed.">        return nodes.size() == 1 &amp;&amp; nodes.iterator().next().getSelfLabel() == this;</span>
+    }
+
+    /**
+     * Gets all {@link Node}s that belong to this label.
+     */
+    @Exported
+    public Set&lt;Node&gt; getNodes() {
+<span class="nc" id="L204">        Set&lt;Node&gt; nodes = this.nodes;</span>
+<span class="nc bnc" id="L205" title="All 2 branches missed.">        if(nodes!=null) return nodes;</span>
+
+<span class="nc" id="L207">        Set&lt;Node&gt; r = new HashSet&lt;Node&gt;();</span>
+<span class="nc" id="L208">        Jenkins h = Jenkins.getInstance();</span>
+<span class="nc bnc" id="L209" title="All 2 branches missed.">        if(this.matches(h))</span>
+<span class="nc" id="L210">            r.add(h);</span>
+<span class="nc bnc" id="L211" title="All 2 branches missed.">        for (Node n : h.getNodes()) {</span>
+<span class="nc bnc" id="L212" title="All 2 branches missed.">            if(this.matches(n))</span>
+<span class="nc" id="L213">                r.add(n);</span>
+        }
+<span class="nc" id="L215">        return this.nodes = Collections.unmodifiableSet(r);</span>
+    }
+
+    /**
+     * Gets all {@link Cloud}s that can launch for this label.
+     */
+    @Exported
+    public Set&lt;Cloud&gt; getClouds() {
+<span class="nc bnc" id="L223" title="All 2 branches missed.">        if(clouds==null) {</span>
+<span class="nc" id="L224">            Set&lt;Cloud&gt; r = new HashSet&lt;Cloud&gt;();</span>
+<span class="nc" id="L225">            Jenkins h = Jenkins.getInstance();</span>
+<span class="nc bnc" id="L226" title="All 2 branches missed.">            for (Cloud c : h.clouds) {</span>
+<span class="nc bnc" id="L227" title="All 2 branches missed.">                if(c.canProvision(this))</span>
+<span class="nc" id="L228">                    r.add(c);</span>
+            }
+<span class="nc" id="L230">            clouds = Collections.unmodifiableSet(r);</span>
+        }
+<span class="nc" id="L232">        return clouds;</span>
+    }
+
+    /**
+     * Can jobs be assigned to this label?
+     * &lt;p&gt;
+     * The answer is yes if there is a reasonable basis to believe that Hudson can have
+     * an executor under this label, given the current configuration. This includes
+     * situations such as (1) there are offline slaves that have this label (2) clouds exist
+     * that can provision slaves that have this label.
+     */
+    public boolean isAssignable() {
+<span class="nc bnc" id="L244" title="All 2 branches missed.">        for (Node n : getNodes())</span>
+<span class="nc bnc" id="L245" title="All 2 branches missed.">            if(n.getNumExecutors()&gt;0)</span>
+<span class="nc" id="L246">                return true;</span>
+<span class="nc bnc" id="L247" title="All 2 branches missed.">        return !getClouds().isEmpty();</span>
+    }
+
+    /**
+     * Number of total {@link Executor}s that belong to this label.
+     * &lt;p&gt;
+     * This includes executors that belong to offline nodes, so the result
+     * can be thought of as a potential capacity, whereas {@link #getTotalExecutors()}
+     * is the currently functioning total number of executors.
+     * &lt;p&gt;
+     * This method doesn't take the dynamically allocatable nodes (via {@link Cloud})
+     * into account. If you just want to test if there's some executors, use {@link #isAssignable()}.
+     */
+    public int getTotalConfiguredExecutors() {
+<span class="nc" id="L261">        int r=0;</span>
+<span class="nc bnc" id="L262" title="All 2 branches missed.">        for (Node n : getNodes())</span>
+<span class="nc" id="L263">            r += n.getNumExecutors();</span>
+<span class="nc" id="L264">        return r;</span>
+    }
+
+    /**
+     * Number of total {@link Executor}s that belong to this label that are functioning.
+     * &lt;p&gt;
+     * This excludes executors that belong to offline nodes.
+     */
+    @Exported
+    public int getTotalExecutors() {
+<span class="nc" id="L274">        int r=0;</span>
+<span class="nc bnc" id="L275" title="All 2 branches missed.">        for (Node n : getNodes()) {</span>
+<span class="nc" id="L276">            Computer c = n.toComputer();</span>
+<span class="nc bnc" id="L277" title="All 4 branches missed.">            if(c!=null &amp;&amp; c.isOnline())</span>
+<span class="nc" id="L278">                r += c.countExecutors();</span>
+        }
+<span class="nc" id="L280">        return r;</span>
+    }
+
+    /**
+     * Number of busy {@link Executor}s that are carrying out some work right now.
+     */
+    @Exported
+    public int getBusyExecutors() {
+<span class="nc" id="L288">        int r=0;</span>
+<span class="nc bnc" id="L289" title="All 2 branches missed.">        for (Node n : getNodes()) {</span>
+<span class="nc" id="L290">            Computer c = n.toComputer();</span>
+<span class="nc bnc" id="L291" title="All 4 branches missed.">            if(c!=null &amp;&amp; c.isOnline())</span>
+<span class="nc" id="L292">                r += c.countBusy();</span>
+        }
+<span class="nc" id="L294">        return r;</span>
+    }
+
+    /**
+     * Number of idle {@link Executor}s that can start working immediately.
+     */
+    @Exported
+    public int getIdleExecutors() {
+<span class="nc" id="L302">        int r=0;</span>
+<span class="nc bnc" id="L303" title="All 2 branches missed.">        for (Node n : getNodes()) {</span>
+<span class="nc" id="L304">            Computer c = n.toComputer();</span>
+<span class="nc bnc" id="L305" title="All 8 branches missed.">            if(c!=null &amp;&amp; (c.isOnline() || c.isConnecting()) &amp;&amp; c.isAcceptingTasks())</span>
+<span class="nc" id="L306">                r += c.countIdle();</span>
+        }
+<span class="nc" id="L308">        return r;</span>
+    }
+
+    /**
+     * Returns true if all the nodes of this label is offline.
+     */
+    @Exported
+    public boolean isOffline() {
+<span class="nc bnc" id="L316" title="All 2 branches missed.">        for (Node n : getNodes()) {</span>
+<span class="nc" id="L317">            Computer c = n.toComputer();</span>
+<span class="nc bnc" id="L318" title="All 4 branches missed.">            if(c != null &amp;&amp; !c.isOffline())</span>
+<span class="nc" id="L319">                return false;</span>
+        }
+<span class="nc" id="L321">        return true;</span>
+    }
+
+    /**
+     * Returns a human readable text that explains this label.
+     */
+    @Exported
+    public String getDescription() {
+<span class="nc" id="L329">        Set&lt;Node&gt; nodes = getNodes();</span>
+<span class="nc bnc" id="L330" title="All 2 branches missed.">        if(nodes.isEmpty()) {</span>
+<span class="nc" id="L331">            Set&lt;Cloud&gt; clouds = getClouds();</span>
+<span class="nc bnc" id="L332" title="All 2 branches missed.">            if(clouds.isEmpty())</span>
+<span class="nc" id="L333">                return Messages.Label_InvalidLabel();</span>
+
+<span class="nc" id="L335">            return Messages.Label_ProvisionedFrom(toString(clouds));</span>
+        }
+
+<span class="nc bnc" id="L338" title="All 2 branches missed.">        if(nodes.size()==1)</span>
+<span class="nc" id="L339">            return nodes.iterator().next().getNodeDescription();</span>
+
+<span class="nc" id="L341">        return Messages.Label_GroupOf(toString(nodes));</span>
+    }
+
+    private String toString(Collection&lt;? extends ModelObject&gt; model) {
+<span class="nc" id="L345">        boolean first=true;</span>
+<span class="nc" id="L346">        StringBuilder buf = new StringBuilder();</span>
+<span class="nc bnc" id="L347" title="All 2 branches missed.">        for (ModelObject c : model) {</span>
+<span class="nc bnc" id="L348" title="All 2 branches missed.">            if(buf.length()&gt;80) {</span>
+<span class="nc" id="L349">                buf.append(&quot;,...&quot;);</span>
+<span class="nc" id="L350">                break;</span>
+            }
+<span class="nc bnc" id="L352" title="All 2 branches missed.">            if(!first)  buf.append(',');</span>
+<span class="nc" id="L353">            else        first=false;</span>
+<span class="nc" id="L354">            buf.append(c.getDisplayName());</span>
+        }
+<span class="nc" id="L356">        return buf.toString();</span>
+    }
+
+    /**
+     * Returns projects that are tied on this node.
+     */
+    @Exported
+    public List&lt;AbstractProject&gt; getTiedJobs() {
+<span class="nc" id="L364">        List&lt;AbstractProject&gt; r = new ArrayList&lt;AbstractProject&gt;();</span>
+<span class="nc bnc" id="L365" title="All 2 branches missed.">        for (AbstractProject&lt;?,?&gt; p : Jenkins.getInstance().getAllItems(AbstractProject.class)) {</span>
+<span class="nc bnc" id="L366" title="All 4 branches missed.">            if(p instanceof TopLevelItem &amp;&amp; this.equals(p.getAssignedLabel()))</span>
+<span class="nc" id="L367">                r.add(p);</span>
+        }
+<span class="nc" id="L369">        return r;</span>
+    }
+
+    /**
+     * Returns an approximate count of projects that are tied on this node.
+     *
+     * In a system without security this should be the same
+     * as {@code getTiedJobs().size()} but significantly faster as it involves fewer temporary objects and avoids
+     * sorting the intermediary list. In a system with security, this will likely return a higher value as it counts
+     * all jobs (mostly) irrespective of access.
+     * @return a count of projects that are tied on this node.
+     */
+    public int getTiedJobCount() {
+<span class="nc bnc" id="L382" title="All 2 branches missed.">        if (tiedJobsCount != -1) return tiedJobsCount;</span>
+
+        // denormalize for performance
+        // we don't need to respect security as much when returning a simple count
+<span class="nc" id="L386">        SecurityContext context = ACL.impersonate(ACL.SYSTEM);</span>
+        try {
+<span class="nc" id="L388">            int result = 0;</span>
+            // top level gives the map without checking security of items in the map
+            // therefore best performance
+<span class="nc bnc" id="L391" title="All 2 branches missed.">            for (TopLevelItem topLevelItem : Jenkins.getInstance().getItemMap().values()) {</span>
+<span class="nc bnc" id="L392" title="All 2 branches missed.">                if (topLevelItem instanceof AbstractProject) {</span>
+<span class="nc" id="L393">                    final AbstractProject project = (AbstractProject) topLevelItem;</span>
+<span class="nc bnc" id="L394" title="All 2 branches missed.">                    if (matches(project.getAssignedLabelString())) {</span>
+<span class="nc" id="L395">                        result++;</span>
+                    }
+                }
+<span class="nc bnc" id="L398" title="All 2 branches missed.">                if (topLevelItem instanceof ItemGroup) {</span>
+<span class="nc" id="L399">                    Stack&lt;ItemGroup&gt; q = new Stack&lt;ItemGroup&gt;();</span>
+<span class="nc" id="L400">                    q.push((ItemGroup) topLevelItem);</span>
+
+<span class="nc bnc" id="L402" title="All 2 branches missed.">                    while (!q.isEmpty()) {</span>
+<span class="nc" id="L403">                        ItemGroup&lt;?&gt; parent = q.pop();</span>
+                        // we run the risk of permissions checks in ItemGroup#getItems()
+                        // not much we can do here though
+<span class="nc bnc" id="L406" title="All 2 branches missed.">                        for (Item i : parent.getItems()) {</span>
+<span class="nc bnc" id="L407" title="All 2 branches missed.">                            if (i instanceof AbstractProject) {</span>
+<span class="nc" id="L408">                                final AbstractProject project = (AbstractProject) i;</span>
+<span class="nc bnc" id="L409" title="All 2 branches missed.">                                if (matches(project.getAssignedLabelString())) {</span>
+<span class="nc" id="L410">                                    result++;</span>
+                                }
+                            }
+<span class="nc bnc" id="L413" title="All 2 branches missed.">                            if (i instanceof ItemGroup) {</span>
+<span class="nc" id="L414">                                q.push((ItemGroup) i);</span>
+                            }
+                        }
+                    }
+                }
+            }
+<span class="nc" id="L420">            return tiedJobsCount = result;</span>
+<span class="nc" id="L421">        } finally {</span>
+<span class="nc" id="L422">            SecurityContextHolder.setContext(context);</span>
+<span class="nc" id="L423">        }</span>
+    }
+
+    public boolean contains(Node node) {
+<span class="nc" id="L427">        return getNodes().contains(node);</span>
+    }
+
+    /**
+     * If there's no such label defined in {@link Node} or {@link Cloud}.
+     * This is usually used as a signal that this label is invalid.
+     */
+    public boolean isEmpty() {
+<span class="nc bnc" id="L435" title="All 4 branches missed.">        return getNodes().isEmpty() &amp;&amp; getClouds().isEmpty();</span>
+    }
+
+    /*package*/ void reset() {
+<span class="nc" id="L439">        nodes = null;</span>
+<span class="nc" id="L440">        clouds = null;</span>
+<span class="nc" id="L441">        tiedJobsCount = -1;</span>
+<span class="nc" id="L442">    }</span>
+
+    /**
+     * Expose this object to the remote API.
+     */
+    public Api getApi() {
+<span class="nc" id="L448">        return new Api(this);</span>
+    }
+
+    /**
+     * Accepts a visitor and call its respective &quot;onXYZ&quot; method based no the actual type of 'this'.
+     */
+    public abstract &lt;V,P&gt; V accept(LabelVisitor&lt;V,P&gt; visitor, P param);
+
+    /**
+     * Lists up all the atoms contained in in this label.
+     *
+     * @since 1.420
+     */
+    public Set&lt;LabelAtom&gt; listAtoms() {
+<span class="nc" id="L462">        Set&lt;LabelAtom&gt; r = new HashSet&lt;LabelAtom&gt;();</span>
+<span class="nc" id="L463">        accept(ATOM_COLLECTOR,r);</span>
+<span class="nc" id="L464">        return r;</span>
+    }
+
+    /**
+     * Returns the label that represents &quot;this&amp;amp;rhs&quot;
+     */
+    public Label and(Label rhs) {
+<span class="nc" id="L471">        return new LabelExpression.And(this,rhs);</span>
+    }
+
+    /**
+     * Returns the label that represents &quot;this|rhs&quot;
+     */
+    public Label or(Label rhs) {
+<span class="nc" id="L478">        return new LabelExpression.Or(this,rhs);</span>
+    }
+
+    /**
+     * Returns the label that represents &quot;this&amp;lt;-&gt;rhs&quot;
+     */
+    public Label iff(Label rhs) {
+<span class="nc" id="L485">        return new LabelExpression.Iff(this,rhs);</span>
+    }
+
+    /**
+     * Returns the label that represents &quot;this-&gt;rhs&quot;
+     */
+    public Label implies(Label rhs) {
+<span class="nc" id="L492">        return new LabelExpression.Implies(this,rhs);</span>
+    }
+
+    /**
+     * Returns the label that represents &quot;!this&quot;
+     */
+    public Label not() {
+<span class="nc" id="L499">        return new LabelExpression.Not(this);</span>
+    }
+
+    /**
+     * Returns the label that represents &quot;(this)&quot;
+     * This is a pointless operation for machines, but useful
+     * for humans who find the additional parenthesis often useful
+     */
+    public Label paren() {
+<span class="nc" id="L508">        return new LabelExpression.Paren(this);</span>
+    }
+
+    /**
+     * Precedence of the top most operator.
+     */
+    public abstract LabelOperatorPrecedence precedence();
+
+
+    @Override
+    public final boolean equals(Object that) {
+<span class="nc bnc" id="L519" title="All 2 branches missed.">        if (this == that) return true;</span>
+<span class="nc bnc" id="L520" title="All 4 branches missed.">        if (that == null || getClass() != that.getClass()) return false;</span>
+
+<span class="nc" id="L522">        return matches(((Label)that).name);</span>
+
+    }
+
+    @Override
+    public final int hashCode() {
+<span class="nc" id="L528">        return name.hashCode();</span>
+    }
+
+    public final int compareTo(Label that) {
+<span class="nc" id="L532">        return this.name.compareTo(that.name);</span>
+    }
+
+
+    /**
+     * Evaluates whether the current label name is equal to the name parameter.
+     *
+     */
+    private final boolean matches(String name) {
+<span class="nc" id="L541">        return this.name.equals(name);</span>
+    }
+
+    @Override
+    public String toString() {
+<span class="nc" id="L546">        return name;</span>
+    }
+
+    public ContextMenu doChildrenContextMenu(StaplerRequest request, StaplerResponse response) throws Exception {
+<span class="nc" id="L550">        ContextMenu menu = new ContextMenu();</span>
+<span class="nc bnc" id="L551" title="All 2 branches missed.">        for (Node node : getNodes()) {</span>
+<span class="nc" id="L552">            menu.add(node);</span>
+        }
+<span class="nc" id="L554">        return menu;</span>
+    }
+
+    public static final class ConverterImpl implements Converter {
+<span class="fc" id="L558">        public ConverterImpl() {</span>
+<span class="fc" id="L559">        }</span>
+
+        public boolean canConvert(Class type) {
+<span class="fc" id="L562">            return Label.class.isAssignableFrom(type);</span>
+        }
+
+        public void marshal(Object source, HierarchicalStreamWriter writer, MarshallingContext context) {
+<span class="nc" id="L566">            Label src = (Label) source;</span>
+<span class="nc" id="L567">            writer.setValue(src.getExpression());</span>
+<span class="nc" id="L568">        }</span>
+
+        public Object unmarshal(HierarchicalStreamReader reader, final UnmarshallingContext context) {
+<span class="nc" id="L571">            return Jenkins.getInstance().getLabel(reader.getValue());</span>
+        }
+    }
+
+    /**
+     * Convers a whitespace-separate list of tokens into a set of {@link Label}s.
+     *
+     * @param labels
+     *      Strings like &quot;abc def ghi&quot;. Can be empty or null.
+     * @return
+     *      Can be empty but never null. A new writable set is always returned,
+     *      so that the caller can add more to the set.
+     * @since 1.308
+     */
+    public static Set&lt;LabelAtom&gt; parse(String labels) {
+<span class="nc" id="L586">        Set&lt;LabelAtom&gt; r = new TreeSet&lt;LabelAtom&gt;();</span>
+<span class="nc" id="L587">        labels = fixNull(labels);</span>
+<span class="nc bnc" id="L588" title="All 2 branches missed.">        if(labels.length()&gt;0)</span>
+<span class="nc bnc" id="L589" title="All 2 branches missed.">            for( String l : new QuotedStringTokenizer(labels).toArray())</span>
+<span class="nc" id="L590">                r.add(Jenkins.getInstance().getLabelAtom(l));</span>
+<span class="nc" id="L591">        return r;</span>
+    }
+
+    /**
+     * Obtains a label by its {@linkplain #getName() name}.
+     */
+    public static Label get(String l) {
+<span class="nc" id="L598">        return Jenkins.getInstance().getLabel(l);</span>
+    }
+
+    /**
+     * Parses the expression into a label expression tree.
+     *
+     * TODO: replace this with a real parser later
+     */
+    public static Label parseExpression(String labelExpression) throws ANTLRException {
+<span class="nc" id="L607">        LabelExpressionLexer lexer = new LabelExpressionLexer(new StringReader(labelExpression));</span>
+<span class="nc" id="L608">        return new LabelExpressionParser(lexer).expr();</span>
+    }
+
+    /**
+     * Collects all the atoms in the expression.
+     */
+<span class="nc" id="L614">    private static final LabelVisitor&lt;Void,Set&lt;LabelAtom&gt;&gt; ATOM_COLLECTOR = new LabelVisitor&lt;Void,Set&lt;LabelAtom&gt;&gt;() {</span>
+        @Override
+        public Void onAtom(LabelAtom a, Set&lt;LabelAtom&gt; param) {
+<span class="nc" id="L617">            param.add(a);</span>
+<span class="nc" id="L618">            return null;</span>
+        }
+
+        @Override
+        public Void onParen(Paren p, Set&lt;LabelAtom&gt; param) {
+<span class="nc" id="L623">            return p.base.accept(this,param);</span>
+        }
+
+        @Override
+        public Void onNot(Not p, Set&lt;LabelAtom&gt; param) {
+<span class="nc" id="L628">            return p.base.accept(this,param);</span>
+        }
+
+        @Override
+        public Void onAnd(And p, Set&lt;LabelAtom&gt; param) {
+<span class="nc" id="L633">            return onBinary(p,param);</span>
+        }
+
+        @Override
+        public Void onOr(Or p, Set&lt;LabelAtom&gt; param) {
+<span class="nc" id="L638">            return onBinary(p,param);</span>
+        }
+
+        @Override
+        public Void onIff(Iff p, Set&lt;LabelAtom&gt; param) {
+<span class="nc" id="L643">            return onBinary(p,param);</span>
+        }
+
+        @Override
+        public Void onImplies(Implies p, Set&lt;LabelAtom&gt; param) {
+<span class="nc" id="L648">            return onBinary(p,param);</span>
+        }
+
+        private Void onBinary(Binary b, Set&lt;LabelAtom&gt; param) {
+<span class="nc" id="L652">            b.lhs.accept(this,param);</span>
+<span class="nc" id="L653">            b.rhs.accept(this,param);</span>
+<span class="nc" id="L654">            return null;</span>
+        }
+<span class="nc" id="L656">    };</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

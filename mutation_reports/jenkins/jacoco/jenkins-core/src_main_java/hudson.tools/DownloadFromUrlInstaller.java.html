@@ -1,0 +1,282 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>DownloadFromUrlInstaller.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.tools</a> &gt; <span class="el_source">DownloadFromUrlInstaller.java</span></div><h1>DownloadFromUrlInstaller.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">package hudson.tools;</span>
+
+import hudson.FilePath;
+import hudson.model.DownloadService.Downloadable;
+import hudson.model.Node;
+import hudson.model.TaskListener;
+import hudson.slaves.NodeSpecific;
+import net.sf.json.JSONObject;
+
+import java.io.IOException;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.LinkedList;
+import java.util.List;
+import java.net.URL;
+
+/**
+ * Partial convenience implementation of {@link ToolInstaller} that just downloads
+ * an archive from the URL and extracts it.
+ *
+ * &lt;p&gt;
+ * Each instance of this is configured to download from a specific URL identified by an ID.
+ *
+ * @author Kohsuke Kawaguchi
+ * @since 1.308
+ */
+public abstract class DownloadFromUrlInstaller extends ToolInstaller {
+    public final String id;
+
+    protected DownloadFromUrlInstaller(String id) {
+        // this installer implementation is designed for platform independent binary,
+        // and as such we don't provide the label support
+<span class="nc" id="L33">        super(null);</span>
+<span class="nc" id="L34">        this.id = id;</span>
+<span class="nc" id="L35">    }</span>
+
+    /**
+     * Checks if the specified expected location already contains the installed version of the tool.
+     *
+     * This check needs to run fairly efficiently. The current implementation uses the souce URL of {@link Installable},
+     * based on the assumption that released bits do not change its content.
+     */
+    protected boolean isUpToDate(FilePath expectedLocation, Installable i) throws IOException, InterruptedException {
+<span class="nc" id="L44">        FilePath marker = expectedLocation.child(&quot;.installedFrom&quot;);</span>
+<span class="nc bnc" id="L45" title="All 4 branches missed.">        return marker.exists() &amp;&amp; marker.readToString().equals(i.url);</span>
+    }
+
+    /**
+     * Gets the {@link Installable} identified by {@link #id}.
+     *
+     * @return null if no such ID is found.
+     */
+    public Installable getInstallable() throws IOException {
+<span class="nc bnc" id="L54" title="All 2 branches missed.">        for (Installable i : ((DescriptorImpl&lt;?&gt;)getDescriptor()).getInstallables())</span>
+<span class="nc bnc" id="L55" title="All 2 branches missed.">            if(id.equals(i.id))</span>
+<span class="nc" id="L56">                return i;</span>
+<span class="nc" id="L57">        return null;</span>
+    }
+
+    public FilePath performInstallation(ToolInstallation tool, Node node, TaskListener log) throws IOException, InterruptedException {
+<span class="nc" id="L61">        FilePath expected = preferredLocation(tool, node);</span>
+
+<span class="nc" id="L63">        Installable inst = getInstallable();</span>
+<span class="nc bnc" id="L64" title="All 2 branches missed.">        if(inst==null) {</span>
+<span class="nc" id="L65">            log.getLogger().println(&quot;Invalid tool ID &quot;+id);</span>
+<span class="nc" id="L66">            return expected;</span>
+        }
+
+<span class="nc bnc" id="L69" title="All 2 branches missed.">        if (inst instanceof NodeSpecific) {</span>
+<span class="nc" id="L70">            inst = (Installable) ((NodeSpecific) inst).forNode(node, log);</span>
+        }
+
+<span class="nc bnc" id="L73" title="All 2 branches missed.">        if(isUpToDate(expected,inst))</span>
+<span class="nc" id="L74">            return expected;</span>
+
+<span class="nc bnc" id="L76" title="All 2 branches missed.">        if(expected.installIfNecessaryFrom(new URL(inst.url), log, &quot;Unpacking &quot; + inst.url + &quot; to &quot; + expected + &quot; on &quot; + node.getDisplayName())) {</span>
+<span class="nc" id="L77">            expected.child(&quot;.timestamp&quot;).delete(); // we don't use the timestamp</span>
+<span class="nc" id="L78">            FilePath base = findPullUpDirectory(expected);</span>
+<span class="nc bnc" id="L79" title="All 4 branches missed.">            if(base!=null &amp;&amp; base!=expected)</span>
+<span class="nc" id="L80">                base.moveAllChildrenTo(expected);</span>
+            // leave a record for the next up-to-date check
+<span class="nc" id="L82">            expected.child(&quot;.installedFrom&quot;).write(inst.url,&quot;UTF-8&quot;);</span>
+<span class="nc" id="L83">            expected.act(new ZipExtractionInstaller.ChmodRecAPlusX());</span>
+        }
+
+<span class="nc" id="L86">        return expected;</span>
+    }
+
+    /**
+     * Often an archive contains an extra top-level directory that's unnecessary when extracted on the disk
+     * into the expected location. If your installation sources provide that kind of archives, override
+     * this method to find the real root location.
+     *
+     * &lt;p&gt;
+     * The caller will &quot;pull up&quot; the discovered real root by throw away the intermediate directory,
+     * so that the user-configured &quot;tool home&quot; directory contains the right files.
+     *
+     * &lt;p&gt;
+     * The default implementation applies some heuristics to auto-determine if the pull up is necessary.
+     * This should work for typical archive files.
+     *
+     * @param root
+     *      The directory that contains the extracted archive. This directory contains nothing but the
+     *      extracted archive. For example, if the user installed
+     *      http://archive.apache.org/dist/ant/binaries/jakarta-ant-1.1.zip , this directory would contain
+     *      a single directory &quot;jakarta-ant&quot;.
+     *
+     * @return
+     *      Return the real top directory inside {@code root} that contains the meat. In the above example,
+     *      &lt;tt&gt;root.child(&quot;jakarta-ant&quot;)&lt;/tt&gt; should be returned. If there's no directory to pull up,
+     *      return null. 
+     */
+    protected FilePath findPullUpDirectory(FilePath root) throws IOException, InterruptedException {
+        // if the directory just contains one directory and that alone, assume that's the pull up subject
+        // otherwise leave it as is.
+<span class="nc" id="L116">        List&lt;FilePath&gt; children = root.list();</span>
+<span class="nc bnc" id="L117" title="All 2 branches missed.">        if(children.size()!=1)    return null;</span>
+<span class="nc bnc" id="L118" title="All 2 branches missed.">        if(children.get(0).isDirectory())</span>
+<span class="nc" id="L119">            return children.get(0);</span>
+<span class="nc" id="L120">        return null;</span>
+    }
+
+    public static abstract class DescriptorImpl&lt;T extends DownloadFromUrlInstaller&gt; extends ToolInstallerDescriptor&lt;T&gt; {
+        
+        @SuppressWarnings(&quot;deprecation&quot;) // intentionally adding dynamic item here
+<span class="nc" id="L126">        protected DescriptorImpl() {</span>
+<span class="nc" id="L127">            Downloadable.all().add(createDownloadable());</span>
+<span class="nc" id="L128">        }</span>
+
+        /**
+         * function that creates a {@link Downloadable}.
+         * @return a downloadable object
+         */
+        public Downloadable createDownloadable() {
+<span class="nc bnc" id="L135" title="All 2 branches missed.">            if (this instanceof DownloadFromUrlInstaller.DescriptorImpl) {</span>
+<span class="nc" id="L136">                final DownloadFromUrlInstaller.DescriptorImpl delegate = (DownloadFromUrlInstaller.DescriptorImpl)this;</span>
+<span class="nc" id="L137">                return new Downloadable(getId()) {</span>
+                    public JSONObject reduce(List&lt;JSONObject&gt; jsonList) {
+<span class="nc bnc" id="L139" title="All 2 branches missed.">                        if (isDefualtSchema(jsonList)) {</span>
+<span class="nc" id="L140">                            return delegate.reduce(jsonList);</span>
+                        } else {
+                            //if it's not default schema fall back to the super class implementation
+<span class="nc" id="L143">                            return super.reduce(jsonList);</span>
+                        }
+                    }
+                };
+            }
+<span class="nc" id="L148">            return new Downloadable(getId());</span>
+        }
+
+        /**
+         * this function checks is the update center tool has the default schema
+         * @param jsonList the list of Update centers json files
+         * @return true if the schema is the default one (id, name, url), false otherwise
+         */
+        private boolean isDefualtSchema(List&lt;JSONObject&gt; jsonList) {
+<span class="nc" id="L157">            JSONObject jsonToolInstallerList = jsonList.get(0);</span>
+<span class="nc" id="L158">            ToolInstallerList toolInstallerList = (ToolInstallerList) JSONObject.toBean(jsonToolInstallerList, ToolInstallerList.class);</span>
+
+<span class="nc bnc" id="L160" title="All 2 branches missed.">            if (toolInstallerList != null) {</span>
+<span class="nc" id="L161">                ToolInstallerEntry[] entryList = toolInstallerList.list;</span>
+<span class="nc" id="L162">                ToolInstallerEntry sampleEntry = entryList[0];</span>
+<span class="nc bnc" id="L163" title="All 2 branches missed.">                if (sampleEntry != null) {</span>
+<span class="nc bnc" id="L164" title="All 6 branches missed.">                    if (sampleEntry.id != null &amp;&amp; sampleEntry.name != null &amp;&amp; sampleEntry.url != null) {</span>
+<span class="nc" id="L165">                        return true;</span>
+                    }
+                }
+            }
+<span class="nc" id="L169">            return false;</span>
+        }
+
+        private JSONObject reduce(List&lt;JSONObject&gt; jsonList) {
+<span class="nc" id="L173">            List&lt;ToolInstallerEntry&gt; reducedToolEntries = new LinkedList&lt;&gt;();</span>
+            //collect all tool installers objects from the multiple json objects
+<span class="nc bnc" id="L175" title="All 2 branches missed.">            for (JSONObject jsonToolList : jsonList) {</span>
+<span class="nc" id="L176">                ToolInstallerList toolInstallerList = (ToolInstallerList) JSONObject.toBean(jsonToolList, ToolInstallerList.class);</span>
+<span class="nc" id="L177">                reducedToolEntries.addAll(Arrays.asList(toolInstallerList.list));</span>
+            }
+
+<span class="nc bnc" id="L180" title="All 2 branches missed.">            while (Downloadable.hasDuplicates(reducedToolEntries, &quot;id&quot;)) {</span>
+<span class="nc" id="L181">                List&lt;ToolInstallerEntry&gt; tmpToolInstallerEntries = new LinkedList&lt;&gt;();</span>
+                //we need to skip the processed entries
+<span class="nc" id="L183">                boolean processed[] = new boolean[reducedToolEntries.size()];</span>
+<span class="nc bnc" id="L184" title="All 2 branches missed.">                for (int i = 0; i &lt; reducedToolEntries.size(); i++) {</span>
+<span class="nc bnc" id="L185" title="All 2 branches missed.">                    if (processed[i] == true) {</span>
+<span class="nc" id="L186">                        continue;</span>
+                    }
+<span class="nc" id="L188">                    ToolInstallerEntry data1 = reducedToolEntries.get(i);</span>
+<span class="nc" id="L189">                    boolean hasDuplicate = false;</span>
+<span class="nc bnc" id="L190" title="All 2 branches missed.">                    for (int j = i + 1; j &lt; reducedToolEntries.size(); j ++) {</span>
+<span class="nc" id="L191">                        ToolInstallerEntry data2 = reducedToolEntries.get(j);</span>
+                        //if we found a duplicate we choose the first one
+<span class="nc bnc" id="L193" title="All 2 branches missed.">                        if (data1.id.equals(data2.id)) {</span>
+<span class="nc" id="L194">                            hasDuplicate = true;</span>
+<span class="nc" id="L195">                            processed[j] = true;</span>
+<span class="nc" id="L196">                            tmpToolInstallerEntries.add(data1);</span>
+                            //after the first duplicate has been found we break the loop since the duplicates are
+                            //processed two by two
+<span class="nc" id="L199">                            break;</span>
+                        }
+                    }
+                    //if no duplicate has been found we just insert the entry in the tmp list
+<span class="nc bnc" id="L203" title="All 2 branches missed.">                    if (!hasDuplicate) {</span>
+<span class="nc" id="L204">                        tmpToolInstallerEntries.add(data1);</span>
+                    }
+                }
+<span class="nc" id="L207">                reducedToolEntries = tmpToolInstallerEntries;</span>
+            }
+
+<span class="nc" id="L210">            ToolInstallerList toolInstallerList = new ToolInstallerList();</span>
+<span class="nc" id="L211">            toolInstallerList.list = new ToolInstallerEntry[reducedToolEntries.size()];</span>
+<span class="nc" id="L212">            reducedToolEntries.toArray(toolInstallerList.list);</span>
+<span class="nc" id="L213">            JSONObject reducedToolEntriesJsonList = JSONObject.fromObject(toolInstallerList);</span>
+            //return the list with no duplicates
+<span class="nc" id="L215">            return reducedToolEntriesJsonList;</span>
+        }
+
+        /**
+         * This ID needs to be unique, and needs to match the ID token in the JSON update file.
+         * &lt;p&gt;
+         * By default we use the fully-qualified class name of the {@link DownloadFromUrlInstaller} subtype.
+         */
+        public String getId() {
+<span class="nc" id="L224">            return clazz.getName().replace('$','.');</span>
+        }
+
+        /**
+         * List of installable tools.
+         *
+         * &lt;p&gt;
+         * The UI uses this information to populate the drop-down. Subtypes can override this method
+         * if it wants to change the way the list is filled.
+         *
+         * @return never null.
+         */
+        public List&lt;? extends Installable&gt; getInstallables() throws IOException {
+<span class="nc" id="L237">            JSONObject d = Downloadable.get(getId()).getData();</span>
+<span class="nc bnc" id="L238" title="All 2 branches missed.">            if(d==null)     return Collections.emptyList();</span>
+<span class="nc" id="L239">            return Arrays.asList(((InstallableList)JSONObject.toBean(d,InstallableList.class)).list);</span>
+        }
+    }
+
+    /**
+     * Used for JSON databinding to parse the obtained list.
+     */
+<span class="nc" id="L246">    public static class InstallableList {</span>
+        // initialize with an empty array just in case JSON doesn't have the list field (which shouldn't happen.)
+<span class="nc" id="L248">        public Installable[] list = new Installable[0];</span>
+    }
+
+    /**
+     * Downloadable and installable tool.
+     */
+<span class="nc" id="L254">    public static class Installable {</span>
+        /**
+         * Used internally to uniquely identify the name.
+         */
+        public String id;
+        /**
+         * This is the human readable name.
+         */
+        public String name;
+        /**
+         * URL.
+         */
+        public String url;
+    }
+
+    /**
+     * Convenient abstract class to implement a NodeSpecificInstallable based on an existing Installable
+     * @since 1.626
+     */
+    public abstract class NodeSpecificInstallable extends Installable implements NodeSpecific&lt;NodeSpecificInstallable&gt; {
+
+<span class="nc" id="L275">        public NodeSpecificInstallable(Installable inst) {</span>
+<span class="nc" id="L276">            this.id = inst.id;</span>
+<span class="nc" id="L277">            this.name = inst.name;</span>
+<span class="nc" id="L278">            this.url = inst.url;</span>
+<span class="nc" id="L279">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

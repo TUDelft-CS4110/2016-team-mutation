@@ -1,0 +1,410 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>MappingWorksheet.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.model.queue</a> &gt; <span class="el_source">MappingWorksheet.java</span></div><h1>MappingWorksheet.java</h1><pre class="source lang-java linenums">/*
+ * The MIT License
+ *
+ * Copyright (c) 2010, InfraDNA, Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.model.queue;
+
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Iterables;
+import hudson.model.Computer;
+import hudson.model.Executor;
+import hudson.model.Label;
+import hudson.model.LoadBalancer;
+import hudson.model.Node;
+import hudson.model.Queue.BuildableItem;
+import hudson.model.Queue.Executable;
+import hudson.model.Queue.JobOffer;
+import hudson.model.Queue.Task;
+import hudson.model.labels.LabelAssignmentAction;
+import hudson.security.ACL;
+
+import java.util.AbstractList;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+
+import static java.lang.Math.*;
+
+/**
+ * Defines a mapping problem for answering &quot;where do we execute this task?&quot;
+ *
+ * &lt;p&gt;
+ * The heart of the placement problem is a mapping problem. We are given a {@link Task},
+ * (which in the general case consists of a set of {@link SubTask}s), and we are also given a number
+ * of idle {@link Executor}s, and our goal is to find a mapping from the former to the latter,
+ * which determines where each {@link SubTask} gets executed.
+ *
+ * &lt;p&gt;
+ * This mapping is done under the following constraints:
+ *
+ * &lt;ul&gt;
+ * &lt;li&gt;
+ * &quot;Same node&quot; constraint. Some of the subtasks need to be co-located on the same node.
+ * See {@link SubTask#getSameNodeConstraint()}
+ * &lt;li&gt;
+ * Label constraint. {@link SubTask}s can specify that it can be only run on nodes that has the label.
+ * &lt;/ul&gt;
+ *
+ * &lt;p&gt;
+ * We first fold the former constraint into the problem definition. That is, we now consider
+ * a set of {@link SubTask}s that need to be co-located as a single {@link WorkChunk}. Similarly,
+ * we consider a set of all {@link Executor}s from the same node as {@link ExecutorChunk}.
+ * Now, the problem becomes the weighted matching problem from {@link WorkChunk} to {@link ExecutorChunk}.
+ *
+ * &lt;p&gt;
+ * An instance of {@link MappingWorksheet} captures a problem definition, plus which
+ * {@link ExecutorChunk} and {@link WorkChunk} are compatible. The purpose of this class
+ * (and {@link ExecutorChunk} and {@link WorkChunk}) are to expose a lot of convenience methods
+ * to assist various algorithms that produce the solution of this mapping problem,
+ * which is represented as {@link Mapping}.
+ *
+ * @see LoadBalancer#map(Queue.Task, MappingWorksheet)
+ * @author Kohsuke Kawaguchi
+ */
+public class MappingWorksheet {
+    public final List&lt;ExecutorChunk&gt; executors;
+    public final List&lt;WorkChunk&gt; works;
+    /**
+     * {@link BuildableItem} for which we are trying to figure out the execution plan. Never null.
+     */
+    public final BuildableItem item;
+
+    private static class ReadOnlyList&lt;E&gt; extends AbstractList&lt;E&gt; {
+        protected final List&lt;E&gt; base;
+
+<span class="nc" id="L98">        ReadOnlyList(List&lt;E&gt; base) {</span>
+<span class="nc" id="L99">            this.base = base;</span>
+<span class="nc" id="L100">        }</span>
+
+        public E get(int index) {
+<span class="nc" id="L103">            return base.get(index);</span>
+        }
+
+        public int size() {
+<span class="nc" id="L107">            return base.size();</span>
+        }
+    }
+
+<span class="nc bnc" id="L111" title="All 2 branches missed.">    public final class ExecutorChunk extends ReadOnlyList&lt;ExecutorSlot&gt; {</span>
+        public final int index;
+        public final Computer computer;
+        public final Node node;
+        public final ACL nodeAcl;
+
+<span class="nc" id="L117">        private ExecutorChunk(List&lt;ExecutorSlot&gt; base, int index) {</span>
+<span class="nc" id="L118">            super(base);</span>
+<span class="nc" id="L119">            this.index = index;</span>
+<span class="nc bnc" id="L120" title="All 4 branches missed.">            assert !base.isEmpty();</span>
+<span class="nc" id="L121">            computer = base.get(0).getExecutor().getOwner();</span>
+<span class="nc" id="L122">            node = computer.getNode();</span>
+<span class="nc" id="L123">            nodeAcl = node.getACL();</span>
+<span class="nc" id="L124">        }</span>
+
+        /**
+         * Is this executor chunk and the given work chunk compatible? Can the latter be run on the former?
+         */
+        public boolean canAccept(WorkChunk c) {
+<span class="nc bnc" id="L130" title="All 2 branches missed.">            if (this.size()&lt;c.size())</span>
+<span class="nc" id="L131">                return false;   // too small compared towork</span>
+
+<span class="nc bnc" id="L133" title="All 4 branches missed.">            if (c.assignedLabel!=null &amp;&amp; !c.assignedLabel.contains(node))</span>
+<span class="nc" id="L134">                return false;   // label mismatch</span>
+
+<span class="nc bnc" id="L136" title="All 2 branches missed.">            if (!nodeAcl.hasPermission(item.authenticate(), Computer.BUILD))</span>
+<span class="nc" id="L137">                return false;   // tasks don't have a permission to run on this node</span>
+
+<span class="nc" id="L139">            return true;</span>
+        }
+
+        /**
+         * Node name.
+         */
+        public String getName() {
+<span class="nc" id="L146">            return node.getNodeName();</span>
+        }
+
+        /**
+         * Number of executors in this chunk.
+         * Alias for size but more readable.
+         */
+        public int capacity() {
+<span class="nc" id="L154">            return size();</span>
+        }
+
+        private void execute(WorkChunk wc, WorkUnitContext wuc) {
+<span class="nc bnc" id="L158" title="All 4 branches missed.">            assert capacity() &gt;= wc.size();</span>
+<span class="nc" id="L159">            int e = 0;</span>
+<span class="nc bnc" id="L160" title="All 2 branches missed.">            for (SubTask s : wc) {</span>
+<span class="nc bnc" id="L161" title="All 2 branches missed.">                while (!get(e).isAvailable())</span>
+<span class="nc" id="L162">                    e++;</span>
+<span class="nc" id="L163">                get(e++).set(wuc.createWorkUnit(s));</span>
+            }
+<span class="nc" id="L165">        }</span>
+    }
+
+    /**
+     * {@link SubTask}s that need to run on the same node.
+     */
+<span class="nc bnc" id="L171" title="All 2 branches missed.">    public class WorkChunk extends ReadOnlyList&lt;SubTask&gt; {</span>
+        public final int index;
+
+        // the main should be always at position 0
+//        /**
+//         * This chunk includes {@linkplain WorkUnit#isMainWork() the main work unit}.
+//         */
+//        public final boolean isMain;
+
+        /**
+         * If this task needs to be run on a node with a particular label,
+         * return that {@link Label}. Otherwise null, indicating
+         * it can run on anywhere.
+         */
+        public final Label assignedLabel;
+
+        /**
+         * If the previous execution of this task run on a certain node
+         * and this task prefers to run on the same node, return that.
+         * Otherwise null.
+         */
+        public final ExecutorChunk lastBuiltOn;
+
+
+<span class="nc" id="L195">        private WorkChunk(List&lt;SubTask&gt; base, int index) {</span>
+<span class="nc" id="L196">            super(base);</span>
+<span class="nc bnc" id="L197" title="All 4 branches missed.">            assert !base.isEmpty();</span>
+<span class="nc" id="L198">            this.index = index;</span>
+<span class="nc" id="L199">            this.assignedLabel = getAssignedLabel(base.get(0));</span>
+
+<span class="nc" id="L201">            Node lbo = base.get(0).getLastBuiltOn();</span>
+<span class="nc bnc" id="L202" title="All 2 branches missed.">            for (ExecutorChunk ec : executors) {</span>
+<span class="nc bnc" id="L203" title="All 2 branches missed.">                if (ec.node==lbo) {</span>
+<span class="nc" id="L204">                    lastBuiltOn = ec;</span>
+<span class="nc" id="L205">                    return;</span>
+                }
+            }
+<span class="nc" id="L208">            lastBuiltOn = null;</span>
+<span class="nc" id="L209">        }</span>
+
+        private Label getAssignedLabel(SubTask task) {
+<span class="nc bnc" id="L212" title="All 2 branches missed.">            for (LabelAssignmentAction laa : item.getActions(LabelAssignmentAction.class)) {</span>
+<span class="nc" id="L213">                Label l = laa.getAssignedLabel(task);</span>
+<span class="nc bnc" id="L214" title="All 2 branches missed.">                if (l!=null)    return l;</span>
+            }
+<span class="nc" id="L216">            return task.getAssignedLabel();</span>
+        }
+
+        public List&lt;ExecutorChunk&gt; applicableExecutorChunks() {
+<span class="nc" id="L220">            List&lt;ExecutorChunk&gt; r = new ArrayList&lt;ExecutorChunk&gt;(executors.size());</span>
+<span class="nc bnc" id="L221" title="All 2 branches missed.">            for (ExecutorChunk e : executors) {</span>
+<span class="nc bnc" id="L222" title="All 2 branches missed.">                if (e.canAccept(this))</span>
+<span class="nc" id="L223">                    r.add(e);</span>
+            }
+<span class="nc" id="L225">            return r;</span>
+        }
+    }
+
+    /**
+     * Represents the solution to the mapping problem.
+     * It's a mapping from every {@link WorkChunk} to {@link ExecutorChunk}
+     * that satisfies the constraints.
+     */
+<span class="nc" id="L234">    public final class Mapping {</span>
+        // for each WorkChunk, identify ExecutorChunk where it is assigned to.
+<span class="nc" id="L236">        private final ExecutorChunk[] mapping = new ExecutorChunk[works.size()];</span>
+
+        /**
+         * {@link ExecutorChunk} assigned to the n-th work chunk.
+         */
+        public ExecutorChunk assigned(int n) {
+<span class="nc" id="L242">            return mapping[n];</span>
+        }
+
+        /**
+         * n-th {@link WorkChunk}.
+         */
+        public WorkChunk get(int n) {
+<span class="nc" id="L249">            return works.get(n);</span>
+        }
+
+        /**
+         * Update the mapping to execute n-th {@link WorkChunk} on the specified {@link ExecutorChunk}.
+         */
+        public ExecutorChunk assign(int index, ExecutorChunk element) {
+<span class="nc" id="L256">            ExecutorChunk o = mapping[index];</span>
+<span class="nc" id="L257">            mapping[index] = element;</span>
+<span class="nc" id="L258">            return o;</span>
+        }
+
+        /**
+         * Number of {@link WorkUnit}s that require assignments.
+         */
+        public int size() {
+<span class="nc" id="L265">            return mapping.length;</span>
+        }
+
+        /**
+         * Returns the assignment as a map.
+         */
+        public Map&lt;WorkChunk,ExecutorChunk&gt; toMap() {
+<span class="nc" id="L272">            Map&lt;WorkChunk,ExecutorChunk&gt; r = new HashMap&lt;WorkChunk,ExecutorChunk&gt;();</span>
+<span class="nc bnc" id="L273" title="All 2 branches missed.">            for (int i=0; i&lt;size(); i++)</span>
+<span class="nc" id="L274">                r.put(get(i),assigned(i));</span>
+<span class="nc" id="L275">            return r;</span>
+        }
+
+        /**
+         * Checks if the assignments made thus far are valid an within the constraints.
+         */
+        public boolean isPartiallyValid() {
+<span class="nc" id="L282">            int[] used = new int[executors.size()];</span>
+<span class="nc bnc" id="L283" title="All 2 branches missed.">            for (int i=0; i&lt;mapping.length; i++) {</span>
+<span class="nc" id="L284">                ExecutorChunk ec = mapping[i];</span>
+<span class="nc bnc" id="L285" title="All 2 branches missed.">                if (ec==null)   continue;</span>
+<span class="nc bnc" id="L286" title="All 2 branches missed.">                if (!ec.canAccept(works(i)))</span>
+<span class="nc" id="L287">                    return false;   // invalid assignment</span>
+<span class="nc bnc" id="L288" title="All 2 branches missed.">                if ((used[ec.index] += works(i).size()) &gt; ec.capacity())</span>
+<span class="nc" id="L289">                    return false;</span>
+            }
+<span class="nc" id="L291">            return true;</span>
+        }
+
+        /**
+         * Makes sure that all the assignments are made and it is within the constraints.
+         */
+        public boolean isCompletelyValid() {
+<span class="nc bnc" id="L298" title="All 2 branches missed.">            for (ExecutorChunk ec : mapping)</span>
+<span class="nc bnc" id="L299" title="All 2 branches missed.">                if (ec==null)   return false;   // unassigned</span>
+<span class="nc" id="L300">            return isPartiallyValid();</span>
+        }
+
+        /**
+         * Executes this mapping by handing over {@link Executable}s to {@link JobOffer}
+         * as defined by the mapping.
+         */
+        public void execute(WorkUnitContext wuc) {
+<span class="nc bnc" id="L308" title="All 2 branches missed.">            if (!isCompletelyValid())</span>
+<span class="nc" id="L309">                throw new IllegalStateException();</span>
+
+<span class="nc bnc" id="L311" title="All 2 branches missed.">            for (int i=0; i&lt;size(); i++)</span>
+<span class="nc" id="L312">                assigned(i).execute(get(i),wuc);</span>
+<span class="nc" id="L313">        }</span>
+    }
+
+    public MappingWorksheet(BuildableItem item, List&lt;? extends ExecutorSlot&gt; offers) {
+<span class="nc" id="L317">        this(item,offers,LoadPredictor.all());</span>
+<span class="nc" id="L318">    }</span>
+
+<span class="nc" id="L320">    public MappingWorksheet(BuildableItem item, List&lt;? extends ExecutorSlot&gt; offers, Collection&lt;? extends LoadPredictor&gt; loadPredictors) {</span>
+<span class="nc" id="L321">        this.item = item;</span>
+        
+        // group executors by their computers
+<span class="nc" id="L324">        Map&lt;Computer,List&lt;ExecutorSlot&gt;&gt; j = new HashMap&lt;Computer, List&lt;ExecutorSlot&gt;&gt;();</span>
+<span class="nc bnc" id="L325" title="All 2 branches missed.">        for (ExecutorSlot o : offers) {</span>
+<span class="nc" id="L326">            Computer c = o.getExecutor().getOwner();</span>
+<span class="nc" id="L327">            List&lt;ExecutorSlot&gt; l = j.get(c);</span>
+<span class="nc bnc" id="L328" title="All 2 branches missed.">            if (l==null)</span>
+<span class="nc" id="L329">                j.put(c,l=new ArrayList&lt;ExecutorSlot&gt;());</span>
+<span class="nc" id="L330">            l.add(o);</span>
+        }
+
+        {// take load prediction into account and reduce the available executor pool size accordingly
+<span class="nc" id="L334">            long duration = item.task.getEstimatedDuration();</span>
+<span class="nc bnc" id="L335" title="All 2 branches missed.">            if (duration &gt; 0) {</span>
+<span class="nc" id="L336">                long now = System.currentTimeMillis();</span>
+<span class="nc bnc" id="L337" title="All 2 branches missed.">                for (Entry&lt;Computer, List&lt;ExecutorSlot&gt;&gt; e : j.entrySet()) {</span>
+<span class="nc" id="L338">                    final List&lt;ExecutorSlot&gt; list = e.getValue();</span>
+<span class="nc" id="L339">                    final int max = e.getKey().countExecutors();</span>
+
+                    // build up the prediction model. cut the chase if we hit the max.
+<span class="nc" id="L342">                    Timeline timeline = new Timeline();</span>
+<span class="nc" id="L343">                    int peak = 0;</span>
+                    OUTER:
+<span class="nc bnc" id="L345" title="All 2 branches missed.">                    for (LoadPredictor lp : loadPredictors) {</span>
+<span class="nc bnc" id="L346" title="All 2 branches missed.">                        for (FutureLoad fl : Iterables.limit(lp.predict(this,e.getKey(), now, now + duration),100)) {</span>
+<span class="nc" id="L347">                            peak = max(peak,timeline.insert(fl.startTime, fl.startTime+fl.duration, fl.numExecutors));</span>
+<span class="nc bnc" id="L348" title="All 2 branches missed.">                            if (peak&gt;=max)  break OUTER;</span>
+                        }
+                    }
+
+<span class="nc" id="L352">                    int minIdle = max-peak; // minimum number of idle nodes during this time period</span>
+                    // total predicted load could exceed available executors [JENKINS-8882]
+<span class="nc bnc" id="L354" title="All 2 branches missed.">                    if (minIdle&lt;0) {</span>
+                        // Should we toss a warning/info message?
+<span class="nc" id="L356">                        minIdle = 0;</span>
+                    }
+<span class="nc bnc" id="L358" title="All 2 branches missed.">                    if (minIdle&lt;list.size())</span>
+<span class="nc" id="L359">                        e.setValue(list.subList(0,minIdle));</span>
+                }
+            }
+        }
+
+        // build into the final shape
+<span class="nc" id="L365">        List&lt;ExecutorChunk&gt; executors = new ArrayList&lt;ExecutorChunk&gt;();</span>
+<span class="nc bnc" id="L366" title="All 2 branches missed.">        for (List&lt;ExecutorSlot&gt; group : j.values()) {</span>
+<span class="nc bnc" id="L367" title="All 2 branches missed.">            if (group.isEmpty())    continue;   // evict empty group</span>
+<span class="nc" id="L368">            ExecutorChunk ec = new ExecutorChunk(group, executors.size());</span>
+<span class="nc bnc" id="L369" title="All 2 branches missed.">            if (ec.node==null)  continue;   // evict out of sync node</span>
+<span class="nc" id="L370">            executors.add(ec);</span>
+        }
+<span class="nc" id="L372">        this.executors = ImmutableList.copyOf(executors);</span>
+
+        // group execution units into chunks. use of LinkedHashMap ensures that the main work comes at the top
+<span class="nc" id="L375">        Map&lt;Object,List&lt;SubTask&gt;&gt; m = new LinkedHashMap&lt;Object,List&lt;SubTask&gt;&gt;();</span>
+<span class="nc bnc" id="L376" title="All 2 branches missed.">        for (SubTask meu : Tasks.getSubTasksOf(item.task)) {</span>
+<span class="nc" id="L377">            Object c = Tasks.getSameNodeConstraintOf(meu);</span>
+<span class="nc bnc" id="L378" title="All 2 branches missed.">            if (c==null)    c = new Object();</span>
+
+<span class="nc" id="L380">            List&lt;SubTask&gt; l = m.get(c);</span>
+<span class="nc bnc" id="L381" title="All 2 branches missed.">            if (l==null)</span>
+<span class="nc" id="L382">                m.put(c,l= new ArrayList&lt;SubTask&gt;());</span>
+<span class="nc" id="L383">            l.add(meu);</span>
+        }
+
+        // build into the final shape
+<span class="nc" id="L387">        List&lt;WorkChunk&gt; works = new ArrayList&lt;WorkChunk&gt;();</span>
+<span class="nc bnc" id="L388" title="All 2 branches missed.">        for (List&lt;SubTask&gt; group : m.values()) {</span>
+<span class="nc" id="L389">            works.add(new WorkChunk(group,works.size()));</span>
+        }
+<span class="nc" id="L391">        this.works = ImmutableList.copyOf(works);</span>
+<span class="nc" id="L392">    }</span>
+
+    public WorkChunk works(int index) {
+<span class="nc" id="L395">        return works.get(index);</span>
+    }
+
+    public ExecutorChunk executors(int index) {
+<span class="nc" id="L399">        return executors.get(index);</span>
+    }
+
+<span class="nc" id="L402">    public static abstract class ExecutorSlot {</span>
+        public abstract Executor getExecutor();
+
+        public abstract boolean isAvailable();
+
+        protected abstract void set(WorkUnit p) throws UnsupportedOperationException;
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

@@ -1,0 +1,441 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>ZFSInstaller.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.os.solaris</a> &gt; <span class="el_source">ZFSInstaller.java</span></div><h1>ZFSInstaller.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">/*</span>
+ * The MIT License
+ *
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.os.solaris;
+
+import com.sun.akuma.Daemon;
+import com.sun.akuma.JavaVMArguments;
+import hudson.Launcher.LocalLauncher;
+import hudson.Util;
+import hudson.Extension;
+import hudson.os.SU;
+import hudson.model.AdministrativeMonitor;
+import jenkins.model.Jenkins;
+import hudson.model.TaskListener;
+import hudson.util.ForkOutputStream;
+import hudson.util.HudsonIsRestarting;
+import hudson.util.StreamTaskListener;
+import static hudson.util.jna.GNUCLibrary.*;
+
+import jenkins.security.MasterToSlaveCallable;
+import org.apache.commons.io.output.ByteArrayOutputStream;
+import org.jvnet.libpam.impl.CLibrary.passwd;
+import org.jvnet.solaris.libzfs.ACLBuilder;
+import org.jvnet.solaris.libzfs.LibZFS;
+import org.jvnet.solaris.libzfs.ZFSException;
+import org.jvnet.solaris.libzfs.ZFSFileSystem;
+import org.jvnet.solaris.libzfs.ErrorCode;
+import org.jvnet.solaris.mount.MountFlags;
+import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.StaplerResponse;
+import org.kohsuke.stapler.QueryParameter;
+import org.kohsuke.stapler.HttpResponse;
+import org.kohsuke.stapler.HttpResponses;
+import org.kohsuke.stapler.HttpRedirect;
+import org.kohsuke.stapler.interceptor.RequirePOST;
+
+import javax.servlet.ServletException;
+import java.io.File;
+import java.io.IOException;
+import java.io.PrintStream;
+import java.io.Serializable;
+import java.util.List;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+/**
+ * Encourages the user to migrate JENKINS_HOME on a ZFS file system.
+ *
+ * @author Kohsuke Kawaguchi
+ * @since 1.283
+ */
+<span class="nc" id="L72">public class ZFSInstaller extends AdministrativeMonitor implements Serializable {</span>
+    private static final long serialVersionUID = 1018007614648118323L;
+
+    /**
+     * True if $JENKINS_HOME is a ZFS file system by itself.
+     */
+<span class="nc" id="L78">    private final boolean active = shouldBeActive();</span>
+
+    /**
+     * This will be the file system name that we'll create.
+     */
+    private String prospectiveZfsFileSystemName;
+
+    public boolean isActivated() {
+<span class="nc" id="L86">        return active;</span>
+    }
+
+    public boolean isRoot() {
+<span class="nc bnc" id="L90" title="All 2 branches missed.">        return LIBC.geteuid()==0;</span>
+    }
+
+    public String getProspectiveZfsFileSystemName() {
+<span class="nc" id="L94">        return prospectiveZfsFileSystemName;</span>
+    }
+
+    private boolean shouldBeActive() {
+<span class="nc bnc" id="L98" title="All 4 branches missed.">        if(!System.getProperty(&quot;os.name&quot;).equals(&quot;SunOS&quot;) || disabled)</span>
+            // on systems that don't have ZFS, we don't need this monitor
+<span class="nc" id="L100">            return false;</span>
+
+        try {
+<span class="nc" id="L103">            LibZFS zfs = new LibZFS();</span>
+<span class="nc" id="L104">            List&lt;ZFSFileSystem&gt; roots = zfs.roots();</span>
+<span class="nc bnc" id="L105" title="All 2 branches missed.">            if(roots.isEmpty())</span>
+<span class="nc" id="L106">                return false;       // no active ZFS pool</span>
+
+            // if we don't run on a ZFS file system, activate
+<span class="nc" id="L109">            ZFSFileSystem hudsonZfs = zfs.getFileSystemByMountPoint(Jenkins.getInstance().getRootDir());</span>
+<span class="nc bnc" id="L110" title="All 2 branches missed.">            if(hudsonZfs!=null)</span>
+<span class="nc" id="L111">                return false;       // already on ZFS</span>
+
+            // decide what file system we'll create
+<span class="nc" id="L114">            ZFSFileSystem pool = roots.get(0);</span>
+<span class="nc" id="L115">            prospectiveZfsFileSystemName = computeHudsonFileSystemName(zfs,pool);</span>
+
+<span class="nc" id="L117">            return true;</span>
+<span class="nc" id="L118">        } catch (Exception e) {</span>
+<span class="nc" id="L119">            LOGGER.log(Level.WARNING, &quot;Failed to detect whether Hudson is on ZFS&quot;,e);</span>
+<span class="nc" id="L120">            return false;</span>
+<span class="nc" id="L121">        } catch (LinkageError e) {</span>
+<span class="nc" id="L122">            LOGGER.info(&quot;No ZFS available. If you believe this is an error, increase the logging level to get the stack trace&quot;);</span>
+<span class="nc" id="L123">            LOGGER.log(Level.FINE,&quot;Stack trace of failed ZFS load&quot;,e);</span>
+<span class="nc" id="L124">            return false;</span>
+        }
+    }
+
+    /**
+     * Called from the management screen.
+     */
+    @RequirePOST
+    public HttpResponse doAct(StaplerRequest req) throws ServletException, IOException {
+<span class="nc" id="L133">        Jenkins.getInstance().checkPermission(Jenkins.ADMINISTER);</span>
+
+<span class="nc bnc" id="L135" title="All 2 branches missed.">        if(req.hasParameter(&quot;n&quot;)) {</span>
+            // we'll shut up
+<span class="nc" id="L137">            disable(true);</span>
+<span class="nc" id="L138">            return HttpResponses.redirectViaContextPath(&quot;/manage&quot;);</span>
+        }
+
+<span class="nc" id="L141">        return new HttpRedirect(&quot;confirm&quot;);</span>
+    }
+
+    /**
+     * Creates a ZFS file system to migrate the data to.
+     *
+     * &lt;p&gt;
+     * This has to be done while we still have an interactive access with the user, since it involves the password.
+     *
+     * &lt;p&gt;
+     * An exception will be thrown if the operation fails. A normal completion means a success.
+     *
+     * @return
+     *      The ZFS dataset name to migrate the data to.
+     */
+    private String createZfsFileSystem(final TaskListener listener, String rootUsername, String rootPassword) throws IOException, InterruptedException, ZFSException {
+        // capture the UID that Hudson runs under
+        // so that we can allow this user to do everything on this new partition
+<span class="nc" id="L159">        final int uid = LIBC.geteuid();</span>
+<span class="nc" id="L160">        final int gid = LIBC.getegid();</span>
+<span class="nc" id="L161">        passwd pwd = LIBC.getpwuid(uid);</span>
+<span class="nc bnc" id="L162" title="All 2 branches missed.">        if(pwd==null)</span>
+<span class="nc" id="L163">            throw new IOException(&quot;Failed to obtain the current user information for &quot;+uid);</span>
+<span class="nc" id="L164">        final String userName = pwd.pw_name;</span>
+
+<span class="nc" id="L166">        final File home = Jenkins.getInstance().getRootDir();</span>
+
+        // this is the actual creation of the file system.
+        // return true indicating a success
+<span class="nc" id="L170">        return SU.execute(listener, rootUsername, rootPassword, new MasterToSlaveCallable&lt;String,IOException&gt;() {</span>
+            private static final long serialVersionUID = 7731167233498214301L;
+
+            public String call() throws IOException {
+<span class="nc" id="L174">                PrintStream out = listener.getLogger();</span>
+
+<span class="nc" id="L176">                LibZFS zfs = new LibZFS();</span>
+<span class="nc" id="L177">                ZFSFileSystem existing = zfs.getFileSystemByMountPoint(home);</span>
+<span class="nc bnc" id="L178" title="All 2 branches missed.">                if(existing!=null) {</span>
+                    // no need for migration
+<span class="nc" id="L180">                    out.println(home+&quot; is already on ZFS. Doing nothing&quot;);</span>
+<span class="nc" id="L181">                    return existing.getName();</span>
+                }
+
+<span class="nc" id="L184">                String name = computeHudsonFileSystemName(zfs, zfs.roots().get(0));</span>
+<span class="nc" id="L185">                out.println(&quot;Creating &quot;+name);</span>
+<span class="nc" id="L186">                ZFSFileSystem hudson = zfs.create(name, ZFSFileSystem.class);</span>
+
+                // mount temporarily to set the owner right
+<span class="nc" id="L189">                File dir = Util.createTempDir();</span>
+<span class="nc" id="L190">                hudson.setMountPoint(dir);</span>
+<span class="nc" id="L191">                hudson.mount();</span>
+<span class="nc bnc" id="L192" title="All 2 branches missed.">                if(LIBC.chown(dir.getPath(),uid,gid)!=0)</span>
+<span class="nc" id="L193">                    throw new IOException(&quot;Failed to chown &quot;+dir);</span>
+<span class="nc" id="L194">                hudson.unmount();</span>
+
+                try {
+<span class="nc" id="L197">                    hudson.setProperty(&quot;hudson:managed-by&quot;,&quot;hudson&quot;); // mark this file system as &quot;managed by Hudson&quot;</span>
+
+<span class="nc" id="L199">                    ACLBuilder acl = new ACLBuilder();</span>
+<span class="nc" id="L200">                    acl.user(userName).withEverything();</span>
+<span class="nc" id="L201">                    hudson.allow(acl);</span>
+<span class="nc" id="L202">                } catch (ZFSException e) {</span>
+                    // revert the file system creation
+                    try {
+<span class="nc" id="L205">                        hudson.destory();</span>
+<span class="nc" id="L206">                    } catch (Exception _) {</span>
+                        // but ignore the error and let the original error thrown
+                    }
+<span class="nc" id="L209">                    throw e;</span>
+                }
+<span class="nc" id="L211">                return hudson.getName();</span>
+            }
+        });
+    }
+
+    /**
+     * Called from the confirmation screen to actually initiate the migration.
+     */
+    @RequirePOST
+    public void doStart(StaplerRequest req, StaplerResponse rsp, @QueryParameter String username, @QueryParameter String password) throws ServletException, IOException {
+<span class="nc" id="L221">        Jenkins hudson = Jenkins.getInstance();</span>
+<span class="nc" id="L222">        hudson.checkPermission(Jenkins.ADMINISTER);</span>
+
+        final String datasetName;
+<span class="nc" id="L225">        ByteArrayOutputStream log = new ByteArrayOutputStream();</span>
+<span class="nc" id="L226">        StreamTaskListener listener = new StreamTaskListener(log);</span>
+        try {
+<span class="nc" id="L228">            datasetName = createZfsFileSystem(listener,username,password);</span>
+<span class="nc" id="L229">        } catch (Exception e) {</span>
+<span class="nc" id="L230">            e.printStackTrace(listener.error(e.getMessage()));</span>
+
+<span class="nc bnc" id="L232" title="All 2 branches missed.">            if (e instanceof ZFSException) {</span>
+<span class="nc" id="L233">                ZFSException ze = (ZFSException) e;</span>
+<span class="nc bnc" id="L234" title="All 2 branches missed.">                if(ze.getCode()==ErrorCode.EZFS_PERM) {</span>
+                    // permission problem. ask the user to give us the root password
+<span class="nc" id="L236">                    req.setAttribute(&quot;message&quot;,log.toString());</span>
+<span class="nc" id="L237">                    rsp.forward(this,&quot;askRootPassword&quot;,req);</span>
+<span class="nc" id="L238">                    return;</span>
+                }
+            }
+
+            // for other kinds of problems, report and bail out
+<span class="nc" id="L243">            req.setAttribute(&quot;pre&quot;,true);</span>
+<span class="nc" id="L244">            sendError(log.toString(),req,rsp);</span>
+<span class="nc" id="L245">            return;</span>
+        }
+
+        // file system creation successful, so restart
+
+<span class="nc" id="L250">        hudson.servletContext.setAttribute(&quot;app&quot;,new HudsonIsRestarting());</span>
+        // redirect the user to the manage page
+<span class="nc" id="L252">        rsp.sendRedirect2(req.getContextPath()+&quot;/manage&quot;);</span>
+
+        // asynchronously restart, so that we can give a bit of time to the browser to load &quot;restarting...&quot; screen.
+<span class="nc" id="L255">        new Thread(&quot;restart thread&quot;) {</span>
+            @Override
+            public void run() {
+                try {
+<span class="nc" id="L259">                    Thread.sleep(5000);</span>
+
+                    // close all descriptors on exec except stdin,out,err
+<span class="nc" id="L262">                    int sz = LIBC.getdtablesize();</span>
+<span class="nc bnc" id="L263" title="All 2 branches missed.">                    for(int i=3; i&lt;sz; i++) {</span>
+<span class="nc" id="L264">                        int flags = LIBC.fcntl(i, F_GETFD);</span>
+<span class="nc bnc" id="L265" title="All 2 branches missed.">                        if(flags&lt;0) continue;</span>
+<span class="nc" id="L266">                        LIBC.fcntl(i, F_SETFD,flags| FD_CLOEXEC);</span>
+                    }
+
+                    // re-exec with the system property to indicate where to migrate the data to.
+                    // the 2nd phase is implemented in the migrate method.
+<span class="nc" id="L271">                    JavaVMArguments args = JavaVMArguments.current();</span>
+<span class="nc" id="L272">                    args.setSystemProperty(ZFSInstaller.class.getName()+&quot;.migrate&quot;,datasetName);</span>
+<span class="nc" id="L273">                    Daemon.selfExec(args);</span>
+<span class="nc" id="L274">                } catch (InterruptedException e) {</span>
+<span class="nc" id="L275">                    LOGGER.log(Level.SEVERE, &quot;Restart failed&quot;,e);</span>
+<span class="nc" id="L276">                } catch (IOException e) {</span>
+<span class="nc" id="L277">                    LOGGER.log(Level.SEVERE, &quot;Restart failed&quot;,e);</span>
+                }
+<span class="nc" id="L279">            }</span>
+<span class="nc" id="L280">        }.start();</span>
+<span class="nc" id="L281">    }</span>
+
+    @Extension
+    public static AdministrativeMonitor init() {
+<span class="nc" id="L285">        String migrationTarget = System.getProperty(ZFSInstaller.class.getName() + &quot;.migrate&quot;);</span>
+<span class="nc bnc" id="L286" title="All 2 branches missed.">        if(migrationTarget!=null) {</span>
+<span class="nc" id="L287">            ByteArrayOutputStream out = new ByteArrayOutputStream();</span>
+<span class="nc" id="L288">            StreamTaskListener listener = new StreamTaskListener(new ForkOutputStream(System.out, out));</span>
+            try {
+<span class="nc bnc" id="L290" title="All 2 branches missed.">                if(migrate(listener,migrationTarget)) {</span>
+                    // completed successfully
+<span class="nc" id="L292">                    return new MigrationCompleteNotice();</span>
+                }
+<span class="nc" id="L294">            } catch (Exception e) {</span>
+                // if we let any exception from here, it will prevent Hudson from starting.
+<span class="nc" id="L296">                e.printStackTrace(listener.error(&quot;Migration failed&quot;));</span>
+            }
+            // migration failed
+<span class="nc" id="L299">            return new MigrationFailedNotice(out);</span>
+        }
+
+        // install the monitor if applicable
+<span class="nc" id="L303">        ZFSInstaller zi = new ZFSInstaller();</span>
+<span class="nc bnc" id="L304" title="All 2 branches missed.">        if(zi.isActivated())</span>
+<span class="nc" id="L305">            return zi;</span>
+
+<span class="nc" id="L307">        return null;</span>
+    }
+
+    /**
+     * Migrates $JENKINS_HOME to a new ZFS file system.
+     *
+     * TODO: do this in a separate JVM to elevate the privilege.
+     *
+     * @param listener
+     *      Log of migration goes here.
+     * @param target
+     *      Dataset to move the data to.
+     * @return
+     *      false if a migration failed.
+     */
+    private static boolean migrate(TaskListener listener, String target) throws IOException, InterruptedException {
+<span class="nc" id="L323">        PrintStream out = listener.getLogger();</span>
+
+<span class="nc" id="L325">        File home = Jenkins.getInstance().getRootDir();</span>
+        // do the migration
+<span class="nc" id="L327">        LibZFS zfs = new LibZFS();</span>
+<span class="nc" id="L328">        ZFSFileSystem existing = zfs.getFileSystemByMountPoint(home);</span>
+<span class="nc bnc" id="L329" title="All 2 branches missed.">        if(existing!=null) {</span>
+<span class="nc" id="L330">            out.println(home+&quot; is already on ZFS. Doing nothing&quot;);</span>
+<span class="nc" id="L331">            return true;</span>
+        }
+
+<span class="nc" id="L334">        File tmpDir = Util.createTempDir();</span>
+
+        // mount a new file system to a temporary location
+<span class="nc" id="L337">        out.println(&quot;Opening &quot;+target);</span>
+<span class="nc" id="L338">        ZFSFileSystem hudson = zfs.open(target, ZFSFileSystem.class);</span>
+<span class="nc" id="L339">        hudson.setMountPoint(tmpDir);</span>
+<span class="nc" id="L340">        hudson.setProperty(&quot;hudson:managed-by&quot;,&quot;hudson&quot;); // mark this file system as &quot;managed by Hudson&quot;</span>
+<span class="nc" id="L341">        hudson.mount();</span>
+
+        // copy all the files
+<span class="nc" id="L344">        out.println(&quot;Copying all existing data files&quot;);</span>
+<span class="nc bnc" id="L345" title="All 2 branches missed.">        if(system(home,listener, &quot;/usr/bin/cp&quot;,&quot;-pR&quot;,&quot;.&quot;, tmpDir.getAbsolutePath())!=0) {</span>
+<span class="nc" id="L346">            out.println(&quot;Failed to copy &quot;+home+&quot; to &quot;+tmpDir);</span>
+<span class="nc" id="L347">            return false;</span>
+        }
+
+        // unmount
+<span class="nc" id="L351">        out.println(&quot;Unmounting &quot;+target);</span>
+<span class="nc" id="L352">        hudson.unmount(MountFlags.MS_FORCE);</span>
+
+        // move the original directory to the side
+<span class="nc" id="L355">        File backup = new File(home.getPath()+&quot;.backup&quot;);</span>
+<span class="nc" id="L356">        out.println(&quot;Moving &quot;+home+&quot; to &quot;+backup);</span>
+<span class="nc bnc" id="L357" title="All 2 branches missed.">        if(backup.exists())</span>
+<span class="nc" id="L358">            Util.deleteRecursive(backup);</span>
+<span class="nc bnc" id="L359" title="All 2 branches missed.">        if(!home.renameTo(backup)) {</span>
+<span class="nc" id="L360">            out.println(&quot;Failed to move your current data &quot;+home+&quot; out of the way&quot;);</span>
+        }
+
+        // update the mount point
+<span class="nc" id="L364">        out.println(&quot;Creating a new mount point at &quot;+home);</span>
+<span class="nc bnc" id="L365" title="All 2 branches missed.">        if(!home.mkdir())</span>
+<span class="nc" id="L366">            throw new IOException(&quot;Failed to create mount point &quot;+home);</span>
+
+<span class="nc" id="L368">        out.println(&quot;Mounting &quot;+target);</span>
+<span class="nc" id="L369">        hudson.setMountPoint(home);</span>
+<span class="nc" id="L370">        hudson.mount();</span>
+
+<span class="nc" id="L372">        out.println(&quot;Sharing &quot;+target);</span>
+        try {
+<span class="nc" id="L374">            hudson.setProperty(&quot;sharesmb&quot;,&quot;on&quot;);</span>
+<span class="nc" id="L375">            hudson.setProperty(&quot;sharenfs&quot;,&quot;on&quot;);</span>
+<span class="nc" id="L376">            hudson.share();</span>
+<span class="nc" id="L377">        } catch (ZFSException e) {</span>
+<span class="nc" id="L378">            listener.error(&quot;Failed to share the file systems: &quot;+e.getCode());</span>
+        }
+
+        // delete back up
+<span class="nc" id="L382">        out.println(&quot;Deleting &quot;+backup);</span>
+<span class="nc bnc" id="L383" title="All 2 branches missed.">        if(system(new File(&quot;/&quot;),listener,&quot;/usr/bin/rm&quot;,&quot;-rf&quot;,backup.getAbsolutePath())!=0) {</span>
+<span class="nc" id="L384">            out.println(&quot;Failed to delete &quot;+backup.getAbsolutePath());</span>
+<span class="nc" id="L385">            return false;</span>
+        }
+
+<span class="nc" id="L388">        out.println(&quot;Migration completed&quot;);</span>
+<span class="nc" id="L389">        return true;</span>
+    }
+
+    private static int system(File pwd, TaskListener listener, String... args) throws IOException, InterruptedException {
+<span class="nc" id="L393">        return new LocalLauncher(listener).launch().cmds(args).stdout(System.out).pwd(pwd).join();</span>
+    }
+
+    private static String computeHudsonFileSystemName(LibZFS zfs, ZFSFileSystem top) {
+<span class="nc bnc" id="L397" title="All 2 branches missed.">        if(!zfs.exists(top.getName()+&quot;/hudson&quot;))</span>
+<span class="nc" id="L398">            return top.getName()+&quot;/hudson&quot;;</span>
+<span class="nc" id="L399">        for( int i=2; ; i++ ) {</span>
+<span class="nc" id="L400">            String name = top.getName() + &quot;/hudson&quot; + i;</span>
+<span class="nc bnc" id="L401" title="All 2 branches missed.">            if(!zfs.exists(name))</span>
+<span class="nc" id="L402">                return name;</span>
+        }
+    }
+
+    /**
+     * Used to indicate that the migration was completed successfully.
+     */
+<span class="nc" id="L409">    public static final class MigrationCompleteNotice extends AdministrativeMonitor {</span>
+        public boolean isActivated() {
+<span class="nc" id="L411">            return true;</span>
+        }
+    }
+
+    /**
+     * Used to indicate a failure in the migration.
+     */
+    public static final class MigrationFailedNotice extends AdministrativeMonitor {
+        ByteArrayOutputStream record;
+
+<span class="nc" id="L421">        MigrationFailedNotice(ByteArrayOutputStream record) {</span>
+<span class="nc" id="L422">            this.record = record;</span>
+<span class="nc" id="L423">        }</span>
+
+        public boolean isActivated() {
+<span class="nc" id="L426">            return true;</span>
+        }
+        
+        public String getLog() {
+<span class="nc" id="L430">            return record.toString();</span>
+        }
+    }
+
+<span class="nc" id="L434">    private static final Logger LOGGER = Logger.getLogger(ZFSInstaller.class.getName());</span>
+
+    /**
+     * Escape hatch in case JNI calls fatally crash, like in HUDSON-3733.
+     */
+<span class="nc" id="L439">    public static boolean disabled = Boolean.getBoolean(ZFSInstaller.class.getName()+&quot;.disabled&quot;);</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

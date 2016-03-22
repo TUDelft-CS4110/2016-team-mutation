@@ -1,0 +1,1578 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>AntClassLoader.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">jenkins.util</a> &gt; <span class="el_source">AntClassLoader.java</span></div><h1>AntClassLoader.java</h1><pre class="source lang-java linenums">/*
+ *  Licensed to the Apache Software Foundation (ASF) under one or more
+ *  contributor license agreements.  See the NOTICE file distributed with
+ *  this work for additional information regarding copyright ownership.
+ *  The ASF licenses this file to You under the Apache License, Version 2.0
+ *  (the &quot;License&quot;); you may not use this file except in compliance with
+ *  the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ */
+package jenkins.util;
+
+import org.apache.tools.ant.BuildEvent;
+import org.apache.tools.ant.BuildException;
+import org.apache.tools.ant.Project;
+import org.apache.tools.ant.SubBuildListener;
+import org.apache.tools.ant.launch.Locator;
+import org.apache.tools.ant.types.Path;
+import org.apache.tools.ant.util.CollectionUtils;
+import org.apache.tools.ant.util.FileUtils;
+import org.apache.tools.ant.util.JavaEnvUtils;
+import org.apache.tools.ant.util.LoaderUtils;
+import org.apache.tools.ant.util.ReflectUtil;
+import org.apache.tools.ant.util.VectorSet;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
+
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.lang.reflect.Constructor;
+import java.net.MalformedURLException;
+import java.net.URL;
+import java.security.CodeSource;
+import java.security.ProtectionDomain;
+import java.security.cert.Certificate;
+import java.util.Collections;
+import java.util.Enumeration;
+import java.util.HashMap;
+import java.util.Hashtable;
+import java.util.Map;
+import java.util.NoSuchElementException;
+import java.util.StringTokenizer;
+import java.util.Vector;
+import java.util.jar.Attributes;
+import java.util.jar.Attributes.Name;
+import java.util.jar.JarEntry;
+import java.util.jar.JarFile;
+import java.util.jar.Manifest;
+
+/**
+ * Used to load classes within ant with a different classpath from
+ * that used to start ant. Note that it is possible to force a class
+ * into this loader even when that class is on the system classpath by
+ * using the forceLoadClass method. Any subsequent classes loaded by that
+ * class will then use this loader rather than the system class loader.
+ *
+ * &lt;p&gt;
+ * Note that this classloader has a feature to allow loading
+ * in reverse order and for &quot;isolation&quot;.
+ * Due to the fact that a number of
+ * methods in java.lang.ClassLoader are final (at least
+ * in java 1.4 getResources) this means that the
+ * class has to fake the given parent.
+ * &lt;/p&gt;
+ *
+ */
+@Restricted(NoExternalUse.class)
+public class AntClassLoader extends ClassLoader implements SubBuildListener {
+
+<span class="nc" id="L80">    private static final FileUtils FILE_UTILS = FileUtils.getFileUtils();</span>
+
+    /**
+     * An enumeration of all resources of a given name found within the
+     * classpath of this class loader. This enumeration is used by the
+     * ClassLoader.findResources method, which is in
+     * turn used by the ClassLoader.getResources method.
+     *
+     * @see AntClassLoader#findResources(String)
+     * @see java.lang.ClassLoader#getResources(String)
+     */
+    private class ResourceEnumeration implements Enumeration {
+        /**
+         * The name of the resource being searched for.
+         */
+        private String resourceName;
+
+        /**
+         * The index of the next classpath element to search.
+         */
+        private int pathElementsIndex;
+
+        /**
+         * The URL of the next resource to return in the enumeration. If this
+         * field is &lt;code&gt;null&lt;/code&gt; then the enumeration has been completed,
+         * i.e., there are no more elements to return.
+         */
+        private URL nextResource;
+
+        /**
+         * Constructs a new enumeration of resources of the given name found
+         * within this class loader's classpath.
+         *
+         * @param name the name of the resource to search for.
+         */
+<span class="nc" id="L115">        ResourceEnumeration(String name) {</span>
+<span class="nc" id="L116">            this.resourceName = name;</span>
+<span class="nc" id="L117">            this.pathElementsIndex = 0;</span>
+<span class="nc" id="L118">            findNextResource();</span>
+<span class="nc" id="L119">        }</span>
+
+        /**
+         * Indicates whether there are more elements in the enumeration to
+         * return.
+         *
+         * @return &lt;code&gt;true&lt;/code&gt; if there are more elements in the
+         *         enumeration; &lt;code&gt;false&lt;/code&gt; otherwise.
+         */
+        public boolean hasMoreElements() {
+<span class="nc bnc" id="L129" title="All 2 branches missed.">            return (this.nextResource != null);</span>
+        }
+
+        /**
+         * Returns the next resource in the enumeration.
+         *
+         * @return the next resource in the enumeration
+         */
+        public Object nextElement() {
+<span class="nc" id="L138">            URL ret = this.nextResource;</span>
+<span class="nc bnc" id="L139" title="All 2 branches missed.">            if (ret == null) {</span>
+<span class="nc" id="L140">                throw new NoSuchElementException();</span>
+            }
+<span class="nc" id="L142">            findNextResource();</span>
+<span class="nc" id="L143">            return ret;</span>
+        }
+
+        /**
+         * Locates the next resource of the correct name in the classpath and
+         * sets &lt;code&gt;nextResource&lt;/code&gt; to the URL of that resource. If no
+         * more resources can be found, &lt;code&gt;nextResource&lt;/code&gt; is set to
+         * &lt;code&gt;null&lt;/code&gt;.
+         */
+        private void findNextResource() {
+<span class="nc" id="L153">            URL url = null;</span>
+<span class="nc bnc" id="L154" title="All 4 branches missed.">            while ((pathElementsIndex &lt; pathComponents.size()) &amp;&amp; (url == null)) {</span>
+                try {
+<span class="nc" id="L156">                    File pathComponent = (File) pathComponents.elementAt(pathElementsIndex);</span>
+<span class="nc" id="L157">                    url = getResourceURL(pathComponent, this.resourceName);</span>
+<span class="nc" id="L158">                    pathElementsIndex++;</span>
+<span class="nc" id="L159">                } catch (BuildException e) {</span>
+                    // ignore path elements which are not valid relative to the
+                    // project
+                }
+            }
+<span class="nc" id="L164">            this.nextResource = url;</span>
+<span class="nc" id="L165">        }</span>
+    }
+
+    /**
+     * The size of buffers to be used in this classloader.
+     */
+    private static final int BUFFER_SIZE = 8192;
+
+    /**
+     * Number of array elements in a test array of strings
+     */
+    private static final int NUMBER_OF_STRINGS = 256;
+
+    /**
+     * The components of the classpath that the classloader searches
+     * for classes.
+     */
+<span class="nc" id="L182">    private Vector pathComponents  = new VectorSet();</span>
+
+    /**
+     * The project to which this class loader belongs.
+     */
+    private Project project;
+
+    /**
+     * Indicates whether the parent class loader should be
+     * consulted before trying to load with this class loader.
+     */
+<span class="nc" id="L193">    private boolean parentFirst = true;</span>
+
+    /**
+     * These are the package roots that are to be loaded by the parent class
+     * loader regardless of whether the parent class loader is being searched
+     * first or not.
+     */
+<span class="nc" id="L200">    private Vector systemPackages = new Vector();</span>
+
+    /**
+     * These are the package roots that are to be loaded by this class loader
+     * regardless of whether the parent class loader is being searched first
+     * or not.
+     */
+<span class="nc" id="L207">    private Vector loaderPackages = new Vector();</span>
+
+    /**
+     * Whether or not this classloader will ignore the base
+     * classloader if it can't find a class.
+     *
+     * @see #setIsolated(boolean)
+     */
+<span class="nc" id="L215">    private boolean ignoreBase = false;</span>
+
+    /**
+     * The parent class loader, if one is given or can be determined.
+     */
+<span class="nc" id="L220">    private ClassLoader parent = null;</span>
+
+    /**
+     * A hashtable of zip files opened by the classloader (File to JarFile).
+     */
+<span class="nc" id="L225">    private Hashtable jarFiles = new Hashtable();</span>
+
+    /** Static map of jar file/time to manifest class-path entries */
+<span class="nc" id="L228">    private static Map/*&lt;String,String&gt;*/ pathMap = Collections.synchronizedMap(new HashMap());</span>
+
+    /**
+     * The context loader saved when setting the thread's current
+     * context loader.
+     */
+<span class="nc" id="L234">    private ClassLoader savedContextLoader = null;</span>
+
+    /**
+     * Whether or not the context loader is currently saved.
+     */
+<span class="nc" id="L239">    private boolean isContextLoaderSaved = false;</span>
+
+    /**
+     * Create an Ant ClassLoader for a given project, with
+     * a parent classloader and an initial classpath.
+     * @since Ant 1.7.
+     * @param parent the parent for this classloader.
+     * @param project The project to which this classloader is to
+     *                belong.
+     * @param classpath The classpath to use to load classes.
+     */
+    public AntClassLoader(ClassLoader parent, Project project, Path classpath) {
+<span class="nc" id="L251">        super(parent);  // KK patch for JENKINS-21579</span>
+<span class="nc" id="L252">        setParent(parent);</span>
+<span class="nc" id="L253">        setClassPath(classpath);</span>
+<span class="nc" id="L254">        setProject(project);</span>
+<span class="nc" id="L255">    }</span>
+
+    /**
+     * Create an Ant Class Loader
+     */
+<span class="nc" id="L260">    public AntClassLoader() {</span>
+<span class="nc" id="L261">        setParent(null);</span>
+<span class="nc" id="L262">    }</span>
+
+    /**
+     * Creates a classloader for the given project using the classpath given.
+     *
+     * @param project The project to which this classloader is to belong.
+     *                Must not be &lt;code&gt;null&lt;/code&gt;.
+     * @param classpath The classpath to use to load the classes.  This
+     *                is combined with the system classpath in a manner
+     *                determined by the value of ${build.sysclasspath}.
+     *                May be &lt;code&gt;null&lt;/code&gt;, in which case no path
+     *                elements are set up to start with.
+     */
+<span class="nc" id="L275">    public AntClassLoader(Project project, Path classpath) {</span>
+<span class="nc" id="L276">        setParent(null);</span>
+<span class="nc" id="L277">        setProject(project);</span>
+<span class="nc" id="L278">        setClassPath(classpath);</span>
+<span class="nc" id="L279">    }</span>
+
+    /**
+     * Creates a classloader for the given project using the classpath given.
+     *
+     * @param parent The parent classloader to which unsatisfied loading
+     *               attempts are delegated. May be &lt;code&gt;null&lt;/code&gt;,
+     *               in which case the classloader which loaded this
+     *               class is used as the parent.
+     * @param project The project to which this classloader is to belong.
+     *                Must not be &lt;code&gt;null&lt;/code&gt;.
+     * @param classpath the classpath to use to load the classes.
+     *                  May be &lt;code&gt;null&lt;/code&gt;, in which case no path
+     *                  elements are set up to start with.
+     * @param parentFirst If &lt;code&gt;true&lt;/code&gt;, indicates that the parent
+     *                    classloader should be consulted  before trying to
+     *                    load the a class through this loader.
+     */
+    public AntClassLoader(
+        ClassLoader parent, Project project, Path classpath, boolean parentFirst) {
+<span class="nc" id="L299">        this(project, classpath);</span>
+<span class="nc bnc" id="L300" title="All 2 branches missed.">        if (parent != null) {</span>
+<span class="nc" id="L301">            setParent(parent);</span>
+        }
+<span class="nc" id="L303">        setParentFirst(parentFirst);</span>
+<span class="nc" id="L304">        addJavaLibraries();</span>
+<span class="nc" id="L305">    }</span>
+
+    /**
+     * Creates a classloader for the given project using the classpath given.
+     *
+     * @param project The project to which this classloader is to belong.
+     *                Must not be &lt;code&gt;null&lt;/code&gt;.
+     * @param classpath The classpath to use to load the classes. May be
+     *                  &lt;code&gt;null&lt;/code&gt;, in which case no path
+     *                  elements are set up to start with.
+     * @param parentFirst If &lt;code&gt;true&lt;/code&gt;, indicates that the parent
+     *                    classloader should be consulted before trying to
+     *                    load the a class through this loader.
+     */
+    public AntClassLoader(Project project, Path classpath, boolean parentFirst) {
+<span class="nc" id="L320">        this(null, project, classpath, parentFirst);</span>
+<span class="nc" id="L321">    }</span>
+
+    /**
+     * Creates an empty class loader. The classloader should be configured
+     * with path elements to specify where the loader is to look for
+     * classes.
+     *
+     * @param parent The parent classloader to which unsatisfied loading
+     *               attempts are delegated. May be &lt;code&gt;null&lt;/code&gt;,
+     *               in which case the classloader which loaded this
+     *               class is used as the parent.
+     * @param parentFirst If &lt;code&gt;true&lt;/code&gt;, indicates that the parent
+     *                    classloader should be consulted before trying to
+     *                    load the a class through this loader.
+     */
+    public AntClassLoader(ClassLoader parent, boolean parentFirst) {
+<span class="nc" id="L337">        super(parent);  // KK patch for JENKINS-21579</span>
+<span class="nc" id="L338">        setParent(parent);</span>
+<span class="nc" id="L339">        project = null;</span>
+<span class="nc" id="L340">        this.parentFirst = parentFirst;</span>
+<span class="nc" id="L341">    }</span>
+
+    /**
+     * Set the project associated with this class loader
+     *
+     * @param project the project instance
+     */
+    public void setProject(Project project) {
+<span class="nc" id="L349">        this.project = project;</span>
+<span class="nc bnc" id="L350" title="All 2 branches missed.">        if (project != null) {</span>
+<span class="nc" id="L351">            project.addBuildListener(this);</span>
+        }
+<span class="nc" id="L353">    }</span>
+
+    /**
+     * Set the classpath to search for classes to load. This should not be
+     * changed once the classloader starts to server classes
+     *
+     * @param classpath the search classpath consisting of directories and
+     *        jar/zip files.
+     */
+    public void setClassPath(Path classpath) {
+<span class="nc" id="L363">        pathComponents.removeAllElements();</span>
+<span class="nc bnc" id="L364" title="All 2 branches missed.">        if (classpath != null) {</span>
+<span class="nc" id="L365">            Path actualClasspath = classpath.concatSystemClasspath(&quot;ignore&quot;);</span>
+<span class="nc" id="L366">            String[] pathElements = actualClasspath.list();</span>
+<span class="nc bnc" id="L367" title="All 2 branches missed.">            for (int i = 0; i &lt; pathElements.length; ++i) {</span>
+                try {
+<span class="nc" id="L369">                    addPathElement(pathElements[i]);</span>
+<span class="nc" id="L370">                } catch (BuildException e) {</span>
+                    // ignore path elements which are invalid
+                    // relative to the project
+                }
+            }
+        }
+<span class="nc" id="L376">    }</span>
+
+    /**
+     * Set the parent for this class loader. This is the class loader to which
+     * this class loader will delegate to load classes
+     *
+     * @param parent the parent class loader.
+     */
+    public void setParent(ClassLoader parent) {
+<span class="nc bnc" id="L385" title="All 2 branches missed.">        this.parent = parent == null ? AntClassLoader.class.getClassLoader() : parent;</span>
+<span class="nc" id="L386">    }</span>
+
+    /**
+     * Control whether class lookup is delegated to the parent loader first
+     * or after this loader. Use with extreme caution. Setting this to
+     * false violates the class loader hierarchy and can lead to Linkage errors
+     *
+     * @param parentFirst if true, delegate initial class search to the parent
+     *                    classloader.
+     */
+    public void setParentFirst(boolean parentFirst) {
+<span class="nc" id="L397">        this.parentFirst = parentFirst;</span>
+<span class="nc" id="L398">    }</span>
+
+    /**
+     * Logs a message through the project object if one has been provided.
+     *
+     * @param message The message to log.
+     *                Should not be &lt;code&gt;null&lt;/code&gt;.
+     *
+     * @param priority The logging priority of the message.
+     */
+    protected void log(String message, int priority) {
+<span class="nc bnc" id="L409" title="All 2 branches missed.">        if (project != null) {</span>
+<span class="nc" id="L410">            project.log(message, priority);</span>
+        }
+<span class="nc" id="L412">    }</span>
+
+    /**
+     * Sets the current thread's context loader to this classloader, storing
+     * the current loader value for later resetting.
+     */
+    public void setThreadContextLoader() {
+<span class="nc bnc" id="L419" title="All 2 branches missed.">        if (isContextLoaderSaved) {</span>
+<span class="nc" id="L420">            throw new BuildException(&quot;Context loader has not been reset&quot;);</span>
+        }
+<span class="nc bnc" id="L422" title="All 2 branches missed.">        if (LoaderUtils.isContextLoaderAvailable()) {</span>
+<span class="nc" id="L423">            savedContextLoader = LoaderUtils.getContextClassLoader();</span>
+<span class="nc" id="L424">            ClassLoader loader = this;</span>
+<span class="nc bnc" id="L425" title="All 4 branches missed.">            if (project != null &amp;&amp; &quot;only&quot;.equals(project.getProperty(&quot;build.sysclasspath&quot;))) {</span>
+<span class="nc" id="L426">                loader = this.getClass().getClassLoader();</span>
+            }
+<span class="nc" id="L428">            LoaderUtils.setContextClassLoader(loader);</span>
+<span class="nc" id="L429">            isContextLoaderSaved = true;</span>
+        }
+<span class="nc" id="L431">    }</span>
+
+    /**
+     * Resets the current thread's context loader to its original value.
+     */
+    public void resetThreadContextLoader() {
+<span class="nc bnc" id="L437" title="All 4 branches missed.">        if (LoaderUtils.isContextLoaderAvailable() &amp;&amp; isContextLoaderSaved) {</span>
+<span class="nc" id="L438">            LoaderUtils.setContextClassLoader(savedContextLoader);</span>
+<span class="nc" id="L439">            savedContextLoader = null;</span>
+<span class="nc" id="L440">            isContextLoaderSaved = false;</span>
+        }
+<span class="nc" id="L442">    }</span>
+
+
+    /**
+     * Adds an element to the classpath to be searched.
+     *
+     * @param pathElement The path element to add. Must not be
+     *                    &lt;code&gt;null&lt;/code&gt;.
+     *
+     * @exception BuildException if the given path element cannot be resolved
+     *                           against the project.
+     */
+    public void addPathElement(String pathElement) throws BuildException {
+<span class="nc bnc" id="L455" title="All 2 branches missed.">        File pathComponent = project != null ? project.resolveFile(pathElement) : new File(</span>
+<span class="nc" id="L456">                pathElement);</span>
+        try {
+<span class="nc" id="L458">            addPathFile(pathComponent);</span>
+<span class="nc" id="L459">        } catch (IOException e) {</span>
+<span class="nc" id="L460">            throw new BuildException(e);</span>
+        }
+<span class="nc" id="L462">    }</span>
+
+    /**
+     * Add a path component.
+     * This simply adds the file, unlike addPathElement
+     * it does not open jar files and load files from
+     * their CLASSPATH entry in the manifest file.
+     * @param file the jar file or directory to add.
+     */
+    public void addPathComponent(File file) {
+<span class="nc bnc" id="L472" title="All 2 branches missed.">        if (pathComponents.contains(file)) {</span>
+<span class="nc" id="L473">            return;</span>
+        }
+<span class="nc" id="L475">        pathComponents.addElement(file);</span>
+<span class="nc" id="L476">    }</span>
+
+    /**
+     * Add a file to the path.
+     * Reads the manifest, if available, and adds any additional class path jars
+     * specified in the manifest.
+     *
+     * @param pathComponent the file which is to be added to the path for
+     *                      this class loader
+     *
+     * @throws IOException if data needed from the file cannot be read.
+     */
+    protected void addPathFile(File pathComponent) throws IOException {
+<span class="nc bnc" id="L489" title="All 2 branches missed.">        if (!pathComponents.contains(pathComponent)) {</span>
+<span class="nc" id="L490">            pathComponents.addElement(pathComponent);</span>
+        }
+<span class="nc bnc" id="L492" title="All 2 branches missed.">        if (pathComponent.isDirectory()) {</span>
+<span class="nc" id="L493">            return;</span>
+        }
+
+<span class="nc" id="L496">        String absPathPlusTimeAndLength = pathComponent.getAbsolutePath()</span>
+<span class="nc" id="L497">                + pathComponent.lastModified() + &quot;-&quot; + pathComponent.length();</span>
+<span class="nc" id="L498">        String classpath = (String) pathMap.get(absPathPlusTimeAndLength);</span>
+<span class="nc bnc" id="L499" title="All 2 branches missed.">        if (classpath == null) {</span>
+<span class="nc" id="L500">            JarFile jarFile = null;</span>
+            try {
+<span class="nc" id="L502">                jarFile = new JarFile(pathComponent);</span>
+<span class="nc" id="L503">                Manifest manifest = jarFile.getManifest();</span>
+<span class="nc bnc" id="L504" title="All 2 branches missed.">                if (manifest == null) {</span>
+<span class="nc" id="L505">                    return;</span>
+                }
+<span class="nc" id="L507">                classpath = manifest.getMainAttributes()</span>
+<span class="nc" id="L508">                    .getValue(Attributes.Name.CLASS_PATH);</span>
+<span class="nc" id="L509">            } finally {</span>
+<span class="nc bnc" id="L510" title="All 6 branches missed.">                if (jarFile != null) {</span>
+<span class="nc" id="L511">                    jarFile.close();</span>
+                }
+<span class="nc" id="L513">            }</span>
+<span class="nc bnc" id="L514" title="All 2 branches missed.">            if (classpath == null) {</span>
+<span class="nc" id="L515">                classpath = &quot;&quot;;</span>
+            }
+<span class="nc" id="L517">            pathMap.put(absPathPlusTimeAndLength, classpath);</span>
+        }
+
+<span class="nc bnc" id="L520" title="All 2 branches missed.">        if (!&quot;&quot;.equals(classpath)) {</span>
+<span class="nc" id="L521">            URL baseURL = FILE_UTILS.getFileURL(pathComponent);</span>
+<span class="nc" id="L522">            StringTokenizer st = new StringTokenizer(classpath);</span>
+<span class="nc bnc" id="L523" title="All 2 branches missed.">            while (st.hasMoreTokens()) {</span>
+<span class="nc" id="L524">                String classpathElement = st.nextToken();</span>
+<span class="nc" id="L525">                URL libraryURL = new URL(baseURL, classpathElement);</span>
+<span class="nc bnc" id="L526" title="All 2 branches missed.">                if (!libraryURL.getProtocol().equals(&quot;file&quot;)) {</span>
+<span class="nc" id="L527">                    log(&quot;Skipping jar library &quot; + classpathElement</span>
+<span class="nc" id="L528">                            + &quot; since only relative URLs are supported by this&quot; + &quot; loader&quot;,</span>
+<span class="nc" id="L529">                            Project.MSG_VERBOSE);</span>
+<span class="nc" id="L530">                    continue;</span>
+                }
+<span class="nc" id="L532">                String decodedPath = Locator.decodeUri(libraryURL.getFile());</span>
+<span class="nc" id="L533">                File libraryFile = new File(decodedPath);</span>
+<span class="nc bnc" id="L534" title="All 4 branches missed.">                if (libraryFile.exists() &amp;&amp; !isInPath(libraryFile)) {</span>
+<span class="nc" id="L535">                    addPathFile(libraryFile);</span>
+                }
+            }
+        }
+<span class="nc" id="L539">    }</span>
+
+    /**
+     * Returns the classpath this classloader will consult.
+     *
+     * @return the classpath used for this classloader, with elements
+     *         separated by the path separator for the system.
+     */
+    public String getClasspath() {
+<span class="nc" id="L548">        StringBuffer sb = new StringBuffer();</span>
+<span class="nc" id="L549">        boolean firstPass = true;</span>
+<span class="nc" id="L550">        Enumeration componentEnum = pathComponents.elements();</span>
+<span class="nc bnc" id="L551" title="All 2 branches missed.">        while (componentEnum.hasMoreElements()) {</span>
+<span class="nc bnc" id="L552" title="All 2 branches missed.">            if (!firstPass) {</span>
+<span class="nc" id="L553">                sb.append(System.getProperty(&quot;path.separator&quot;));</span>
+<span class="nc" id="L554">            } else {</span>
+<span class="nc" id="L555">                firstPass = false;</span>
+            }
+<span class="nc" id="L557">            sb.append(((File) componentEnum.nextElement()).getAbsolutePath());</span>
+        }
+<span class="nc" id="L559">        return sb.toString();</span>
+    }
+
+    /**
+     * Sets whether this classloader should run in isolated mode. In
+     * isolated mode, classes not found on the given classpath will
+     * not be referred to the parent class loader but will cause a
+     * ClassNotFoundException.
+     *
+     * @param isolated Whether or not this classloader should run in
+     *                 isolated mode.
+     */
+    public synchronized void setIsolated(boolean isolated) {
+<span class="nc" id="L572">        ignoreBase = isolated;</span>
+<span class="nc" id="L573">    }</span>
+
+    /**
+     * Forces initialization of a class in a JDK 1.1 compatible, albeit hacky
+     * way.
+     *
+     * @param theClass The class to initialize.
+     *                 Must not be &lt;code&gt;null&lt;/code&gt;.
+     *
+     * @deprecated since 1.6.x.
+     *             Use Class.forName with initialize=true instead.
+     */
+    @Deprecated
+    public static void initializeClass(Class theClass) {
+        // ***HACK*** We ask the VM to create an instance
+        // by voluntarily providing illegal arguments to force
+        // the VM to run the class' static initializer, while
+        // at the same time not running a valid constructor.
+
+<span class="nc" id="L592">        final Constructor[] cons = theClass.getDeclaredConstructors();</span>
+        //At least one constructor is guaranteed to be there, but check anyway.
+<span class="nc bnc" id="L594" title="All 2 branches missed.">        if (cons != null) {</span>
+<span class="nc bnc" id="L595" title="All 4 branches missed.">            if (cons.length &gt; 0 &amp;&amp; cons[0] != null) {</span>
+<span class="nc" id="L596">                final String[] strs = new String[NUMBER_OF_STRINGS];</span>
+                try {
+<span class="nc" id="L598">                    cons[0].newInstance((Object[]) strs);</span>
+                    // Expecting an exception to be thrown by this call:
+                    // IllegalArgumentException: wrong number of Arguments
+<span class="nc" id="L601">                } catch (Exception e) {</span>
+                    // Ignore - we are interested only in the side
+                    // effect - that of getting the static initializers
+                    // invoked.  As we do not want to call a valid
+                    // constructor to get this side effect, an
+                    // attempt is made to call a hopefully
+                    // invalid constructor - come on, nobody
+                    // would have a constructor that takes in
+                    // 256 String arguments ;-)
+                    // (In fact, they can't - according to JVM spec
+                    // section 4.10, the number of method parameters is limited
+                    // to 255 by the definition of a method descriptor.
+                    // Constructors count as methods here.)
+                }
+            }
+        }
+<span class="nc" id="L617">    }</span>
+
+    /**
+     * Adds a package root to the list of packages which must be loaded on the
+     * parent loader.
+     *
+     * All subpackages are also included.
+     *
+     * @param packageRoot The root of all packages to be included.
+     *                    Should not be &lt;code&gt;null&lt;/code&gt;.
+     */
+    public void addSystemPackageRoot(String packageRoot) {
+<span class="nc bnc" id="L629" title="All 2 branches missed.">        systemPackages.addElement(packageRoot + (packageRoot.endsWith(&quot;.&quot;) ? &quot;&quot; : &quot;.&quot;));</span>
+<span class="nc" id="L630">    }</span>
+
+    /**
+     * Adds a package root to the list of packages which must be loaded using
+     * this loader.
+     *
+     * All subpackages are also included.
+     *
+     * @param packageRoot The root of all packages to be included.
+     *                    Should not be &lt;code&gt;null&lt;/code&gt;.
+     */
+    public void addLoaderPackageRoot(String packageRoot) {
+<span class="nc bnc" id="L642" title="All 2 branches missed.">        loaderPackages.addElement(packageRoot + (packageRoot.endsWith(&quot;.&quot;) ? &quot;&quot; : &quot;.&quot;));</span>
+<span class="nc" id="L643">    }</span>
+
+    /**
+     * Loads a class through this class loader even if that class is available
+     * on the parent classpath.
+     *
+     * This ensures that any classes which are loaded by the returned class
+     * will use this classloader.
+     *
+     * @param classname The name of the class to be loaded.
+     *                  Must not be &lt;code&gt;null&lt;/code&gt;.
+     *
+     * @return the required Class object
+     *
+     * @exception ClassNotFoundException if the requested class does not exist
+     *                                   on this loader's classpath.
+     */
+    public Class forceLoadClass(String classname) throws ClassNotFoundException {
+<span class="nc" id="L661">        log(&quot;force loading &quot; + classname, Project.MSG_DEBUG);</span>
+
+<span class="nc" id="L663">        Class theClass = findLoadedClass(classname);</span>
+
+<span class="nc bnc" id="L665" title="All 2 branches missed.">        if (theClass == null) {</span>
+<span class="nc" id="L666">            theClass = findClass(classname);</span>
+        }
+<span class="nc" id="L668">        return theClass;</span>
+    }
+
+    /**
+     * Loads a class through this class loader but defer to the parent class
+     * loader.
+     *
+     * This ensures that instances of the returned class will be compatible
+     * with instances which have already been loaded on the parent
+     * loader.
+     *
+     * @param classname The name of the class to be loaded.
+     *                  Must not be &lt;code&gt;null&lt;/code&gt;.
+     *
+     * @return the required Class object
+     *
+     * @exception ClassNotFoundException if the requested class does not exist
+     * on this loader's classpath.
+     */
+    public Class forceLoadSystemClass(String classname) throws ClassNotFoundException {
+<span class="nc" id="L688">        log(&quot;force system loading &quot; + classname, Project.MSG_DEBUG);</span>
+
+<span class="nc" id="L690">        Class theClass = findLoadedClass(classname);</span>
+
+<span class="nc bnc" id="L692" title="All 2 branches missed.">        if (theClass == null) {</span>
+<span class="nc" id="L693">            theClass = findBaseClass(classname);</span>
+        }
+<span class="nc" id="L695">        return theClass;</span>
+    }
+
+    /**
+     * Returns a stream to read the requested resource name.
+     *
+     * @param name The name of the resource for which a stream is required.
+     *             Must not be &lt;code&gt;null&lt;/code&gt;.
+     *
+     * @return a stream to the required resource or &lt;code&gt;null&lt;/code&gt; if the
+     *         resource cannot be found on the loader's classpath.
+     */
+    public InputStream getResourceAsStream(String name) {
+<span class="nc" id="L708">        InputStream resourceStream = null;</span>
+<span class="nc bnc" id="L709" title="All 2 branches missed.">        if (isParentFirst(name)) {</span>
+<span class="nc" id="L710">            resourceStream = loadBaseResource(name);</span>
+        }
+<span class="nc bnc" id="L712" title="All 2 branches missed.">        if (resourceStream != null) {</span>
+<span class="nc" id="L713">            log(&quot;ResourceStream for &quot; + name</span>
+<span class="nc" id="L714">                + &quot; loaded from parent loader&quot;, Project.MSG_DEBUG);</span>
+<span class="nc" id="L715">        } else {</span>
+<span class="nc" id="L716">            resourceStream = loadResource(name);</span>
+<span class="nc bnc" id="L717" title="All 2 branches missed.">            if (resourceStream != null) {</span>
+<span class="nc" id="L718">                log(&quot;ResourceStream for &quot; + name</span>
+<span class="nc" id="L719">                    + &quot; loaded from ant loader&quot;, Project.MSG_DEBUG);</span>
+            }
+        }
+<span class="nc bnc" id="L722" title="All 4 branches missed.">        if (resourceStream == null &amp;&amp; !isParentFirst(name)) {</span>
+<span class="nc bnc" id="L723" title="All 2 branches missed.">            if (ignoreBase) {</span>
+<span class="nc bnc" id="L724" title="All 2 branches missed.">                resourceStream = getRootLoader() == null ? null : getRootLoader().getResourceAsStream(name);</span>
+<span class="nc" id="L725">            } else {</span>
+<span class="nc" id="L726">                resourceStream = loadBaseResource(name);</span>
+            }
+<span class="nc bnc" id="L728" title="All 2 branches missed.">            if (resourceStream != null) {</span>
+<span class="nc" id="L729">                log(&quot;ResourceStream for &quot; + name + &quot; loaded from parent loader&quot;,</span>
+<span class="nc" id="L730">                    Project.MSG_DEBUG);</span>
+            }
+        }
+<span class="nc bnc" id="L733" title="All 2 branches missed.">        if (resourceStream == null) {</span>
+<span class="nc" id="L734">            log(&quot;Couldn't load ResourceStream for &quot; + name, Project.MSG_DEBUG);</span>
+        }
+<span class="nc" id="L736">        return resourceStream;</span>
+    }
+
+    /**
+     * Returns a stream to read the requested resource name from this loader.
+     *
+     * @param name The name of the resource for which a stream is required.
+     *             Must not be &lt;code&gt;null&lt;/code&gt;.
+     *
+     * @return a stream to the required resource or &lt;code&gt;null&lt;/code&gt; if
+     *         the resource cannot be found on the loader's classpath.
+     */
+    private InputStream loadResource(String name) {
+        // we need to search the components of the path to see if we can
+        // find the class we want.
+<span class="nc" id="L751">        InputStream stream = null;</span>
+
+<span class="nc" id="L753">        Enumeration e = pathComponents.elements();</span>
+<span class="nc bnc" id="L754" title="All 4 branches missed.">        while (e.hasMoreElements() &amp;&amp; stream == null) {</span>
+<span class="nc" id="L755">            File pathComponent = (File) e.nextElement();</span>
+<span class="nc" id="L756">            stream = getResourceStream(pathComponent, name);</span>
+        }
+<span class="nc" id="L758">        return stream;</span>
+    }
+
+    /**
+     * Finds a system resource (which should be loaded from the parent
+     * classloader).
+     *
+     * @param name The name of the system resource to load.
+     *             Must not be &lt;code&gt;null&lt;/code&gt;.
+     *
+     * @return a stream to the named resource, or &lt;code&gt;null&lt;/code&gt; if
+     *         the resource cannot be found.
+     */
+    private InputStream loadBaseResource(String name) {
+<span class="nc bnc" id="L772" title="All 2 branches missed.">        return parent == null ? super.getResourceAsStream(name) : parent.getResourceAsStream(name);</span>
+    }
+
+    /**
+     * Returns an inputstream to a given resource in the given file which may
+     * either be a directory or a zip file.
+     *
+     * @param file the file (directory or jar) in which to search for the
+     *             resource. Must not be &lt;code&gt;null&lt;/code&gt;.
+     * @param resourceName The name of the resource for which a stream is
+     *                     required. Must not be &lt;code&gt;null&lt;/code&gt;.
+     *
+     * @return a stream to the required resource or &lt;code&gt;null&lt;/code&gt; if
+     *         the resource cannot be found in the given file.
+     */
+    private InputStream getResourceStream(File file, String resourceName) {
+        try {
+<span class="nc" id="L789">            JarFile jarFile = (JarFile) jarFiles.get(file);</span>
+<span class="nc bnc" id="L790" title="All 4 branches missed.">            if (jarFile == null &amp;&amp; file.isDirectory()) {</span>
+<span class="nc" id="L791">                File resource = new File(file, resourceName);</span>
+<span class="nc bnc" id="L792" title="All 2 branches missed.">                if (resource.exists()) {</span>
+<span class="nc" id="L793">                    return new FileInputStream(resource);</span>
+                }
+            } else {
+<span class="nc bnc" id="L796" title="All 2 branches missed.">                if (jarFile == null) {</span>
+<span class="nc bnc" id="L797" title="All 2 branches missed.">                    if (file.exists()) {</span>
+<span class="nc" id="L798">                        jarFile = new JarFile(file);</span>
+<span class="nc" id="L799">                        jarFiles.put(file, jarFile);</span>
+<span class="nc" id="L800">                    } else {</span>
+<span class="nc" id="L801">                        return null;</span>
+                    }
+                    //to eliminate a race condition, retrieve the entry
+                    //that is in the hash table under that filename
+<span class="nc" id="L805">                    jarFile = (JarFile) jarFiles.get(file);</span>
+                }
+<span class="nc" id="L807">                JarEntry entry = jarFile.getJarEntry(resourceName);</span>
+<span class="nc bnc" id="L808" title="All 2 branches missed.">                if (entry != null) {</span>
+<span class="nc" id="L809">                    return jarFile.getInputStream(entry);</span>
+                }
+            }
+<span class="nc" id="L812">        } catch (Exception e) {</span>
+<span class="nc" id="L813">            log(&quot;Ignoring Exception &quot; + e.getClass().getName() + &quot;: &quot; + e.getMessage()</span>
+<span class="nc" id="L814">                    + &quot; reading resource &quot; + resourceName + &quot; from &quot; + file, Project.MSG_VERBOSE);</span>
+        }
+<span class="nc" id="L816">        return null;</span>
+    }
+
+    /**
+     * Tests whether or not the parent classloader should be checked for a
+     * resource before this one. If the resource matches both the &quot;use parent
+     * classloader first&quot; and the &quot;use this classloader first&quot; lists, the latter
+     * takes priority.
+     *
+     * @param resourceName
+     *            The name of the resource to check. Must not be
+     *            &lt;code&gt;null&lt;/code&gt;.
+     *
+     * @return whether or not the parent classloader should be checked for a
+     *         resource before this one is.
+     */
+    private boolean isParentFirst(String resourceName) {
+        // default to the global setting and then see
+        // if this class belongs to a package which has been
+        // designated to use a specific loader first
+        // (this one or the parent one)
+
+        // TODO shouldn't this always return false in isolated mode?
+
+<span class="nc" id="L840">        boolean useParentFirst = parentFirst;</span>
+
+<span class="nc bnc" id="L842" title="All 2 branches missed.">        for (Enumeration e = systemPackages.elements(); e.hasMoreElements();) {</span>
+<span class="nc" id="L843">            String packageName = (String) e.nextElement();</span>
+<span class="nc bnc" id="L844" title="All 2 branches missed.">            if (resourceName.startsWith(packageName)) {</span>
+<span class="nc" id="L845">                useParentFirst = true;</span>
+<span class="nc" id="L846">                break;</span>
+            }
+        }
+<span class="nc bnc" id="L849" title="All 2 branches missed.">        for (Enumeration e = loaderPackages.elements(); e.hasMoreElements();) {</span>
+<span class="nc" id="L850">            String packageName = (String) e.nextElement();</span>
+<span class="nc bnc" id="L851" title="All 2 branches missed.">            if (resourceName.startsWith(packageName)) {</span>
+<span class="nc" id="L852">                useParentFirst = false;</span>
+<span class="nc" id="L853">                break;</span>
+            }
+        }
+<span class="nc" id="L856">        return useParentFirst;</span>
+    }
+
+    /**
+     * Used for isolated resource seaching.
+     * @return the root classloader of AntClassLoader.
+     */
+    private ClassLoader getRootLoader() {
+<span class="nc" id="L864">        ClassLoader ret = getClass().getClassLoader();</span>
+<span class="nc bnc" id="L865" title="All 4 branches missed.">        while (ret != null &amp;&amp; ret.getParent() != null) {</span>
+<span class="nc" id="L866">            ret = ret.getParent();</span>
+        }
+<span class="nc" id="L868">        return ret;</span>
+    }
+
+    /**
+     * Finds the resource with the given name. A resource is
+     * some data (images, audio, text, etc) that can be accessed by class
+     * code in a way that is independent of the location of the code.
+     *
+     * @param name The name of the resource for which a stream is required.
+     *             Must not be &lt;code&gt;null&lt;/code&gt;.
+     *
+     * @return a URL for reading the resource, or &lt;code&gt;null&lt;/code&gt; if the
+     *         resource could not be found or the caller doesn't have
+     *         adequate privileges to get the resource.
+     */
+    public URL getResource(String name) {
+        // we need to search the components of the path to see if
+        // we can find the class we want.
+<span class="nc" id="L886">        URL url = null;</span>
+<span class="nc bnc" id="L887" title="All 2 branches missed.">        if (isParentFirst(name)) {</span>
+<span class="nc bnc" id="L888" title="All 2 branches missed.">            url = parent == null ? super.getResource(name) : parent.getResource(name);</span>
+        }
+<span class="nc bnc" id="L890" title="All 2 branches missed.">        if (url != null) {</span>
+<span class="nc" id="L891">            log(&quot;Resource &quot; + name + &quot; loaded from parent loader&quot;, Project.MSG_DEBUG);</span>
+<span class="nc" id="L892">        } else {</span>
+            // try and load from this loader if the parent either didn't find
+            // it or wasn't consulted.
+<span class="nc" id="L895">            Enumeration e = pathComponents.elements();</span>
+<span class="nc bnc" id="L896" title="All 4 branches missed.">            while (e.hasMoreElements() &amp;&amp; url == null) {</span>
+<span class="nc" id="L897">                File pathComponent = (File) e.nextElement();</span>
+<span class="nc" id="L898">                url = getResourceURL(pathComponent, name);</span>
+<span class="nc bnc" id="L899" title="All 2 branches missed.">                if (url != null) {</span>
+<span class="nc" id="L900">                    log(&quot;Resource &quot; + name + &quot; loaded from ant loader&quot;, Project.MSG_DEBUG);</span>
+                }
+            }
+        }
+<span class="nc bnc" id="L904" title="All 4 branches missed.">        if (url == null &amp;&amp; !isParentFirst(name)) {</span>
+            // this loader was first but it didn't find it - try the parent
+<span class="nc bnc" id="L906" title="All 2 branches missed.">            if (ignoreBase) {</span>
+<span class="nc bnc" id="L907" title="All 2 branches missed.">                url = getRootLoader() == null ? null : getRootLoader().getResource(name);</span>
+<span class="nc" id="L908">            } else {</span>
+<span class="nc bnc" id="L909" title="All 2 branches missed.">                url = parent == null ? super.getResource(name) : parent.getResource(name);</span>
+            }
+<span class="nc bnc" id="L911" title="All 2 branches missed.">            if (url != null) {</span>
+<span class="nc" id="L912">                log(&quot;Resource &quot; + name + &quot; loaded from parent loader&quot;, Project.MSG_DEBUG);</span>
+            }
+        }
+<span class="nc bnc" id="L915" title="All 2 branches missed.">        if (url == null) {</span>
+<span class="nc" id="L916">            log(&quot;Couldn't load Resource &quot; + name, Project.MSG_DEBUG);</span>
+        }
+<span class="nc" id="L918">        return url;</span>
+    }
+
+    /**
+     * Finds all the resources with the given name. A resource is some
+     * data (images, audio, text, etc) that can be accessed by class
+     * code in a way that is independent of the location of the code.
+     *
+     * &lt;p&gt;Would override getResources if that wasn't final in Java
+     * 1.4.&lt;/p&gt;
+     *
+     * @since Ant 1.8.0
+     */
+    public Enumeration/*&lt;URL&gt;*/ getNamedResources(String name)
+        throws IOException {
+<span class="nc" id="L933">        return findResources(name, false);</span>
+    }
+
+    /**
+     * Returns an enumeration of URLs representing all the resources with the
+     * given name by searching the class loader's classpath.
+     *
+     * @param name The resource name to search for.
+     *             Must not be &lt;code&gt;null&lt;/code&gt;.
+     * @return an enumeration of URLs for the resources
+     * @exception IOException if I/O errors occurs (can't happen)
+     */
+    protected Enumeration/*&lt;URL&gt;*/ findResources(String name) throws IOException {
+<span class="nc" id="L946">        return findResources(name, true);</span>
+    }
+
+    /**
+     * Returns an enumeration of URLs representing all the resources with the
+     * given name by searching the class loader's classpath.
+     *
+     * @param name The resource name to search for.
+     *             Must not be &lt;code&gt;null&lt;/code&gt;.
+     * @param parentHasBeenSearched whether ClassLoader.this.parent
+     * has been searched - will be true if the method is (indirectly)
+     * called from ClassLoader.getResources
+     * @return an enumeration of URLs for the resources
+     * @exception IOException if I/O errors occurs (can't happen)
+     */
+    protected Enumeration/*&lt;URL&gt;*/ findResources(String name,
+                                                 boolean parentHasBeenSearched)
+        throws IOException {
+<span class="nc" id="L964">        Enumeration/*&lt;URL&gt;*/ mine = new ResourceEnumeration(name);</span>
+        Enumeration/*&lt;URL&gt;*/ base;
+<span class="nc bnc" id="L966" title="All 6 branches missed.">        if (parent != null &amp;&amp; (!parentHasBeenSearched || parent != getParent())) {</span>
+            // Delegate to the parent:
+<span class="nc" id="L968">            base = parent.getResources(name);</span>
+            // Note: could cause overlaps in case
+            // ClassLoader.this.parent has matches and
+            // parentHasBeenSearched is true
+<span class="nc" id="L972">        } else {</span>
+            // ClassLoader.this.parent is already delegated to for example from
+            // ClassLoader.getResources, no need:
+<span class="nc" id="L975">            base = new CollectionUtils.EmptyEnumeration();</span>
+        }
+<span class="nc bnc" id="L977" title="All 2 branches missed.">        if (isParentFirst(name)) {</span>
+            // Normal case.
+<span class="nc" id="L979">            return CollectionUtils.append(base, mine);</span>
+        }
+<span class="nc bnc" id="L981" title="All 2 branches missed.">        if (ignoreBase) {</span>
+<span class="nc bnc" id="L982" title="All 2 branches missed.">            return getRootLoader() == null ? mine : CollectionUtils.append(mine, getRootLoader()</span>
+<span class="nc" id="L983">                    .getResources(name));</span>
+        }
+        // parent last:
+<span class="nc" id="L986">        return CollectionUtils.append(mine, base);</span>
+    }
+
+    /**
+     * Returns the URL of a given resource in the given file which may
+     * either be a directory or a zip file.
+     *
+     * @param file The file (directory or jar) in which to search for
+     *             the resource. Must not be &lt;code&gt;null&lt;/code&gt;.
+     * @param resourceName The name of the resource for which a stream
+     *                     is required. Must not be &lt;code&gt;null&lt;/code&gt;.
+     *
+     * @return a stream to the required resource or &lt;code&gt;null&lt;/code&gt; if the
+     *         resource cannot be found in the given file object.
+     */
+    protected URL getResourceURL(File file, String resourceName) {
+        try {
+<span class="nc" id="L1003">            JarFile jarFile = (JarFile) jarFiles.get(file);</span>
+<span class="nc bnc" id="L1004" title="All 4 branches missed.">            if (jarFile == null &amp;&amp; file.isDirectory()) {</span>
+<span class="nc" id="L1005">                File resource = new File(file, resourceName);</span>
+
+<span class="nc bnc" id="L1007" title="All 2 branches missed.">                if (resource.exists()) {</span>
+                    try {
+<span class="nc" id="L1009">                        return FILE_UTILS.getFileURL(resource);</span>
+<span class="nc" id="L1010">                    } catch (MalformedURLException ex) {</span>
+<span class="nc" id="L1011">                        return null;</span>
+                    }
+                }
+            } else {
+<span class="nc bnc" id="L1015" title="All 2 branches missed.">                if (jarFile == null) {</span>
+<span class="nc bnc" id="L1016" title="All 2 branches missed.">                    if (file.exists()) {</span>
+<span class="nc" id="L1017">                        jarFile = new JarFile(file);</span>
+<span class="nc" id="L1018">                        jarFiles.put(file, jarFile);</span>
+<span class="nc" id="L1019">                    } else {</span>
+<span class="nc" id="L1020">                        return null;</span>
+                    }
+                    // potential race-condition
+<span class="nc" id="L1023">                    jarFile = (JarFile) jarFiles.get(file);</span>
+                }
+<span class="nc" id="L1025">                JarEntry entry = jarFile.getJarEntry(resourceName);</span>
+<span class="nc bnc" id="L1026" title="All 2 branches missed.">                if (entry != null) {</span>
+                    try {
+<span class="nc" id="L1028">                        return new URL(&quot;jar:&quot; + FILE_UTILS.getFileURL(file) + &quot;!/&quot; + entry);</span>
+<span class="nc" id="L1029">                    } catch (MalformedURLException ex) {</span>
+<span class="nc" id="L1030">                        return null;</span>
+                    }
+                }
+            }
+<span class="nc" id="L1034">        } catch (Exception e) {</span>
+<span class="nc" id="L1035">            String msg = &quot;Unable to obtain resource from &quot; + file + &quot;: &quot;;</span>
+<span class="nc" id="L1036">            log(msg + e, Project.MSG_WARN);</span>
+<span class="nc" id="L1037">            System.err.println(msg);</span>
+<span class="nc" id="L1038">            e.printStackTrace();</span>
+        }
+<span class="nc" id="L1040">        return null;</span>
+    }
+
+    /**
+     * Loads a class with this class loader.
+     *
+     * This class attempts to load the class in an order determined by whether
+     * or not the class matches the system/loader package lists, with the
+     * loader package list taking priority. If the classloader is in isolated
+     * mode, failure to load the class in this loader will result in a
+     * ClassNotFoundException.
+     *
+     * @param classname The name of the class to be loaded.
+     *                  Must not be &lt;code&gt;null&lt;/code&gt;.
+     * @param resolve &lt;code&gt;true&lt;/code&gt; if all classes upon which this class
+     *                depends are to be loaded.
+     *
+     * @return the required Class object
+     *
+     * @exception ClassNotFoundException if the requested class does not exist
+     * on the system classpath (when not in isolated mode) or this loader's
+     * classpath.
+     */
+    protected synchronized Class loadClass(String classname, boolean resolve)
+            throws ClassNotFoundException {
+        // 'sync' is needed - otherwise 2 threads can load the same class
+        // twice, resulting in LinkageError: duplicated class definition.
+        // findLoadedClass avoids that, but without sync it won't work.
+
+<span class="nc" id="L1069">        Class theClass = findLoadedClass(classname);</span>
+<span class="nc bnc" id="L1070" title="All 2 branches missed.">        if (theClass != null) {</span>
+<span class="nc" id="L1071">            return theClass;</span>
+        }
+<span class="nc bnc" id="L1073" title="All 2 branches missed.">        if (isParentFirst(classname)) {</span>
+            try {
+<span class="nc" id="L1075">                theClass = findBaseClass(classname);</span>
+<span class="nc" id="L1076">                log(&quot;Class &quot; + classname + &quot; loaded from parent loader &quot; + &quot;(parentFirst)&quot;,</span>
+<span class="nc" id="L1077">                        Project.MSG_DEBUG);</span>
+<span class="nc" id="L1078">            } catch (ClassNotFoundException cnfe) {</span>
+<span class="nc" id="L1079">                theClass = findClass(classname);</span>
+<span class="nc" id="L1080">                log(&quot;Class &quot; + classname + &quot; loaded from ant loader &quot; + &quot;(parentFirst)&quot;,</span>
+<span class="nc" id="L1081">                        Project.MSG_DEBUG);</span>
+            }
+<span class="nc" id="L1083">        } else {</span>
+            try {
+<span class="nc" id="L1085">                theClass = findClass(classname);</span>
+<span class="nc" id="L1086">                log(&quot;Class &quot; + classname + &quot; loaded from ant loader&quot;, Project.MSG_DEBUG);</span>
+<span class="nc" id="L1087">            } catch (ClassNotFoundException cnfe) {</span>
+<span class="nc bnc" id="L1088" title="All 2 branches missed.">                if (ignoreBase) {</span>
+<span class="nc" id="L1089">                    throw cnfe;</span>
+                }
+<span class="nc" id="L1091">                theClass = findBaseClass(classname);</span>
+<span class="nc" id="L1092">                log(&quot;Class &quot; + classname + &quot; loaded from parent loader&quot;, Project.MSG_DEBUG);</span>
+            }
+        }
+<span class="nc bnc" id="L1095" title="All 2 branches missed.">        if (resolve) {</span>
+<span class="nc" id="L1096">            resolveClass(theClass);</span>
+        }
+<span class="nc" id="L1098">        return theClass;</span>
+    }
+
+    /**
+     * Converts the class dot notation to a filesystem equivalent for
+     * searching purposes.
+     *
+     * @param classname The class name in dot format (eg java.lang.Integer).
+     *                  Must not be &lt;code&gt;null&lt;/code&gt;.
+     *
+     * @return the classname in filesystem format (eg java/lang/Integer.class)
+     */
+    private String getClassFilename(String classname) {
+<span class="nc" id="L1111">        return classname.replace('.', '/') + &quot;.class&quot;;</span>
+    }
+
+    /**
+     * Define a class given its bytes
+     *
+     * @param container the container from which the class data has been read
+     *                  may be a directory or a jar/zip file.
+     *
+     * @param classData the bytecode data for the class
+     * @param classname the name of the class
+     *
+     * @return the Class instance created from the given data
+     *
+     * @throws IOException if the class data cannot be read.
+     */
+    protected Class defineClassFromData(File container, byte[] classData, String classname)
+            throws IOException {
+<span class="nc" id="L1129">        definePackage(container, classname);</span>
+<span class="nc" id="L1130">        ProtectionDomain currentPd = Project.class.getProtectionDomain();</span>
+<span class="nc" id="L1131">        String classResource = getClassFilename(classname);</span>
+<span class="nc" id="L1132">        CodeSource src = new CodeSource(FILE_UTILS.getFileURL(container),</span>
+<span class="nc" id="L1133">                                        getCertificates(container,</span>
+<span class="nc" id="L1134">                                                        classResource));</span>
+<span class="nc" id="L1135">        ProtectionDomain classesPd =</span>
+<span class="nc" id="L1136">            new ProtectionDomain(src, currentPd.getPermissions(),</span>
+<span class="nc" id="L1137">                                 this,</span>
+<span class="nc" id="L1138">                                 currentPd.getPrincipals());</span>
+<span class="nc" id="L1139">        return defineClass(classname, classData, 0, classData.length,</span>
+<span class="nc" id="L1140">                           classesPd);</span>
+    }
+
+    /**
+     * Define the package information associated with a class.
+     *
+     * @param container the file containing the class definition.
+     * @param className the class name of for which the package information
+     *        is to be determined.
+     *
+     * @exception IOException if the package information cannot be read from the
+     *            container.
+     */
+    protected void definePackage(File container, String className) throws IOException {
+<span class="nc" id="L1154">        int classIndex = className.lastIndexOf('.');</span>
+<span class="nc bnc" id="L1155" title="All 2 branches missed.">        if (classIndex == -1) {</span>
+<span class="nc" id="L1156">            return;</span>
+        }
+<span class="nc" id="L1158">        String packageName = className.substring(0, classIndex);</span>
+<span class="nc bnc" id="L1159" title="All 2 branches missed.">        if (getPackage(packageName) != null) {</span>
+            // already defined
+<span class="nc" id="L1161">            return;</span>
+        }
+        // define the package now
+<span class="nc" id="L1164">        Manifest manifest = getJarManifest(container);</span>
+
+<span class="nc bnc" id="L1166" title="All 2 branches missed.">        if (manifest == null) {</span>
+<span class="nc" id="L1167">            definePackage(packageName, null, null, null, null, null, null, null);</span>
+<span class="nc" id="L1168">        } else {</span>
+<span class="nc" id="L1169">            definePackage(container, packageName, manifest);</span>
+        }
+<span class="nc" id="L1171">    }</span>
+
+    /**
+     * Get the manifest from the given jar, if it is indeed a jar and it has a
+     * manifest
+     *
+     * @param container the File from which a manifest is required.
+     *
+     * @return the jar's manifest or null is the container is not a jar or it
+     *         has no manifest.
+     *
+     * @exception IOException if the manifest cannot be read.
+     */
+    private Manifest getJarManifest(File container) throws IOException {
+<span class="nc bnc" id="L1185" title="All 2 branches missed.">        if (container.isDirectory()) {</span>
+<span class="nc" id="L1186">            return null;</span>
+        }
+<span class="nc" id="L1188">        JarFile jarFile = (JarFile) jarFiles.get(container);</span>
+<span class="nc bnc" id="L1189" title="All 2 branches missed.">        if (jarFile == null) {</span>
+<span class="nc" id="L1190">            return null;</span>
+        }
+<span class="nc" id="L1192">        return jarFile.getManifest();</span>
+    }
+
+    /**
+     * Get the certificates for a given jar entry, if it is indeed a jar.
+     *
+     * @param container the File from which to read the entry
+     * @param entry the entry of which the certificates are requested
+     *
+     * @return the entry's certificates or null is the container is
+     *         not a jar or it has no certificates.
+     *
+     * @exception IOException if the manifest cannot be read.
+     */
+    private Certificate[] getCertificates(File container, String entry)
+        throws IOException {
+<span class="nc bnc" id="L1208" title="All 2 branches missed.">        if (container.isDirectory()) {</span>
+<span class="nc" id="L1209">            return null;</span>
+        }
+<span class="nc" id="L1211">        JarFile jarFile = (JarFile) jarFiles.get(container);</span>
+<span class="nc bnc" id="L1212" title="All 2 branches missed.">        if (jarFile == null) {</span>
+<span class="nc" id="L1213">            return null;</span>
+        }
+<span class="nc" id="L1215">        JarEntry ent = jarFile.getJarEntry(entry);</span>
+<span class="nc bnc" id="L1216" title="All 2 branches missed.">        return ent == null ? null : ent.getCertificates();</span>
+    }
+
+    /**
+     * Define the package information when the class comes from a
+     * jar with a manifest
+     *
+     * @param container the jar file containing the manifest
+     * @param packageName the name of the package being defined.
+     * @param manifest the jar's manifest
+     */
+    protected void definePackage(File container, String packageName, Manifest manifest) {
+<span class="nc" id="L1228">        String sectionName = packageName.replace('.', '/') + &quot;/&quot;;</span>
+
+<span class="nc" id="L1230">        String specificationTitle = null;</span>
+<span class="nc" id="L1231">        String specificationVendor = null;</span>
+<span class="nc" id="L1232">        String specificationVersion = null;</span>
+<span class="nc" id="L1233">        String implementationTitle = null;</span>
+<span class="nc" id="L1234">        String implementationVendor = null;</span>
+<span class="nc" id="L1235">        String implementationVersion = null;</span>
+<span class="nc" id="L1236">        String sealedString = null;</span>
+<span class="nc" id="L1237">        URL sealBase = null;</span>
+
+<span class="nc" id="L1239">        Attributes sectionAttributes = manifest.getAttributes(sectionName);</span>
+<span class="nc bnc" id="L1240" title="All 2 branches missed.">        if (sectionAttributes != null) {</span>
+<span class="nc" id="L1241">            specificationTitle = sectionAttributes.getValue(Name.SPECIFICATION_TITLE);</span>
+<span class="nc" id="L1242">            specificationVendor = sectionAttributes.getValue(Name.SPECIFICATION_VENDOR);</span>
+<span class="nc" id="L1243">            specificationVersion = sectionAttributes.getValue(Name.SPECIFICATION_VERSION);</span>
+<span class="nc" id="L1244">            implementationTitle = sectionAttributes.getValue(Name.IMPLEMENTATION_TITLE);</span>
+<span class="nc" id="L1245">            implementationVendor = sectionAttributes.getValue(Name.IMPLEMENTATION_VENDOR);</span>
+<span class="nc" id="L1246">            implementationVersion = sectionAttributes.getValue(Name.IMPLEMENTATION_VERSION);</span>
+<span class="nc" id="L1247">            sealedString = sectionAttributes.getValue(Name.SEALED);</span>
+        }
+<span class="nc" id="L1249">        Attributes mainAttributes = manifest.getMainAttributes();</span>
+<span class="nc bnc" id="L1250" title="All 2 branches missed.">        if (mainAttributes != null) {</span>
+<span class="nc bnc" id="L1251" title="All 2 branches missed.">            if (specificationTitle == null) {</span>
+<span class="nc" id="L1252">                specificationTitle = mainAttributes.getValue(Name.SPECIFICATION_TITLE);</span>
+            }
+<span class="nc bnc" id="L1254" title="All 2 branches missed.">            if (specificationVendor == null) {</span>
+<span class="nc" id="L1255">                specificationVendor = mainAttributes.getValue(Name.SPECIFICATION_VENDOR);</span>
+            }
+<span class="nc bnc" id="L1257" title="All 2 branches missed.">            if (specificationVersion == null) {</span>
+<span class="nc" id="L1258">                specificationVersion = mainAttributes.getValue(Name.SPECIFICATION_VERSION);</span>
+            }
+<span class="nc bnc" id="L1260" title="All 2 branches missed.">            if (implementationTitle == null) {</span>
+<span class="nc" id="L1261">                implementationTitle = mainAttributes.getValue(Name.IMPLEMENTATION_TITLE);</span>
+            }
+<span class="nc bnc" id="L1263" title="All 2 branches missed.">            if (implementationVendor == null) {</span>
+<span class="nc" id="L1264">                implementationVendor = mainAttributes.getValue(Name.IMPLEMENTATION_VENDOR);</span>
+            }
+<span class="nc bnc" id="L1266" title="All 2 branches missed.">            if (implementationVersion == null) {</span>
+<span class="nc" id="L1267">                implementationVersion = mainAttributes.getValue(Name.IMPLEMENTATION_VERSION);</span>
+            }
+<span class="nc bnc" id="L1269" title="All 2 branches missed.">            if (sealedString == null) {</span>
+<span class="nc" id="L1270">                sealedString = mainAttributes.getValue(Name.SEALED);</span>
+            }
+        }
+<span class="nc bnc" id="L1273" title="All 4 branches missed.">        if (sealedString != null &amp;&amp; sealedString.equalsIgnoreCase(&quot;true&quot;)) {</span>
+            try {
+<span class="nc" id="L1275">                sealBase = new URL(FileUtils.getFileUtils().toURI(container.getAbsolutePath()));</span>
+<span class="nc" id="L1276">            } catch (MalformedURLException e) {</span>
+                // ignore
+            }
+        }
+<span class="nc" id="L1280">        definePackage(packageName, specificationTitle, specificationVersion, specificationVendor,</span>
+<span class="nc" id="L1281">                implementationTitle, implementationVersion, implementationVendor, sealBase);</span>
+<span class="nc" id="L1282">    }</span>
+
+    /**
+     * Reads a class definition from a stream.
+     *
+     * @param stream The stream from which the class is to be read.
+     *               Must not be &lt;code&gt;null&lt;/code&gt;.
+     * @param classname The name of the class in the stream.
+     *                  Must not be &lt;code&gt;null&lt;/code&gt;.
+     * @param container the file or directory containing the class.
+     *
+     * @return the Class object read from the stream.
+     *
+     * @exception IOException if there is a problem reading the class from the
+     * stream.
+     * @exception SecurityException if there is a security problem while
+     * reading the class from the stream.
+     */
+    private Class getClassFromStream(InputStream stream, String classname, File container)
+            throws IOException, SecurityException {
+<span class="nc" id="L1302">        ByteArrayOutputStream baos = new ByteArrayOutputStream();</span>
+<span class="nc" id="L1303">        int bytesRead = -1;</span>
+<span class="nc" id="L1304">        byte[] buffer = new byte[BUFFER_SIZE];</span>
+
+<span class="nc bnc" id="L1306" title="All 2 branches missed.">        while ((bytesRead = stream.read(buffer, 0, BUFFER_SIZE)) != -1) {</span>
+<span class="nc" id="L1307">            baos.write(buffer, 0, bytesRead);</span>
+        }
+<span class="nc" id="L1309">        byte[] classData = baos.toByteArray();</span>
+<span class="nc" id="L1310">        return defineClassFromData(container, classData, classname);</span>
+    }
+
+    /**
+     * Searches for and load a class on the classpath of this class loader.
+     *
+     * @param name The name of the class to be loaded. Must not be
+     *             &lt;code&gt;null&lt;/code&gt;.
+     *
+     * @return the required Class object
+     *
+     * @exception ClassNotFoundException if the requested class does not exist
+     *                                   on this loader's classpath.
+     */
+    public Class findClass(String name) throws ClassNotFoundException {
+<span class="nc" id="L1325">        log(&quot;Finding class &quot; + name, Project.MSG_DEBUG);</span>
+<span class="nc" id="L1326">        return findClassInComponents(name);</span>
+    }
+
+    /**
+     * Indicate if the given file is in this loader's path
+     *
+     * @param component the file which is to be checked
+     *
+     * @return true if the file is in the class path
+     */
+    protected boolean isInPath(File component) {
+<span class="nc" id="L1337">        return pathComponents.contains(component);</span>
+    }
+
+    /**
+     * Finds a class on the given classpath.
+     *
+     * @param name The name of the class to be loaded. Must not be
+     *             &lt;code&gt;null&lt;/code&gt;.
+     *
+     * @return the required Class object
+     *
+     * @exception ClassNotFoundException if the requested class does not exist
+     * on this loader's classpath.
+     */
+    private Class findClassInComponents(String name)
+        throws ClassNotFoundException {
+        // we need to search the components of the path to see if
+        // we can find the class we want.
+<span class="nc" id="L1355">        InputStream stream = null;</span>
+<span class="nc" id="L1356">        String classFilename = getClassFilename(name);</span>
+        try {
+<span class="nc" id="L1358">            Enumeration e = pathComponents.elements();</span>
+<span class="nc bnc" id="L1359" title="All 2 branches missed.">            while (e.hasMoreElements()) {</span>
+<span class="nc" id="L1360">                File pathComponent = (File) e.nextElement();</span>
+                try {
+<span class="nc" id="L1362">                    stream = getResourceStream(pathComponent, classFilename);</span>
+<span class="nc bnc" id="L1363" title="All 2 branches missed.">                    if (stream != null) {</span>
+<span class="nc" id="L1364">                        log(&quot;Loaded from &quot; + pathComponent + &quot; &quot;</span>
+<span class="nc" id="L1365">                            + classFilename, Project.MSG_DEBUG);</span>
+<span class="nc" id="L1366">                        return getClassFromStream(stream, name, pathComponent);</span>
+                    }
+<span class="nc" id="L1368">                } catch (SecurityException se) {</span>
+<span class="nc" id="L1369">                    throw se;</span>
+<span class="nc" id="L1370">                } catch (IOException ioe) {</span>
+                    // ioe.printStackTrace();
+<span class="nc" id="L1372">                    log(&quot;Exception reading component &quot; + pathComponent + &quot; (reason: &quot;</span>
+<span class="nc" id="L1373">                            + ioe.getMessage() + &quot;)&quot;, Project.MSG_VERBOSE);</span>
+                }
+            }
+<span class="nc" id="L1376">            throw new ClassNotFoundException(name);</span>
+<span class="nc" id="L1377">        } finally {</span>
+<span class="nc" id="L1378">            FileUtils.close(stream);</span>
+<span class="nc" id="L1379">        }</span>
+    }
+
+    /**
+     * Finds a system class (which should be loaded from the same classloader
+     * as the Ant core).
+     *
+     * For JDK 1.1 compatibility, this uses the findSystemClass method if
+     * no parent classloader has been specified.
+     *
+     * @param name The name of the class to be loaded.
+     *             Must not be &lt;code&gt;null&lt;/code&gt;.
+     *
+     * @return the required Class object
+     *
+     * @exception ClassNotFoundException if the requested class does not exist
+     * on this loader's classpath.
+     */
+    private Class findBaseClass(String name) throws ClassNotFoundException {
+<span class="nc bnc" id="L1398" title="All 2 branches missed.">        return parent == null ? findSystemClass(name) : parent.loadClass(name);</span>
+    }
+
+    /**
+     * Cleans up any resources held by this classloader. Any open archive
+     * files are closed.
+     */
+    public synchronized void cleanup() {
+<span class="nc bnc" id="L1406" title="All 2 branches missed.">        for (Enumeration e = jarFiles.elements(); e.hasMoreElements();) {</span>
+<span class="nc" id="L1407">            JarFile jarFile = (JarFile) e.nextElement();</span>
+            try {
+<span class="nc" id="L1409">                jarFile.close();</span>
+<span class="nc" id="L1410">            } catch (IOException ioe) {</span>
+                // ignore
+            }
+        }
+<span class="nc" id="L1414">        jarFiles = new Hashtable();</span>
+<span class="nc bnc" id="L1415" title="All 2 branches missed.">        if (project != null) {</span>
+<span class="nc" id="L1416">            project.removeBuildListener(this);</span>
+        }
+<span class="nc" id="L1418">        project = null;</span>
+<span class="nc" id="L1419">    }</span>
+
+    /**
+     * Gets the parent as has been specified in the constructor or via
+     * setParent.
+     *
+     * @since Ant 1.8.0
+     */
+    public ClassLoader getConfiguredParent() {
+<span class="nc" id="L1428">        return parent;</span>
+    }
+
+    /**
+     * Empty implementation to satisfy the BuildListener interface.
+     *
+     * @param event the buildStarted event
+     */
+    public void buildStarted(BuildEvent event) {
+        // Not significant for the class loader.
+<span class="nc" id="L1438">    }</span>
+
+    /**
+     * Cleans up any resources held by this classloader at the end
+     * of a build.
+     *
+     * @param event the buildFinished event
+     */
+    public void buildFinished(BuildEvent event) {
+<span class="nc" id="L1447">        cleanup();</span>
+<span class="nc" id="L1448">    }</span>
+
+    /**
+     * Cleans up any resources held by this classloader at the end of
+     * a subbuild if it has been created for the subbuild's project
+     * instance.
+     *
+     * @param event the buildFinished event
+     *
+     * @since Ant 1.6.2
+     */
+    public void subBuildFinished(BuildEvent event) {
+<span class="nc bnc" id="L1460" title="All 2 branches missed.">        if (event.getProject() == project) {</span>
+<span class="nc" id="L1461">            cleanup();</span>
+        }
+<span class="nc" id="L1463">    }</span>
+
+    /**
+     * Empty implementation to satisfy the BuildListener interface.
+     *
+     * @param event the buildStarted event
+     *
+     * @since Ant 1.6.2
+     */
+    public void subBuildStarted(BuildEvent event) {
+        // Not significant for the class loader.
+<span class="nc" id="L1474">    }</span>
+
+    /**
+     * Empty implementation to satisfy the BuildListener interface.
+     *
+     * @param event the targetStarted event
+     */
+    public void targetStarted(BuildEvent event) {
+        // Not significant for the class loader.
+<span class="nc" id="L1483">    }</span>
+
+    /**
+     * Empty implementation to satisfy the BuildListener interface.
+     *
+     * @param event the targetFinished event
+     */
+    public void targetFinished(BuildEvent event) {
+        // Not significant for the class loader.
+<span class="nc" id="L1492">    }</span>
+
+    /**
+     * Empty implementation to satisfy the BuildListener interface.
+     *
+     * @param event the taskStarted event
+     */
+    public void taskStarted(BuildEvent event) {
+        // Not significant for the class loader.
+<span class="nc" id="L1501">    }</span>
+
+    /**
+     * Empty implementation to satisfy the BuildListener interface.
+     *
+     * @param event the taskFinished event
+     */
+    public void taskFinished(BuildEvent event) {
+        // Not significant for the class loader.
+<span class="nc" id="L1510">    }</span>
+
+    /**
+     * Empty implementation to satisfy the BuildListener interface.
+     *
+     * @param event the messageLogged event
+     */
+    public void messageLogged(BuildEvent event) {
+        // Not significant for the class loader.
+<span class="nc" id="L1519">    }</span>
+
+    /**
+     * add any libraries that come with different java versions
+     * here
+     */
+    public void addJavaLibraries() {
+<span class="nc" id="L1526">        Vector packages = JavaEnvUtils.getJrePackages();</span>
+<span class="nc" id="L1527">        Enumeration e = packages.elements();</span>
+<span class="nc bnc" id="L1528" title="All 2 branches missed.">        while (e.hasMoreElements()) {</span>
+<span class="nc" id="L1529">            String packageName = (String) e.nextElement();</span>
+<span class="nc" id="L1530">            addSystemPackageRoot(packageName);</span>
+        }
+<span class="nc" id="L1532">    }</span>
+
+    /**
+     * Returns a &lt;code&gt;String&lt;/code&gt; representing this loader.
+     * @return the path that this classloader has.
+     */
+    public String toString() {
+<span class="nc" id="L1539">        return &quot;AntClassLoader[&quot; + getClasspath() + &quot;]&quot;;</span>
+    }
+
+<span class="nc" id="L1542">    private static Class subClassToLoad = null;</span>
+<span class="nc" id="L1543">    private static final Class[] CONSTRUCTOR_ARGS = new Class[] {</span>
+<span class="nc" id="L1544">        ClassLoader.class, Project.class, Path.class, Boolean.TYPE</span>
+    };
+
+    static {
+<span class="nc bnc" id="L1548" title="All 2 branches missed.">        if (JavaEnvUtils.isAtLeastJavaVersion(JavaEnvUtils.JAVA_1_5)) {</span>
+            try {
+<span class="nc" id="L1550">                subClassToLoad =</span>
+<span class="nc" id="L1551">                    Class.forName(&quot;org.apache.tools.ant.loader.AntClassLoader5&quot;);</span>
+<span class="nc" id="L1552">            } catch (ClassNotFoundException e) {</span>
+                // this is Java5 but the installation is lacking our subclass
+            }
+        }
+<span class="nc" id="L1556">    }</span>
+
+    /**
+     * Factory method
+     */
+    public static AntClassLoader newAntClassLoader(ClassLoader parent,
+                                                   Project project,
+                                                   Path path,
+                                                   boolean parentFirst) {
+<span class="nc bnc" id="L1565" title="All 2 branches missed.">        if (subClassToLoad != null) {</span>
+<span class="nc" id="L1566">            return (AntClassLoader)</span>
+<span class="nc" id="L1567">                ReflectUtil.newInstance(subClassToLoad,</span>
+<span class="nc" id="L1568">                                        CONSTRUCTOR_ARGS,</span>
+<span class="nc" id="L1569">                                        new Object[] {</span>
+<span class="nc" id="L1570">                                            parent, project, path,</span>
+<span class="nc" id="L1571">                                            Boolean.valueOf(parentFirst)</span>
+                                        });
+        }
+<span class="nc" id="L1574">        return new AntClassLoader(parent, project, path, parentFirst);</span>
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

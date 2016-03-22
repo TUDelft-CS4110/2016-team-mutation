@@ -1,0 +1,534 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>Slave.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.model</a> &gt; <span class="el_source">Slave.java</span></div><h1>Slave.java</h1><pre class="source lang-java linenums">/*
+ * The MIT License
+ *
+ * Copyright (c) 2004-2011, Sun Microsystems, Inc., Kohsuke Kawaguchi,
+ * Erik Ramfelt, Martin Eigenbrodt, Stephen Connolly, Tom Huybrechts
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.model;
+
+import com.google.common.collect.ImmutableSet;
+import hudson.FilePath;
+import hudson.Launcher;
+import hudson.Util;
+import hudson.Launcher.RemoteLauncher;
+import hudson.model.Descriptor.FormException;
+import hudson.remoting.Callable;
+import hudson.slaves.CommandLauncher;
+import hudson.slaves.ComputerLauncher;
+import hudson.slaves.DumbSlave;
+import hudson.slaves.JNLPLauncher;
+import hudson.slaves.NodeDescriptor;
+import hudson.slaves.NodeProperty;
+import hudson.slaves.NodePropertyDescriptor;
+import hudson.slaves.RetentionStrategy;
+import hudson.slaves.SlaveComputer;
+import hudson.util.ClockDifference;
+import hudson.util.DescribableList;
+import hudson.util.FormValidation;
+
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.Serializable;
+import java.net.MalformedURLException;
+import java.net.URL;
+import java.net.URLConnection;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Set;
+import java.util.TreeSet;
+
+import javax.servlet.ServletException;
+
+import javax.annotation.CheckForNull;
+import javax.annotation.Nonnull;
+import jenkins.model.Jenkins;
+import jenkins.security.MasterToSlaveCallable;
+import jenkins.slaves.WorkspaceLocator;
+
+import org.apache.commons.io.IOUtils;
+import org.apache.commons.lang.StringUtils;
+import org.kohsuke.stapler.HttpResponse;
+import org.kohsuke.stapler.QueryParameter;
+import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.StaplerResponse;
+
+/**
+ * Information about a Hudson slave node.
+ *
+ * &lt;p&gt;
+ * Ideally this would have been in the &lt;tt&gt;hudson.slaves&lt;/tt&gt; package,
+ * but for compatibility reasons, it can't.
+ *
+ * &lt;p&gt;
+ * TODO: move out more stuff to {@link DumbSlave}.
+ *
+ * @author Kohsuke Kawaguchi
+ */
+<span class="nc bnc" id="L87" title="All 2 branches missed.">public abstract class Slave extends Node implements Serializable {</span>
+    /**
+     * Name of this slave node.
+     */
+    protected String name;
+
+    /**
+     * Description of this node.
+     */
+    private final String description;
+
+    /**
+     * Path to the root of the workspace from the view point of this node, such as &quot;/hudson&quot;, this need not
+     * be absolute provided that the launcher establishes a consistent working directory, such as &quot;./.jenkins-slave&quot;
+     * when used with an SSH launcher.
+     *
+     * NOTE: if the administrator is using a relative path they are responsible for ensuring that the launcher used
+     * provides a consistent working directory
+     */
+    protected final String remoteFS;
+
+    /**
+     * Number of executors of this node.
+     */
+<span class="nc" id="L111">    private int numExecutors = 2;</span>
+
+    /**
+     * Job allocation strategy.
+     */
+    private Mode mode;
+
+    /**
+     * Slave availablility strategy.
+     */
+    private RetentionStrategy retentionStrategy;
+
+    /**
+     * The starter that will startup this slave.
+     */
+    private ComputerLauncher launcher;
+
+    /**
+     * Whitespace-separated labels.
+     */
+<span class="nc" id="L131">    private String label=&quot;&quot;;</span>
+
+<span class="nc" id="L133">    private /*almost final*/ DescribableList&lt;NodeProperty&lt;?&gt;,NodePropertyDescriptor&gt; nodeProperties = </span>
+<span class="nc" id="L134">                                    new DescribableList&lt;NodeProperty&lt;?&gt;,NodePropertyDescriptor&gt;(Jenkins.getInstance().getNodesObject());</span>
+
+    /**
+     * Lazily computed set of labels from {@link #label}.
+     */
+    private transient volatile Set&lt;Label&gt; labels;
+
+    /**
+     * Id of user which creates this slave {@link User}.
+     */
+    private String userId;
+
+    public Slave(String name, String nodeDescription, String remoteFS, String numExecutors,
+                 Mode mode, String labelString, ComputerLauncher launcher, RetentionStrategy retentionStrategy, List&lt;? extends NodeProperty&lt;?&gt;&gt; nodeProperties) throws FormException, IOException {
+<span class="nc" id="L148">        this(name,nodeDescription,remoteFS,Util.tryParseNumber(numExecutors, 1).intValue(),mode,labelString,launcher,retentionStrategy, nodeProperties);</span>
+<span class="nc" id="L149">    }</span>
+
+    /**
+     * @deprecated since 2009-02-20.
+     */
+    @Deprecated
+    public Slave(String name, String nodeDescription, String remoteFS, int numExecutors,
+            Mode mode, String labelString, ComputerLauncher launcher, RetentionStrategy retentionStrategy) throws FormException, IOException {
+<span class="nc" id="L157">    	this(name, nodeDescription, remoteFS, numExecutors, mode, labelString, launcher, retentionStrategy, new ArrayList());</span>
+<span class="nc" id="L158">    }</span>
+
+<span class="nc" id="L160">    public Slave(@Nonnull String name, String nodeDescription, String remoteFS, int numExecutors,</span>
+                 Mode mode, String labelString, ComputerLauncher launcher, RetentionStrategy retentionStrategy, List&lt;? extends NodeProperty&lt;?&gt;&gt; nodeProperties) throws FormException, IOException {
+<span class="nc" id="L162">        this.name = name;</span>
+<span class="nc" id="L163">        this.description = nodeDescription;</span>
+<span class="nc" id="L164">        this.numExecutors = numExecutors;</span>
+<span class="nc" id="L165">        this.mode = mode;</span>
+<span class="nc" id="L166">        this.remoteFS = Util.fixNull(remoteFS).trim();</span>
+<span class="nc" id="L167">        this.label = Util.fixNull(labelString).trim();</span>
+<span class="nc" id="L168">        this.launcher = launcher;</span>
+<span class="nc" id="L169">        this.retentionStrategy = retentionStrategy;</span>
+<span class="nc" id="L170">        getAssignedLabels();    // compute labels now</span>
+
+<span class="nc" id="L172">        this.nodeProperties.replaceBy(nodeProperties);</span>
+<span class="nc" id="L173">         Slave node = (Slave) Jenkins.getInstance().getNode(name);</span>
+
+<span class="nc bnc" id="L175" title="All 2 branches missed.">       if(node!=null){</span>
+<span class="nc" id="L176">            this.userId= node.getUserId(); //slave has already existed</span>
+<span class="nc" id="L177">        }</span>
+       else{
+<span class="nc" id="L179">            User user = User.current();</span>
+<span class="nc bnc" id="L180" title="All 2 branches missed.">            userId = user!=null ? user.getId() : &quot;anonymous&quot;;</span>
+        }
+<span class="nc bnc" id="L182" title="All 2 branches missed.">        if (name.equals(&quot;&quot;))</span>
+<span class="nc" id="L183">            throw new FormException(Messages.Slave_InvalidConfig_NoName(), null);</span>
+
+//        if (remoteFS.equals(&quot;&quot;))
+//            throw new FormException(Messages.Slave_InvalidConfig_NoRemoteDir(name), null);
+
+<span class="nc bnc" id="L188" title="All 2 branches missed.">        if (this.numExecutors&lt;=0)</span>
+<span class="nc" id="L189">            throw new FormException(Messages.Slave_InvalidConfig_Executors(name), null);</span>
+<span class="nc" id="L190">    }</span>
+
+    /**
+     * Return id of user which created this slave
+     *
+     * @return id of user
+     */
+    public String getUserId() {
+<span class="nc" id="L198">        return userId;</span>
+    }
+
+    public void setUserId(String userId){
+<span class="nc" id="L202">        this.userId = userId;</span>
+<span class="nc" id="L203">    }</span>
+
+    public ComputerLauncher getLauncher() {
+<span class="nc bnc" id="L206" title="All 2 branches missed.">        return launcher == null ? new JNLPLauncher() : launcher;</span>
+    }
+
+    public void setLauncher(ComputerLauncher launcher) {
+<span class="nc" id="L210">        this.launcher = launcher;</span>
+<span class="nc" id="L211">    }</span>
+
+    public String getRemoteFS() {
+<span class="nc" id="L214">        return remoteFS;</span>
+    }
+
+    public String getNodeName() {
+<span class="nc" id="L218">        return name;</span>
+    }
+
+    @Override public String toString() {
+<span class="nc" id="L222">        return getClass().getName() + &quot;[&quot; + name + &quot;]&quot;;</span>
+    }
+
+    public void setNodeName(String name) {
+<span class="nc" id="L226">        this.name = name;</span>
+<span class="nc" id="L227">    }</span>
+
+    public String getNodeDescription() {
+<span class="nc" id="L230">        return description;</span>
+    }
+
+    public int getNumExecutors() {
+<span class="nc" id="L234">        return numExecutors;</span>
+    }
+
+    public Mode getMode() {
+<span class="nc" id="L238">        return mode;</span>
+    }
+
+    public void setMode(Mode mode) {
+<span class="nc" id="L242">        this.mode = mode;</span>
+<span class="nc" id="L243">    }</span>
+
+    public DescribableList&lt;NodeProperty&lt;?&gt;, NodePropertyDescriptor&gt; getNodeProperties() {
+<span class="nc bnc" id="L246" title="All 4 branches missed.">        assert nodeProperties != null;</span>
+<span class="nc" id="L247">    	return nodeProperties;</span>
+    }
+
+    public RetentionStrategy getRetentionStrategy() {
+<span class="nc bnc" id="L251" title="All 2 branches missed.">        return retentionStrategy == null ? RetentionStrategy.Always.INSTANCE : retentionStrategy;</span>
+    }
+
+    public void setRetentionStrategy(RetentionStrategy availabilityStrategy) {
+<span class="nc" id="L255">        this.retentionStrategy = availabilityStrategy;</span>
+<span class="nc" id="L256">    }</span>
+
+    public String getLabelString() {
+<span class="nc" id="L259">        return Util.fixNull(label).trim();</span>
+    }
+
+    @Override
+    public void setLabelString(String labelString) throws IOException {
+<span class="nc" id="L264">        this.label = Util.fixNull(labelString).trim();</span>
+        // Compute labels now.
+<span class="nc" id="L266">        getAssignedLabels();</span>
+<span class="nc" id="L267">    }</span>
+
+    @Override
+    public Callable&lt;ClockDifference,IOException&gt; getClockDifferenceCallable() {
+<span class="nc" id="L271">        return new GetClockDifference1();</span>
+    }
+
+    public Computer createComputer() {
+<span class="nc" id="L275">        return new SlaveComputer(this);</span>
+    }
+
+    public FilePath getWorkspaceFor(TopLevelItem item) {
+<span class="nc bnc" id="L279" title="All 2 branches missed.">        for (WorkspaceLocator l : WorkspaceLocator.all()) {</span>
+<span class="nc" id="L280">            FilePath workspace = l.locate(item, this);</span>
+<span class="nc bnc" id="L281" title="All 2 branches missed.">            if (workspace != null) {</span>
+<span class="nc" id="L282">                return workspace;</span>
+            }
+        }
+
+<span class="nc" id="L286">        FilePath r = getWorkspaceRoot();</span>
+<span class="nc bnc" id="L287" title="All 2 branches missed.">        if(r==null)     return null;    // offline</span>
+<span class="nc" id="L288">        return r.child(item.getFullName());</span>
+    }
+
+    @CheckForNull
+    public FilePath getRootPath() {
+<span class="nc" id="L293">        final SlaveComputer computer = getComputer();</span>
+<span class="nc bnc" id="L294" title="All 2 branches missed.">        if (computer == null) {</span>
+            // if computer is null then channel is null and thus we were going to return null anyway
+<span class="nc" id="L296">            return null;</span>
+        } else {
+<span class="nc" id="L298">            return createPath(StringUtils.defaultString(computer.getAbsoluteRemoteFs(), remoteFS));</span>
+        }
+    }
+
+    /**
+     * Root directory on this slave where all the job workspaces are laid out.
+     * @return
+     *      null if not connected.
+     */
+    public @CheckForNull FilePath getWorkspaceRoot() {
+<span class="nc" id="L308">        FilePath r = getRootPath();</span>
+<span class="nc bnc" id="L309" title="All 2 branches missed.">        if(r==null) return null;</span>
+<span class="nc" id="L310">        return r.child(WORKSPACE_ROOT);</span>
+    }
+
+    /**
+     * Web-bound object used to serve jar files for JNLP.
+     */
+    public static final class JnlpJar implements HttpResponse {
+        private final String fileName;
+
+<span class="nc" id="L319">        public JnlpJar(String fileName) {</span>
+<span class="nc" id="L320">            this.fileName = fileName;</span>
+<span class="nc" id="L321">        }</span>
+
+        public void doIndex( StaplerRequest req, StaplerResponse rsp) throws IOException, ServletException {
+<span class="nc" id="L324">            URLConnection con = connect();</span>
+            // since we end up redirecting users to jnlpJars/foo.jar/, set the content disposition
+            // so that browsers can download them in the right file name.
+            // see http://support.microsoft.com/kb/260519 and http://www.boutell.com/newfaq/creating/forcedownload.html
+<span class="nc" id="L328">            rsp.setHeader(&quot;Content-Disposition&quot;, &quot;attachment; filename=&quot; + fileName);</span>
+<span class="nc" id="L329">            InputStream in = con.getInputStream();</span>
+<span class="nc" id="L330">            rsp.serveFile(req, in, con.getLastModified(), con.getContentLength(), &quot;*.jar&quot; );</span>
+<span class="nc" id="L331">            in.close();</span>
+<span class="nc" id="L332">        }</span>
+
+        public void generateResponse(StaplerRequest req, StaplerResponse rsp, Object node) throws IOException, ServletException {
+<span class="nc" id="L335">            doIndex(req,rsp);</span>
+<span class="nc" id="L336">        }</span>
+
+        private URLConnection connect() throws IOException {
+<span class="nc" id="L339">            URL res = getURL();</span>
+<span class="nc" id="L340">            return res.openConnection();</span>
+        }
+
+        public URL getURL() throws MalformedURLException {
+<span class="nc" id="L344">            String name = fileName;</span>
+            
+            // Prevent the access to war contents &amp; prevent the folder escaping (SECURITY-195)
+<span class="nc bnc" id="L347" title="All 2 branches missed.">            if (!ALLOWED_JNLPJARS_FILES.contains(name)) {</span>
+<span class="nc" id="L348">                throw new MalformedURLException(&quot;The specified file path &quot; + fileName + &quot; is not allowed due to security reasons&quot;);</span>
+            }
+            
+<span class="nc bnc" id="L351" title="All 2 branches missed.">            if (name.equals(&quot;hudson-cli.jar&quot;))  {</span>
+<span class="nc" id="L352">                name=&quot;jenkins-cli.jar&quot;;</span>
+            }
+            
+<span class="nc" id="L355">            URL res = Jenkins.getInstance().servletContext.getResource(&quot;/WEB-INF/&quot; + name);</span>
+<span class="nc bnc" id="L356" title="All 2 branches missed.">            if(res==null) {</span>
+                // during the development this path doesn't have the files.
+<span class="nc" id="L358">                res = new URL(new File(&quot;.&quot;).getAbsoluteFile().toURI().toURL(),&quot;target/jenkins/WEB-INF/&quot;+name);</span>
+            }
+<span class="nc" id="L360">            return res;</span>
+        }
+
+        public byte[] readFully() throws IOException {
+<span class="nc" id="L364">            InputStream in = connect().getInputStream();</span>
+            try {
+<span class="nc" id="L366">                return IOUtils.toByteArray(in);</span>
+<span class="nc" id="L367">            } finally {</span>
+<span class="nc" id="L368">                in.close();</span>
+<span class="nc" id="L369">            }</span>
+        }
+
+    }
+
+    /**
+     * Creates a launcher for the slave.
+     *
+     * @return
+     *      If there is no computer it will return a {@link hudson.Launcher.DummyLauncher}, otherwise it
+     *      will return a {@link hudson.Launcher.RemoteLauncher} instead.
+     */
+    public Launcher createLauncher(TaskListener listener) {
+<span class="nc" id="L382">        SlaveComputer c = getComputer();</span>
+<span class="nc bnc" id="L383" title="All 2 branches missed.">        if (c == null) {</span>
+<span class="nc" id="L384">            listener.error(&quot;Issue with creating launcher for slave &quot; + name + &quot;.&quot;);</span>
+<span class="nc" id="L385">            return new Launcher.DummyLauncher(listener);</span>
+        } else {
+<span class="nc" id="L387">            return new RemoteLauncher(listener, c.getChannel(), c.isUnix()).decorateFor(this);</span>
+        }
+    }
+
+    /**
+     * Gets the corresponding computer object.
+     */
+    public SlaveComputer getComputer() {
+<span class="nc" id="L395">        return (SlaveComputer)toComputer();</span>
+    }
+
+    @Override
+    public boolean equals(Object o) {
+<span class="nc bnc" id="L400" title="All 2 branches missed.">        if (this == o) return true;</span>
+<span class="nc bnc" id="L401" title="All 4 branches missed.">        if (o == null || getClass() != o.getClass()) return false;</span>
+
+<span class="nc" id="L403">        final Slave that = (Slave) o;</span>
+
+<span class="nc" id="L405">        return name.equals(that.name);</span>
+    }
+
+    @Override
+    public int hashCode() {
+<span class="nc" id="L410">        return name.hashCode();</span>
+    }
+
+    /**
+     * Invoked by XStream when this object is read into memory.
+     */
+    protected Object readResolve() {
+        // convert the old format to the new one
+<span class="nc bnc" id="L418" title="All 2 branches missed.">        if (launcher == null) {</span>
+<span class="nc bnc" id="L419" title="All 4 branches missed.">            launcher = (agentCommand == null || agentCommand.trim().length() == 0)</span>
+<span class="nc" id="L420">                    ? new JNLPLauncher()</span>
+<span class="nc" id="L421">                    : new CommandLauncher(agentCommand);</span>
+        }
+<span class="nc bnc" id="L423" title="All 2 branches missed.">        if(nodeProperties==null)</span>
+<span class="nc" id="L424">            nodeProperties = new DescribableList&lt;NodeProperty&lt;?&gt;,NodePropertyDescriptor&gt;(Jenkins.getInstance().getNodesObject());</span>
+<span class="nc" id="L425">        return this;</span>
+    }
+
+    public SlaveDescriptor getDescriptor() {
+<span class="nc" id="L429">        Descriptor d = Jenkins.getInstance().getDescriptorOrDie(getClass());</span>
+<span class="nc bnc" id="L430" title="All 2 branches missed.">        if (d instanceof SlaveDescriptor)</span>
+<span class="nc" id="L431">            return (SlaveDescriptor) d;</span>
+<span class="nc" id="L432">        throw new IllegalStateException(d.getClass()+&quot; needs to extend from SlaveDescriptor&quot;);</span>
+    }
+
+<span class="nc" id="L435">    public static abstract class SlaveDescriptor extends NodeDescriptor {</span>
+        public FormValidation doCheckNumExecutors(@QueryParameter String value) {
+<span class="nc" id="L437">            return FormValidation.validatePositiveInteger(value);</span>
+        }
+
+        /**
+         * Performs syntactical check on the remote FS for slaves.
+         */
+        public FormValidation doCheckRemoteFS(@QueryParameter String value) throws IOException, ServletException {
+<span class="nc bnc" id="L444" title="All 2 branches missed.">            if(Util.fixEmptyAndTrim(value)==null)</span>
+<span class="nc" id="L445">                return FormValidation.error(Messages.Slave_Remote_Director_Mandatory());</span>
+
+<span class="nc bnc" id="L447" title="All 4 branches missed.">            if(value.startsWith(&quot;\\\\&quot;) || value.startsWith(&quot;/net/&quot;))</span>
+<span class="nc" id="L448">                return FormValidation.warning(Messages.Slave_Network_Mounted_File_System_Warning());</span>
+
+<span class="nc bnc" id="L450" title="All 2 branches missed.">            if (Util.isRelativePath(value)) {</span>
+<span class="nc" id="L451">                return FormValidation.warning(Messages.Slave_Remote_Relative_Path_Warning());</span>
+            }
+
+<span class="nc" id="L454">            return FormValidation.ok();</span>
+        }
+    }
+
+
+//
+// backward compatibility
+//
+    /**
+     * Command line to launch the agent, like
+     * &quot;ssh myslave java -jar /path/to/hudson-remoting.jar&quot;
+     * @deprecated in 1.216
+     */
+    @Deprecated
+    private transient String agentCommand;
+
+    /**
+     * Obtains the clock difference between this side and that side of the channel.
+     *
+     * &lt;p&gt;
+     * This is a hack to wrap the whole thing into a simple {@link Callable}.
+     *
+     * &lt;ol&gt;
+     *     &lt;li&gt;When the callable is sent to remote, we capture the time (on this side) in {@link GetClockDifference2#startTime}
+     *     &lt;li&gt;When the other side receives the callable it is {@link GetClockDifference2}.
+     *     &lt;li&gt;We capture the time on the other side and {@link GetClockDifference3} gets sent from the other side
+     *     &lt;li&gt;When it's read on this side as a return value, it morphs itself into {@link ClockDifference}.
+     * &lt;/ol&gt;
+     */
+<span class="nc" id="L483">    private static final class GetClockDifference1 extends MasterToSlaveCallable&lt;ClockDifference,IOException&gt; {</span>
+        public ClockDifference call() {
+            // this method must be being invoked locally, which means the clock is in sync
+<span class="nc" id="L486">            return new ClockDifference(0);</span>
+        }
+
+        private Object writeReplace() {
+<span class="nc" id="L490">            return new GetClockDifference2();</span>
+        }
+
+        private static final long serialVersionUID = 1L;
+    }
+
+<span class="nc" id="L496">    private static final class GetClockDifference2 extends MasterToSlaveCallable&lt;GetClockDifference3,IOException&gt; {</span>
+        /**
+         * Capture the time on the master when this object is sent to remote, which is when
+         * {@link GetClockDifference1#writeReplace()} is run.
+         */
+<span class="nc" id="L501">        private final long startTime = System.currentTimeMillis();</span>
+
+        public GetClockDifference3 call() {
+<span class="nc" id="L504">            return new GetClockDifference3(startTime);</span>
+        }
+
+        private static final long serialVersionUID = 1L;
+    }
+
+    private static final class GetClockDifference3 implements Serializable {
+<span class="nc" id="L511">        private final long remoteTime = System.currentTimeMillis();</span>
+        private final long startTime;
+
+<span class="nc" id="L514">        public GetClockDifference3(long startTime) {</span>
+<span class="nc" id="L515">            this.startTime = startTime;</span>
+<span class="nc" id="L516">        }</span>
+
+        private Object readResolve() {
+<span class="nc" id="L519">            long endTime = System.currentTimeMillis();</span>
+<span class="nc" id="L520">            return new ClockDifference((startTime + endTime)/2-remoteTime);</span>
+        }
+    }
+
+    /**
+     * Determines the workspace root file name for those who really really need the shortest possible path name.
+     */
+<span class="nc" id="L527">    private static final String WORKSPACE_ROOT = System.getProperty(Slave.class.getName()+&quot;.workspaceRoot&quot;,&quot;workspace&quot;);</span>
+
+    /**
+     * Provides a collection of file names, which are accessible via /jnlpJars link.
+     */
+<span class="nc" id="L532">    private static final Set&lt;String&gt; ALLOWED_JNLPJARS_FILES = ImmutableSet.of(&quot;slave.jar&quot;, &quot;remoting.jar&quot;, &quot;jenkins-cli.jar&quot;, &quot;hudson-cli.jar&quot;);</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

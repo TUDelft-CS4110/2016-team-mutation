@@ -1,0 +1,1520 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>Job.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.model</a> &gt; <span class="el_source">Job.java</span></div><h1>Job.java</h1><pre class="source lang-java linenums"><span class="pc" id="L1">/*</span>
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc., Kohsuke Kawaguchi, Martin Eigenbrodt, Matthew R. Harrah, Red Hat, Inc., Stephen Connolly, Tom Huybrechts, CloudBees, Inc.
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.model;
+
+import com.google.common.base.Function;
+import com.google.common.collect.Collections2;
+import com.infradna.tool.bridge_method_injector.WithBridgeMethods;
+import hudson.BulkChange;
+
+import hudson.EnvVars;
+import hudson.Extension;
+import hudson.ExtensionPoint;
+import hudson.PermalinkList;
+import hudson.Util;
+import hudson.cli.declarative.CLIResolver;
+import hudson.model.Descriptor.FormException;
+import hudson.model.Fingerprint.Range;
+import hudson.model.Fingerprint.RangeSet;
+import hudson.model.PermalinkProjectAction.Permalink;
+import hudson.model.listeners.ItemListener;
+import hudson.search.QuickSilver;
+import hudson.search.SearchIndex;
+import hudson.search.SearchIndexBuilder;
+import hudson.search.SearchItem;
+import hudson.search.SearchItems;
+import hudson.security.ACL;
+import hudson.tasks.LogRotator;
+import hudson.util.AlternativeUiTextProvider;
+import hudson.util.ChartUtil;
+import hudson.util.ColorPalette;
+import hudson.util.CopyOnWriteList;
+import hudson.util.DataSetBuilder;
+import hudson.util.DescribableList;
+import hudson.util.FormApply;
+import hudson.util.Graph;
+import hudson.util.ProcessTree;
+import hudson.util.QuotedStringTokenizer;
+import hudson.util.RunList;
+import hudson.util.ShiftedCategoryAxis;
+import hudson.util.StackedAreaRenderer2;
+import hudson.util.TextFile;
+import hudson.widgets.HistoryWidget;
+import hudson.widgets.HistoryWidget.Adapter;
+import hudson.widgets.Widget;
+import jenkins.model.BuildDiscarder;
+import jenkins.model.DirectlyModifiableTopLevelItemGroup;
+import jenkins.model.Jenkins;
+import jenkins.model.ProjectNamingStrategy;
+import jenkins.security.HexStringConfidentialKey;
+import jenkins.util.io.OnMaster;
+import net.sf.json.JSONException;
+import net.sf.json.JSONObject;
+
+import org.apache.commons.io.FileUtils;
+import org.jfree.chart.ChartFactory;
+import org.jfree.chart.JFreeChart;
+import org.jfree.chart.axis.CategoryAxis;
+import org.jfree.chart.axis.CategoryLabelPositions;
+import org.jfree.chart.axis.NumberAxis;
+import org.jfree.chart.plot.CategoryPlot;
+import org.jfree.chart.plot.PlotOrientation;
+import org.jfree.chart.renderer.category.StackedAreaRenderer;
+import org.jfree.data.category.CategoryDataset;
+import org.jfree.ui.RectangleInsets;
+import org.jvnet.localizer.Localizable;
+import org.kohsuke.args4j.Argument;
+import org.kohsuke.args4j.CmdLineException;
+import org.kohsuke.stapler.StaplerOverridable;
+import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.StaplerResponse;
+import org.kohsuke.stapler.export.Exported;
+import org.kohsuke.stapler.interceptor.RequirePOST;
+
+import javax.servlet.ServletException;
+
+import java.awt.*;
+import java.io.*;
+import java.net.URLEncoder;
+import java.util.*;
+import java.util.List;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import javax.annotation.CheckForNull;
+import javax.annotation.Nonnull;
+
+import static javax.servlet.http.HttpServletResponse.*;
+import jenkins.model.BuildDiscarderProperty;
+import jenkins.model.ModelObjectWithChildren;
+import jenkins.model.RunIdMigrator;
+import jenkins.model.lazy.LazyBuildMixIn;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
+
+/**
+ * A job is an runnable entity under the monitoring of Hudson.
+ * 
+ * &lt;p&gt;
+ * Every time it &quot;runs&quot;, it will be recorded as a {@link Run} object.
+ *
+ * &lt;p&gt;
+ * To create a custom job type, extend {@link TopLevelItemDescriptor} and put {@link Extension} on it.
+ *
+ * @author Kohsuke Kawaguchi
+ */
+public abstract class Job&lt;JobT extends Job&lt;JobT, RunT&gt;, RunT extends Run&lt;JobT, RunT&gt;&gt;
+        extends AbstractItem implements ExtensionPoint, StaplerOverridable, ModelObjectWithChildren, OnMaster {
+
+    /**
+     * Next build number. Kept in a separate file because this is the only
+     * information that gets updated often. This allows the rest of the
+     * configuration to be in the VCS.
+     * &lt;p&gt;
+     * In 1.28 and earlier, this field was stored in the project configuration
+     * file, so even though this is marked as transient, don't move it around.
+     */
+<span class="fc" id="L137">    protected transient volatile int nextBuildNumber = 1;</span>
+
+    /**
+     * Newly copied jobs get this flag set, so that Hudson doesn't try to run the job until its configuration
+     * is saved once.
+     */
+    private transient volatile boolean holdOffBuildUntilSave;
+
+    /**
+     * {@link ItemListener}s can, and do, modify the job with a corresponding save which will clear
+     * {@link #holdOffBuildUntilSave} prematurely. The {@link LastItemListener} is responsible for
+     * clearing this flag as the last item listener.
+     */
+    private transient volatile boolean holdOffBuildUntilUserSave;
+
+    /** @deprecated Replaced by {@link BuildDiscarderProperty} */
+    private volatile BuildDiscarder logRotator;
+
+    /**
+     * Not all plugins are good at calculating their health report quickly.
+     * These fields are used to cache the health reports to speed up rendering
+     * the main page.
+     */
+<span class="fc" id="L160">    private transient Integer cachedBuildHealthReportsBuildNumber = null;</span>
+<span class="fc" id="L161">    private transient List&lt;HealthReport&gt; cachedBuildHealthReports = null;</span>
+
+    boolean keepDependencies;
+
+    /**
+     * List of properties configured for this project.
+     */
+    // this should have been DescribableList but now it's too late
+<span class="fc" id="L169">    protected CopyOnWriteList&lt;JobProperty&lt;? super JobT&gt;&gt; properties = new CopyOnWriteList&lt;JobProperty&lt;? super JobT&gt;&gt;();</span>
+
+    @Restricted(NoExternalUse.class)
+    public transient RunIdMigrator runIdMigrator;
+
+    protected Job(ItemGroup parent, String name) {
+<span class="fc" id="L175">        super(parent, name);</span>
+<span class="fc" id="L176">    }</span>
+
+    @Override
+    public synchronized void save() throws IOException {
+<span class="nc" id="L180">        super.save();</span>
+<span class="nc" id="L181">        holdOffBuildUntilSave = holdOffBuildUntilUserSave;</span>
+<span class="nc" id="L182">    }</span>
+
+    @Override public void onCreatedFromScratch() {
+<span class="nc" id="L185">        super.onCreatedFromScratch();</span>
+<span class="nc" id="L186">        runIdMigrator = new RunIdMigrator();</span>
+<span class="nc" id="L187">        runIdMigrator.created(getBuildDir());</span>
+<span class="nc" id="L188">    }</span>
+
+    @Override
+    public void onLoad(ItemGroup&lt;? extends Item&gt; parent, String name)
+            throws IOException {
+<span class="nc" id="L193">        super.onLoad(parent, name);</span>
+
+<span class="nc" id="L195">        File buildDir = getBuildDir();</span>
+<span class="nc" id="L196">        runIdMigrator = new RunIdMigrator();</span>
+<span class="nc" id="L197">        runIdMigrator.migrate(buildDir, Jenkins.getInstance().getRootDir());</span>
+
+<span class="nc" id="L199">        TextFile f = getNextBuildNumberFile();</span>
+<span class="nc bnc" id="L200" title="All 2 branches missed.">        if (f.exists()) {</span>
+            // starting 1.28, we store nextBuildNumber in a separate file.
+            // but old Hudson didn't do it, so if the file doesn't exist,
+            // assume that nextBuildNumber was read from config.xml
+            try {
+<span class="nc" id="L205">                synchronized (this) {</span>
+<span class="nc" id="L206">                    this.nextBuildNumber = Integer.parseInt(f.readTrim());</span>
+                }
+<span class="nc" id="L208">            } catch (NumberFormatException e) {</span>
+                // try to infer the value of the next build number from the existing build records. See JENKINS-11563
+<span class="nc" id="L210">                File[] folders = buildDir.listFiles(new FileFilter() {</span>
+                    public boolean accept(File file) {
+<span class="nc bnc" id="L212" title="All 4 branches missed.">                        return file.isDirectory() &amp;&amp; file.getName().matches(&quot;[0-9]+&quot;);</span>
+                    }
+                });
+
+<span class="nc bnc" id="L216" title="All 4 branches missed.">                if (folders == null || folders.length == 0) {</span>
+<span class="nc" id="L217">                    this.nextBuildNumber = 1;</span>
+<span class="nc" id="L218">                } else {</span>
+<span class="nc" id="L219">                    Collection&lt;Integer&gt; foldersInt = Collections2.transform(Arrays.asList(folders), new Function&lt;File, Integer&gt;() {</span>
+                        public Integer apply(File file) {
+<span class="nc" id="L221">                            return Integer.parseInt(file.getName());</span>
+                        }
+                    });
+<span class="nc" id="L224">                    this.nextBuildNumber = Collections.max(foldersInt) + 1;</span>
+                }
+<span class="nc" id="L226">                saveNextBuildNumber();</span>
+            }
+<span class="nc" id="L228">        } else {</span>
+            // From the old Hudson, or doCreateItem. Create this file now.
+<span class="nc" id="L230">            saveNextBuildNumber();</span>
+        }
+
+<span class="nc bnc" id="L233" title="All 2 branches missed.">        if (properties == null) // didn't exist &lt; 1.72</span>
+<span class="nc" id="L234">            properties = new CopyOnWriteList&lt;JobProperty&lt;? super JobT&gt;&gt;();</span>
+
+<span class="nc bnc" id="L236" title="All 2 branches missed.">        for (JobProperty p : properties)</span>
+<span class="nc" id="L237">            p.setOwner(this);</span>
+<span class="nc" id="L238">    }</span>
+
+    @Override
+    public void onCopiedFrom(Item src) {
+<span class="nc" id="L242">        super.onCopiedFrom(src);</span>
+<span class="nc" id="L243">        synchronized (this) {</span>
+<span class="nc" id="L244">            this.nextBuildNumber = 1; // reset the next build number</span>
+<span class="nc" id="L245">            this.holdOffBuildUntilUserSave = true;</span>
+<span class="nc" id="L246">            this.holdOffBuildUntilSave = this.holdOffBuildUntilUserSave;</span>
+        }
+<span class="nc" id="L248">    }</span>
+
+    @Extension(ordinal = -Double.MAX_VALUE)
+<span class="nc" id="L251">    public static class LastItemListener extends ItemListener {</span>
+
+        @Override
+        public void onCopied(Item src, Item item) {
+            // If any of the other ItemListeners modify the job, they effect
+            // a save, which will clear the holdOffBuildUntilUserSave and
+            // causing a regression of JENKINS-2494
+<span class="nc bnc" id="L258" title="All 2 branches missed.">            if (item instanceof Job) {</span>
+<span class="nc" id="L259">                Job job = (Job) item;</span>
+<span class="nc" id="L260">                synchronized (job) {</span>
+<span class="nc" id="L261">                    job.holdOffBuildUntilUserSave = false;</span>
+                }
+            }
+<span class="nc" id="L264">        }</span>
+    }
+
+    @Override
+    protected void performDelete() throws IOException, InterruptedException {
+        // if a build is in progress. Cancel it.
+<span class="nc" id="L270">        RunT lb = getLastBuild();</span>
+<span class="nc bnc" id="L271" title="All 2 branches missed.">        if (lb != null) {</span>
+<span class="nc" id="L272">            Executor e = lb.getExecutor();</span>
+<span class="nc bnc" id="L273" title="All 2 branches missed.">            if (e != null) {</span>
+<span class="nc" id="L274">                e.interrupt();</span>
+                // should we block until the build is cancelled?
+            }
+        }
+<span class="nc" id="L278">        super.performDelete();</span>
+<span class="nc" id="L279">    }</span>
+
+    /*package*/ TextFile getNextBuildNumberFile() {
+<span class="nc" id="L282">        return new TextFile(new File(this.getRootDir(), &quot;nextBuildNumber&quot;));</span>
+    }
+
+    public synchronized boolean isHoldOffBuildUntilSave() {
+<span class="nc" id="L286">        return holdOffBuildUntilSave;</span>
+    }
+
+    protected synchronized void saveNextBuildNumber() throws IOException {
+<span class="nc bnc" id="L290" title="All 2 branches missed.">        if (nextBuildNumber == 0) { // #3361</span>
+<span class="nc" id="L291">            nextBuildNumber = 1;</span>
+        }
+<span class="nc" id="L293">        getNextBuildNumberFile().write(String.valueOf(nextBuildNumber) + '\n');</span>
+<span class="nc" id="L294">    }</span>
+
+    @Exported
+    public boolean isInQueue() {
+<span class="nc" id="L298">        return false;</span>
+    }
+
+    /**
+     * If this job is in the build queue, return its item.
+     */
+    @Exported
+    public Queue.Item getQueueItem() {
+<span class="nc" id="L306">        return null;</span>
+    }
+
+    /**
+     * Returns true if a build of this project is in progress.
+     */
+    public boolean isBuilding() {
+<span class="nc" id="L313">        RunT b = getLastBuild();</span>
+<span class="nc bnc" id="L314" title="All 4 branches missed.">        return b!=null &amp;&amp; b.isBuilding();</span>
+    }
+    
+    /**
+     * Returns true if the log file is still being updated.
+     */
+    public boolean isLogUpdated() {
+<span class="nc" id="L321">        RunT b = getLastBuild();</span>
+<span class="nc bnc" id="L322" title="All 4 branches missed.">        return b!=null &amp;&amp; b.isLogUpdated();</span>
+    }    
+
+    @Override
+    public String getPronoun() {
+<span class="nc" id="L327">        return AlternativeUiTextProvider.get(PRONOUN, this, Messages.Job_Pronoun());</span>
+    }
+
+    /**
+     * Returns whether the name of this job can be changed by user.
+     */
+    public boolean isNameEditable() {
+<span class="nc" id="L334">        return true;</span>
+    }
+
+    /**
+     * If true, it will keep all the build logs of dependency components.
+     * (This really only makes sense in {@link AbstractProject} but historically it was defined here.)
+     */
+    @Exported
+    public boolean isKeepDependencies() {
+<span class="nc" id="L343">        return keepDependencies;</span>
+    }
+
+    /**
+     * Allocates a new buildCommand number.
+     */
+    public synchronized int assignBuildNumber() throws IOException {
+<span class="nc" id="L350">        int r = nextBuildNumber++;</span>
+<span class="nc" id="L351">        saveNextBuildNumber();</span>
+<span class="nc" id="L352">        return r;</span>
+    }
+
+    /**
+     * Peeks the next build number.
+     */
+    @Exported
+    public int getNextBuildNumber() {
+<span class="nc" id="L360">        return nextBuildNumber;</span>
+    }
+
+    /**
+     * Builds up the environment variable map that's sufficient to identify a process
+     * as ours. This is used to kill run-away processes via {@link ProcessTree#killAll(Map)}.
+     */
+    public EnvVars getCharacteristicEnvVars() {
+<span class="nc" id="L368">        EnvVars env = new EnvVars();</span>
+<span class="nc" id="L369">        env.put(&quot;JENKINS_SERVER_COOKIE&quot;,SERVER_COOKIE.get());</span>
+<span class="nc" id="L370">        env.put(&quot;HUDSON_SERVER_COOKIE&quot;,SERVER_COOKIE.get()); // Legacy compatibility</span>
+<span class="nc" id="L371">        env.put(&quot;JOB_NAME&quot;,getFullName());</span>
+<span class="nc" id="L372">        return env;</span>
+    }
+
+    /**
+     * Creates an environment variable override for launching processes for this project.
+     *
+     * &lt;p&gt;
+     * This is for process launching outside the build execution (such as polling, tagging, deployment, etc.)
+     * that happens in a context of a specific job.
+     *
+     * @param node
+     *      Node to eventually run a process on. The implementation must cope with this parameter being null
+     *      (in which case none of the node specific properties would be reflected in the resulting override.)
+     */
+    public @Nonnull EnvVars getEnvironment(@CheckForNull Node node, @Nonnull TaskListener listener) throws IOException, InterruptedException {
+        EnvVars env;
+
+<span class="nc bnc" id="L389" title="All 2 branches missed.">        if (node!=null) {</span>
+<span class="nc" id="L390">            final Computer computer = node.toComputer();</span>
+<span class="nc bnc" id="L391" title="All 2 branches missed.">            env = (computer != null) ? computer.buildEnvironment(listener) : new EnvVars();                </span>
+<span class="nc" id="L392">        } else {</span>
+<span class="nc" id="L393">            env = new EnvVars();</span>
+        }
+
+<span class="nc" id="L396">        env.putAll(getCharacteristicEnvVars());</span>
+
+        // servlet container may have set CLASSPATH in its launch script,
+        // so don't let that inherit to the new child process.
+        // see http://www.nabble.com/Run-Job-with-JDK-1.4.2-tf4468601.html
+<span class="nc" id="L401">        env.put(&quot;CLASSPATH&quot;,&quot;&quot;);</span>
+
+        // apply them in a reverse order so that higher ordinal ones can modify values added by lower ordinal ones
+<span class="nc bnc" id="L404" title="All 2 branches missed.">        for (EnvironmentContributor ec : EnvironmentContributor.all().reverseView())</span>
+<span class="nc" id="L405">            ec.buildEnvironmentFor(this,env,listener);</span>
+
+
+<span class="nc" id="L408">        return env;</span>
+    }
+
+    /**
+     * Programatically updates the next build number.
+     * 
+     * &lt;p&gt;
+     * Much of Hudson assumes that the build number is unique and monotonic, so
+     * this method can only accept a new value that's bigger than
+     * {@link #getLastBuild()} returns. Otherwise it'll be no-op.
+     * 
+     * @since 1.199 (before that, this method was package private.)
+     */
+    public synchronized void updateNextBuildNumber(int next) throws IOException {
+<span class="nc" id="L422">        RunT lb = getLastBuild();</span>
+<span class="nc bnc" id="L423" title="All 6 branches missed.">        if (lb!=null ?  next&gt;lb.getNumber() : next&gt;0) {</span>
+<span class="nc" id="L424">            this.nextBuildNumber = next;</span>
+<span class="nc" id="L425">            saveNextBuildNumber();</span>
+        }
+<span class="nc" id="L427">    }</span>
+
+    /**
+     * Returns the configured build discarder for this job, via {@link BuildDiscarderProperty}, or null if none.
+     */
+    public synchronized BuildDiscarder getBuildDiscarder() {
+<span class="nc" id="L433">        BuildDiscarderProperty prop = _getProperty(BuildDiscarderProperty.class);</span>
+<span class="nc bnc" id="L434" title="All 2 branches missed.">        return prop != null ? prop.getStrategy() : /* settings compatibility */ logRotator;</span>
+    }
+
+    public synchronized void setBuildDiscarder(BuildDiscarder bd) throws IOException {
+<span class="nc" id="L438">        BulkChange bc = new BulkChange(this);</span>
+        try {
+<span class="nc" id="L440">            removeProperty(BuildDiscarderProperty.class);</span>
+<span class="nc bnc" id="L441" title="All 2 branches missed.">            if (bd != null) {</span>
+<span class="nc" id="L442">                addProperty(new BuildDiscarderProperty(bd));</span>
+            }
+<span class="nc" id="L444">            bc.commit();</span>
+<span class="nc" id="L445">        } finally {</span>
+<span class="nc" id="L446">            bc.abort();</span>
+<span class="nc" id="L447">        }</span>
+<span class="nc" id="L448">    }</span>
+
+    /**
+     * Left for backward compatibility. Returns non-null if and only
+     * if {@link LogRotator} is configured as {@link BuildDiscarder}.
+     *
+     * @deprecated as of 1.503
+     *      Use {@link #getBuildDiscarder()}.
+     */
+    @Deprecated
+    public LogRotator getLogRotator() {
+<span class="nc" id="L459">        BuildDiscarder buildDiscarder = getBuildDiscarder();</span>
+<span class="nc bnc" id="L460" title="All 2 branches missed.">        return buildDiscarder instanceof LogRotator ? (LogRotator) buildDiscarder : null;</span>
+    }
+
+    /**
+     * @deprecated as of 1.503
+     *      Use {@link #setBuildDiscarder(BuildDiscarder)}
+     */
+    @Deprecated
+    public void setLogRotator(LogRotator logRotator) throws IOException {
+<span class="nc" id="L469">        setBuildDiscarder(logRotator);</span>
+<span class="nc" id="L470">    }</span>
+
+    /**
+     * Perform log rotation.
+     */
+    public void logRotate() throws IOException, InterruptedException {
+<span class="nc" id="L476">        BuildDiscarder bd = getBuildDiscarder();</span>
+<span class="nc bnc" id="L477" title="All 2 branches missed.">        if (bd != null)</span>
+<span class="nc" id="L478">            bd.perform(this);</span>
+<span class="nc" id="L479">    }</span>
+
+    /**
+     * True if this instance supports log rotation configuration.
+     */
+    public boolean supportsLogRotator() {
+<span class="nc" id="L485">        return true;</span>
+    }
+
+    @Override
+    protected SearchIndexBuilder makeSearchIndex() {
+<span class="nc" id="L490">        return super.makeSearchIndex().add(new SearchIndex() {</span>
+            public void find(String token, List&lt;SearchItem&gt; result) {
+                try {
+<span class="nc bnc" id="L493" title="All 2 branches missed.">                    if (token.startsWith(&quot;#&quot;))</span>
+<span class="nc" id="L494">                        token = token.substring(1); // ignore leading '#'</span>
+<span class="nc" id="L495">                    int n = Integer.parseInt(token);</span>
+<span class="nc" id="L496">                    Run b = getBuildByNumber(n);</span>
+<span class="nc bnc" id="L497" title="All 2 branches missed.">                    if (b == null)</span>
+<span class="nc" id="L498">                        return; // no such build</span>
+<span class="nc" id="L499">                    result.add(SearchItems.create(&quot;#&quot; + n, &quot;&quot; + n, b));</span>
+<span class="nc" id="L500">                } catch (NumberFormatException e) {</span>
+                    // not a number.
+                }
+<span class="nc" id="L503">            }</span>
+
+            public void suggest(String token, List&lt;SearchItem&gt; result) {
+<span class="nc" id="L506">                find(token, result);</span>
+<span class="nc" id="L507">            }</span>
+<span class="nc" id="L508">        }).add(&quot;configure&quot;, &quot;config&quot;, &quot;configure&quot;);</span>
+    }
+
+    public Collection&lt;? extends Job&gt; getAllJobs() {
+<span class="nc" id="L512">        return Collections.&lt;Job&gt; singleton(this);</span>
+    }
+
+    /**
+     * Adds {@link JobProperty}.
+     * 
+     * @since 1.188
+     */
+    public void addProperty(JobProperty&lt;? super JobT&gt; jobProp) throws IOException {
+<span class="nc" id="L521">        ((JobProperty)jobProp).setOwner(this);</span>
+<span class="nc" id="L522">        properties.add(jobProp);</span>
+<span class="nc" id="L523">        save();</span>
+<span class="nc" id="L524">    }</span>
+
+    /**
+     * Removes {@link JobProperty}
+     *
+     * @since 1.279
+     */
+    public void removeProperty(JobProperty&lt;? super JobT&gt; jobProp) throws IOException {
+<span class="nc" id="L532">        properties.remove(jobProp);</span>
+<span class="nc" id="L533">        save();</span>
+<span class="nc" id="L534">    }</span>
+
+    /**
+     * Removes the property of the given type.
+     *
+     * @return
+     *      The property that was just removed.
+     * @since 1.279
+     */
+    public &lt;T extends JobProperty&gt; T removeProperty(Class&lt;T&gt; clazz) throws IOException {
+<span class="nc bnc" id="L544" title="All 2 branches missed.">        for (JobProperty&lt;? super JobT&gt; p : properties) {</span>
+<span class="nc bnc" id="L545" title="All 2 branches missed.">            if (clazz.isInstance(p)) {</span>
+<span class="nc" id="L546">                removeProperty(p);</span>
+<span class="nc" id="L547">                return clazz.cast(p);</span>
+            }
+        }
+<span class="nc" id="L550">        return null;</span>
+    }
+
+    /**
+     * Gets all the job properties configured for this job.
+     */
+    @SuppressWarnings({&quot;unchecked&quot;, &quot;rawtypes&quot;})
+    public Map&lt;JobPropertyDescriptor, JobProperty&lt;? super JobT&gt;&gt; getProperties() {
+<span class="nc" id="L558">        Map result = Descriptor.toMap((Iterable) properties);</span>
+<span class="nc bnc" id="L559" title="All 2 branches missed.">        if (logRotator != null) {</span>
+<span class="nc" id="L560">            result.put(Jenkins.getActiveInstance().getDescriptorByType(BuildDiscarderProperty.DescriptorImpl.class), new BuildDiscarderProperty(logRotator));</span>
+        }
+<span class="nc" id="L562">        return result;</span>
+    }
+
+    /**
+     * List of all {@link JobProperty} exposed primarily for the remoting API.
+     * @since 1.282
+     */
+    @Exported(name=&quot;property&quot;,inline=true)
+    public List&lt;JobProperty&lt;? super JobT&gt;&gt; getAllProperties() {
+<span class="nc" id="L571">        return properties.getView();</span>
+    }
+
+    /**
+     * Gets the specific property, or null if the propert is not configured for
+     * this job.
+     */
+    public &lt;T extends JobProperty&gt; T getProperty(Class&lt;T&gt; clazz) {
+<span class="nc bnc" id="L579" title="All 4 branches missed.">        if (clazz == BuildDiscarderProperty.class &amp;&amp; logRotator != null) {</span>
+<span class="nc" id="L580">            return clazz.cast(new BuildDiscarderProperty(logRotator));</span>
+        }
+<span class="nc" id="L582">        return _getProperty(clazz);</span>
+    }
+
+    private &lt;T extends JobProperty&gt; T _getProperty(Class&lt;T&gt; clazz) {
+<span class="nc bnc" id="L586" title="All 2 branches missed.">        for (JobProperty p : properties) {</span>
+<span class="nc bnc" id="L587" title="All 2 branches missed.">            if (clazz.isInstance(p))</span>
+<span class="nc" id="L588">                return clazz.cast(p);</span>
+        }
+<span class="nc" id="L590">        return null;</span>
+    }
+
+    /**
+     * Bind {@link JobProperty}s to URL spaces.
+     *
+     * @since 1.403
+     */
+    public JobProperty getProperty(String className) {
+<span class="nc bnc" id="L599" title="All 2 branches missed.">        for (JobProperty p : properties)</span>
+<span class="nc bnc" id="L600" title="All 2 branches missed.">            if (p.getClass().getName().equals(className))</span>
+<span class="nc" id="L601">                return p;</span>
+<span class="nc" id="L602">        return null;</span>
+    }
+
+    /**
+     * Overrides from job properties.
+     * @see JobProperty#getJobOverrides
+     */
+    public Collection&lt;?&gt; getOverrides() {
+<span class="nc" id="L610">        List&lt;Object&gt; r = new ArrayList&lt;Object&gt;();</span>
+<span class="nc bnc" id="L611" title="All 2 branches missed.">        for (JobProperty&lt;? super JobT&gt; p : properties)</span>
+<span class="nc" id="L612">            r.addAll(p.getJobOverrides());</span>
+<span class="nc" id="L613">        return r;</span>
+    }
+
+    public List&lt;Widget&gt; getWidgets() {
+<span class="nc" id="L617">        ArrayList&lt;Widget&gt; r = new ArrayList&lt;Widget&gt;();</span>
+<span class="nc" id="L618">        r.add(createHistoryWidget());</span>
+<span class="nc" id="L619">        return r;</span>
+    }
+
+    /**
+     * @see LazyBuildMixIn#createHistoryWidget
+     */
+    protected HistoryWidget createHistoryWidget() {
+<span class="nc" id="L626">        return new HistoryWidget&lt;Job, RunT&gt;(this, getBuilds(), HISTORY_ADAPTER);</span>
+    }
+
+<span class="fc" id="L629">    public static final HistoryWidget.Adapter&lt;Run&gt; HISTORY_ADAPTER = new Adapter&lt;Run&gt;() {</span>
+        public int compare(Run record, String key) {
+            try {
+<span class="nc" id="L632">                int k = Integer.parseInt(key);</span>
+<span class="nc" id="L633">                return record.getNumber() - k;</span>
+<span class="nc" id="L634">            } catch (NumberFormatException nfe) {</span>
+<span class="nc" id="L635">                return String.valueOf(record.getNumber()).compareTo(key);</span>
+            }
+        }
+
+        public String getKey(Run record) {
+<span class="nc" id="L640">            return String.valueOf(record.getNumber());</span>
+        }
+
+        public boolean isBuilding(Run record) {
+<span class="nc" id="L644">            return record.isBuilding();</span>
+        }
+
+        public String getNextKey(String key) {
+            try {
+<span class="nc" id="L649">                int k = Integer.parseInt(key);</span>
+<span class="nc" id="L650">                return String.valueOf(k + 1);</span>
+<span class="nc" id="L651">            } catch (NumberFormatException nfe) {</span>
+<span class="nc" id="L652">                return &quot;-unable to determine next key-&quot;;</span>
+            }
+        }
+    };
+
+    /**
+     * Renames a job.
+     */
+    @Override
+    public void renameTo(String newName) throws IOException {
+<span class="nc" id="L662">        File oldBuildDir = getBuildDir();</span>
+<span class="nc" id="L663">        super.renameTo(newName);</span>
+<span class="nc" id="L664">        File newBuildDir = getBuildDir();</span>
+<span class="nc bnc" id="L665" title="All 4 branches missed.">        if (oldBuildDir.isDirectory() &amp;&amp; !newBuildDir.isDirectory()) {</span>
+<span class="nc bnc" id="L666" title="All 2 branches missed.">            if (!newBuildDir.getParentFile().isDirectory()) {</span>
+<span class="nc" id="L667">                newBuildDir.getParentFile().mkdirs();</span>
+            }
+<span class="nc bnc" id="L669" title="All 2 branches missed.">            if (!oldBuildDir.renameTo(newBuildDir)) {</span>
+<span class="nc" id="L670">                throw new IOException(&quot;failed to rename &quot; + oldBuildDir + &quot; to &quot; + newBuildDir);</span>
+            }
+        }
+<span class="nc" id="L673">    }</span>
+
+    @Override
+    public void movedTo(DirectlyModifiableTopLevelItemGroup destination, AbstractItem newItem, File destDir) throws IOException {
+<span class="nc" id="L677">        Job newJob = (Job) newItem; // Missing covariant parameters type here.</span>
+<span class="nc" id="L678">        File oldBuildDir = getBuildDir();</span>
+<span class="nc" id="L679">        super.movedTo(destination, newItem, destDir);</span>
+<span class="nc" id="L680">        File newBuildDir = getBuildDir();</span>
+<span class="nc bnc" id="L681" title="All 2 branches missed.">        if (oldBuildDir.isDirectory()) {</span>
+<span class="nc" id="L682">            FileUtils.moveDirectory(oldBuildDir, newBuildDir);</span>
+        }
+<span class="nc" id="L684">    }</span>
+
+    @Override public void delete() throws IOException, InterruptedException {
+<span class="nc" id="L687">        super.delete();</span>
+<span class="nc" id="L688">        Util.deleteRecursive(getBuildDir());</span>
+<span class="nc" id="L689">    }</span>
+
+    /**
+     * Returns true if we should display &quot;build now&quot; icon
+     */
+    @Exported
+    public abstract boolean isBuildable();
+
+    /**
+     * Gets the read-only view of all the builds.
+     * 
+     * @return never null. The first entry is the latest build.
+     */
+    @Exported(name=&quot;allBuilds&quot;,visibility=-2)
+    @WithBridgeMethods(List.class)
+    public RunList&lt;RunT&gt; getBuilds() {
+<span class="nc" id="L705">        return RunList.fromRuns(_getRuns().values());</span>
+    }
+
+    /**
+     * Gets the read-only view of the recent builds.
+     *
+     * @since 1.485
+     */
+    @Exported(name=&quot;builds&quot;)
+    public RunList&lt;RunT&gt; getNewBuilds() {
+<span class="nc" id="L715">        return getBuilds().limit(100);</span>
+    }
+
+    /**
+     * Obtains all the {@link Run}s whose build numbers matches the given {@link RangeSet}.
+     */
+    public synchronized List&lt;RunT&gt; getBuilds(RangeSet rs) {
+<span class="nc" id="L722">        List&lt;RunT&gt; builds = new LinkedList&lt;RunT&gt;();</span>
+
+<span class="nc bnc" id="L724" title="All 2 branches missed.">        for (Range r : rs.getRanges()) {</span>
+<span class="nc bnc" id="L725" title="All 4 branches missed.">            for (RunT b = getNearestBuild(r.start); b!=null &amp;&amp; b.getNumber()&lt;r.end; b=b.getNextBuild()) {</span>
+<span class="nc" id="L726">                builds.add(b);</span>
+            }
+        }
+
+<span class="nc" id="L730">        return builds;</span>
+    }
+
+    /**
+     * Gets all the builds in a map.
+     */
+    public SortedMap&lt;Integer, RunT&gt; getBuildsAsMap() {
+<span class="nc" id="L737">        return Collections.unmodifiableSortedMap(_getRuns());</span>
+    }
+
+    /**
+     * Looks up a build by its ID.
+     * @see LazyBuildMixIn#getBuild
+     */
+    public RunT getBuild(String id) {
+<span class="nc bnc" id="L745" title="All 2 branches missed.">        for (RunT r : _getRuns().values()) {</span>
+<span class="nc bnc" id="L746" title="All 2 branches missed.">            if (r.getId().equals(id))</span>
+<span class="nc" id="L747">                return r;</span>
+        }
+<span class="nc" id="L749">        return null;</span>
+    }
+
+    /**
+     * @param n
+     *            The build number.
+     * @return null if no such build exists.
+     * @see Run#getNumber()
+     * @see LazyBuildMixIn#getBuildByNumber
+     */
+    public RunT getBuildByNumber(int n) {
+<span class="nc" id="L760">        return _getRuns().get(n);</span>
+    }
+
+    /**
+     * Obtains a list of builds, in the descending order, that are within the specified time range [start,end).
+     *
+     * @return can be empty but never null.
+     * @deprecated
+     *      as of 1.372. Should just do {@code getBuilds().byTimestamp(s,e)} to avoid code bloat in {@link Job}.
+     */
+    @WithBridgeMethods(List.class)
+    @Deprecated
+    public RunList&lt;RunT&gt; getBuildsByTimestamp(long start, long end) {
+<span class="nc" id="L773">        return getBuilds().byTimestamp(start,end);</span>
+    }
+
+    @CLIResolver
+    public RunT getBuildForCLI(@Argument(required=true,metaVar=&quot;BUILD#&quot;,usage=&quot;Build number&quot;) String id) throws CmdLineException {
+        try {
+<span class="nc" id="L779">            int n = Integer.parseInt(id);</span>
+<span class="nc" id="L780">            RunT r = getBuildByNumber(n);</span>
+<span class="nc bnc" id="L781" title="All 2 branches missed.">            if (r==null)</span>
+<span class="nc" id="L782">                throw new CmdLineException(null, &quot;No such build '#&quot;+n+&quot;' exists&quot;);</span>
+<span class="nc" id="L783">            return r;</span>
+<span class="nc" id="L784">        } catch (NumberFormatException e) {</span>
+<span class="nc" id="L785">            throw new CmdLineException(null, id+ &quot;is not a number&quot;);</span>
+        }
+    }
+
+    /**
+     * Gets the youngest build #m that satisfies &lt;tt&gt;n&amp;lt;=m&lt;/tt&gt;.
+     * 
+     * This is useful when you'd like to fetch a build but the exact build might
+     * be already gone (deleted, rotated, etc.)
+     * @see LazyBuildMixIn#getNearestBuild
+     */
+    public RunT getNearestBuild(int n) {
+<span class="nc" id="L797">        SortedMap&lt;Integer, ? extends RunT&gt; m = _getRuns().headMap(n - 1); // the map should</span>
+                                                                          // include n, so n-1
+<span class="nc bnc" id="L799" title="All 2 branches missed.">        if (m.isEmpty())</span>
+<span class="nc" id="L800">            return null;</span>
+<span class="nc" id="L801">        return m.get(m.lastKey());</span>
+    }
+
+    /**
+     * Gets the latest build #m that satisfies &lt;tt&gt;m&amp;lt;=n&lt;/tt&gt;.
+     * 
+     * This is useful when you'd like to fetch a build but the exact build might
+     * be already gone (deleted, rotated, etc.)
+     * @see LazyBuildMixIn#getNearestOldBuild
+     */
+    public RunT getNearestOldBuild(int n) {
+<span class="nc" id="L812">        SortedMap&lt;Integer, ? extends RunT&gt; m = _getRuns().tailMap(n);</span>
+<span class="nc bnc" id="L813" title="All 2 branches missed.">        if (m.isEmpty())</span>
+<span class="nc" id="L814">            return null;</span>
+<span class="nc" id="L815">        return m.get(m.firstKey());</span>
+    }
+
+    @Override
+    public Object getDynamic(String token, StaplerRequest req,
+            StaplerResponse rsp) {
+        try {
+            // try to interpret the token as build number
+<span class="nc" id="L823">            return getBuildByNumber(Integer.valueOf(token));</span>
+<span class="nc" id="L824">        } catch (NumberFormatException e) {</span>
+            // try to map that to widgets
+<span class="nc bnc" id="L826" title="All 2 branches missed.">            for (Widget w : getWidgets()) {</span>
+<span class="nc bnc" id="L827" title="All 2 branches missed.">                if (w.getUrlName().equals(token))</span>
+<span class="nc" id="L828">                    return w;</span>
+            }
+
+            // is this a permalink?
+<span class="nc bnc" id="L832" title="All 2 branches missed.">            for (Permalink p : getPermalinks()) {</span>
+<span class="nc bnc" id="L833" title="All 2 branches missed.">                if(p.getId().equals(token))</span>
+<span class="nc" id="L834">                    return p.resolve(this);</span>
+            }
+
+<span class="nc" id="L837">            return super.getDynamic(token, req, rsp);</span>
+        }
+    }
+
+    /**
+     * Directory for storing {@link Run} records.
+     * &lt;p&gt;
+     * Some {@link Job}s may not have backing data store for {@link Run}s, but
+     * those {@link Job}s that use file system for storing data should use this
+     * directory for consistency.
+     * 
+     * @see RunMap
+     */
+    public File getBuildDir() {
+<span class="nc" id="L851">        Jenkins j = Jenkins.getInstance();</span>
+<span class="nc bnc" id="L852" title="All 2 branches missed.">        if (j == null) {</span>
+<span class="nc" id="L853">            return new File(getRootDir(), &quot;builds&quot;);</span>
+        }
+<span class="nc" id="L855">        return j.getBuildDirFor(this);</span>
+    }
+
+    /**
+     * Gets all the runs.
+     * 
+     * The resulting map must be treated immutable (by employing copy-on-write
+     * semantics.) The map is descending order, with newest builds at the top.
+     * @see LazyBuildMixIn#_getRuns
+     */
+    protected abstract SortedMap&lt;Integer, ? extends RunT&gt; _getRuns();
+
+    /**
+     * Called from {@link Run} to remove it from this job.
+     * 
+     * The files are deleted already. So all the callee needs to do is to remove
+     * a reference from this {@link Job}.
+     * @see LazyBuildMixIn#removeRun
+     */
+    protected abstract void removeRun(RunT run);
+
+    /**
+     * Returns the last build.
+     * @see LazyBuildMixIn#getLastBuild
+     */
+    @Exported
+    @QuickSilver
+    public RunT getLastBuild() {
+<span class="nc" id="L883">        SortedMap&lt;Integer, ? extends RunT&gt; runs = _getRuns();</span>
+
+<span class="nc bnc" id="L885" title="All 2 branches missed.">        if (runs.isEmpty())</span>
+<span class="nc" id="L886">            return null;</span>
+<span class="nc" id="L887">        return runs.get(runs.firstKey());</span>
+    }
+
+    /**
+     * Returns the oldest build in the record.
+     * @see LazyBuildMixIn#getFirstBuild
+     */
+    @Exported
+    @QuickSilver
+    public RunT getFirstBuild() {
+<span class="nc" id="L897">        SortedMap&lt;Integer, ? extends RunT&gt; runs = _getRuns();</span>
+
+<span class="nc bnc" id="L899" title="All 2 branches missed.">        if (runs.isEmpty())</span>
+<span class="nc" id="L900">            return null;</span>
+<span class="nc" id="L901">        return runs.get(runs.lastKey());</span>
+    }
+
+    /**
+     * Returns the last successful build, if any. Otherwise null. A successful build
+     * would include either {@link Result#SUCCESS} or {@link Result#UNSTABLE}.
+     * 
+     * @see #getLastStableBuild()
+     */
+    @Exported
+    @QuickSilver
+    public RunT getLastSuccessfulBuild() {
+<span class="nc" id="L913">        return (RunT)Permalink.LAST_SUCCESSFUL_BUILD.resolve(this);</span>
+    }
+
+    /**
+     * Returns the last build that was anything but stable, if any. Otherwise null.
+     * @see #getLastSuccessfulBuild
+     */
+    @Exported
+    @QuickSilver
+    public RunT getLastUnsuccessfulBuild() {
+<span class="nc" id="L923">        return (RunT)Permalink.LAST_UNSUCCESSFUL_BUILD.resolve(this);</span>
+    }
+
+    /**
+     * Returns the last unstable build, if any. Otherwise null.
+     * @see #getLastSuccessfulBuild
+     */
+    @Exported
+    @QuickSilver
+    public RunT getLastUnstableBuild() {
+<span class="nc" id="L933">        return (RunT)Permalink.LAST_UNSTABLE_BUILD.resolve(this);</span>
+    }
+
+    /**
+     * Returns the last stable build, if any. Otherwise null.
+     * @see #getLastSuccessfulBuild
+     */
+    @Exported
+    @QuickSilver
+    public RunT getLastStableBuild() {
+<span class="nc" id="L943">        return (RunT)Permalink.LAST_STABLE_BUILD.resolve(this);</span>
+    }
+
+    /**
+     * Returns the last failed build, if any. Otherwise null.
+     */
+    @Exported
+    @QuickSilver
+    public RunT getLastFailedBuild() {
+<span class="nc" id="L952">        return (RunT)Permalink.LAST_FAILED_BUILD.resolve(this);</span>
+    }
+
+    /**
+     * Returns the last completed build, if any. Otherwise null.
+     */
+    @Exported
+    @QuickSilver
+    public RunT getLastCompletedBuild() {
+<span class="nc" id="L961">        RunT r = getLastBuild();</span>
+<span class="nc bnc" id="L962" title="All 4 branches missed.">        while (r != null &amp;&amp; r.isBuilding())</span>
+<span class="nc" id="L963">            r = r.getPreviousBuild();</span>
+<span class="nc" id="L964">        return r;</span>
+    }
+    
+    /**
+     * Returns the last 'numberOfBuilds' builds with a build result &gt;= 'threshold'
+     * 
+     * @return a list with the builds. May be smaller than 'numberOfBuilds' or even empty
+     *   if not enough builds satisfying the threshold have been found. Never null.
+     */
+    public List&lt;RunT&gt; getLastBuildsOverThreshold(int numberOfBuilds, Result threshold) {
+        
+<span class="nc" id="L975">        List&lt;RunT&gt; result = new ArrayList&lt;RunT&gt;(numberOfBuilds);</span>
+        
+<span class="nc" id="L977">        RunT r = getLastBuild();</span>
+<span class="nc bnc" id="L978" title="All 4 branches missed.">        while (r != null &amp;&amp; result.size() &lt; numberOfBuilds) {</span>
+<span class="nc bnc" id="L979" title="All 2 branches missed.">            if (!r.isBuilding() &amp;&amp; </span>
+<span class="nc bnc" id="L980" title="All 4 branches missed.">                 (r.getResult() != null &amp;&amp; r.getResult().isBetterOrEqualTo(threshold))) {</span>
+<span class="nc" id="L981">                result.add(r);</span>
+            }
+<span class="nc" id="L983">            r = r.getPreviousBuild();</span>
+        }
+        
+<span class="nc" id="L986">        return result;</span>
+    }
+    
+    /**
+     * Returns candidate build for calculating the estimated duration of the current run.
+     * 
+     * Returns the 3 last successful (stable or unstable) builds, if there are any.
+     * Failing to find 3 of those, it will return up to 3 last unsuccessful builds.
+     * 
+     * In any case it will not go more than 6 builds into the past to avoid costly build loading.
+     */
+    @SuppressWarnings(&quot;unchecked&quot;)
+    protected List&lt;RunT&gt; getEstimatedDurationCandidates() {
+<span class="nc" id="L999">        List&lt;RunT&gt; candidates = new ArrayList&lt;RunT&gt;(3);</span>
+<span class="nc" id="L1000">        RunT lastSuccessful = getLastSuccessfulBuild();</span>
+<span class="nc" id="L1001">        int lastSuccessfulNumber = -1;</span>
+<span class="nc bnc" id="L1002" title="All 2 branches missed.">        if (lastSuccessful != null) {</span>
+<span class="nc" id="L1003">            candidates.add(lastSuccessful);</span>
+<span class="nc" id="L1004">            lastSuccessfulNumber = lastSuccessful.getNumber();</span>
+        }
+
+<span class="nc" id="L1007">        int i = 0;</span>
+<span class="nc" id="L1008">        RunT r = getLastBuild();</span>
+<span class="nc" id="L1009">        List&lt;RunT&gt; fallbackCandidates = new ArrayList&lt;RunT&gt;(3);</span>
+<span class="nc bnc" id="L1010" title="All 6 branches missed.">        while (r != null &amp;&amp; candidates.size() &lt; 3 &amp;&amp; i &lt; 6) {</span>
+<span class="nc bnc" id="L1011" title="All 6 branches missed.">            if (!r.isBuilding() &amp;&amp; r.getResult() != null &amp;&amp; r.getNumber() != lastSuccessfulNumber) {</span>
+<span class="nc" id="L1012">                Result result = r.getResult();</span>
+<span class="nc bnc" id="L1013" title="All 2 branches missed.">                if (result.isBetterOrEqualTo(Result.UNSTABLE)) {</span>
+<span class="nc" id="L1014">                    candidates.add(r);</span>
+<span class="nc bnc" id="L1015" title="All 2 branches missed.">                } else if (result.isCompleteBuild()) {</span>
+<span class="nc" id="L1016">                    fallbackCandidates.add(r);</span>
+                }
+            }
+<span class="nc" id="L1019">            i++;</span>
+<span class="nc" id="L1020">            r = r.getPreviousBuild();</span>
+        }
+        
+<span class="nc bnc" id="L1023" title="All 2 branches missed.">        while (candidates.size() &lt; 3) {</span>
+<span class="nc bnc" id="L1024" title="All 2 branches missed.">            if (fallbackCandidates.isEmpty())</span>
+<span class="nc" id="L1025">                break;</span>
+<span class="nc" id="L1026">            RunT run = fallbackCandidates.remove(0);</span>
+<span class="nc" id="L1027">            candidates.add(run);</span>
+        }
+        
+<span class="nc" id="L1030">        return candidates;</span>
+    }
+    
+    public long getEstimatedDuration() {
+<span class="nc" id="L1034">        List&lt;RunT&gt; builds = getEstimatedDurationCandidates();</span>
+        
+<span class="nc bnc" id="L1036" title="All 2 branches missed.">        if(builds.isEmpty())     return -1;</span>
+
+<span class="nc" id="L1038">        long totalDuration = 0;</span>
+<span class="nc bnc" id="L1039" title="All 2 branches missed.">        for (RunT b : builds) {</span>
+<span class="nc" id="L1040">            totalDuration += b.getDuration();</span>
+        }
+<span class="nc bnc" id="L1042" title="All 2 branches missed.">        if(totalDuration==0) return -1;</span>
+
+<span class="nc" id="L1044">        return Math.round((double)totalDuration / builds.size());</span>
+    }
+
+    /**
+     * Gets all the {@link Permalink}s defined for this job.
+     *
+     * @return never null
+     */
+    public PermalinkList getPermalinks() {
+        // TODO: shall we cache this?
+<span class="nc" id="L1054">        PermalinkList permalinks = new PermalinkList(Permalink.BUILTIN);</span>
+<span class="nc bnc" id="L1055" title="All 2 branches missed.">        for (PermalinkProjectAction ppa : getActions(PermalinkProjectAction.class)) {</span>
+<span class="nc" id="L1056">            permalinks.addAll(ppa.getPermalinks());</span>
+        }
+<span class="nc" id="L1058">        return permalinks;</span>
+    }
+    
+    @Override public ContextMenu doChildrenContextMenu(StaplerRequest request, StaplerResponse response) throws Exception {
+        // not sure what would be really useful here. This needs more thoughts.
+        // for the time being, I'm starting with permalinks
+<span class="nc" id="L1064">        ContextMenu menu = new ContextMenu();</span>
+<span class="nc bnc" id="L1065" title="All 2 branches missed.">        for (Permalink p : getPermalinks()) {</span>
+<span class="nc bnc" id="L1066" title="All 2 branches missed.">            if (p.resolve(this) != null) {</span>
+<span class="nc" id="L1067">                menu.add(p.getId(), p.getDisplayName());</span>
+            }
+        }
+<span class="nc" id="L1070">        return menu;</span>
+    }
+
+    /**
+     * Used as the color of the status ball for the project.
+     */
+    @Exported(visibility = 2, name = &quot;color&quot;)
+    public BallColor getIconColor() {
+<span class="nc" id="L1078">        RunT lastBuild = getLastBuild();</span>
+<span class="nc bnc" id="L1079" title="All 4 branches missed.">        while (lastBuild != null &amp;&amp; lastBuild.hasntStartedYet())</span>
+<span class="nc" id="L1080">            lastBuild = lastBuild.getPreviousBuild();</span>
+
+<span class="nc bnc" id="L1082" title="All 2 branches missed.">        if (lastBuild != null)</span>
+<span class="nc" id="L1083">            return lastBuild.getIconColor();</span>
+        else
+<span class="nc" id="L1085">            return BallColor.NOTBUILT;</span>
+    }
+
+    /**
+     * Get the current health report for a job.
+     * 
+     * @return the health report. Never returns null
+     */
+    public HealthReport getBuildHealth() {
+<span class="nc" id="L1094">        List&lt;HealthReport&gt; reports = getBuildHealthReports();</span>
+<span class="nc bnc" id="L1095" title="All 2 branches missed.">        return reports.isEmpty() ? new HealthReport() : reports.get(0);</span>
+    }
+
+    @Exported(name = &quot;healthReport&quot;)
+    public List&lt;HealthReport&gt; getBuildHealthReports() {
+<span class="nc" id="L1100">        List&lt;HealthReport&gt; reports = new ArrayList&lt;HealthReport&gt;();</span>
+<span class="nc" id="L1101">        RunT lastBuild = getLastBuild();</span>
+
+<span class="nc bnc" id="L1103" title="All 4 branches missed.">        if (lastBuild != null &amp;&amp; lastBuild.isBuilding()) {</span>
+            // show the previous build's report until the current one is
+            // finished building.
+<span class="nc" id="L1106">            lastBuild = lastBuild.getPreviousBuild();</span>
+        }
+
+        // check the cache
+<span class="nc bnc" id="L1110" title="All 2 branches missed.">        if (cachedBuildHealthReportsBuildNumber != null</span>
+<span class="nc bnc" id="L1111" title="All 2 branches missed.">                &amp;&amp; cachedBuildHealthReports != null</span>
+<span class="nc bnc" id="L1112" title="All 2 branches missed.">                &amp;&amp; lastBuild != null</span>
+<span class="nc bnc" id="L1113" title="All 2 branches missed.">                &amp;&amp; cachedBuildHealthReportsBuildNumber.intValue() == lastBuild</span>
+<span class="nc" id="L1114">                        .getNumber()) {</span>
+<span class="nc" id="L1115">            reports.addAll(cachedBuildHealthReports);</span>
+<span class="nc bnc" id="L1116" title="All 2 branches missed.">        } else if (lastBuild != null) {</span>
+<span class="nc bnc" id="L1117" title="All 2 branches missed.">            for (HealthReportingAction healthReportingAction : lastBuild</span>
+<span class="nc" id="L1118">                    .getActions(HealthReportingAction.class)) {</span>
+<span class="nc" id="L1119">                final HealthReport report = healthReportingAction</span>
+<span class="nc" id="L1120">                        .getBuildHealth();</span>
+<span class="nc bnc" id="L1121" title="All 2 branches missed.">                if (report != null) {</span>
+<span class="nc bnc" id="L1122" title="All 2 branches missed.">                    if (report.isAggregateReport()) {</span>
+<span class="nc" id="L1123">                        reports.addAll(report.getAggregatedReports());</span>
+<span class="nc" id="L1124">                    } else {</span>
+<span class="nc" id="L1125">                        reports.add(report);</span>
+                    }
+                }
+            }
+<span class="nc" id="L1129">            final HealthReport report = getBuildStabilityHealthReport();</span>
+<span class="nc bnc" id="L1130" title="All 2 branches missed.">            if (report != null) {</span>
+<span class="nc bnc" id="L1131" title="All 2 branches missed.">                if (report.isAggregateReport()) {</span>
+<span class="nc" id="L1132">                    reports.addAll(report.getAggregatedReports());</span>
+<span class="nc" id="L1133">                } else {</span>
+<span class="nc" id="L1134">                    reports.add(report);</span>
+                }
+            }
+
+<span class="nc" id="L1138">            Collections.sort(reports);</span>
+
+            // store the cache
+<span class="nc" id="L1141">            cachedBuildHealthReportsBuildNumber = lastBuild.getNumber();</span>
+<span class="nc" id="L1142">            cachedBuildHealthReports = new ArrayList&lt;HealthReport&gt;(reports);</span>
+        }
+
+<span class="nc" id="L1145">        return reports;</span>
+    }
+
+    private HealthReport getBuildStabilityHealthReport() {
+        // we can give a simple view of build health from the last five builds
+<span class="nc" id="L1150">        int failCount = 0;</span>
+<span class="nc" id="L1151">        int totalCount = 0;</span>
+<span class="nc" id="L1152">        RunT i = getLastBuild();</span>
+<span class="nc bnc" id="L1153" title="All 4 branches missed.">        while (totalCount &lt; 5 &amp;&amp; i != null) {</span>
+<span class="nc bnc" id="L1154" title="All 3 branches missed.">            switch (i.getIconColor()) {</span>
+            case BLUE:
+            case YELLOW:
+                // failCount stays the same
+<span class="nc" id="L1158">                totalCount++;</span>
+<span class="nc" id="L1159">                break;</span>
+            case RED:
+<span class="nc" id="L1161">                failCount++;</span>
+<span class="nc" id="L1162">                totalCount++;</span>
+<span class="nc" id="L1163">                break;</span>
+
+            default:
+                // do nothing as these are inconclusive statuses
+                break;
+            }
+<span class="nc" id="L1169">            i = i.getPreviousBuild();</span>
+        }
+<span class="nc bnc" id="L1171" title="All 2 branches missed.">        if (totalCount &gt; 0) {</span>
+<span class="nc" id="L1172">            int score = (int) ((100.0 * (totalCount - failCount)) / totalCount);</span>
+
+            Localizable description;
+<span class="nc bnc" id="L1175" title="All 2 branches missed.">            if (failCount == 0) {</span>
+<span class="nc" id="L1176">                description = Messages._Job_NoRecentBuildFailed();</span>
+<span class="nc bnc" id="L1177" title="All 2 branches missed.">            } else if (totalCount == failCount) {</span>
+                // this should catch the case where totalCount == 1
+                // as failCount must be between 0 and totalCount
+                // and we can't get here if failCount == 0
+<span class="nc" id="L1181">                description = Messages._Job_AllRecentBuildFailed();</span>
+<span class="nc" id="L1182">            } else {</span>
+<span class="nc" id="L1183">                description = Messages._Job_NOfMFailed(failCount, totalCount);</span>
+            }
+<span class="nc" id="L1185">            return new HealthReport(score, Messages._Job_BuildStability(description));</span>
+        }
+<span class="nc" id="L1187">        return null;</span>
+    }
+
+    //
+    //
+    // actions
+    //
+    //
+    /**
+     * Accepts submission from the configuration page.
+     */
+    @RequirePOST
+    public synchronized void doConfigSubmit(StaplerRequest req,
+            StaplerResponse rsp) throws IOException, ServletException, FormException {
+<span class="nc" id="L1201">        checkPermission(CONFIGURE);</span>
+
+<span class="nc" id="L1203">        description = req.getParameter(&quot;description&quot;);</span>
+
+<span class="nc" id="L1205">        JSONObject json = req.getSubmittedForm();</span>
+
+        try {
+<span class="nc" id="L1208">            setDisplayName(json.optString(&quot;displayNameOrNull&quot;));</span>
+
+<span class="nc" id="L1210">            logRotator = null;</span>
+
+<span class="nc" id="L1212">            DescribableList&lt;JobProperty&lt;?&gt;, JobPropertyDescriptor&gt; t = new DescribableList&lt;JobProperty&lt;?&gt;, JobPropertyDescriptor&gt;(NOOP,getAllProperties());</span>
+<span class="nc" id="L1213">            JSONObject jsonProperties = json.optJSONObject(&quot;properties&quot;);</span>
+<span class="nc bnc" id="L1214" title="All 2 branches missed.">            if (jsonProperties != null) {</span>
+<span class="nc" id="L1215">              t.rebuild(req,jsonProperties,JobPropertyDescriptor.getPropertyDescriptors(Job.this.getClass()));</span>
+<span class="nc" id="L1216">            } else {</span>
+<span class="nc" id="L1217">              t.clear();</span>
+            }
+<span class="nc" id="L1219">            properties.clear();</span>
+<span class="nc bnc" id="L1220" title="All 2 branches missed.">            for (JobProperty p : t) {</span>
+<span class="nc" id="L1221">                p.setOwner(this);</span>
+<span class="nc" id="L1222">                properties.add(p);</span>
+            }
+
+<span class="nc" id="L1225">            submit(req, rsp);</span>
+
+<span class="nc" id="L1227">            save();</span>
+<span class="nc" id="L1228">            ItemListener.fireOnUpdated(this);</span>
+
+<span class="nc" id="L1230">            String newName = req.getParameter(&quot;name&quot;);</span>
+<span class="nc" id="L1231">            final ProjectNamingStrategy namingStrategy = Jenkins.getInstance().getProjectNamingStrategy();</span>
+<span class="nc bnc" id="L1232" title="All 2 branches missed.">            if (validRename(name, newName)) {</span>
+<span class="nc" id="L1233">                newName = newName.trim();</span>
+                // check this error early to avoid HTTP response splitting.
+<span class="nc" id="L1235">                Jenkins.checkGoodName(newName);</span>
+<span class="nc" id="L1236">                namingStrategy.checkName(newName);</span>
+<span class="nc bnc" id="L1237" title="All 2 branches missed.">                if (FormApply.isApply(req)) {</span>
+<span class="nc" id="L1238">                    FormApply.applyResponse(&quot;notificationBar.show(&quot; + QuotedStringTokenizer.quote(Messages.Job_you_must_use_the_save_button_if_you_wish()) + &quot;,notificationBar.WARNING)&quot;).generateResponse(req, rsp, null);</span>
+<span class="nc" id="L1239">                } else {</span>
+<span class="nc" id="L1240">                    rsp.sendRedirect(&quot;rename?newName=&quot; + URLEncoder.encode(newName, &quot;UTF-8&quot;));</span>
+                }
+<span class="nc" id="L1242">            } else {</span>
+<span class="nc bnc" id="L1243" title="All 2 branches missed.">                if(namingStrategy.isForceExistingJobs()){</span>
+<span class="nc" id="L1244">                    namingStrategy.checkName(name);</span>
+                }
+<span class="nc" id="L1246">                FormApply.success(&quot;.&quot;).generateResponse(req, rsp, null);</span>
+            }
+<span class="nc" id="L1248">        } catch (JSONException e) {</span>
+<span class="nc" id="L1249">            Logger.getLogger(Job.class.getName()).log(Level.WARNING, &quot;failed to parse &quot; + json, e);</span>
+<span class="nc" id="L1250">            sendError(e, req, rsp);</span>
+        }
+<span class="nc" id="L1252">    }</span>
+
+    private boolean validRename(String oldName, String newName) {
+<span class="nc bnc" id="L1255" title="All 2 branches missed.">        if (newName == null) {</span>
+<span class="nc" id="L1256">            return false;</span>
+        }
+<span class="nc" id="L1258">        boolean noChange = oldName.equals(newName);</span>
+<span class="nc" id="L1259">        boolean spaceAdded = oldName.equals(newName.trim());</span>
+<span class="nc bnc" id="L1260" title="All 4 branches missed.">        return !noChange &amp;&amp; !spaceAdded;</span>
+    }
+
+    /**
+     * Derived class can override this to perform additional config submission
+     * work.
+     */
+    protected void submit(StaplerRequest req, StaplerResponse rsp)
+            throws IOException, ServletException, FormException {
+<span class="nc" id="L1269">    }</span>
+
+    /**
+     * Accepts and serves the job description
+     */
+    public void doDescription(StaplerRequest req, StaplerResponse rsp)
+            throws IOException {
+<span class="nc bnc" id="L1276" title="All 2 branches missed.">        if (req.getMethod().equals(&quot;GET&quot;)) {</span>
+            //read
+<span class="nc" id="L1278">            rsp.setContentType(&quot;text/plain;charset=UTF-8&quot;);</span>
+<span class="nc" id="L1279">            rsp.getWriter().write(Util.fixNull(this.getDescription()));</span>
+<span class="nc" id="L1280">            return;</span>
+        }
+<span class="nc bnc" id="L1282" title="All 2 branches missed.">        if (req.getMethod().equals(&quot;POST&quot;)) {</span>
+<span class="nc" id="L1283">            checkPermission(CONFIGURE);</span>
+
+            // submission
+<span class="nc bnc" id="L1286" title="All 2 branches missed.">            if (req.getParameter(&quot;description&quot;) != null) {</span>
+<span class="nc" id="L1287">                this.setDescription(req.getParameter(&quot;description&quot;));</span>
+<span class="nc" id="L1288">                rsp.sendError(SC_NO_CONTENT);</span>
+<span class="nc" id="L1289">                return;</span>
+            }
+        }
+
+        // huh?
+<span class="nc" id="L1294">        rsp.sendError(SC_BAD_REQUEST);</span>
+<span class="nc" id="L1295">    }</span>
+
+    /**
+     * Returns the image that shows the current buildCommand status.
+     */
+    public void doBuildStatus(StaplerRequest req, StaplerResponse rsp)
+            throws IOException {
+<span class="nc" id="L1302">        rsp.sendRedirect2(req.getContextPath() + &quot;/images/48x48/&quot; + getBuildStatusUrl());</span>
+<span class="nc" id="L1303">    }</span>
+
+    public String getBuildStatusUrl() {
+<span class="nc" id="L1306">        return getIconColor().getImage();</span>
+    }
+
+    public String getBuildStatusIconClassName() {
+<span class="nc" id="L1310">        return getIconColor().getIconClassName();</span>
+    }
+
+    public Graph getBuildTimeGraph() {
+<span class="nc" id="L1314">        return new Graph(getLastBuildTime(),500,400) {</span>
+            @Override
+            protected JFreeChart createGraph() {
+                class ChartLabel implements Comparable&lt;ChartLabel&gt; {
+                    final Run run;
+
+<span class="nc" id="L1320">                    public ChartLabel(Run r) {</span>
+<span class="nc" id="L1321">                        this.run = r;</span>
+<span class="nc" id="L1322">                    }</span>
+
+                    public int compareTo(ChartLabel that) {
+<span class="nc" id="L1325">                        return this.run.number - that.run.number;</span>
+                    }
+
+                    @Override
+                    public boolean equals(Object o) {
+                        // HUDSON-2682 workaround for Eclipse compilation bug
+                        // on (c instanceof ChartLabel)
+<span class="nc bnc" id="L1332" title="All 4 branches missed.">                        if (o == null || !ChartLabel.class.isAssignableFrom( o.getClass() ))  {</span>
+<span class="nc" id="L1333">                            return false;</span>
+                        }
+<span class="nc" id="L1335">                        ChartLabel that = (ChartLabel) o;</span>
+<span class="nc bnc" id="L1336" title="All 2 branches missed.">                        return run == that.run;</span>
+                    }
+
+                    public Color getColor() {
+                        // TODO: consider gradation. See
+                        // http://www.javadrive.jp/java2d/shape/index9.html
+<span class="nc" id="L1342">                        Result r = run.getResult();</span>
+<span class="nc bnc" id="L1343" title="All 2 branches missed.">                        if (r == Result.FAILURE)</span>
+<span class="nc" id="L1344">                            return ColorPalette.RED;</span>
+<span class="nc bnc" id="L1345" title="All 2 branches missed.">                        else if (r == Result.UNSTABLE)</span>
+<span class="nc" id="L1346">                            return ColorPalette.YELLOW;</span>
+<span class="nc bnc" id="L1347" title="All 4 branches missed.">                        else if (r == Result.ABORTED || r == Result.NOT_BUILT)</span>
+<span class="nc" id="L1348">                            return ColorPalette.GREY;</span>
+                        else
+<span class="nc" id="L1350">                            return ColorPalette.BLUE;</span>
+                    }
+
+                    @Override
+                    public int hashCode() {
+<span class="nc" id="L1355">                        return run.hashCode();</span>
+                    }
+
+                    @Override
+                    public String toString() {
+<span class="nc" id="L1360">                        String l = run.getDisplayName();</span>
+<span class="nc bnc" id="L1361" title="All 2 branches missed.">                        if (run instanceof Build) {</span>
+<span class="nc" id="L1362">                            String s = ((Build) run).getBuiltOnStr();</span>
+<span class="nc bnc" id="L1363" title="All 2 branches missed.">                            if (s != null)</span>
+<span class="nc" id="L1364">                                l += ' ' + s;</span>
+                        }
+<span class="nc" id="L1366">                        return l;</span>
+                    }
+
+                }
+
+<span class="nc" id="L1371">                DataSetBuilder&lt;String, ChartLabel&gt; data = new DataSetBuilder&lt;String, ChartLabel&gt;();</span>
+<span class="nc bnc" id="L1372" title="All 2 branches missed.">                for (Run r : getNewBuilds()) {</span>
+<span class="nc bnc" id="L1373" title="All 2 branches missed.">                    if (r.isBuilding())</span>
+<span class="nc" id="L1374">                        continue;</span>
+<span class="nc" id="L1375">                    data.add(((double) r.getDuration()) / (1000 * 60), &quot;min&quot;,</span>
+<span class="nc" id="L1376">                            new ChartLabel(r));</span>
+                }
+
+<span class="nc" id="L1379">                final CategoryDataset dataset = data.build();</span>
+
+<span class="nc" id="L1381">                final JFreeChart chart = ChartFactory.createStackedAreaChart(null, // chart</span>
+                                                                                    // title
+<span class="nc" id="L1383">                        null, // unused</span>
+<span class="nc" id="L1384">                        Messages.Job_minutes(), // range axis label</span>
+<span class="nc" id="L1385">                        dataset, // data</span>
+<span class="nc" id="L1386">                        PlotOrientation.VERTICAL, // orientation</span>
+<span class="nc" id="L1387">                        false, // include legend</span>
+<span class="nc" id="L1388">                        true, // tooltips</span>
+<span class="nc" id="L1389">                        false // urls</span>
+                        );
+
+<span class="nc" id="L1392">                chart.setBackgroundPaint(Color.white);</span>
+
+<span class="nc" id="L1394">                final CategoryPlot plot = chart.getCategoryPlot();</span>
+
+                // plot.setAxisOffset(new Spacer(Spacer.ABSOLUTE, 5.0, 5.0, 5.0, 5.0));
+<span class="nc" id="L1397">                plot.setBackgroundPaint(Color.WHITE);</span>
+<span class="nc" id="L1398">                plot.setOutlinePaint(null);</span>
+<span class="nc" id="L1399">                plot.setForegroundAlpha(0.8f);</span>
+                // plot.setDomainGridlinesVisible(true);
+                // plot.setDomainGridlinePaint(Color.white);
+<span class="nc" id="L1402">                plot.setRangeGridlinesVisible(true);</span>
+<span class="nc" id="L1403">                plot.setRangeGridlinePaint(Color.black);</span>
+
+<span class="nc" id="L1405">                CategoryAxis domainAxis = new ShiftedCategoryAxis(null);</span>
+<span class="nc" id="L1406">                plot.setDomainAxis(domainAxis);</span>
+<span class="nc" id="L1407">                domainAxis.setCategoryLabelPositions(CategoryLabelPositions.UP_90);</span>
+<span class="nc" id="L1408">                domainAxis.setLowerMargin(0.0);</span>
+<span class="nc" id="L1409">                domainAxis.setUpperMargin(0.0);</span>
+<span class="nc" id="L1410">                domainAxis.setCategoryMargin(0.0);</span>
+
+<span class="nc" id="L1412">                final NumberAxis rangeAxis = (NumberAxis) plot.getRangeAxis();</span>
+<span class="nc" id="L1413">                ChartUtil.adjustChebyshev(dataset, rangeAxis);</span>
+<span class="nc" id="L1414">                rangeAxis.setStandardTickUnits(NumberAxis.createIntegerTickUnits());</span>
+
+<span class="nc" id="L1416">                StackedAreaRenderer ar = new StackedAreaRenderer2() {</span>
+                    @Override
+                    public Paint getItemPaint(int row, int column) {
+<span class="nc" id="L1419">                        ChartLabel key = (ChartLabel) dataset.getColumnKey(column);</span>
+<span class="nc" id="L1420">                        return key.getColor();</span>
+                    }
+
+                    @Override
+                    public String generateURL(CategoryDataset dataset, int row,
+                            int column) {
+<span class="nc" id="L1426">                        ChartLabel label = (ChartLabel) dataset.getColumnKey(column);</span>
+<span class="nc" id="L1427">                        return String.valueOf(label.run.number);</span>
+                    }
+
+                    @Override
+                    public String generateToolTip(CategoryDataset dataset, int row,
+                            int column) {
+<span class="nc" id="L1433">                        ChartLabel label = (ChartLabel) dataset.getColumnKey(column);</span>
+<span class="nc" id="L1434">                        return label.run.getDisplayName() + &quot; : &quot;</span>
+<span class="nc" id="L1435">                                + label.run.getDurationString();</span>
+                    }
+                };
+<span class="nc" id="L1438">                plot.setRenderer(ar);</span>
+
+                // crop extra space around the graph
+<span class="nc" id="L1441">                plot.setInsets(new RectangleInsets(0, 0, 0, 5.0));</span>
+
+<span class="nc" id="L1443">                return chart;</span>
+            }
+        };
+    }
+
+    private Calendar getLastBuildTime() {
+<span class="nc" id="L1449">        final RunT lastBuild = getLastBuild();</span>
+<span class="nc bnc" id="L1450" title="All 2 branches missed.">        if (lastBuild ==null) {</span>
+<span class="nc" id="L1451">            final GregorianCalendar neverBuiltCalendar = new GregorianCalendar();</span>
+<span class="nc" id="L1452">            neverBuiltCalendar.setTimeInMillis(0);</span>
+<span class="nc" id="L1453">            return neverBuiltCalendar;</span>
+        }
+<span class="nc" id="L1455">        return lastBuild.getTimestamp();</span>
+    }
+
+    /**
+     * Renames this job.
+     */
+    @RequirePOST
+    public/* not synchronized. see renameTo() */void doDoRename(
+            StaplerRequest req, StaplerResponse rsp) throws IOException,
+            ServletException {
+
+<span class="nc bnc" id="L1466" title="All 2 branches missed.">        if (!hasPermission(CONFIGURE)) {</span>
+            // rename is essentially delete followed by a create
+<span class="nc" id="L1468">            checkPermission(CREATE);</span>
+<span class="nc" id="L1469">            checkPermission(DELETE);</span>
+        }
+
+<span class="nc" id="L1472">        String newName = req.getParameter(&quot;newName&quot;);</span>
+<span class="nc" id="L1473">        Jenkins.checkGoodName(newName);</span>
+
+<span class="nc bnc" id="L1475" title="All 2 branches missed.">        if (isBuilding()) {</span>
+            // redirect to page explaining that we can't rename now
+<span class="nc" id="L1477">            rsp.sendRedirect(&quot;rename?newName=&quot; + URLEncoder.encode(newName, &quot;UTF-8&quot;));</span>
+<span class="nc" id="L1478">            return;</span>
+        }
+
+<span class="nc" id="L1481">        renameTo(newName);</span>
+        // send to the new job page
+        // note we can't use getUrl() because that would pick up old name in the
+        // Ancestor.getUrl()
+<span class="nc" id="L1485">        rsp.sendRedirect2(&quot;../&quot; + newName);</span>
+<span class="nc" id="L1486">    }</span>
+
+    public void doRssAll(StaplerRequest req, StaplerResponse rsp)
+            throws IOException, ServletException {
+<span class="nc" id="L1490">        rss(req, rsp, &quot; all builds&quot;, getBuilds());</span>
+<span class="nc" id="L1491">    }</span>
+
+    public void doRssFailed(StaplerRequest req, StaplerResponse rsp)
+            throws IOException, ServletException {
+<span class="nc" id="L1495">        rss(req, rsp, &quot; failed builds&quot;, getBuilds().failureOnly());</span>
+<span class="nc" id="L1496">    }</span>
+
+    private void rss(StaplerRequest req, StaplerResponse rsp, String suffix,
+            RunList runs) throws IOException, ServletException {
+<span class="nc" id="L1500">        RSS.forwardToRss(getDisplayName() + suffix, getUrl(), runs.newBuilds(),</span>
+<span class="nc" id="L1501">                Run.FEED_ADAPTER, req, rsp);</span>
+<span class="nc" id="L1502">    }</span>
+
+    /**
+     * Returns the {@link ACL} for this object.
+     * We need to override the identical method in AbstractItem because we won't
+     * call getACL(Job) otherwise (single dispatch)
+     */
+    @Override
+    public ACL getACL() {
+<span class="nc" id="L1511">        return Jenkins.getInstance().getAuthorizationStrategy().getACL(this);</span>
+    }
+
+    public BuildTimelineWidget getTimeline() {
+<span class="nc" id="L1515">        return new BuildTimelineWidget(getBuilds());</span>
+    }
+
+<span class="fc" id="L1518">    private final static HexStringConfidentialKey SERVER_COOKIE = new HexStringConfidentialKey(Job.class,&quot;serverCookie&quot;,16);</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

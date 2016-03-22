@@ -1,0 +1,596 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>DirectoryBrowserSupport.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.model</a> &gt; <span class="el_source">DirectoryBrowserSupport.java</span></div><h1>DirectoryBrowserSupport.java</h1><pre class="source lang-java linenums">/*
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2010, Sun Microsystems, Inc., Kohsuke Kawaguchi, Erik Ramfelt
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.model;
+
+import hudson.FilePath;
+import hudson.Util;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.io.Serializable;
+import java.text.Collator;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Locale;
+import java.util.StringTokenizer;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import javax.servlet.ServletException;
+import javax.servlet.http.HttpServletResponse;
+import jenkins.model.Jenkins;
+import jenkins.security.MasterToSlaveCallable;
+import jenkins.util.VirtualFile;
+import org.apache.commons.io.IOUtils;
+import org.apache.tools.zip.ZipEntry;
+import org.apache.tools.zip.ZipOutputStream;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
+import org.kohsuke.stapler.HttpResponse;
+import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.StaplerResponse;
+
+/**
+ * Has convenience methods to serve file system.
+ *
+ * &lt;p&gt;
+ * This object can be used in a mix-in style to provide a directory browsing capability
+ * to a {@link ModelObject}. 
+ *
+ * @author Kohsuke Kawaguchi
+ */
+public final class DirectoryBrowserSupport implements HttpResponse {
+
+    public final ModelObject owner;
+    
+    public final String title;
+
+    private final VirtualFile base;
+    private final String icon;
+    private final boolean serveDirIndex;
+<span class="nc" id="L74">    private String indexFileName = &quot;index.html&quot;;</span>
+
+    /**
+     * @deprecated as of 1.297
+     *      Use {@link #DirectoryBrowserSupport(ModelObject, FilePath, String, String, boolean)}
+     */
+    @Deprecated
+    public DirectoryBrowserSupport(ModelObject owner, String title) {
+<span class="nc" id="L82">        this(owner, (VirtualFile) null, title, null, false);</span>
+<span class="nc" id="L83">    }</span>
+
+    /**
+     * @param owner
+     *      The parent model object under which the directory browsing is added.
+     * @param base
+     *      The root of the directory that's bound to URL.
+     * @param title
+     *      Used in the HTML caption. 
+     * @param icon
+     *      The icon file name, like &quot;folder.gif&quot;
+     * @param serveDirIndex
+     *      True to generate the directory index.
+     *      False to serve &quot;index.html&quot;
+     */
+    public DirectoryBrowserSupport(ModelObject owner, FilePath base, String title, String icon, boolean serveDirIndex) {
+<span class="nc" id="L99">        this(owner, base.toVirtualFile(), title, icon, serveDirIndex);</span>
+<span class="nc" id="L100">    }</span>
+
+    /**
+     * @param owner
+     *      The parent model object under which the directory browsing is added.
+     * @param base
+     *      The root of the directory that's bound to URL.
+     * @param title
+     *      Used in the HTML caption.
+     * @param icon
+     *      The icon file name, like &quot;folder.gif&quot;
+     * @param serveDirIndex
+     *      True to generate the directory index.
+     *      False to serve &quot;index.html&quot;
+     * @since 1.532
+     */
+<span class="nc" id="L116">    public DirectoryBrowserSupport(ModelObject owner, VirtualFile base, String title, String icon, boolean serveDirIndex) {</span>
+<span class="nc" id="L117">        this.owner = owner;</span>
+<span class="nc" id="L118">        this.base = base;</span>
+<span class="nc" id="L119">        this.title = title;</span>
+<span class="nc" id="L120">        this.icon = icon;</span>
+<span class="nc" id="L121">        this.serveDirIndex = serveDirIndex;</span>
+<span class="nc" id="L122">    }</span>
+
+    public void generateResponse(StaplerRequest req, StaplerResponse rsp, Object node) throws IOException, ServletException {
+        try {
+<span class="nc" id="L126">            serveFile(req,rsp,base,icon,serveDirIndex);</span>
+<span class="nc" id="L127">        } catch (InterruptedException e) {</span>
+<span class="nc" id="L128">            throw new IOException(&quot;interrupted&quot;,e);</span>
+        }
+<span class="nc" id="L130">    }</span>
+
+    /**
+     * If the directory is requested but the directory listing is disabled, a file of this name
+     * is served. By default it's &quot;index.html&quot;.
+     * @since 1.312
+     */
+    public void setIndexFileName(String fileName) {
+<span class="nc" id="L138">        this.indexFileName = fileName;</span>
+<span class="nc" id="L139">    }</span>
+
+    /**
+     * Serves a file from the file system (Maps the URL to a directory in a file system.)
+     *
+     * @param icon
+     *      The icon file name, like &quot;folder-open.gif&quot;
+     * @param serveDirIndex
+     *      True to generate the directory index.
+     *      False to serve &quot;index.html&quot;
+     * @deprecated as of 1.297
+     *      Instead of calling this method explicitly, just return the {@link DirectoryBrowserSupport} object
+     *      from the {@code doXYZ} method and let Stapler generate a response for you.
+     */
+    @Deprecated
+    public void serveFile(StaplerRequest req, StaplerResponse rsp, FilePath root, String icon, boolean serveDirIndex) throws IOException, ServletException, InterruptedException {
+<span class="nc" id="L155">        serveFile(req, rsp, root.toVirtualFile(), icon, serveDirIndex);</span>
+<span class="nc" id="L156">    }</span>
+
+    private void serveFile(StaplerRequest req, StaplerResponse rsp, VirtualFile root, String icon, boolean serveDirIndex) throws IOException, ServletException, InterruptedException {
+        // handle form submission
+<span class="nc" id="L160">        String pattern = req.getParameter(&quot;pattern&quot;);</span>
+<span class="nc bnc" id="L161" title="All 2 branches missed.">        if(pattern==null)</span>
+<span class="nc" id="L162">            pattern = req.getParameter(&quot;path&quot;); // compatibility with Hudson&lt;1.129</span>
+<span class="nc bnc" id="L163" title="All 4 branches missed.">        if(pattern!=null &amp;&amp; !Util.isAbsoluteUri(pattern)) {// avoid open redirect</span>
+<span class="nc" id="L164">            rsp.sendRedirect2(pattern);</span>
+<span class="nc" id="L165">            return;</span>
+        }
+
+<span class="nc" id="L168">        String path = getPath(req);</span>
+<span class="nc bnc" id="L169" title="All 2 branches missed.">        if(path.replace('\\','/').indexOf(&quot;/../&quot;)!=-1) {</span>
+            // don't serve anything other than files in the artifacts dir
+<span class="nc" id="L171">            rsp.sendError(HttpServletResponse.SC_BAD_REQUEST);</span>
+<span class="nc" id="L172">            return;</span>
+        }
+
+        // split the path to the base directory portion &quot;abc/def/ghi&quot; which doesn't include any wildcard,
+        // and the GLOB portion &quot;**/*.xml&quot; (the rest)
+<span class="nc" id="L177">        StringBuilder _base = new StringBuilder();</span>
+<span class="nc" id="L178">        StringBuilder _rest = new StringBuilder();</span>
+<span class="nc" id="L179">        int restSize=-1; // number of &quot;..&quot; needed to go back to the 'base' level.</span>
+<span class="nc" id="L180">        boolean zip=false;  // if we are asked to serve a zip file bundle</span>
+<span class="nc" id="L181">        boolean plain = false; // if asked to serve a plain text directory listing</span>
+        {
+<span class="nc" id="L183">            boolean inBase = true;</span>
+<span class="nc" id="L184">            StringTokenizer pathTokens = new StringTokenizer(path,&quot;/&quot;);</span>
+<span class="nc bnc" id="L185" title="All 2 branches missed.">            while(pathTokens.hasMoreTokens()) {</span>
+<span class="nc" id="L186">                String pathElement = pathTokens.nextToken();</span>
+                // Treat * and ? as wildcard unless they match a literal filename
+<span class="nc bnc" id="L188" title="All 4 branches missed.">                if((pathElement.contains(&quot;?&quot;) || pathElement.contains(&quot;*&quot;))</span>
+<span class="nc bnc" id="L189" title="All 6 branches missed.">                        &amp;&amp; inBase &amp;&amp; !root.child((_base.length() &gt; 0 ? _base + &quot;/&quot; : &quot;&quot;) + pathElement).exists())</span>
+<span class="nc" id="L190">                    inBase = false;</span>
+<span class="nc bnc" id="L191" title="All 2 branches missed.">                if(pathElement.equals(&quot;*zip*&quot;)) {</span>
+                    // the expected syntax is foo/bar/*zip*/bar.zip
+                    // the last 'bar.zip' portion is to causes browses to set a good default file name.
+                    // so the 'rest' portion ends here.
+<span class="nc" id="L195">                    zip=true;</span>
+<span class="nc" id="L196">                    break;</span>
+                }
+<span class="nc bnc" id="L198" title="All 2 branches missed.">                if(pathElement.equals(&quot;*plain*&quot;)) {</span>
+<span class="nc" id="L199">                    plain = true;</span>
+<span class="nc" id="L200">                    break;</span>
+                }
+
+<span class="nc bnc" id="L203" title="All 2 branches missed.">                StringBuilder sb = inBase?_base:_rest;</span>
+<span class="nc bnc" id="L204" title="All 2 branches missed.">                if(sb.length()&gt;0)   sb.append('/');</span>
+<span class="nc" id="L205">                sb.append(pathElement);</span>
+<span class="nc bnc" id="L206" title="All 2 branches missed.">                if(!inBase)</span>
+<span class="nc" id="L207">                    restSize++;</span>
+            }
+        }
+<span class="nc" id="L210">        restSize = Math.max(restSize,0);</span>
+<span class="nc" id="L211">        String base = _base.toString();</span>
+<span class="nc" id="L212">        String rest = _rest.toString();</span>
+
+        // this is the base file/directory
+<span class="nc" id="L215">        VirtualFile baseFile = root.child(base);</span>
+
+<span class="nc bnc" id="L217" title="All 2 branches missed.">        if(baseFile.isDirectory()) {</span>
+<span class="nc bnc" id="L218" title="All 2 branches missed.">            if(zip) {</span>
+<span class="nc" id="L219">                rsp.setContentType(&quot;application/zip&quot;);</span>
+<span class="nc" id="L220">                zip(rsp.getOutputStream(), baseFile, rest);</span>
+<span class="nc" id="L221">                return;</span>
+            }
+<span class="nc bnc" id="L223" title="All 2 branches missed.">            if (plain) {</span>
+<span class="nc" id="L224">                rsp.setContentType(&quot;text/plain;charset=UTF-8&quot;);</span>
+<span class="nc" id="L225">                OutputStream os = rsp.getOutputStream();</span>
+                try {
+<span class="nc bnc" id="L227" title="All 2 branches missed.">                    for (VirtualFile kid : baseFile.list()) {</span>
+<span class="nc" id="L228">                        os.write(kid.getName().getBytes(&quot;UTF-8&quot;));</span>
+<span class="nc bnc" id="L229" title="All 2 branches missed.">                        if (kid.isDirectory()) {</span>
+<span class="nc" id="L230">                            os.write('/');</span>
+                        }
+<span class="nc" id="L232">                        os.write('\n');</span>
+                    }
+<span class="nc" id="L234">                    os.flush();</span>
+<span class="nc" id="L235">                } finally {</span>
+<span class="nc" id="L236">                    os.close();</span>
+<span class="nc" id="L237">                }</span>
+<span class="nc" id="L238">                return;</span>
+            }
+
+<span class="nc bnc" id="L241" title="All 2 branches missed.">            if(rest.length()==0) {</span>
+                // if the target page to be displayed is a directory and the path doesn't end with '/', redirect
+<span class="nc" id="L243">                StringBuffer reqUrl = req.getRequestURL();</span>
+<span class="nc bnc" id="L244" title="All 2 branches missed.">                if(reqUrl.charAt(reqUrl.length()-1)!='/') {</span>
+<span class="nc" id="L245">                    rsp.sendRedirect2(reqUrl.append('/').toString());</span>
+<span class="nc" id="L246">                    return;</span>
+                }
+            }
+
+<span class="nc" id="L250">            List&lt;List&lt;Path&gt;&gt; glob = null;</span>
+
+<span class="nc bnc" id="L252" title="All 2 branches missed.">            if(rest.length()&gt;0) {</span>
+                // the rest is Ant glob pattern
+<span class="nc" id="L254">                glob = patternScan(baseFile, rest, createBackRef(restSize));</span>
+<span class="nc" id="L255">            } else</span>
+<span class="nc bnc" id="L256" title="All 2 branches missed.">            if(serveDirIndex) {</span>
+                // serve directory index
+<span class="nc" id="L258">                glob = baseFile.run(new BuildChildPaths(baseFile, req.getLocale()));</span>
+            }
+
+<span class="nc bnc" id="L261" title="All 2 branches missed.">            if(glob!=null) {</span>
+                // serve glob
+<span class="nc" id="L263">                req.setAttribute(&quot;it&quot;, this);</span>
+<span class="nc" id="L264">                List&lt;Path&gt; parentPaths = buildParentPath(base,restSize);</span>
+<span class="nc" id="L265">                req.setAttribute(&quot;parentPath&quot;,parentPaths);</span>
+<span class="nc" id="L266">                req.setAttribute(&quot;backPath&quot;, createBackRef(restSize));</span>
+<span class="nc" id="L267">                req.setAttribute(&quot;topPath&quot;, createBackRef(parentPaths.size()+restSize));</span>
+<span class="nc" id="L268">                req.setAttribute(&quot;files&quot;, glob);</span>
+<span class="nc" id="L269">                req.setAttribute(&quot;icon&quot;, icon);</span>
+<span class="nc" id="L270">                req.setAttribute(&quot;path&quot;, path);</span>
+<span class="nc" id="L271">                req.setAttribute(&quot;pattern&quot;,rest);</span>
+<span class="nc" id="L272">                req.setAttribute(&quot;dir&quot;, baseFile);</span>
+<span class="nc" id="L273">                req.getView(this,&quot;dir.jelly&quot;).forward(req, rsp);</span>
+<span class="nc" id="L274">                return;</span>
+            }
+
+            // convert a directory service request to a single file service request by serving
+            // 'index.html'
+<span class="nc" id="L279">            baseFile = baseFile.child(indexFileName);</span>
+        }
+
+        //serve a single file
+<span class="nc bnc" id="L283" title="All 2 branches missed.">        if(!baseFile.exists()) {</span>
+<span class="nc" id="L284">            rsp.sendError(HttpServletResponse.SC_NOT_FOUND);</span>
+<span class="nc" id="L285">            return;</span>
+        }
+
+<span class="nc" id="L288">        boolean view = rest.equals(&quot;*view*&quot;);</span>
+
+<span class="nc bnc" id="L290" title="All 2 branches missed.">        if(rest.equals(&quot;*fingerprint*&quot;)) {</span>
+<span class="nc" id="L291">            InputStream fingerprintInput = baseFile.open();</span>
+            try {
+<span class="nc" id="L293">                rsp.forward(Jenkins.getInstance().getFingerprint(Util.getDigestOf(fingerprintInput)), &quot;/&quot;, req);</span>
+<span class="nc" id="L294">            } finally {</span>
+<span class="nc" id="L295">                fingerprintInput.close();</span>
+<span class="nc" id="L296">            }</span>
+<span class="nc" id="L297">            return;</span>
+        }
+
+<span class="nc" id="L300">        long lastModified = baseFile.lastModified();</span>
+<span class="nc" id="L301">        long length = baseFile.length();</span>
+
+<span class="nc bnc" id="L303" title="All 2 branches missed.">        if(LOGGER.isLoggable(Level.FINE))</span>
+<span class="nc" id="L304">            LOGGER.fine(&quot;Serving &quot;+baseFile+&quot; with lastModified=&quot; + lastModified + &quot;, length=&quot; + length);</span>
+
+<span class="nc" id="L306">        InputStream in = baseFile.open();</span>
+<span class="nc bnc" id="L307" title="All 2 branches missed.">        if (view) {</span>
+            // for binary files, provide the file name for download
+<span class="nc" id="L309">            rsp.setHeader(&quot;Content-Disposition&quot;, &quot;inline; filename=&quot; + baseFile.getName());</span>
+
+            // pseudo file name to let the Stapler set text/plain
+<span class="nc" id="L312">            rsp.serveFile(req, in, lastModified, -1, length, &quot;plain.txt&quot;);</span>
+<span class="nc" id="L313">        } else {</span>
+<span class="nc" id="L314">            String csp = System.getProperty(DirectoryBrowserSupport.class.getName() + &quot;.CSP&quot;);</span>
+<span class="nc bnc" id="L315" title="All 2 branches missed.">            if (csp == null) {</span>
+                // default value unless overridden with system property
+<span class="nc" id="L317">                csp = DEFAULT_CSP_VALUE;</span>
+            }
+<span class="nc bnc" id="L319" title="All 2 branches missed.">            if (!csp.trim().equals(&quot;&quot;)) {</span>
+                // allow users to prevent sending this header by setting empty system property
+<span class="nc bnc" id="L321" title="All 2 branches missed.">                for (String header : new String[]{&quot;Content-Security-Policy&quot;, &quot;X-WebKit-CSP&quot;, &quot;X-Content-Security-Policy&quot;}) {</span>
+<span class="nc" id="L322">                    rsp.setHeader(header, csp);</span>
+                }
+            }
+<span class="nc" id="L325">            rsp.serveFile(req, in, lastModified, -1, length, baseFile.getName() );</span>
+        }
+<span class="nc" id="L327">    }</span>
+
+    private String getPath(StaplerRequest req) {
+<span class="nc" id="L330">        String path = req.getRestOfPath();</span>
+<span class="nc bnc" id="L331" title="All 2 branches missed.">        if(path.length()==0)</span>
+<span class="nc" id="L332">            path = &quot;/&quot;;</span>
+<span class="nc" id="L333">        return path;</span>
+    }
+
+    /**
+     * Builds a list of {@link Path} that represents ancestors
+     * from a string like &quot;/foo/bar/zot&quot;.
+     */
+    private List&lt;Path&gt; buildParentPath(String pathList, int restSize) {
+<span class="nc" id="L341">        List&lt;Path&gt; r = new ArrayList&lt;Path&gt;();</span>
+<span class="nc" id="L342">        StringTokenizer tokens = new StringTokenizer(pathList, &quot;/&quot;);</span>
+<span class="nc" id="L343">        int total = tokens.countTokens();</span>
+<span class="nc" id="L344">        int current=1;</span>
+<span class="nc bnc" id="L345" title="All 2 branches missed.">        while(tokens.hasMoreTokens()) {</span>
+<span class="nc" id="L346">            String token = tokens.nextToken();</span>
+<span class="nc" id="L347">            r.add(new Path(createBackRef(total-current+restSize),token,true,0, true));</span>
+<span class="nc" id="L348">            current++;</span>
+        }
+<span class="nc" id="L350">        return r;</span>
+    }
+
+    private static String createBackRef(int times) {
+<span class="nc bnc" id="L354" title="All 2 branches missed.">        if(times==0)    return &quot;./&quot;;</span>
+<span class="nc" id="L355">        StringBuilder buf = new StringBuilder(3*times);</span>
+<span class="nc bnc" id="L356" title="All 2 branches missed.">        for(int i=0; i&lt;times; i++ )</span>
+<span class="nc" id="L357">            buf.append(&quot;../&quot;);</span>
+<span class="nc" id="L358">        return buf.toString();</span>
+    }
+
+    private static void zip(OutputStream outputStream, VirtualFile dir, String glob) throws IOException {
+<span class="nc" id="L362">        ZipOutputStream zos = new ZipOutputStream(outputStream);</span>
+<span class="nc" id="L363">        zos.setEncoding(System.getProperty(&quot;file.encoding&quot;)); // TODO JENKINS-20663 make this overridable via query parameter</span>
+<span class="nc bnc" id="L364" title="All 4 branches missed.">        for (String n : dir.list(glob.length() == 0 ? &quot;**&quot; : glob)) {</span>
+            String relativePath;
+<span class="nc bnc" id="L366" title="All 2 branches missed.">            if (glob.length() == 0) {</span>
+                // JENKINS-19947: traditional behavior is to prepend the directory name
+<span class="nc" id="L368">                relativePath = dir.getName() + '/' + n;</span>
+<span class="nc" id="L369">            } else {</span>
+<span class="nc" id="L370">                relativePath = n;</span>
+            }
+            // In ZIP archives &quot;All slashes MUST be forward slashes&quot; (http://pkware.com/documents/casestudies/APPNOTE.TXT)
+            // TODO On Linux file names can contain backslashes which should not treated as file separators.
+            //      Unfortunately, only the file separator char of the master is known (File.separatorChar)
+            //      but not the file separator char of the (maybe remote) &quot;dir&quot;.
+<span class="nc" id="L376">            ZipEntry e = new ZipEntry(relativePath.replace('\\', '/'));</span>
+<span class="nc" id="L377">            VirtualFile f = dir.child(n);</span>
+<span class="nc" id="L378">            e.setTime(f.lastModified());</span>
+<span class="nc" id="L379">            zos.putNextEntry(e);</span>
+<span class="nc" id="L380">            InputStream in = f.open();</span>
+            try {
+<span class="nc" id="L382">                Util.copyStream(in, zos);</span>
+<span class="nc" id="L383">            } finally {</span>
+<span class="nc" id="L384">                IOUtils.closeQuietly(in);</span>
+<span class="nc" id="L385">            }</span>
+<span class="nc" id="L386">            zos.closeEntry();</span>
+        }
+<span class="nc" id="L388">        zos.close();</span>
+<span class="nc" id="L389">    }</span>
+
+    /**
+     * Represents information about one file or folder.
+     */
+    public static final class Path implements Serializable {
+        /**
+         * Relative URL to this path from the current page.
+         */
+        private final String href;
+        /**
+         * Name of this path. Just the file name portion.
+         */
+        private final String title;
+
+        private final boolean isFolder;
+
+        /**
+         * File size, or null if this is not a file.
+         */
+        private final long size;
+        
+        /**
+         * If the current user can read the file.
+         */
+        private final boolean isReadable;
+
+<span class="nc" id="L416">        public Path(String href, String title, boolean isFolder, long size, boolean isReadable) {</span>
+<span class="nc" id="L417">            this.href = href;</span>
+<span class="nc" id="L418">            this.title = title;</span>
+<span class="nc" id="L419">            this.isFolder = isFolder;</span>
+<span class="nc" id="L420">            this.size = size;</span>
+<span class="nc" id="L421">            this.isReadable = isReadable;</span>
+<span class="nc" id="L422">        }</span>
+
+        public boolean isFolder() {
+<span class="nc" id="L425">            return isFolder;</span>
+        }
+        
+        public boolean isReadable() {
+<span class="nc" id="L429">            return isReadable;</span>
+        }
+
+        public String getHref() {
+<span class="nc" id="L433">            return href;</span>
+        }
+
+        public String getTitle() {
+<span class="nc" id="L437">            return title;</span>
+        }
+
+        public String getIconName() {
+<span class="nc bnc" id="L441" title="All 2 branches missed.">            if (isReadable)</span>
+<span class="nc bnc" id="L442" title="All 2 branches missed.">                return isFolder?&quot;folder.png&quot;:&quot;text.png&quot;;</span>
+            else
+<span class="nc bnc" id="L444" title="All 2 branches missed.">                return isFolder?&quot;folder-error.png&quot;:&quot;text-error.png&quot;;</span>
+        }
+
+        public String getIconClassName() {
+<span class="nc bnc" id="L448" title="All 2 branches missed.">            if (isReadable)</span>
+<span class="nc bnc" id="L449" title="All 2 branches missed.">                return isFolder?&quot;icon-folder&quot;:&quot;icon-text&quot;;</span>
+            else
+<span class="nc bnc" id="L451" title="All 2 branches missed.">                return isFolder?&quot;icon-folder-error&quot;:&quot;icon-text-error&quot;;</span>
+        }
+
+        public long getSize() {
+<span class="nc" id="L455">            return size;</span>
+        }
+
+        private static final long serialVersionUID = 1L;
+    }
+
+
+
+    private static final class FileComparator implements Comparator&lt;VirtualFile&gt; {
+        private Collator collator;
+
+<span class="nc" id="L466">        FileComparator(Locale locale) {</span>
+<span class="nc" id="L467">            this.collator = Collator.getInstance(locale);</span>
+<span class="nc" id="L468">        }</span>
+
+        public int compare(VirtualFile lhs, VirtualFile rhs) {
+            // directories first, files next
+<span class="nc" id="L472">            int r = dirRank(lhs)-dirRank(rhs);</span>
+<span class="nc bnc" id="L473" title="All 2 branches missed.">            if(r!=0) return r;</span>
+            // otherwise alphabetical
+<span class="nc" id="L475">            return this.collator.compare(lhs.getName(), rhs.getName());</span>
+        }
+
+        private int dirRank(VirtualFile f) {
+            try {
+<span class="nc bnc" id="L480" title="All 2 branches missed.">            if(f.isDirectory())     return 0;</span>
+<span class="nc" id="L481">            else                    return 1;</span>
+<span class="nc" id="L482">            } catch (IOException ex) {</span>
+<span class="nc" id="L483">                return 0;</span>
+            }
+        }
+    }
+
+    private static final class BuildChildPaths extends MasterToSlaveCallable&lt;List&lt;List&lt;Path&gt;&gt;,IOException&gt; {
+        private final VirtualFile cur;
+        private final Locale locale;
+<span class="nc" id="L491">        BuildChildPaths(VirtualFile cur, Locale locale) {</span>
+<span class="nc" id="L492">            this.cur = cur;</span>
+<span class="nc" id="L493">            this.locale = locale;</span>
+<span class="nc" id="L494">        }</span>
+        @Override public List&lt;List&lt;Path&gt;&gt; call() throws IOException {
+<span class="nc" id="L496">            return buildChildPaths(cur, locale);</span>
+        }
+    }
+    /**
+     * Builds a list of list of {@link Path}. The inner
+     * list of {@link Path} represents one child item to be shown
+     * (this mechanism is used to skip empty intermediate directory.)
+     */
+    private static List&lt;List&lt;Path&gt;&gt; buildChildPaths(VirtualFile cur, Locale locale) throws IOException {
+<span class="nc" id="L505">            List&lt;List&lt;Path&gt;&gt; r = new ArrayList&lt;List&lt;Path&gt;&gt;();</span>
+
+<span class="nc" id="L507">            VirtualFile[] files = cur.list();</span>
+<span class="nc" id="L508">                Arrays.sort(files,new FileComparator(locale));</span>
+    
+<span class="nc bnc" id="L510" title="All 2 branches missed.">                for( VirtualFile f : files ) {</span>
+<span class="nc" id="L511">                    Path p = new Path(Util.rawEncode(f.getName()), f.getName(), f.isDirectory(), f.length(), f.canRead());</span>
+<span class="nc bnc" id="L512" title="All 2 branches missed.">                    if(!f.isDirectory()) {</span>
+<span class="nc" id="L513">                        r.add(Collections.singletonList(p));</span>
+<span class="nc" id="L514">                    } else {</span>
+                        // find all empty intermediate directory
+<span class="nc" id="L516">                        List&lt;Path&gt; l = new ArrayList&lt;Path&gt;();</span>
+<span class="nc" id="L517">                        l.add(p);</span>
+<span class="nc" id="L518">                        String relPath = Util.rawEncode(f.getName());</span>
+<span class="nc" id="L519">                        while(true) {</span>
+                            // files that don't start with '.' qualify for 'meaningful files', nor SCM related files
+<span class="nc" id="L521">                            List&lt;VirtualFile&gt; sub = new ArrayList&lt;VirtualFile&gt;();</span>
+<span class="nc bnc" id="L522" title="All 2 branches missed.">                            for (VirtualFile vf : f.list()) {</span>
+<span class="nc" id="L523">                                String name = vf.getName();</span>
+<span class="nc bnc" id="L524" title="All 6 branches missed.">                                if (!name.startsWith(&quot;.&quot;) &amp;&amp; !name.equals(&quot;CVS&quot;) &amp;&amp; !name.equals(&quot;.svn&quot;)) {</span>
+<span class="nc" id="L525">                                    sub.add(vf);</span>
+                                }
+                            }
+<span class="nc bnc" id="L528" title="All 4 branches missed.">                            if (sub.size() !=1 || !sub.get(0).isDirectory())</span>
+<span class="nc" id="L529">                                break;</span>
+<span class="nc" id="L530">                            f = sub.get(0);</span>
+<span class="nc" id="L531">                            relPath += '/'+Util.rawEncode(f.getName());</span>
+<span class="nc" id="L532">                            l.add(new Path(relPath,f.getName(),true,0, f.canRead()));</span>
+                        }
+<span class="nc" id="L534">                        r.add(l);</span>
+                    }
+                }
+
+<span class="nc" id="L538">            return r;</span>
+    }
+
+    /**
+     * Runs ant GLOB against the current {@link FilePath} and returns matching
+     * paths.
+     * @param baseRef String like &quot;../../../&quot; that cancels the 'rest' portion. Can be &quot;./&quot;
+     */
+    private static List&lt;List&lt;Path&gt;&gt; patternScan(VirtualFile baseDir, String pattern, String baseRef) throws IOException {
+<span class="nc" id="L547">            String[] files = baseDir.list(pattern);</span>
+
+<span class="nc bnc" id="L549" title="All 2 branches missed.">            if (files.length &gt; 0) {</span>
+<span class="nc" id="L550">                List&lt;List&lt;Path&gt;&gt; r = new ArrayList&lt;List&lt;Path&gt;&gt;(files.length);</span>
+<span class="nc bnc" id="L551" title="All 2 branches missed.">                for (String match : files) {</span>
+<span class="nc" id="L552">                    List&lt;Path&gt; file = buildPathList(baseDir, baseDir.child(match), baseRef);</span>
+<span class="nc" id="L553">                    r.add(file);</span>
+                }
+<span class="nc" id="L555">                return r;</span>
+            }
+
+<span class="nc" id="L558">            return null;</span>
+        }
+
+        /**
+         * Builds a path list from the current workspace directory down to the specified file path.
+         */
+        private static List&lt;Path&gt; buildPathList(VirtualFile baseDir, VirtualFile filePath, String baseRef) throws IOException {
+<span class="nc" id="L565">            List&lt;Path&gt; pathList = new ArrayList&lt;Path&gt;();</span>
+<span class="nc" id="L566">            StringBuilder href = new StringBuilder(baseRef);</span>
+
+<span class="nc" id="L568">            buildPathList(baseDir, filePath, pathList, href);</span>
+<span class="nc" id="L569">            return pathList;</span>
+        }
+
+        /**
+         * Builds the path list and href recursively top-down.
+         */
+        private static void buildPathList(VirtualFile baseDir, VirtualFile filePath, List&lt;Path&gt; pathList, StringBuilder href) throws IOException {
+<span class="nc" id="L576">            VirtualFile parent = filePath.getParent();</span>
+<span class="nc bnc" id="L577" title="All 2 branches missed.">            if (!baseDir.equals(parent)) {</span>
+<span class="nc" id="L578">                buildPathList(baseDir, parent, pathList, href);</span>
+            }
+
+<span class="nc" id="L581">            href.append(Util.rawEncode(filePath.getName()));</span>
+<span class="nc bnc" id="L582" title="All 2 branches missed.">            if (filePath.isDirectory()) {</span>
+<span class="nc" id="L583">                href.append(&quot;/&quot;);</span>
+            }
+
+<span class="nc" id="L586">            Path path = new Path(href.toString(), filePath.getName(), filePath.isDirectory(), filePath.length(), filePath.canRead());</span>
+<span class="nc" id="L587">            pathList.add(path);</span>
+<span class="nc" id="L588">        }</span>
+
+
+<span class="nc" id="L591">    private static final Logger LOGGER = Logger.getLogger(DirectoryBrowserSupport.class.getName());</span>
+
+    @Restricted(NoExternalUse.class)
+<span class="nc" id="L594">    public static final String DEFAULT_CSP_VALUE = &quot;sandbox; default-src 'none'; img-src 'self'; style-src 'self';&quot;;</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

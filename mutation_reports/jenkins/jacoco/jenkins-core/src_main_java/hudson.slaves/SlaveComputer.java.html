@@ -1,0 +1,864 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>SlaveComputer.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.slaves</a> &gt; <span class="el_source">SlaveComputer.java</span></div><h1>SlaveComputer.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">/*</span>
+ * The MIT License
+ *
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc., Kohsuke Kawaguchi, Stephen Connolly
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.slaves;
+
+import edu.umd.cs.findbugs.annotations.OverrideMustInvoke;
+import edu.umd.cs.findbugs.annotations.When;
+import hudson.AbortException;
+import hudson.FilePath;
+import hudson.Util;
+import hudson.console.ConsoleLogFilter;
+import hudson.model.Computer;
+import hudson.model.Executor;
+import hudson.model.ExecutorListener;
+import hudson.model.Node;
+import hudson.model.Queue;
+import hudson.model.Slave;
+import hudson.model.TaskListener;
+import hudson.model.User;
+import hudson.remoting.Channel;
+import hudson.remoting.ChannelBuilder;
+import hudson.remoting.Launcher;
+import hudson.remoting.VirtualChannel;
+import hudson.security.ACL;
+import hudson.slaves.OfflineCause.ChannelTermination;
+import hudson.util.Futures;
+import hudson.util.IOUtils;
+import hudson.util.NullStream;
+import hudson.util.RingBufferLogHandler;
+import hudson.util.StreamTaskListener;
+import hudson.util.io.ReopenableFileOutputStream;
+import hudson.util.io.ReopenableRotatingFileOutputStream;
+import jenkins.model.Jenkins;
+import jenkins.security.ChannelConfigurator;
+import jenkins.security.MasterToSlaveCallable;
+import jenkins.slaves.EncryptedSlaveAgentJnlpFile;
+import jenkins.slaves.JnlpSlaveAgentProtocol;
+import jenkins.slaves.systemInfo.SlaveSystemInfo;
+import org.acegisecurity.context.SecurityContext;
+import org.acegisecurity.context.SecurityContextHolder;
+import org.kohsuke.stapler.HttpRedirect;
+import org.kohsuke.stapler.HttpResponse;
+import org.kohsuke.stapler.QueryParameter;
+import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.StaplerResponse;
+import org.kohsuke.stapler.WebMethod;
+import org.kohsuke.stapler.interceptor.RequirePOST;
+
+import javax.annotation.CheckForNull;
+import javax.servlet.ServletException;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.io.PrintStream;
+import java.nio.charset.Charset;
+import java.security.Security;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.Future;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
+
+import static hudson.slaves.SlaveComputer.LogHolder.SLAVE_LOG_HANDLER;
+
+
+/**
+ * {@link Computer} for {@link Slave}s.
+ *
+ * @author Kohsuke Kawaguchi
+ */
+<span class="nc bnc" id="L95" title="All 2 branches missed.">public class SlaveComputer extends Computer {</span>
+    private volatile Channel channel;
+<span class="nc" id="L97">    private volatile transient boolean acceptingTasks = true;</span>
+    private Charset defaultCharset;
+    private Boolean isUnix;
+    /**
+     * Effective {@link ComputerLauncher} that hides the details of
+     * how we launch a slave agent on this computer.
+     *
+     * &lt;p&gt;
+     * This is normally the same as {@link Slave#getLauncher()} but
+     * can be different. See {@link #grabLauncher(Node)}.
+     */
+    private ComputerLauncher launcher;
+
+    /**
+     * Perpetually writable log file.
+     */
+    private final ReopenableFileOutputStream log;
+
+    /**
+     * {@link StreamTaskListener} that wraps {@link #log}, hence perpetually writable.
+     */
+    private final TaskListener taskListener;
+
+
+    /**
+     * Number of failed attempts to reconnect to this node
+     * (so that if we keep failing to reconnect, we can stop
+     * trying.)
+     */
+    private transient int numRetryAttempt;
+
+    /**
+     * Tracks the status of the last launch operation, which is always asynchronous.
+     * This can be used to wait for the completion, or cancel the launch activity.
+     */
+<span class="nc" id="L132">    private volatile Future&lt;?&gt; lastConnectActivity = null;</span>
+
+<span class="nc" id="L134">    private Object constructed = new Object();</span>
+
+    private transient volatile String absoluteRemoteFs;
+
+    public SlaveComputer(Slave slave) {
+<span class="nc" id="L139">        super(slave);</span>
+<span class="nc" id="L140">        this.log = new ReopenableRotatingFileOutputStream(getLogFile(),10);</span>
+<span class="nc" id="L141">        this.taskListener = new StreamTaskListener(decorate(this.log));</span>
+<span class="nc bnc" id="L142" title="All 4 branches missed.">        assert slave.getNumExecutors()!=0 : &quot;Computer created with 0 executors&quot;;</span>
+<span class="nc" id="L143">    }</span>
+
+    /**
+     * Uses {@link ConsoleLogFilter} to decorate logger.
+     */
+    private OutputStream decorate(OutputStream os) {
+<span class="nc bnc" id="L149" title="All 2 branches missed.">        for (ConsoleLogFilter f : ConsoleLogFilter.all()) {</span>
+            try {
+<span class="nc" id="L151">                os = f.decorateLogger(this,os);</span>
+<span class="nc" id="L152">            } catch (IOException|InterruptedException e) {</span>
+<span class="nc" id="L153">                LOGGER.log(Level.WARNING, &quot;Failed to filter log with &quot;+f, e);</span>
+            }
+        }
+<span class="nc" id="L156">        return os;</span>
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    @OverrideMustInvoke(When.ANYTIME)
+    public boolean isAcceptingTasks() {
+        // our boolean flag is an override on any additional programmatic reasons why this slave might not be
+        // accepting tasks.
+<span class="nc bnc" id="L167" title="All 4 branches missed.">        return acceptingTasks &amp;&amp; super.isAcceptingTasks();</span>
+    }
+
+    /**
+     * @since 1.498
+     */
+    public String getJnlpMac() {
+<span class="nc" id="L174">        return JnlpSlaveAgentProtocol.SLAVE_SECRET.mac(getName());</span>
+    }
+
+    /**
+     * Allows suspension of tasks being accepted by the slave computer. While this could be called by a
+     * {@linkplain hudson.slaves.ComputerLauncher} or a {@linkplain hudson.slaves.RetentionStrategy}, such usage
+     * can result in fights between multiple actors calling setting differential values. A better approach
+     * is to override {@link hudson.slaves.RetentionStrategy#isAcceptingTasks(hudson.model.Computer)} if the
+     * {@link hudson.slaves.RetentionStrategy} needs to control availability.
+     *
+     * @param acceptingTasks {@code true} if the slave can accept tasks.
+     */
+    public void setAcceptingTasks(boolean acceptingTasks) {
+<span class="nc" id="L187">        this.acceptingTasks = acceptingTasks;</span>
+<span class="nc" id="L188">    }</span>
+
+    @Override
+    public Boolean isUnix() {
+<span class="nc" id="L192">        return isUnix;</span>
+    }
+
+    @CheckForNull
+    @Override
+    public Slave getNode() {
+<span class="nc" id="L198">        Node node = super.getNode();</span>
+<span class="nc bnc" id="L199" title="All 4 branches missed.">        if (node == null || node instanceof Slave) {</span>
+<span class="nc" id="L200">            return (Slave)node;</span>
+        } else {
+<span class="nc" id="L202">            logger.log(Level.WARNING, &quot;found an unexpected kind of node {0} from {1} with nodeName={2}&quot;, new Object[] {node, this, nodeName});</span>
+<span class="nc" id="L203">            return null;</span>
+        }
+    }
+
+    @Override
+    public String getIcon() {
+<span class="nc" id="L209">        Future&lt;?&gt; l = lastConnectActivity;</span>
+<span class="nc bnc" id="L210" title="All 4 branches missed.">        if(l!=null &amp;&amp; !l.isDone())</span>
+<span class="nc" id="L211">            return &quot;computer-flash.gif&quot;;</span>
+<span class="nc" id="L212">        return super.getIcon();</span>
+    }
+
+    /**
+     * @deprecated since 2008-05-20.
+     */
+    @Deprecated @Override
+    public boolean isJnlpAgent() {
+<span class="nc" id="L220">        return launcher instanceof JNLPLauncher;</span>
+    }
+
+    @Override
+    public boolean isLaunchSupported() {
+<span class="nc" id="L225">        return launcher.isLaunchSupported();</span>
+    }
+
+    public ComputerLauncher getLauncher() {
+<span class="nc" id="L229">        return launcher;</span>
+    }
+
+    protected Future&lt;?&gt; _connect(boolean forceReconnect) {
+<span class="nc bnc" id="L233" title="All 2 branches missed.">        if(channel!=null)   return Futures.precomputed(null);</span>
+<span class="nc bnc" id="L234" title="All 4 branches missed.">        if(!forceReconnect &amp;&amp; isConnecting())</span>
+<span class="nc" id="L235">            return lastConnectActivity;</span>
+<span class="nc bnc" id="L236" title="All 4 branches missed.">        if(forceReconnect &amp;&amp; isConnecting())</span>
+<span class="nc" id="L237">            logger.fine(&quot;Forcing a reconnect on &quot;+getName());</span>
+
+<span class="nc" id="L239">        closeChannel();</span>
+<span class="nc" id="L240">        return lastConnectActivity = Computer.threadPoolForRemoting.submit(new java.util.concurrent.Callable&lt;Object&gt;() {</span>
+            public Object call() throws Exception {
+                // do this on another thread so that the lengthy launch operation
+                // (which is typical) won't block UI thread.
+
+<span class="nc" id="L245">                ACL.impersonate(ACL.SYSTEM);    // background activity should run like a super user</span>
+
+                try {
+<span class="nc" id="L248">                    log.rewind();</span>
+                    try {
+<span class="nc bnc" id="L250" title="All 2 branches missed.">                        for (ComputerListener cl : ComputerListener.all())</span>
+<span class="nc" id="L251">                            cl.preLaunch(SlaveComputer.this, taskListener);</span>
+
+<span class="nc" id="L253">                        launcher.launch(SlaveComputer.this, taskListener);</span>
+<span class="nc" id="L254">                    } catch (AbortException e) {</span>
+<span class="nc" id="L255">                        taskListener.error(e.getMessage());</span>
+<span class="nc" id="L256">                        throw e;</span>
+<span class="nc" id="L257">                    } catch (IOException e) {</span>
+<span class="nc" id="L258">                        Util.displayIOException(e,taskListener);</span>
+<span class="nc" id="L259">                        e.printStackTrace(taskListener.error(Messages.ComputerLauncher_unexpectedError()));</span>
+<span class="nc" id="L260">                        throw e;</span>
+<span class="nc" id="L261">                    } catch (InterruptedException e) {</span>
+<span class="nc" id="L262">                        e.printStackTrace(taskListener.error(Messages.ComputerLauncher_abortedLaunch()));</span>
+<span class="nc" id="L263">                        throw e;</span>
+<span class="nc" id="L264">                    } catch (Exception e) {</span>
+<span class="nc" id="L265">                        e.printStackTrace(taskListener.error(Messages.ComputerLauncher_unexpectedError()));</span>
+<span class="nc" id="L266">                        throw e;</span>
+                    }
+<span class="nc" id="L268">                } finally {</span>
+<span class="nc bnc" id="L269" title="All 4 branches missed.">                    if (channel==null) {</span>
+<span class="nc" id="L270">                        offlineCause = new OfflineCause.LaunchFailed();</span>
+<span class="nc bnc" id="L271" title="All 4 branches missed.">                        for (ComputerListener cl : ComputerListener.all())</span>
+<span class="nc" id="L272">                            cl.onLaunchFailure(SlaveComputer.this, taskListener);</span>
+                    }
+<span class="nc" id="L274">                }</span>
+
+<span class="nc bnc" id="L276" title="All 2 branches missed.">                if (channel==null)</span>
+<span class="nc" id="L277">                    throw new IOException(&quot;Slave failed to connect, even though the launcher didn't report it. See the log output for details.&quot;);</span>
+<span class="nc" id="L278">                return null;</span>
+            }
+        });
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public void taskAccepted(Executor executor, Queue.Task task) {
+<span class="nc" id="L288">        super.taskAccepted(executor, task);</span>
+<span class="nc bnc" id="L289" title="All 2 branches missed.">        if (launcher instanceof ExecutorListener) {</span>
+<span class="nc" id="L290">            ((ExecutorListener)launcher).taskAccepted(executor, task);</span>
+        }
+
+        //getNode() can return null at indeterminate times when nodes go offline
+<span class="nc" id="L294">        Slave node = getNode();</span>
+<span class="nc bnc" id="L295" title="All 4 branches missed.">        if (node != null &amp;&amp; node.getRetentionStrategy() instanceof ExecutorListener) {</span>
+<span class="nc" id="L296">            ((ExecutorListener)node.getRetentionStrategy()).taskAccepted(executor, task);</span>
+        }
+<span class="nc" id="L298">    }</span>
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public void taskCompleted(Executor executor, Queue.Task task, long durationMS) {
+<span class="nc" id="L305">        super.taskCompleted(executor, task, durationMS);</span>
+<span class="nc bnc" id="L306" title="All 2 branches missed.">        if (launcher instanceof ExecutorListener) {</span>
+<span class="nc" id="L307">            ((ExecutorListener)launcher).taskCompleted(executor, task, durationMS);</span>
+        }
+<span class="nc" id="L309">        RetentionStrategy r = getRetentionStrategy();</span>
+<span class="nc bnc" id="L310" title="All 2 branches missed.">        if (r instanceof ExecutorListener) {</span>
+<span class="nc" id="L311">            ((ExecutorListener) r).taskCompleted(executor, task, durationMS);</span>
+        }
+<span class="nc" id="L313">    }</span>
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public void taskCompletedWithProblems(Executor executor, Queue.Task task, long durationMS, Throwable problems) {
+<span class="nc" id="L320">        super.taskCompletedWithProblems(executor, task, durationMS, problems);</span>
+<span class="nc bnc" id="L321" title="All 2 branches missed.">        if (launcher instanceof ExecutorListener) {</span>
+<span class="nc" id="L322">            ((ExecutorListener)launcher).taskCompletedWithProblems(executor, task, durationMS, problems);</span>
+        }
+<span class="nc" id="L324">        RetentionStrategy r = getRetentionStrategy();</span>
+<span class="nc bnc" id="L325" title="All 2 branches missed.">        if (r instanceof ExecutorListener) {</span>
+<span class="nc" id="L326">            ((ExecutorListener) r).taskCompletedWithProblems(executor, task, durationMS, problems);</span>
+        }
+<span class="nc" id="L328">    }</span>
+
+    @Override
+    public boolean isConnecting() {
+<span class="nc" id="L332">        Future&lt;?&gt; l = lastConnectActivity;</span>
+<span class="nc bnc" id="L333" title="All 6 branches missed.">        return isOffline() &amp;&amp; l!=null &amp;&amp; !l.isDone();</span>
+    }
+
+    public OutputStream openLogFile() {
+        try {
+<span class="nc" id="L338">            log.rewind();</span>
+<span class="nc" id="L339">            return log;</span>
+<span class="nc" id="L340">        } catch (IOException e) {</span>
+<span class="nc" id="L341">            logger.log(Level.SEVERE, &quot;Failed to create log file &quot;+getLogFile(),e);</span>
+<span class="nc" id="L342">            return new NullStream();</span>
+        }
+    }
+
+<span class="nc" id="L346">    private final Object channelLock = new Object();</span>
+
+    public void setChannel(InputStream in, OutputStream out, TaskListener taskListener, Channel.Listener listener) throws IOException, InterruptedException {
+<span class="nc" id="L349">        setChannel(in,out,taskListener.getLogger(),listener);</span>
+<span class="nc" id="L350">    }</span>
+
+    /**
+     * Creates a {@link Channel} from the given stream and sets that to this slave.
+     *
+     * @param in
+     *      Stream connected to the remote &quot;slave.jar&quot;. It's the caller's responsibility to do
+     *      buffering on this stream, if that's necessary.
+     * @param out
+     *      Stream connected to the remote peer. It's the caller's responsibility to do
+     *      buffering on this stream, if that's necessary.
+     * @param launchLog
+     *      If non-null, receive the portion of data in &lt;tt&gt;is&lt;/tt&gt; before
+     *      the data goes into the &quot;binary mode&quot;. This is useful
+     *      when the established communication channel might include some data that might
+     *      be useful for debugging/trouble-shooting.
+     * @param listener
+     *      Gets a notification when the channel closes, to perform clean up. Can be null.
+     *      By the time this method is called, the cause of the termination is reported to the user,
+     *      so the implementation of the listener doesn't need to do that again.
+     */
+    public void setChannel(InputStream in, OutputStream out, OutputStream launchLog, Channel.Listener listener) throws IOException, InterruptedException {
+<span class="nc" id="L372">        ChannelBuilder cb = new ChannelBuilder(nodeName,threadPoolForRemoting)</span>
+<span class="nc" id="L373">            .withMode(Channel.Mode.NEGOTIATE)</span>
+<span class="nc" id="L374">            .withHeaderStream(launchLog);</span>
+
+<span class="nc bnc" id="L376" title="All 2 branches missed.">        for (ChannelConfigurator cc : ChannelConfigurator.all()) {</span>
+<span class="nc" id="L377">            cc.onChannelBuilding(cb,this);</span>
+        }
+
+<span class="nc" id="L380">        Channel channel = cb.build(in,out);</span>
+<span class="nc" id="L381">        setChannel(channel,launchLog,listener);</span>
+<span class="nc" id="L382">    }</span>
+
+    /**
+     * Shows {@link Channel#classLoadingCount}.
+     * @since 1.495
+     */
+    public int getClassLoadingCount() throws IOException, InterruptedException {
+<span class="nc" id="L389">        return channel.call(new LoadingCount(false));</span>
+    }
+
+    /**
+     * Shows {@link Channel#classLoadingPrefetchCacheCount}.
+     * @return -1 in case that capability is not supported
+     * @since 1.519
+     */
+    public int getClassLoadingPrefetchCacheCount() throws IOException, InterruptedException {
+<span class="nc bnc" id="L398" title="All 2 branches missed.">        if (!channel.remoteCapability.supportsPrefetch()) {</span>
+<span class="nc" id="L399">            return -1;</span>
+        }
+<span class="nc" id="L401">        return channel.call(new LoadingPrefetchCacheCount());</span>
+    }
+
+    /**
+     * Shows {@link Channel#resourceLoadingCount}.
+     * @since 1.495
+     */
+    public int getResourceLoadingCount() throws IOException, InterruptedException {
+<span class="nc" id="L409">        return channel.call(new LoadingCount(true));</span>
+    }
+
+    /**
+     * Shows {@link Channel#classLoadingTime}.
+     * @since 1.495
+     */
+    public long getClassLoadingTime() throws IOException, InterruptedException {
+<span class="nc" id="L417">        return channel.call(new LoadingTime(false));</span>
+    }
+
+    /**
+     * Shows {@link Channel#resourceLoadingTime}.
+     * @since 1.495
+     */
+    public long getResourceLoadingTime() throws IOException, InterruptedException {
+<span class="nc" id="L425">        return channel.call(new LoadingTime(true));</span>
+    }
+
+    /**
+     * Returns the remote FS root absolute path or {@code null} if the slave is off-line. The absolute path may change
+     * between connections if the connection method does not provide a consistent working directory and the node's
+     * remote FS is specified as a relative path.
+     *
+     * @return the remote FS root absolute path or {@code null} if the slave is off-line.
+     * @since 1.606
+     */
+    @CheckForNull
+    public String getAbsoluteRemoteFs() {
+<span class="nc bnc" id="L438" title="All 2 branches missed.">        return channel == null ? null : absoluteRemoteFs;</span>
+    }
+
+    static class LoadingCount extends MasterToSlaveCallable&lt;Integer,RuntimeException&gt; {
+        private final boolean resource;
+<span class="nc" id="L443">        LoadingCount(boolean resource) {</span>
+<span class="nc" id="L444">            this.resource = resource;</span>
+<span class="nc" id="L445">        }</span>
+        @Override public Integer call() {
+<span class="nc" id="L447">            Channel c = Channel.current();</span>
+<span class="nc bnc" id="L448" title="All 2 branches missed.">            return resource ? c.resourceLoadingCount.get() : c.classLoadingCount.get();</span>
+        }
+    }
+
+<span class="nc" id="L452">    static class LoadingPrefetchCacheCount extends MasterToSlaveCallable&lt;Integer,RuntimeException&gt; {</span>
+        @Override public Integer call() {
+<span class="nc" id="L454">            return Channel.current().classLoadingPrefetchCacheCount.get();</span>
+        }
+    }
+
+    static class LoadingTime extends MasterToSlaveCallable&lt;Long,RuntimeException&gt; {
+        private final boolean resource;
+<span class="nc" id="L460">        LoadingTime(boolean resource) {</span>
+<span class="nc" id="L461">            this.resource = resource;</span>
+<span class="nc" id="L462">        }</span>
+        @Override public Long call() {
+<span class="nc" id="L464">            Channel c = Channel.current();</span>
+<span class="nc bnc" id="L465" title="All 2 branches missed.">            return resource ? c.resourceLoadingTime.get() : c.classLoadingTime.get();</span>
+        }
+    }
+
+    /**
+     * Sets up the connection through an existing channel.
+     * @param channel the channel to use; &lt;strong&gt;warning:&lt;/strong&gt; callers are expected to have called {@link ChannelConfigurator} already
+     * @since 1.444
+     */
+    public void setChannel(Channel channel, OutputStream launchLog, Channel.Listener listener) throws IOException, InterruptedException {
+<span class="nc bnc" id="L475" title="All 2 branches missed.">        if(this.channel!=null)</span>
+<span class="nc" id="L476">            throw new IllegalStateException(&quot;Already connected&quot;);</span>
+
+<span class="nc" id="L478">        final TaskListener taskListener = new StreamTaskListener(launchLog);</span>
+<span class="nc" id="L479">        PrintStream log = taskListener.getLogger();</span>
+
+<span class="nc" id="L481">        channel.setProperty(SlaveComputer.class, this);</span>
+
+<span class="nc" id="L483">        channel.addListener(new Channel.Listener() {</span>
+            @Override
+            public void onClosed(Channel c, IOException cause) {
+                // Orderly shutdown will have null exception
+<span class="nc bnc" id="L487" title="All 2 branches missed.">                if (cause!=null) {</span>
+<span class="nc" id="L488">                    offlineCause = new ChannelTermination(cause);</span>
+<span class="nc" id="L489">                    cause.printStackTrace(taskListener.error(&quot;Connection terminated&quot;));</span>
+<span class="nc" id="L490">                } else {</span>
+<span class="nc" id="L491">                    taskListener.getLogger().println(&quot;Connection terminated&quot;);</span>
+                }
+<span class="nc" id="L493">                closeChannel();</span>
+                try {
+<span class="nc" id="L495">                    launcher.afterDisconnect(SlaveComputer.this, taskListener);</span>
+<span class="nc" id="L496">                } catch (Throwable t) {</span>
+<span class="nc" id="L497">                    LogRecord lr = new LogRecord(Level.SEVERE,</span>
+<span class="nc" id="L498">                            &quot;Launcher {0}'s afterDisconnect method propagated an exception when {1}'s connection was closed: {2}&quot;);</span>
+<span class="nc" id="L499">                    lr.setThrown(t);</span>
+<span class="nc" id="L500">                    lr.setParameters(new Object[]{launcher, SlaveComputer.this.getName(), t.getMessage()});</span>
+<span class="nc" id="L501">                    logger.log(lr);</span>
+                }
+<span class="nc" id="L503">            }</span>
+        });
+<span class="nc bnc" id="L505" title="All 2 branches missed.">        if(listener!=null)</span>
+<span class="nc" id="L506">            channel.addListener(listener);</span>
+
+<span class="nc" id="L508">        String slaveVersion = channel.call(new SlaveVersion());</span>
+<span class="nc" id="L509">        log.println(&quot;Slave.jar version: &quot; + slaveVersion);</span>
+
+<span class="nc" id="L511">        boolean _isUnix = channel.call(new DetectOS());</span>
+<span class="nc bnc" id="L512" title="All 2 branches missed.">        log.println(_isUnix? hudson.model.Messages.Slave_UnixSlave():hudson.model.Messages.Slave_WindowsSlave());</span>
+
+<span class="nc" id="L514">        String defaultCharsetName = channel.call(new DetectDefaultCharset());</span>
+
+<span class="nc" id="L516">        Slave node = getNode();</span>
+<span class="nc bnc" id="L517" title="All 2 branches missed.">        if (node == null) { // Node has been disabled/removed during the connection</span>
+<span class="nc" id="L518">            throw new IOException(&quot;Node &quot;+nodeName+&quot; has been deleted during the channel setup&quot;);</span>
+        }
+
+<span class="nc" id="L521">        String remoteFS = node.getRemoteFS();</span>
+<span class="nc bnc" id="L522" title="All 2 branches missed.">        if (Util.isRelativePath(remoteFS)) {</span>
+<span class="nc" id="L523">            remoteFS = channel.call(new AbsolutePath(remoteFS));</span>
+<span class="nc" id="L524">            log.println(&quot;NOTE: Relative remote path resolved to: &quot;+remoteFS);</span>
+        }
+<span class="nc bnc" id="L526" title="All 6 branches missed.">        if(_isUnix &amp;&amp; !remoteFS.contains(&quot;/&quot;) &amp;&amp; remoteFS.contains(&quot;\\&quot;))</span>
+<span class="nc" id="L527">            log.println(&quot;WARNING: &quot;+remoteFS</span>
+<span class="nc" id="L528">                    +&quot; looks suspiciously like Windows path. Maybe you meant &quot;+remoteFS.replace('\\','/')+&quot;?&quot;);</span>
+<span class="nc" id="L529">        FilePath root = new FilePath(channel,remoteFS);</span>
+
+        // reference counting problem is known to happen, such as JENKINS-9017, and so as a preventive measure
+        // we pin the base classloader so that it'll never get GCed. When this classloader gets released,
+        // it'll have a catastrophic impact on the communication.
+<span class="nc" id="L534">        channel.pinClassLoader(getClass().getClassLoader());</span>
+
+<span class="nc" id="L536">        channel.call(new SlaveInitializer());</span>
+<span class="nc" id="L537">        SecurityContext old = ACL.impersonate(ACL.SYSTEM);</span>
+        try {
+<span class="nc bnc" id="L539" title="All 2 branches missed.">            for (ComputerListener cl : ComputerListener.all()) {</span>
+<span class="nc" id="L540">                cl.preOnline(this,channel,root,taskListener);</span>
+            }
+<span class="nc" id="L542">        } finally {</span>
+<span class="nc" id="L543">            SecurityContextHolder.setContext(old);</span>
+<span class="nc" id="L544">        }</span>
+
+<span class="nc" id="L546">        offlineCause = null;</span>
+
+        // update the data structure atomically to prevent others from seeing a channel that's not properly initialized yet
+<span class="nc" id="L549">        synchronized(channelLock) {</span>
+<span class="nc bnc" id="L550" title="All 2 branches missed.">            if(this.channel!=null) {</span>
+                // check again. we used to have this entire method in a big sycnhronization block,
+                // but Channel constructor blocks for an external process to do the connection
+                // if CommandLauncher is used, and that cannot be interrupted because it blocks at InputStream.
+                // so if the process hangs, it hangs the thread in a lock, and since Hudson will try to relaunch,
+                // we'll end up queuing the lot of threads in a pseudo deadlock.
+                // This implementation prevents that by avoiding a lock. HUDSON-1705 is likely a manifestation of this.
+<span class="nc" id="L557">                channel.close();</span>
+<span class="nc" id="L558">                throw new IllegalStateException(&quot;Already connected&quot;);</span>
+            }
+<span class="nc" id="L560">            isUnix = _isUnix;</span>
+<span class="nc" id="L561">            numRetryAttempt = 0;</span>
+<span class="nc" id="L562">            this.channel = channel;</span>
+<span class="nc" id="L563">            this.absoluteRemoteFs = remoteFS;</span>
+<span class="nc" id="L564">            defaultCharset = Charset.forName(defaultCharsetName);</span>
+
+<span class="nc" id="L566">            synchronized (statusChangeLock) {</span>
+<span class="nc" id="L567">                statusChangeLock.notifyAll();</span>
+            }
+        }
+<span class="nc" id="L570">        old = ACL.impersonate(ACL.SYSTEM);</span>
+        try {
+<span class="nc bnc" id="L572" title="All 2 branches missed.">            for (ComputerListener cl : ComputerListener.all()) {</span>
+<span class="nc" id="L573">                cl.onOnline(this,taskListener);</span>
+            }
+<span class="nc" id="L575">        } finally {</span>
+<span class="nc" id="L576">            SecurityContextHolder.setContext(old);</span>
+<span class="nc" id="L577">        }</span>
+<span class="nc" id="L578">        log.println(&quot;Slave successfully connected and online&quot;);</span>
+<span class="nc" id="L579">        Jenkins.getInstance().getQueue().scheduleMaintenance();</span>
+<span class="nc" id="L580">    }</span>
+
+    @Override
+    public Channel getChannel() {
+<span class="nc" id="L584">        return channel;</span>
+    }
+
+    public Charset getDefaultCharset() {
+<span class="nc" id="L588">        return defaultCharset;</span>
+    }
+
+    public List&lt;LogRecord&gt; getLogRecords() throws IOException, InterruptedException {
+<span class="nc bnc" id="L592" title="All 2 branches missed.">        if(channel==null)</span>
+<span class="nc" id="L593">            return Collections.emptyList();</span>
+        else
+<span class="nc" id="L595">            return channel.call(new SlaveLogFetcher());</span>
+    }
+
+    @RequirePOST
+    public HttpResponse doDoDisconnect(@QueryParameter String offlineMessage) throws IOException, ServletException {
+<span class="nc bnc" id="L600" title="All 2 branches missed.">        if (channel!=null) {</span>
+            //does nothing in case computer is already disconnected
+<span class="nc" id="L602">            checkPermission(DISCONNECT);</span>
+<span class="nc" id="L603">            offlineMessage = Util.fixEmptyAndTrim(offlineMessage);</span>
+<span class="nc" id="L604">            disconnect(new OfflineCause.UserCause(User.current(), offlineMessage));</span>
+        }
+<span class="nc" id="L606">        return new HttpRedirect(&quot;.&quot;);</span>
+    }
+
+    @Override
+    public Future&lt;?&gt; disconnect(OfflineCause cause) {
+<span class="nc" id="L611">        super.disconnect(cause);</span>
+<span class="nc" id="L612">        return Computer.threadPoolForRemoting.submit(new Runnable() {</span>
+            public void run() {
+                // do this on another thread so that any lengthy disconnect operation
+                // (which could be typical) won't block UI thread.
+<span class="nc" id="L616">                launcher.beforeDisconnect(SlaveComputer.this, taskListener);</span>
+<span class="nc" id="L617">                closeChannel();</span>
+<span class="nc" id="L618">                launcher.afterDisconnect(SlaveComputer.this, taskListener);</span>
+<span class="nc" id="L619">            }</span>
+        });
+    }
+
+    @RequirePOST
+    public void doLaunchSlaveAgent(StaplerRequest req, StaplerResponse rsp) throws IOException, ServletException {
+<span class="nc bnc" id="L625" title="All 2 branches missed.">        if(channel!=null) {</span>
+<span class="nc" id="L626">            req.getView(this,&quot;already-launched.jelly&quot;).forward(req, rsp);</span>
+<span class="nc" id="L627">            return;</span>
+        }
+
+<span class="nc" id="L630">        connect(true);</span>
+
+        // TODO: would be nice to redirect the user to &quot;launching...&quot; wait page,
+        // then spend a few seconds there and poll for the completion periodically.
+<span class="nc" id="L634">        rsp.sendRedirect(&quot;log&quot;);</span>
+<span class="nc" id="L635">    }</span>
+
+    public void tryReconnect() {
+<span class="nc" id="L638">        numRetryAttempt++;</span>
+<span class="nc bnc" id="L639" title="All 4 branches missed.">        if(numRetryAttempt&lt;6 || (numRetryAttempt%12)==0) {</span>
+            // initially retry several times quickly, and after that, do it infrequently.
+<span class="nc" id="L641">            logger.info(&quot;Attempting to reconnect &quot;+nodeName);</span>
+<span class="nc" id="L642">            connect(true);</span>
+        }
+<span class="nc" id="L644">    }</span>
+
+    /**
+     * Serves jar files for JNLP slave agents.
+     *
+     * @deprecated since 2008-08-18.
+     *      This URL binding is no longer used and moved up directly under to {@link jenkins.model.Jenkins},
+     *      but it's left here for now just in case some old JNLP slave agents request it.
+     */
+    @Deprecated
+    public Slave.JnlpJar getJnlpJars(String fileName) {
+<span class="nc" id="L655">        return new Slave.JnlpJar(fileName);</span>
+    }
+
+    @WebMethod(name=&quot;slave-agent.jnlp&quot;)
+    public HttpResponse doSlaveAgentJnlp(StaplerRequest req, StaplerResponse res) throws IOException, ServletException {
+<span class="nc" id="L660">        return new EncryptedSlaveAgentJnlpFile(this, &quot;slave-agent.jnlp.jelly&quot;, getName(), CONNECT);</span>
+    }
+
+    @Override
+    protected void kill() {
+<span class="nc" id="L665">        super.kill();</span>
+<span class="nc" id="L666">        closeChannel();</span>
+<span class="nc" id="L667">        IOUtils.closeQuietly(log);</span>
+
+        try {
+<span class="nc" id="L670">            Util.deleteRecursive(getLogDir());</span>
+<span class="nc" id="L671">        } catch (IOException ex) {</span>
+<span class="nc" id="L672">            logger.log(Level.WARNING, &quot;Unable to delete slave logs&quot;, ex);</span>
+        }
+<span class="nc" id="L674">    }</span>
+
+    public RetentionStrategy getRetentionStrategy() {
+<span class="nc" id="L677">        Slave n = getNode();</span>
+<span class="nc bnc" id="L678" title="All 2 branches missed.">        return n==null ? RetentionStrategy.INSTANCE : n.getRetentionStrategy();</span>
+    }
+
+    /**
+     * If still connected, disconnect.
+     */
+    private void closeChannel() {
+        // TODO: race condition between this and the setChannel method.
+        Channel c;
+<span class="nc" id="L687">        synchronized (channelLock) {</span>
+<span class="nc" id="L688">            c = channel;</span>
+<span class="nc" id="L689">            channel = null;</span>
+<span class="nc" id="L690">            absoluteRemoteFs = null;</span>
+<span class="nc" id="L691">            isUnix = null;</span>
+        }
+<span class="nc bnc" id="L693" title="All 2 branches missed.">        if (c != null) {</span>
+            try {
+<span class="nc" id="L695">                c.close();</span>
+<span class="nc" id="L696">            } catch (IOException e) {</span>
+<span class="nc" id="L697">                logger.log(Level.SEVERE, &quot;Failed to terminate channel to &quot; + getDisplayName(), e);</span>
+            }
+<span class="nc bnc" id="L699" title="All 2 branches missed.">            for (ComputerListener cl : ComputerListener.all())</span>
+<span class="nc" id="L700">                cl.onOffline(this, offlineCause);</span>
+        }
+<span class="nc" id="L702">    }</span>
+
+    @Override
+    protected void setNode(final Node node) {
+<span class="nc" id="L706">        super.setNode(node);</span>
+<span class="nc" id="L707">        launcher = grabLauncher(node);</span>
+
+        // maybe the configuration was changed to relaunch the slave, so try to re-launch now.
+        // &quot;constructed==null&quot; test is an ugly hack to avoid launching before the object is fully
+        // constructed.
+<span class="nc bnc" id="L712" title="All 2 branches missed.">        if(constructed!=null) {</span>
+<span class="nc bnc" id="L713" title="All 2 branches missed.">            if (node instanceof Slave) {</span>
+<span class="nc" id="L714">                Queue.withLock(new Runnable() {</span>
+                    @Override
+                    public void run() {
+<span class="nc" id="L717">                        ((Slave)node).getRetentionStrategy().check(SlaveComputer.this);</span>
+<span class="nc" id="L718">                    }</span>
+                });
+<span class="nc" id="L720">            } else {</span>
+<span class="nc" id="L721">                connect(false);</span>
+            }
+        }
+<span class="nc" id="L724">    }</span>
+
+    /**
+     * Grabs a {@link ComputerLauncher} out of {@link Node} to keep it in this {@link Computer}.
+     * The returned launcher will be set to {@link #launcher} and used to carry out the actual launch operation.
+     *
+     * &lt;p&gt;
+     * Subtypes that needs to decorate {@link ComputerLauncher} can do so by overriding this method.
+     * This is useful for {@link SlaveComputer}s for clouds for example, where one normally needs
+     * additional pre-launch step (such as waiting for the provisioned node to become available)
+     * before the user specified launch step (like SSH connection) kicks in.
+     *
+     * @see ComputerLauncherFilter
+     */
+    protected ComputerLauncher grabLauncher(Node node) {
+<span class="nc" id="L739">        return ((Slave)node).getLauncher();</span>
+    }
+
+    /**
+     * Get the slave version
+     */
+    public String getSlaveVersion() throws IOException, InterruptedException {
+<span class="nc" id="L746">        return channel.call(new SlaveVersion());</span>
+    }
+
+    /**
+     * Get the OS description.
+     */
+    public String getOSDescription() throws IOException, InterruptedException {
+<span class="nc bnc" id="L753" title="All 2 branches missed.">        return channel.call(new DetectOS()) ? &quot;Unix&quot; : &quot;Windows&quot;;</span>
+    }
+
+<span class="nc" id="L756">    private static final Logger logger = Logger.getLogger(SlaveComputer.class.getName());</span>
+
+<span class="nc" id="L758">    private static final class SlaveVersion extends MasterToSlaveCallable&lt;String,IOException&gt; {</span>
+        public String call() throws IOException {
+<span class="nc" id="L760">            try { return Launcher.VERSION; }</span>
+<span class="nc" id="L761">            catch (Throwable ex) { return &quot;&lt; 1.335&quot;; } // Older slave.jar won't have VERSION</span>
+        }
+    }
+<span class="nc" id="L764">    private static final class DetectOS extends MasterToSlaveCallable&lt;Boolean,IOException&gt; {</span>
+        public Boolean call() throws IOException {
+<span class="nc bnc" id="L766" title="All 2 branches missed.">            return File.pathSeparatorChar==':';</span>
+        }
+    }
+
+    private static final class AbsolutePath extends MasterToSlaveCallable&lt;String,IOException&gt; {
+
+        private static final long serialVersionUID = 1L;
+
+        private final String relativePath;
+
+<span class="nc" id="L776">        private AbsolutePath(String relativePath) {</span>
+<span class="nc" id="L777">            this.relativePath = relativePath;</span>
+<span class="nc" id="L778">        }</span>
+
+        public String call() throws IOException {
+<span class="nc" id="L781">            return new File(relativePath).getAbsolutePath();</span>
+        }
+    }
+
+<span class="nc" id="L785">    private static final class DetectDefaultCharset extends MasterToSlaveCallable&lt;String,IOException&gt; {</span>
+        public String call() throws IOException {
+<span class="nc" id="L787">            return Charset.defaultCharset().name();</span>
+        }
+    }
+
+    /**
+     * Puts the {@link #SLAVE_LOG_HANDLER} into a separate class so that loading this class
+     * in JVM doesn't end up loading tons of additional classes.
+     */
+<span class="nc" id="L795">    static final class LogHolder {</span>
+        /**
+         * This field is used on each slave node to record log records on the slave.
+         */
+<span class="nc" id="L799">        static final RingBufferLogHandler SLAVE_LOG_HANDLER = new RingBufferLogHandler();</span>
+    }
+
+<span class="nc" id="L802">    private static class SlaveInitializer extends MasterToSlaveCallable&lt;Void,RuntimeException&gt; {</span>
+        public Void call() {
+            // avoid double installation of the handler. JNLP slaves can reconnect to the master multiple times
+            // and each connection gets a different RemoteClassLoader, so we need to evict them by class name,
+            // not by their identity.
+<span class="nc bnc" id="L807" title="All 2 branches missed.">            for (Handler h : LOGGER.getHandlers()) {</span>
+<span class="nc bnc" id="L808" title="All 2 branches missed.">                if (h.getClass().getName().equals(SLAVE_LOG_HANDLER.getClass().getName()))</span>
+<span class="nc" id="L809">                    LOGGER.removeHandler(h);</span>
+            }
+<span class="nc" id="L811">            LOGGER.addHandler(SLAVE_LOG_HANDLER);</span>
+
+            // remove Sun PKCS11 provider if present. See http://wiki.jenkins-ci.org/display/JENKINS/Solaris+Issue+6276483
+            try {
+<span class="nc" id="L815">                Security.removeProvider(&quot;SunPKCS11-Solaris&quot;);</span>
+<span class="nc" id="L816">            } catch (SecurityException e) {</span>
+                // ignore this error.
+            }
+
+<span class="nc" id="L820">            Channel.current().setProperty(&quot;slave&quot;,Boolean.TRUE); // indicate that this side of the channel is the slave side.</span>
+
+<span class="nc" id="L822">            return null;</span>
+        }
+        private static final long serialVersionUID = 1L;
+<span class="nc" id="L825">        private static final Logger LOGGER = Logger.getLogger(&quot;&quot;);</span>
+    }
+
+    /**
+     * Obtains a {@link VirtualChannel} that allows some computation to be performed on the master.
+     * This method can be called from any thread on the master, or from slave (more precisely,
+     * it only works from the remoting request-handling thread in slaves, which means if you've started
+     * separate thread on slaves, that'll fail.)
+     *
+     * @return null if the calling thread doesn't have any trace of where its master is.
+     * @since 1.362
+     */
+    public static VirtualChannel getChannelToMaster() {
+<span class="nc bnc" id="L838" title="All 2 branches missed.">        if (Jenkins.getInstance()!=null)</span>
+<span class="nc" id="L839">            return FilePath.localChannel;</span>
+
+        // if this method is called from within the slave computation thread, this should work
+<span class="nc" id="L842">        Channel c = Channel.current();</span>
+<span class="nc bnc" id="L843" title="All 4 branches missed.">        if (c!=null &amp;&amp; Boolean.TRUE.equals(c.getProperty(&quot;slave&quot;)))</span>
+<span class="nc" id="L844">            return c;</span>
+
+<span class="nc" id="L846">        return null;</span>
+    }
+
+    /**
+     * Helper method for Jelly.
+     */
+    public static List&lt;SlaveSystemInfo&gt; getSystemInfoExtensions() {
+<span class="nc" id="L853">        return SlaveSystemInfo.all();</span>
+    }
+
+<span class="nc" id="L856">    private static class SlaveLogFetcher extends MasterToSlaveCallable&lt;List&lt;LogRecord&gt;,RuntimeException&gt; {</span>
+        public List&lt;LogRecord&gt; call() {
+<span class="nc" id="L858">            return new ArrayList&lt;LogRecord&gt;(SLAVE_LOG_HANDLER.getView());</span>
+        }
+    }
+
+<span class="nc" id="L862">    private static final Logger LOGGER = Logger.getLogger(SlaveComputer.class.getName());</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

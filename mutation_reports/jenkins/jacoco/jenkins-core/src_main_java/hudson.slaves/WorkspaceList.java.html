@@ -1,0 +1,313 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>WorkspaceList.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.slaves</a> &gt; <span class="el_source">WorkspaceList.java</span></div><h1>WorkspaceList.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">/*</span>
+ * The MIT License
+ *
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.slaves;
+
+import hudson.FilePath;
+import hudson.Functions;
+import hudson.model.Computer;
+import hudson.model.DirectoryBrowserSupport;
+import java.io.Closeable;
+
+import java.util.Date;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import javax.annotation.Nonnull;
+
+/**
+ * Used by {@link Computer} to keep track of workspaces that are actively in use.
+ *
+ * @author Kohsuke Kawaguchi
+ * @since 1.319
+ * @see Computer#getWorkspaceList()
+ */
+public final class WorkspaceList {
+<span class="nc" id="L48">    private static final class AllocationAt extends Exception {</span>
+        @Override
+        public String toString() {
+<span class="nc" id="L51">            return &quot;Allocation Point&quot;;</span>
+        }
+    }
+    /**
+     * Book keeping for workspace allocation.
+     */
+    public static final class Entry {
+        /**
+         * Who acquired this workspace?
+         */
+<span class="nc" id="L61">        public final Thread holder = Thread.currentThread();</span>
+
+        /**
+         * When?
+         */
+<span class="nc" id="L66">        public final long time = System.currentTimeMillis();</span>
+
+        /**
+         * From where?
+         */
+<span class="nc" id="L71">        public final Exception source = new AllocationAt();</span>
+
+        /**
+         * True makes the caller of {@link WorkspaceList#allocate(FilePath)} wait
+         * for this workspace.
+         */
+        public final boolean quick;
+
+        public final @Nonnull FilePath path;
+
+        /**
+         * Multiple threads can acquire the same lock if they share the same context object.
+         */
+        public final Object context;
+        
+<span class="nc" id="L86">        public int lockCount=1;</span>
+
+        private Entry(@Nonnull FilePath path, boolean quick) {
+<span class="nc" id="L89">            this(path,quick,new Object()); // unique context</span>
+<span class="nc" id="L90">        }</span>
+        
+<span class="nc" id="L92">        private Entry(@Nonnull FilePath path, boolean quick, Object context) {</span>
+<span class="nc" id="L93">            this.path = path;</span>
+<span class="nc" id="L94">            this.quick = quick;</span>
+<span class="nc" id="L95">            this.context = context;</span>
+<span class="nc" id="L96">        }</span>
+
+        @Override
+        public String toString() {
+<span class="nc" id="L100">            String s = path+&quot; owned by &quot;+holder.getName()+&quot; from &quot;+new Date(time);</span>
+<span class="nc bnc" id="L101" title="All 2 branches missed.">            if(quick) s+=&quot; (quick)&quot;;</span>
+<span class="nc" id="L102">            s+=&quot;\n&quot;+Functions.printThrowable(source);</span>
+<span class="nc" id="L103">            return s;</span>
+        }
+    }
+
+    /**
+     * Represents a leased workspace that needs to be returned later.
+     */
+    public static abstract class Lease implements /*Auto*/Closeable {
+        public final @Nonnull FilePath path;
+
+<span class="nc" id="L113">        protected Lease(@Nonnull FilePath path) {</span>
+<span class="nc" id="L114">            path.getRemote(); // null check</span>
+<span class="nc" id="L115">            this.path = path;</span>
+<span class="nc" id="L116">        }</span>
+
+        /**
+         * Releases this lease.
+         */
+        public abstract void release();
+
+        /**
+         * By default, calls {@link #release}, but should be idempotent.
+         * @since 1.600
+         */
+        @Override public void close() {
+<span class="nc" id="L128">            release();</span>
+<span class="nc" id="L129">        }</span>
+
+        /**
+         * Creates a dummy {@link Lease} object that does no-op in the release.
+         */
+        public static Lease createDummyLease(@Nonnull FilePath p) {
+<span class="nc" id="L135">            return new Lease(p) {</span>
+                public void release() {
+                    // noop
+<span class="nc" id="L138">                }</span>
+            };
+        }
+
+        /**
+         * Creates a {@link Lease} object that points  to the specified path, but the lock
+         * is controlled by the given parent lease object.
+         */
+        public static Lease createLinkedDummyLease(@Nonnull FilePath p, final Lease parent) {
+<span class="nc" id="L147">            return new Lease(p) {</span>
+                public void release() {
+<span class="nc" id="L149">                    parent.release();</span>
+<span class="nc" id="L150">                }</span>
+            };
+        }
+    }
+
+<span class="nc" id="L155">    private final Map&lt;FilePath,Entry&gt; inUse = new HashMap&lt;FilePath,Entry&gt;();</span>
+
+<span class="nc" id="L157">    public WorkspaceList() {</span>
+<span class="nc" id="L158">    }</span>
+
+    /**
+     * Allocates a workspace by adding some variation to the given base to make it unique.
+     *
+     * &lt;p&gt;
+     * This method doesn't block prolonged amount of time. Whenever a desired workspace
+     * is in use, the unique variation is added.
+     */
+    public synchronized Lease allocate(@Nonnull FilePath base) throws InterruptedException {
+<span class="nc" id="L168">        return allocate(base,new Object());</span>
+    }
+
+    /**
+     * See {@link #allocate(FilePath)}
+     * 
+     * @param context
+     *      Threads that share the same context can re-acquire the same lock (which will just increment the lock count.)
+     *      This allows related executors to share the same workspace.
+     */
+    public synchronized Lease allocate(@Nonnull FilePath base, Object context) throws InterruptedException {
+<span class="nc" id="L179">        for (int i=1; ; i++) {</span>
+<span class="nc bnc" id="L180" title="All 2 branches missed.">            FilePath candidate = i==1 ? base : base.withSuffix(COMBINATOR+i);</span>
+<span class="nc" id="L181">            Entry e = inUse.get(candidate);</span>
+<span class="nc bnc" id="L182" title="All 6 branches missed.">            if(e!=null &amp;&amp; !e.quick &amp;&amp; e.context!=context)</span>
+<span class="nc" id="L183">                continue;</span>
+<span class="nc" id="L184">            return acquire(candidate,false,context);</span>
+        }
+    }
+
+    /**
+     * Just record that this workspace is being used, without paying any attention to the synchronization support.
+     */
+    public synchronized Lease record(@Nonnull FilePath p) {
+<span class="nc bnc" id="L192" title="All 2 branches missed.">        if (LOGGER.isLoggable(Level.FINE)) {</span>
+<span class="nc" id="L193">            LOGGER.log(Level.FINE, &quot;recorded &quot; + p, new Throwable(&quot;from &quot; + this));</span>
+        }
+<span class="nc" id="L195">        Entry old = inUse.put(p, new Entry(p, false));</span>
+<span class="nc bnc" id="L196" title="All 2 branches missed.">        if (old!=null)</span>
+<span class="nc" id="L197">            throw new AssertionError(&quot;Tried to record a workspace already owned: &quot;+old);</span>
+<span class="nc" id="L198">        return lease(p);</span>
+    }
+
+    /**
+     * Releases an allocated or acquired workspace.
+     */
+    private synchronized void _release(@Nonnull FilePath p) {
+<span class="nc" id="L205">        Entry old = inUse.get(p);</span>
+<span class="nc bnc" id="L206" title="All 2 branches missed.">        if (old==null)</span>
+<span class="nc" id="L207">            throw new AssertionError(&quot;Releasing unallocated workspace &quot;+p);</span>
+<span class="nc bnc" id="L208" title="All 2 branches missed.">        if (LOGGER.isLoggable(Level.FINE)) {</span>
+<span class="nc" id="L209">            LOGGER.log(Level.FINE, &quot;releasing &quot; + p + &quot; with lock count &quot; + old.lockCount, new Throwable(&quot;from &quot; + this));</span>
+        }
+<span class="nc" id="L211">        old.lockCount--;</span>
+<span class="nc bnc" id="L212" title="All 2 branches missed.">        if (old.lockCount==0)</span>
+<span class="nc" id="L213">            inUse.remove(p);</span>
+<span class="nc" id="L214">        notifyAll();</span>
+<span class="nc" id="L215">    }</span>
+
+    /**
+     * Acquires the given workspace. If necessary, this method blocks until it's made available.
+     *
+     * @return
+     *      The same {@link FilePath} as given to this method.
+     */
+    public synchronized Lease acquire(@Nonnull FilePath p) throws InterruptedException {
+<span class="nc" id="L224">        return acquire(p,false);</span>
+    }
+
+    /**
+     * See {@link #acquire(FilePath)}
+     *
+     * @param quick
+     *      If true, indicates that the acquired workspace will be returned quickly.
+     *      This makes other calls to {@link #allocate(FilePath)} to wait for the release of this workspace.
+     */
+    public synchronized Lease acquire(@Nonnull FilePath p, boolean quick) throws InterruptedException {
+<span class="nc" id="L235">        return acquire(p,quick,new Object());</span>
+    }
+    
+    /**
+     * See {@link #acquire(FilePath,boolean)}
+     *
+     * @param context
+     *      Threads that share the same context can re-acquire the same lock (which will just increment the lock count.)
+     *      This allows related executors to share the same workspace.
+     */
+    public synchronized Lease acquire(@Nonnull FilePath p, boolean quick, Object context) throws InterruptedException {
+        Entry e;
+
+<span class="nc" id="L248">        Thread t = Thread.currentThread();</span>
+<span class="nc" id="L249">        String oldName = t.getName();</span>
+<span class="nc" id="L250">        t.setName(&quot;Waiting to acquire &quot;+p+&quot; : &quot;+t.getName());</span>
+        try {
+<span class="nc" id="L252">            while (true) {</span>
+<span class="nc" id="L253">                e = inUse.get(p);</span>
+<span class="nc bnc" id="L254" title="All 4 branches missed.">                if (e==null || e.context==context)</span>
+<span class="nc" id="L255">                    break;</span>
+<span class="nc" id="L256">                wait();</span>
+            }
+<span class="nc" id="L258">        } finally {</span>
+<span class="nc" id="L259">            t.setName(oldName);</span>
+<span class="nc" id="L260">        }</span>
+<span class="nc bnc" id="L261" title="All 2 branches missed.">        if (LOGGER.isLoggable(Level.FINE)) {</span>
+<span class="nc bnc" id="L262" title="All 2 branches missed.">            LOGGER.log(Level.FINE, &quot;acquired &quot; + p + (e == null ? &quot;&quot; : &quot; with lock count &quot; + e.lockCount), new Throwable(&quot;from &quot; + this));</span>
+        }
+        
+<span class="nc bnc" id="L265" title="All 2 branches missed.">        if (e!=null)    e.lockCount++;</span>
+<span class="nc" id="L266">        else            inUse.put(p,new Entry(p,quick,context));</span>
+<span class="nc" id="L267">        return lease(p);</span>
+    }
+
+    /**
+     * Wraps a path into a valid lease.
+     */
+    private Lease lease(@Nonnull FilePath p) {
+<span class="nc" id="L274">        return new Lease(p) {</span>
+<span class="nc" id="L275">            final AtomicBoolean released = new AtomicBoolean();</span>
+            public void release() {
+<span class="nc" id="L277">                _release(path);</span>
+<span class="nc" id="L278">            }</span>
+            @Override public void close() {
+<span class="nc bnc" id="L280" title="All 2 branches missed.">                if (released.compareAndSet(false, true)) {</span>
+<span class="nc" id="L281">                    release();</span>
+                }
+<span class="nc" id="L283">            }</span>
+        };
+    }
+
+    /**
+     * Locates a conventional temporary directory to be associated with a workspace.
+     * &lt;p&gt;This directory is suitable for temporary files to be deleted later in the course of a build,
+     * or caches and local repositories which should persist across builds done in the same workspace.
+     * (If multiple workspaces are present for a single job built concurrently, via {@link #allocate(FilePath)}, each will get its own temporary directory.)
+     * &lt;p&gt;It may also be used for security-sensitive files which {@link DirectoryBrowserSupport} ought not serve,
+     * acknowledging that these will be readable by builds of other jobs done on the same node.
+     * &lt;p&gt;Each plugin using this directory is responsible for specifying sufficiently unique subdirectory/file names.
+     * {@link FilePath#createTempFile} may be used for this purpose if desired.
+     * &lt;p&gt;The resulting directory may not exist; you may call {@link FilePath#mkdirs} on it if you need it to.
+     * It may be deleted alongside the workspace itself during cleanup actions.
+     * @param ws a directory such as a build workspace
+     * @return a sibling directory, for example {@code …/something@tmp} for {@code …/something}
+     * @since 1.652
+     */
+    public static FilePath tempDir(FilePath ws) {
+<span class="nc" id="L303">        return ws.sibling(ws.getName() + COMBINATOR + &quot;tmp&quot;);</span>
+    }
+
+<span class="nc" id="L306">    private static final Logger LOGGER = Logger.getLogger(WorkspaceList.class.getName());</span>
+
+    /**
+     * The token that combines the project name and unique number to create unique workspace directory.
+     */
+<span class="nc" id="L311">    private static final String COMBINATOR = System.getProperty(WorkspaceList.class.getName(),&quot;@&quot;);</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

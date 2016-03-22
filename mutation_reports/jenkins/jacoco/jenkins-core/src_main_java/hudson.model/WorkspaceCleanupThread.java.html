@@ -1,0 +1,160 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>WorkspaceCleanupThread.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.model</a> &gt; <span class="el_source">WorkspaceCleanupThread.java</span></div><h1>WorkspaceCleanupThread.java</h1><pre class="source lang-java linenums">/*
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc., Kohsuke Kawaguchi
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.model;
+
+import hudson.Extension;
+import hudson.ExtensionList;
+import hudson.FilePath;
+import hudson.Util;
+import hudson.slaves.WorkspaceList;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.List;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import javax.annotation.Nonnull;
+import jenkins.model.Jenkins;
+import jenkins.model.ModifiableTopLevelItemGroup;
+
+/**
+ * Clean up old left-over workspaces from slaves.
+ *
+ * @author Kohsuke Kawaguchi
+ */
+@Extension
+public class WorkspaceCleanupThread extends AsyncPeriodicWork {
+    public WorkspaceCleanupThread() {
+<span class="nc" id="L49">        super(&quot;Workspace clean-up&quot;);</span>
+<span class="nc" id="L50">    }</span>
+
+    @Override public long getRecurrencePeriod() {
+<span class="nc" id="L53">        return recurrencePeriodHours * HOUR;</span>
+    }
+
+    public static void invoke() {
+<span class="nc" id="L57">        ExtensionList.lookup(AsyncPeriodicWork.class).get(WorkspaceCleanupThread.class).run();</span>
+<span class="nc" id="L58">    }</span>
+
+    @Override protected void execute(TaskListener listener) throws InterruptedException, IOException {
+<span class="nc bnc" id="L61" title="All 2 branches missed.">        if (disabled) {</span>
+<span class="nc" id="L62">            LOGGER.fine(&quot;Disabled. Skipping execution&quot;);</span>
+<span class="nc" id="L63">            return;</span>
+        }
+<span class="nc" id="L65">        List&lt;Node&gt; nodes = new ArrayList&lt;Node&gt;();</span>
+<span class="nc" id="L66">        Jenkins j = Jenkins.getInstance();</span>
+<span class="nc" id="L67">        nodes.add(j);</span>
+<span class="nc" id="L68">        nodes.addAll(j.getNodes());</span>
+<span class="nc bnc" id="L69" title="All 2 branches missed.">        for (TopLevelItem item : j.getAllItems(TopLevelItem.class)) {</span>
+<span class="nc bnc" id="L70" title="All 2 branches missed.">            if (item instanceof ModifiableTopLevelItemGroup) { // no such thing as TopLevelItemGroup, and ItemGroup offers no access to its type parameter</span>
+<span class="nc" id="L71">                continue; // children will typically have their own workspaces as subdirectories; probably no real workspace of its own</span>
+            }
+<span class="nc" id="L73">            listener.getLogger().println(&quot;Checking &quot; + item.getFullDisplayName());</span>
+<span class="nc bnc" id="L74" title="All 2 branches missed.">            for (Node node : nodes) {</span>
+<span class="nc" id="L75">                FilePath ws = node.getWorkspaceFor(item);</span>
+<span class="nc bnc" id="L76" title="All 2 branches missed.">                if (ws == null) {</span>
+<span class="nc" id="L77">                    continue; // offline, fine</span>
+                }
+                boolean check;
+                try {
+<span class="nc" id="L81">                    check = shouldBeDeleted(item, ws, node);</span>
+<span class="nc" id="L82">                } catch (IOException x) {</span>
+<span class="nc" id="L83">                    x.printStackTrace(listener.error(&quot;Failed to check &quot; + node.getDisplayName()));</span>
+<span class="nc" id="L84">                    continue;</span>
+<span class="nc" id="L85">                } catch (InterruptedException x) {</span>
+<span class="nc" id="L86">                    x.printStackTrace(listener.error(&quot;Failed to check &quot; + node.getDisplayName()));</span>
+<span class="nc" id="L87">                    continue;</span>
+                }
+<span class="nc bnc" id="L89" title="All 2 branches missed.">                if (check) {</span>
+<span class="nc" id="L90">                    listener.getLogger().println(&quot;Deleting &quot; + ws + &quot; on &quot; + node.getDisplayName());</span>
+                    try {
+<span class="nc" id="L92">                        ws.deleteRecursive();</span>
+<span class="nc" id="L93">                        WorkspaceList.tempDir(ws).deleteRecursive();</span>
+<span class="nc" id="L94">                    } catch (IOException x) {</span>
+<span class="nc" id="L95">                        x.printStackTrace(listener.error(&quot;Failed to delete &quot; + ws + &quot; on &quot; + node.getDisplayName()));</span>
+<span class="nc" id="L96">                    } catch (InterruptedException x) {</span>
+<span class="nc" id="L97">                        x.printStackTrace(listener.error(&quot;Failed to delete &quot; + ws + &quot; on &quot; + node.getDisplayName()));</span>
+                    }
+                }
+            }
+        }
+<span class="nc" id="L102">    }</span>
+
+    private boolean shouldBeDeleted(@Nonnull TopLevelItem item, FilePath dir, @Nonnull Node n) throws IOException, InterruptedException {
+        // TODO: the use of remoting is not optimal.
+        // One remoting can execute &quot;exists&quot;, &quot;lastModified&quot;, and &quot;delete&quot; all at once.
+        // (Could even invert master loop so that one FileCallable takes care of all known items.)
+<span class="nc bnc" id="L108" title="All 2 branches missed.">        if(!dir.exists()) {</span>
+<span class="nc" id="L109">            LOGGER.log(Level.FINE, &quot;Directory {0} does not exist&quot;, dir);</span>
+<span class="nc" id="L110">            return false;</span>
+        }
+
+        // if younger than a month, keep it
+<span class="nc" id="L114">        long now = new Date().getTime();</span>
+<span class="nc bnc" id="L115" title="All 2 branches missed.">        if(dir.lastModified() + retainForDays * DAY &gt; now) {</span>
+<span class="nc" id="L116">            LOGGER.log(Level.FINE, &quot;Directory {0} is only {1} old, so not deleting&quot;, new Object[] {dir, Util.getTimeSpanString(now-dir.lastModified())});</span>
+<span class="nc" id="L117">            return false;</span>
+        }
+
+        // TODO could also be good to add checkbox that lets users configure a workspace to never be auto-cleaned.
+
+        // TODO check instead for SCMTriggerItem:
+<span class="nc bnc" id="L123" title="All 2 branches missed.">        if (item instanceof AbstractProject&lt;?,?&gt;) {</span>
+<span class="nc" id="L124">            AbstractProject&lt;?,?&gt; p = (AbstractProject&lt;?,?&gt;) item;</span>
+<span class="nc" id="L125">            Node lb = p.getLastBuiltOn();</span>
+<span class="nc" id="L126">            LOGGER.log(Level.FINER, &quot;Directory {0} is last built on {1}&quot;, new Object[] {dir, lb});</span>
+<span class="nc bnc" id="L127" title="All 4 branches missed.">            if(lb!=null &amp;&amp; lb.equals(n)) {</span>
+                // this is the active workspace. keep it.
+<span class="nc" id="L129">                LOGGER.log(Level.FINE, &quot;Directory {0} is the last workspace for {1}&quot;, new Object[] {dir, p});</span>
+<span class="nc" id="L130">                return false;</span>
+            }
+            
+<span class="nc bnc" id="L133" title="All 2 branches missed.">            if(!p.getScm().processWorkspaceBeforeDeletion((Job&lt;?, ?&gt;) p,dir,n)) {</span>
+<span class="nc" id="L134">                LOGGER.log(Level.FINE, &quot;Directory deletion of {0} is vetoed by SCM&quot;, dir);</span>
+<span class="nc" id="L135">                return false;</span>
+            }
+        }
+
+<span class="nc" id="L139">        LOGGER.log(Level.FINER, &quot;Going to delete directory {0}&quot;, dir);</span>
+<span class="nc" id="L140">        return true;</span>
+    }
+
+<span class="nc" id="L143">    private static final Logger LOGGER = Logger.getLogger(WorkspaceCleanupThread.class.getName());</span>
+
+    /**
+     * Can be used to disable workspace clean up.
+     */
+<span class="nc" id="L148">    public static boolean disabled = Boolean.getBoolean(WorkspaceCleanupThread.class.getName()+&quot;.disabled&quot;);</span>
+
+    /**
+     * How often the clean up should run. This is final as Jenkins will not reflect changes anyway.
+     */
+<span class="nc" id="L153">    public static final int recurrencePeriodHours = Integer.getInteger(WorkspaceCleanupThread.class.getName()+&quot;.recurrencePeriodHours&quot;, 24);</span>
+
+    /**
+     * Number of days workspaces should be retained.
+     */
+<span class="nc" id="L158">    public static int retainForDays = Integer.getInteger(WorkspaceCleanupThread.class.getName()+&quot;.retainForDays&quot;, 30);</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

@@ -1,0 +1,454 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>Items.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.model</a> &gt; <span class="el_source">Items.java</span></div><h1>Items.java</h1><pre class="source lang-java linenums"><span class="pc" id="L1">/*</span>
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc., Kohsuke Kawaguchi
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.model;
+
+import com.thoughtworks.xstream.XStream;
+import hudson.DescriptorExtensionList;
+import hudson.Extension;
+import hudson.XmlFile;
+import hudson.model.listeners.ItemListener;
+import hudson.remoting.Callable;
+import hudson.security.ACL;
+import hudson.security.AccessControlled;
+import hudson.triggers.Trigger;
+import hudson.util.DescriptorList;
+import hudson.util.EditDistance;
+import hudson.util.XStream2;
+import jenkins.model.Jenkins;
+import org.acegisecurity.Authentication;
+import org.apache.commons.lang.StringUtils;
+
+import java.io.File;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Stack;
+import java.util.StringTokenizer;
+import javax.annotation.CheckForNull;
+import javax.annotation.Nonnull;
+
+import jenkins.model.DirectlyModifiableTopLevelItemGroup;
+import org.apache.commons.io.FileUtils;
+
+/**
+ * Convenience methods related to {@link Item}.
+ * 
+ * @author Kohsuke Kawaguchi
+ */
+<span class="nc" id="L62">public class Items {</span>
+    /**
+     * List of all installed {@link TopLevelItem} types.
+     *
+     * @deprecated as of 1.286
+     *      Use {@link #all()} for read access and {@link Extension} for registration.
+     */
+    @Deprecated
+<span class="fc" id="L70">    public static final List&lt;TopLevelItemDescriptor&gt; LIST = (List)new DescriptorList&lt;TopLevelItem&gt;(TopLevelItem.class);</span>
+
+    /**
+     * Used to behave differently when loading posted configuration as opposed to persisted configuration.
+     * @see Trigger#start
+     * @since 1.482
+     */
+<span class="fc" id="L77">    private static final ThreadLocal&lt;Boolean&gt; updatingByXml = new ThreadLocal&lt;Boolean&gt;() {</span>
+        @Override protected Boolean initialValue() {
+<span class="nc" id="L79">            return false;</span>
+        }
+    };
+
+    /**
+     * Runs a block while making {@link #currentlyUpdatingByXml} be temporarily true.
+     * Use this when you are creating or changing an item.
+     * @param &lt;V&gt; a return value type (may be {@link Void})
+     * @param &lt;T&gt; an error type (may be {@link Error})
+     * @param callable a block, typically running {@link #load} or {@link Item#onLoad}
+     * @return whatever {@code callable} returned
+     * @throws T anything {@code callable} throws
+     * @since 1.546
+     */
+    public static &lt;V,T extends Throwable&gt; V whileUpdatingByXml(Callable&lt;V,T&gt; callable) throws T {
+<span class="nc" id="L94">        updatingByXml.set(true);</span>
+        try {
+<span class="nc" id="L96">            return callable.call();</span>
+<span class="nc" id="L97">        } finally {</span>
+<span class="nc" id="L98">            updatingByXml.set(false);</span>
+<span class="nc" id="L99">        }</span>
+    }
+
+    /**
+     * Checks whether we are in the middle of creating or configuring an item via XML.
+     * Used to determine the {@code newInstance} parameter for {@link Trigger#start}.
+     * @return true if {@link #whileUpdatingByXml} is currently being called, false for example when merely starting Jenkins or reloading from disk
+     * @since 1.546
+     */
+    public static boolean currentlyUpdatingByXml() {
+<span class="nc" id="L109">        return updatingByXml.get();</span>
+    }
+
+    /**
+     * Returns all the registered {@link TopLevelItemDescriptor}s.
+     */
+    public static DescriptorExtensionList&lt;TopLevelItem,TopLevelItemDescriptor&gt; all() {
+<span class="nc" id="L116">        return Jenkins.getInstance().&lt;TopLevelItem,TopLevelItemDescriptor&gt;getDescriptorList(TopLevelItem.class);</span>
+    }
+
+    /**
+     * Returns all the registered {@link TopLevelItemDescriptor}s that the current security principal is allowed to
+     * create within the specified item group.
+     *
+     * @since TODO
+     */
+    public static List&lt;TopLevelItemDescriptor&gt; all(ItemGroup c) {
+<span class="nc" id="L126">        return all(Jenkins.getAuthentication(), c);</span>
+    }
+
+    /**
+     * Returns all the registered {@link TopLevelItemDescriptor}s that the specified security principal is allowed to
+     * create within the specified item group.
+     *
+     * @since TODO
+     */
+    public static List&lt;TopLevelItemDescriptor&gt; all(Authentication a, ItemGroup c) {
+<span class="nc" id="L136">        List&lt;TopLevelItemDescriptor&gt; result = new ArrayList&lt;TopLevelItemDescriptor&gt;();</span>
+        ACL acl;
+<span class="nc bnc" id="L138" title="All 2 branches missed.">        if (c instanceof AccessControlled) {</span>
+<span class="nc" id="L139">            acl = ((AccessControlled) c).getACL();</span>
+<span class="nc" id="L140">        } else {</span>
+            // fall back to root
+<span class="nc" id="L142">            acl = Jenkins.getInstance().getACL();</span>
+        }
+<span class="nc bnc" id="L144" title="All 2 branches missed.">        for (TopLevelItemDescriptor d: all()) {</span>
+<span class="nc bnc" id="L145" title="All 4 branches missed.">            if (acl.hasCreatePermission(a, c, d) &amp;&amp; d.isApplicableIn(c)) {</span>
+<span class="nc" id="L146">                result.add(d);</span>
+            }
+        }
+<span class="nc" id="L149">        return result;</span>
+    }
+
+    /**
+     * @deprecated Underspecified what the parameter is. {@link Descriptor#getId}? A {@link Describable} class name?
+     */
+    public static TopLevelItemDescriptor getDescriptor(String fqcn) {
+<span class="nc" id="L156">        return Descriptor.find(all(), fqcn);</span>
+    }
+
+    /**
+     * Converts a list of items into a comma-separated list of full names.
+     */
+    public static String toNameList(Collection&lt;? extends Item&gt; items) {
+<span class="nc" id="L163">        StringBuilder buf = new StringBuilder();</span>
+<span class="nc bnc" id="L164" title="All 2 branches missed.">        for (Item item : items) {</span>
+<span class="nc bnc" id="L165" title="All 2 branches missed.">            if(buf.length()&gt;0)</span>
+<span class="nc" id="L166">                buf.append(&quot;, &quot;);</span>
+<span class="nc" id="L167">            buf.append(item.getFullName());</span>
+        }
+<span class="nc" id="L169">        return buf.toString();</span>
+    }
+
+    /**
+     * @deprecated as of 1.406
+     *      Use {@link #fromNameList(ItemGroup, String, Class)}
+     */
+    @Deprecated
+    public static &lt;T extends Item&gt; List&lt;T&gt; fromNameList(String list, Class&lt;T&gt; type) {
+<span class="nc" id="L178">        return fromNameList(null,list,type);</span>
+    }
+
+    /**
+     * Does the opposite of {@link #toNameList(Collection)}.
+     */
+    public static &lt;T extends Item&gt; List&lt;T&gt; fromNameList(ItemGroup context, @Nonnull String list, @Nonnull Class&lt;T&gt; type) {
+<span class="nc" id="L185">        Jenkins hudson = Jenkins.getInstance();</span>
+
+<span class="nc" id="L187">        List&lt;T&gt; r = new ArrayList&lt;T&gt;();</span>
+<span class="nc" id="L188">        StringTokenizer tokens = new StringTokenizer(list,&quot;,&quot;);</span>
+<span class="nc bnc" id="L189" title="All 2 branches missed.">        while(tokens.hasMoreTokens()) {</span>
+<span class="nc" id="L190">            String fullName = tokens.nextToken().trim();</span>
+<span class="nc" id="L191">            T item = hudson.getItem(fullName, context, type);</span>
+<span class="nc bnc" id="L192" title="All 2 branches missed.">            if(item!=null)</span>
+<span class="nc" id="L193">                r.add(item);</span>
+        }
+<span class="nc" id="L195">        return r;</span>
+    }
+
+    /**
+     * Computes the canonical full name of a relative path in an {@link ItemGroup} context, handling relative
+     * positions &quot;..&quot; and &quot;.&quot; as absolute path starting with &quot;/&quot;. The resulting name is the item fullName from Jenkins
+     * root.
+     */
+    public static String getCanonicalName(ItemGroup context, String path) {
+<span class="fc" id="L204">        String[] c = context.getFullName().split(&quot;/&quot;);</span>
+<span class="fc" id="L205">        String[] p = path.split(&quot;/&quot;);</span>
+
+<span class="fc" id="L207">        Stack&lt;String&gt; name = new Stack&lt;String&gt;();</span>
+<span class="fc bfc" id="L208" title="All 2 branches covered.">        for (int i=0; i&lt;c.length;i++) {</span>
+<span class="fc bfc" id="L209" title="All 4 branches covered.">            if (i==0 &amp;&amp; c[i].equals(&quot;&quot;)) continue;</span>
+<span class="fc" id="L210">            name.push(c[i]);</span>
+        }
+<span class="fc bfc" id="L212" title="All 2 branches covered.">        for (int i=0; i&lt;p.length;i++) {</span>
+<span class="fc bfc" id="L213" title="All 4 branches covered.">            if (i==0 &amp;&amp; p[i].equals(&quot;&quot;)) {</span>
+                // Absolute path starting with a &quot;/&quot;
+<span class="fc" id="L215">                name.clear();</span>
+<span class="fc" id="L216">                continue;</span>
+            }
+<span class="fc bfc" id="L218" title="All 2 branches covered.">            if (p[i].equals(&quot;..&quot;)) {</span>
+<span class="fc bfc" id="L219" title="All 2 branches covered.">                if (name.size() == 0) {</span>
+<span class="fc" id="L220">                    throw new IllegalArgumentException(String.format(</span>
+<span class="fc" id="L221">                            &quot;Illegal relative path '%s' within context '%s'&quot;, path, context.getFullName()</span>
+                    ));
+                }
+<span class="fc" id="L224">                name.pop();</span>
+<span class="fc" id="L225">                continue;</span>
+            }
+<span class="fc bfc" id="L227" title="All 2 branches covered.">            if (p[i].equals(&quot;.&quot;)) {</span>
+<span class="fc" id="L228">                continue;</span>
+            }
+<span class="fc" id="L230">            name.push(p[i]);</span>
+        }
+<span class="fc" id="L232">        return StringUtils.join(name, '/');</span>
+    }
+
+    /**
+     * Computes the relative name of list of items after a rename or move occurred.
+     * Used to manage job references as names in plugins to support {@link hudson.model.listeners.ItemListener#onLocationChanged}.
+     * &lt;p&gt;
+     * In a hierarchical context, when a plugin has a reference to a job as &lt;code&gt;../foo/bar&lt;/code&gt; this method will
+     * handle the relative path as &quot;foo&quot; is renamed to &quot;zot&quot; to compute &lt;code&gt;../zot/bar&lt;/code&gt;
+     *
+     * @param oldFullName the old full name of the item
+     * @param newFullName the new full name of the item
+     * @param relativeNames coma separated list of Item relative names
+     * @param context the {link ItemGroup} relative names refer to
+     * @return relative name for the renamed item, based on the same ItemGroup context
+     */
+    public static String computeRelativeNamesAfterRenaming(String oldFullName, String newFullName, String relativeNames, ItemGroup context) {
+
+<span class="fc" id="L250">        StringTokenizer tokens = new StringTokenizer(relativeNames,&quot;,&quot;);</span>
+<span class="fc" id="L251">        List&lt;String&gt; newValue = new ArrayList&lt;String&gt;();</span>
+<span class="fc bfc" id="L252" title="All 2 branches covered.">        while(tokens.hasMoreTokens()) {</span>
+<span class="fc" id="L253">            String relativeName = tokens.nextToken().trim();</span>
+<span class="fc" id="L254">            String canonicalName = getCanonicalName(context, relativeName);</span>
+<span class="fc bfc" id="L255" title="All 4 branches covered.">            if (canonicalName.equals(oldFullName) || canonicalName.startsWith(oldFullName+'/')) {</span>
+<span class="fc" id="L256">                String newCanonicalName = newFullName + canonicalName.substring(oldFullName.length());</span>
+<span class="fc bfc" id="L257" title="All 2 branches covered.">                if (relativeName.startsWith(&quot;/&quot;)) {</span>
+<span class="fc" id="L258">                    newValue.add(&quot;/&quot; + newCanonicalName);</span>
+<span class="fc" id="L259">                } else {</span>
+<span class="fc" id="L260">                    newValue.add(getRelativeNameFrom(newCanonicalName, context.getFullName()));</span>
+                }
+<span class="fc" id="L262">            } else {</span>
+<span class="fc" id="L263">                newValue.add(relativeName);</span>
+            }
+        }
+<span class="fc" id="L266">        return StringUtils.join(newValue, &quot;,&quot;);</span>
+    }
+
+    // Had difficulty adapting the version in Functions to use no live items, so rewrote it:
+    static String getRelativeNameFrom(String itemFullName, String groupFullName) {
+<span class="pc bpc" id="L271" title="1 of 2 branches missed.">        String[] itemFullNameA = itemFullName.isEmpty() ? new String[0] : itemFullName.split(&quot;/&quot;);</span>
+<span class="fc bfc" id="L272" title="All 2 branches covered.">        String[] groupFullNameA = groupFullName.isEmpty() ? new String[0] : groupFullName.split(&quot;/&quot;);</span>
+<span class="fc" id="L273">        for (int i = 0; ; i++) {</span>
+<span class="fc bfc" id="L274" title="All 2 branches covered.">            if (i == itemFullNameA.length) {</span>
+<span class="fc bfc" id="L275" title="All 2 branches covered.">                if (i == groupFullNameA.length) {</span>
+                    // itemFullName and groupFullName are identical
+<span class="fc" id="L277">                    return &quot;.&quot;;</span>
+                } else {
+                    // itemFullName is an ancestor of groupFullName; insert ../ for rest of groupFullName
+<span class="fc" id="L280">                    StringBuilder b = new StringBuilder();</span>
+<span class="fc bfc" id="L281" title="All 2 branches covered.">                    for (int j = 0; j &lt; groupFullNameA.length - itemFullNameA.length; j++) {</span>
+<span class="fc bfc" id="L282" title="All 2 branches covered.">                        if (j &gt; 0) {</span>
+<span class="fc" id="L283">                            b.append('/');</span>
+                        }
+<span class="fc" id="L285">                        b.append(&quot;..&quot;);</span>
+                    }
+<span class="fc" id="L287">                    return b.toString();</span>
+                }
+<span class="fc bfc" id="L289" title="All 2 branches covered.">            } else if (i == groupFullNameA.length) {</span>
+                // groupFullName is an ancestor of itemFullName; insert rest of itemFullName
+<span class="fc" id="L291">                StringBuilder b = new StringBuilder();</span>
+<span class="fc bfc" id="L292" title="All 2 branches covered.">                for (int j = i; j &lt; itemFullNameA.length; j++) {</span>
+<span class="fc bfc" id="L293" title="All 2 branches covered.">                    if (j &gt; i) {</span>
+<span class="fc" id="L294">                        b.append('/');</span>
+                    }
+<span class="fc" id="L296">                    b.append(itemFullNameA[j]);</span>
+                }
+<span class="fc" id="L298">                return b.toString();</span>
+<span class="fc bfc" id="L299" title="All 2 branches covered.">            } else if (itemFullNameA[i].equals(groupFullNameA[i])) {</span>
+                // identical up to this point
+<span class="fc" id="L301">                continue;</span>
+            } else {
+                // first mismatch; insert ../ for rest of groupFullName, then rest of itemFullName
+<span class="fc" id="L304">                StringBuilder b = new StringBuilder();</span>
+<span class="fc bfc" id="L305" title="All 2 branches covered.">                for (int j = i; j &lt; groupFullNameA.length; j++) {</span>
+<span class="pc bpc" id="L306" title="1 of 2 branches missed.">                    if (j &gt; i) {</span>
+<span class="nc" id="L307">                        b.append('/');</span>
+                    }
+<span class="fc" id="L309">                    b.append(&quot;..&quot;);</span>
+                }
+<span class="fc bfc" id="L311" title="All 2 branches covered.">                for (int j = i; j &lt; itemFullNameA.length; j++) {</span>
+<span class="fc" id="L312">                    b.append('/').append(itemFullNameA[j]);</span>
+                }
+<span class="fc" id="L314">                return b.toString();</span>
+            }
+        }
+    }
+
+    /**
+     * Loads a {@link Item} from a config file.
+     *
+     * @param dir
+     *      The directory that contains the config file, not the config file itself.
+     */
+    public static Item load(ItemGroup parent, File dir) throws IOException {
+<span class="nc" id="L326">        Item item = (Item)getConfigFile(dir).read();</span>
+<span class="nc" id="L327">        item.onLoad(parent,dir.getName());</span>
+<span class="nc" id="L328">        return item;</span>
+    }
+
+    /**
+     * The file we save our configuration.
+     */
+    public static XmlFile getConfigFile(File dir) {
+<span class="nc" id="L335">        return new XmlFile(XSTREAM,new File(dir,&quot;config.xml&quot;));</span>
+    }
+
+    /**
+     * The file we save our configuration.
+     */
+    public static XmlFile getConfigFile(Item item) {
+<span class="nc" id="L342">        return getConfigFile(item.getRootDir());</span>
+    }
+    
+    /**
+     * Gets all the {@link Item}s recursively in the {@link ItemGroup} tree
+     * and filter them by the given type.
+     * 
+     * @since 1.512
+     */
+    public static &lt;T extends Item&gt; List&lt;T&gt; getAllItems(final ItemGroup root, Class&lt;T&gt; type) {
+<span class="nc" id="L352">        List&lt;T&gt; r = new ArrayList&lt;T&gt;();</span>
+<span class="nc" id="L353">        getAllItems(root, type, r);</span>
+<span class="nc" id="L354">        return r;</span>
+    }
+    private static &lt;T extends Item&gt; void getAllItems(final ItemGroup root, Class&lt;T&gt; type, List&lt;T&gt; r) {
+<span class="nc" id="L357">        List&lt;Item&gt; items = new ArrayList&lt;Item&gt;(((ItemGroup&lt;?&gt;) root).getItems());</span>
+<span class="nc" id="L358">        Collections.sort(items, new Comparator&lt;Item&gt;() {</span>
+            @Override public int compare(Item i1, Item i2) {
+<span class="nc" id="L360">                return name(i1).compareToIgnoreCase(name(i2));</span>
+            }
+            String name(Item i) {
+<span class="nc" id="L363">                String n = i.getName();</span>
+<span class="nc bnc" id="L364" title="All 2 branches missed.">                if (i instanceof ItemGroup) {</span>
+<span class="nc" id="L365">                    n += '/';</span>
+                }
+<span class="nc" id="L367">                return n;</span>
+            }
+        });
+<span class="nc bnc" id="L370" title="All 2 branches missed.">        for (Item i : items) {</span>
+<span class="nc bnc" id="L371" title="All 2 branches missed.">            if (type.isInstance(i)) {</span>
+<span class="nc bnc" id="L372" title="All 2 branches missed.">                if (i.hasPermission(Item.READ)) {</span>
+<span class="nc" id="L373">                    r.add(type.cast(i));</span>
+                }
+            }
+<span class="nc bnc" id="L376" title="All 2 branches missed.">            if (i instanceof ItemGroup) {</span>
+<span class="nc" id="L377">                getAllItems((ItemGroup) i, type, r);</span>
+            }
+        }
+<span class="nc" id="L380">    }</span>
+
+    /**
+     * Finds an item whose name (when referenced from the specified context) is closest to the given name.
+     * @param &lt;T&gt; the type of item being considered
+     * @param type same as {@code T}
+     * @param name the supplied name
+     * @param context a context to start from (used to compute relative names)
+     * @return the closest available item
+     * @since 1.538
+     */
+    public static @CheckForNull &lt;T extends Item&gt; T findNearest(Class&lt;T&gt; type, String name, ItemGroup context) {
+<span class="nc" id="L392">        List&lt;T&gt; projects = Jenkins.getInstance().getAllItems(type);</span>
+<span class="nc" id="L393">        String[] names = new String[projects.size()];</span>
+<span class="nc bnc" id="L394" title="All 2 branches missed.">        for (int i = 0; i &lt; projects.size(); i++) {</span>
+<span class="nc" id="L395">            names[i] = projects.get(i).getRelativeNameFrom(context);</span>
+        }
+<span class="nc" id="L397">        String nearest = EditDistance.findNearest(name, names);</span>
+<span class="nc" id="L398">        return Jenkins.getInstance().getItem(nearest, context, type);</span>
+    }
+
+    /**
+     * Moves an item between folders (or top level).
+     * Fires all relevant events but does not verify that the item’s directory is not currently being used in some way (for example by a running build).
+     * Does not check any permissions.
+     * @param item some item (job or folder)
+     * @param destination the destination of the move (a folder or {@link Jenkins}); not the current parent (or you could just call {@link AbstractItem#renameTo})
+     * @return the new item (usually the same object as {@code item})
+     * @throws IOException if the move fails, or some subsequent step fails (directory might have already been moved)
+     * @throws IllegalArgumentException if the move would really be a rename, or the destination cannot accept the item, or the destination already has an item of that name
+     * @since 1.548
+     */
+    public static &lt;I extends AbstractItem &amp; TopLevelItem&gt; I move(I item, DirectlyModifiableTopLevelItemGroup destination) throws IOException, IllegalArgumentException {
+<span class="nc" id="L413">        DirectlyModifiableTopLevelItemGroup oldParent = (DirectlyModifiableTopLevelItemGroup) item.getParent();</span>
+<span class="nc bnc" id="L414" title="All 2 branches missed.">        if (oldParent == destination) {</span>
+<span class="nc" id="L415">            throw new IllegalArgumentException();</span>
+        }
+        // TODO verify that destination is to not equal to, or inside, item
+<span class="nc bnc" id="L418" title="All 2 branches missed.">        if (!destination.canAdd(item)) {</span>
+<span class="nc" id="L419">            throw new IllegalArgumentException();</span>
+        }
+<span class="nc" id="L421">        String name = item.getName();</span>
+<span class="nc bnc" id="L422" title="All 2 branches missed.">        if (destination.getItem(name) != null) {</span>
+<span class="nc" id="L423">            throw new IllegalArgumentException(name + &quot; already exists&quot;);</span>
+        }
+<span class="nc" id="L425">        String oldFullName = item.getFullName();</span>
+        // TODO AbstractItem.renameTo has a more baroque implementation; factor it out into a utility method perhaps?
+<span class="nc" id="L427">        File destDir = destination.getRootDirFor(item);</span>
+<span class="nc" id="L428">        FileUtils.forceMkdir(destDir.getParentFile());</span>
+<span class="nc" id="L429">        FileUtils.moveDirectory(item.getRootDir(), destDir);</span>
+<span class="nc" id="L430">        oldParent.remove(item);</span>
+<span class="nc" id="L431">        I newItem = destination.add(item, name);</span>
+<span class="nc" id="L432">        item.movedTo(destination, newItem, destDir);</span>
+<span class="nc" id="L433">        ItemListener.fireLocationChange(newItem, oldFullName);</span>
+<span class="nc" id="L434">        return newItem;</span>
+    }
+
+    /**
+     * Used to load/save job configuration.
+     *
+     * When you extend {@link Job} in a plugin, try to put the alias so
+     * that it produces a reasonable XML.
+     */
+<span class="fc" id="L443">    public static final XStream XSTREAM = new XStream2();</span>
+
+    /**
+     * Alias to {@link #XSTREAM} so that one can access additional methods on {@link XStream2} more easily.
+     */
+<span class="fc" id="L448">    public static final XStream2 XSTREAM2 = (XStream2)XSTREAM;</span>
+
+    static {
+<span class="fc" id="L451">        XSTREAM.alias(&quot;project&quot;,FreeStyleProject.class);</span>
+<span class="fc" id="L452">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

@@ -1,0 +1,403 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>Search.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.search</a> &gt; <span class="el_source">Search.java</span></div><h1>Search.java</h1><pre class="source lang-java linenums"><span class="pc" id="L1">/*</span>
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2011, Sun Microsystems, Inc., Kohsuke Kawaguchi,
+ * Yahoo!, Inc.
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.search;
+
+import static javax.servlet.http.HttpServletResponse.SC_NOT_FOUND;
+import hudson.Util;
+import hudson.util.EditDistance;
+
+import java.io.IOException;
+import java.util.AbstractList;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+import javax.servlet.ServletException;
+
+import org.kohsuke.stapler.Ancestor;
+import org.kohsuke.stapler.QueryParameter;
+import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.StaplerResponse;
+import org.kohsuke.stapler.export.DataWriter;
+import org.kohsuke.stapler.export.Exported;
+import org.kohsuke.stapler.export.ExportedBean;
+import org.kohsuke.stapler.export.Flavor;
+
+/**
+ * Web-bound object that provides search/navigation capability.
+ *
+ * &lt;p&gt;
+ * This object is bound to &quot;./search&quot; of a model object via {@link SearchableModelObject} and serves
+ * HTTP requests coming from JavaScript to provide search result and auto-completion.
+ *
+ * @author Kohsuke Kawaguchi
+ * @see SearchableModelObject
+ */
+<span class="nc" id="L62">public class Search {</span>
+    public void doIndex(StaplerRequest req, StaplerResponse rsp) throws IOException, ServletException {
+<span class="nc" id="L64">        List&lt;Ancestor&gt; l = req.getAncestors();</span>
+<span class="nc bnc" id="L65" title="All 2 branches missed.">        for( int i=l.size()-1; i&gt;=0; i-- ) {</span>
+<span class="nc" id="L66">            Ancestor a = l.get(i);</span>
+<span class="nc bnc" id="L67" title="All 2 branches missed.">            if (a.getObject() instanceof SearchableModelObject) {</span>
+<span class="nc" id="L68">                SearchableModelObject smo = (SearchableModelObject) a.getObject();</span>
+<span class="nc bnc" id="L69" title="All 2 branches missed.">                if(LOGGER.isLoggable(Level.FINE)){</span>
+<span class="nc" id="L70">                    LOGGER.fine(String.format(&quot;smo.displayName=%s, searchName=%s&quot;,smo.getDisplayName(), smo.getSearchName()));</span>
+                }
+
+<span class="nc" id="L73">                SearchIndex index = smo.getSearchIndex();</span>
+<span class="nc" id="L74">                String query = req.getParameter(&quot;q&quot;);</span>
+<span class="nc bnc" id="L75" title="All 2 branches missed.">                if(query!=null) {</span>
+<span class="nc" id="L76">                    SuggestedItem target = find(index, query, smo);</span>
+<span class="nc bnc" id="L77" title="All 2 branches missed.">                    if(target!=null) {</span>
+                        // found
+<span class="nc" id="L79">                        rsp.sendRedirect2(req.getContextPath()+target.getUrl());</span>
+<span class="nc" id="L80">                        return;</span>
+                    }
+                }
+            }
+        }
+
+        // no exact match. show the suggestions
+<span class="nc" id="L87">        rsp.setStatus(SC_NOT_FOUND);</span>
+<span class="nc" id="L88">        req.getView(this,&quot;search-failed.jelly&quot;).forward(req,rsp);</span>
+<span class="nc" id="L89">    }</span>
+
+    /**
+     * Used by OpenSearch auto-completion. Returns JSON array of the form:
+     *
+     * &lt;pre&gt;
+     * [&quot;queryString&quot;,[&quot;comp1&quot;,&quot;comp2&quot;,...]]
+     * &lt;/pre&gt;
+     *
+     * See http://developer.mozilla.org/en/docs/Supporting_search_suggestions_in_search_plugins
+     */
+    public void doSuggestOpenSearch(StaplerRequest req, StaplerResponse rsp, @QueryParameter String q) throws IOException, ServletException {
+<span class="nc" id="L101">        rsp.setContentType(Flavor.JSON.contentType);</span>
+<span class="nc" id="L102">        DataWriter w = Flavor.JSON.createDataWriter(null, rsp);</span>
+<span class="nc" id="L103">        w.startArray();</span>
+<span class="nc" id="L104">        w.value(q);</span>
+
+<span class="nc" id="L106">        w.startArray();</span>
+<span class="nc bnc" id="L107" title="All 2 branches missed.">        for (SuggestedItem item : getSuggestions(req, q))</span>
+<span class="nc" id="L108">            w.value(item.getPath());</span>
+<span class="nc" id="L109">        w.endArray();</span>
+<span class="nc" id="L110">        w.endArray();</span>
+<span class="nc" id="L111">    }</span>
+
+    /**
+     * Used by search box auto-completion. Returns JSON array.
+     */
+    public void doSuggest(StaplerRequest req, StaplerResponse rsp, @QueryParameter String query) throws IOException, ServletException {
+<span class="nc" id="L117">        Result r = new Result();</span>
+<span class="nc bnc" id="L118" title="All 2 branches missed.">        for (SuggestedItem item : getSuggestions(req, query))</span>
+<span class="nc" id="L119">            r.suggestions.add(new Item(item.getPath()));</span>
+
+<span class="nc" id="L121">        rsp.serveExposedBean(req,r,Flavor.JSON);</span>
+<span class="nc" id="L122">    }</span>
+
+    /**
+     * Gets the list of suggestions that match the given query.
+     *
+     * @return
+     *      can be empty but never null. The size of the list is always smaller than
+     *      a certain threshold to avoid showing too many options. 
+     */
+    public SearchResult getSuggestions(StaplerRequest req, String query) {
+<span class="nc" id="L132">        Set&lt;String&gt; paths = new HashSet&lt;String&gt;();  // paths already added, to control duplicates</span>
+<span class="nc" id="L133">        SearchResultImpl r = new SearchResultImpl();</span>
+<span class="nc bnc" id="L134" title="All 2 branches missed.">        int max = req.hasParameter(&quot;max&quot;) ? Integer.parseInt(req.getParameter(&quot;max&quot;)) : 20;</span>
+<span class="nc" id="L135">        SearchableModelObject smo = findClosestSearchableModelObject(req);</span>
+<span class="nc bnc" id="L136" title="All 2 branches missed.">        for (SuggestedItem i : suggest(makeSuggestIndex(req), query, smo)) {</span>
+<span class="nc bnc" id="L137" title="All 2 branches missed.">            if(r.size()&gt;=max) {</span>
+<span class="nc" id="L138">                r.hasMoreResults = true;</span>
+<span class="nc" id="L139">                break;</span>
+            }
+<span class="nc bnc" id="L141" title="All 2 branches missed.">            if(paths.add(i.getPath()))</span>
+<span class="nc" id="L142">                r.add(i);</span>
+        }
+<span class="nc" id="L144">        return r;</span>
+    }
+
+    private SearchableModelObject findClosestSearchableModelObject(StaplerRequest req) {
+<span class="nc" id="L148">        List&lt;Ancestor&gt; l = req.getAncestors();</span>
+<span class="nc bnc" id="L149" title="All 2 branches missed.">        for( int i=l.size()-1; i&gt;=0; i-- ) {</span>
+<span class="nc" id="L150">            Ancestor a = l.get(i);</span>
+<span class="nc bnc" id="L151" title="All 2 branches missed.">            if (a.getObject() instanceof SearchableModelObject) {</span>
+<span class="nc" id="L152">                return (SearchableModelObject)a.getObject();</span>
+            }
+        }
+<span class="nc" id="L155">        return null;</span>
+    }
+
+    /**
+     * Creates merged search index for suggestion.
+     */
+    private SearchIndex makeSuggestIndex(StaplerRequest req) {
+<span class="nc" id="L162">        SearchIndexBuilder builder = new SearchIndexBuilder();</span>
+<span class="nc bnc" id="L163" title="All 2 branches missed.">        for (Ancestor a : req.getAncestors()) {</span>
+<span class="nc bnc" id="L164" title="All 2 branches missed.">            if (a.getObject() instanceof SearchableModelObject) {</span>
+<span class="nc" id="L165">                SearchableModelObject smo = (SearchableModelObject) a.getObject();</span>
+<span class="nc" id="L166">                builder.add(smo.getSearchIndex());</span>
+            }
+        }
+<span class="nc" id="L169">        return builder.make();</span>
+    }
+
+<span class="nc" id="L172">    private static class SearchResultImpl extends ArrayList&lt;SuggestedItem&gt; implements SearchResult {</span>
+
+<span class="nc" id="L174">        private boolean hasMoreResults = false;</span>
+
+        public boolean hasMoreResults() {
+<span class="nc" id="L177">            return hasMoreResults;</span>
+        }
+    }
+
+    @ExportedBean
+<span class="nc" id="L182">    public static class Result {</span>
+        @Exported
+<span class="nc" id="L184">        public List&lt;Item&gt; suggestions = new ArrayList&lt;Item&gt;();</span>
+    }
+
+    @ExportedBean(defaultVisibility=999)
+    public static class Item {
+        @Exported
+        public String name;
+
+<span class="nc" id="L192">        public Item(String name) {</span>
+<span class="nc" id="L193">            this.name = name;</span>
+<span class="nc" id="L194">        }</span>
+    }
+
+<span class="fc" id="L197">    private enum Mode {</span>
+<span class="fc" id="L198">        FIND {</span>
+            void find(SearchIndex index, String token, List&lt;SearchItem&gt; result) {
+<span class="fc" id="L200">                index.find(token, result);</span>
+<span class="fc" id="L201">            }</span>
+        },
+<span class="fc" id="L203">        SUGGEST {</span>
+            void find(SearchIndex index, String token, List&lt;SearchItem&gt; result) {
+<span class="fc" id="L205">                index.suggest(token, result);</span>
+<span class="fc" id="L206">            }</span>
+        };
+
+        abstract void find(SearchIndex index, String token, List&lt;SearchItem&gt; result);
+
+    }
+
+    /**
+     * When there are mutiple suggested items, this method can narrow down the resultset
+     * to the SuggestedItem that has a url that contains the query. This is useful is one
+     * job has a display name that matches another job's project name.
+     * @param r A list of Suggested items. It is assumed that there is at least one 
+     * SuggestedItem in r.
+     * @param query A query string
+     * @return Returns the SuggestedItem which has a search url that contains the query.
+     * If no SuggestedItems have a search url which contains the query, then the first
+     * SuggestedItem in the List is returned.
+     */
+    static SuggestedItem findClosestSuggestedItem(List&lt;SuggestedItem&gt; r, String query) {
+<span class="fc bfc" id="L225" title="All 2 branches covered.">        for(SuggestedItem curItem : r) {</span>
+<span class="pc bpc" id="L226" title="1 of 2 branches missed.">            if(LOGGER.isLoggable(Level.FINE)) {</span>
+<span class="nc" id="L227">                LOGGER.fine(String.format(&quot;item's searchUrl:%s;query=%s&quot;, curItem.item.getSearchUrl(), query));</span>
+            }
+<span class="fc bfc" id="L229" title="All 2 branches covered.">            if(curItem.item.getSearchUrl().contains(Util.rawEncode(query))) {</span>
+<span class="fc" id="L230">                return curItem;</span>
+            }
+        }
+        
+        // couldn't find an item with the query in the url so just
+        // return the first one
+<span class="fc" id="L236">        return r.get(0);        </span>
+    }
+    
+    /**
+     * @deprecated Use {@link Search#find(SearchIndex, String, SearchableModelObject)} instead.
+     */
+    @Deprecated
+    public static SuggestedItem find(SearchIndex index, String query) {
+<span class="fc" id="L244">        return find(index, query, null);</span>
+    }
+    
+    /**
+     * Performs a search and returns the match, or null if no match was found
+     * or more than one match was found.
+     * @since 1.527
+     */
+    public static SuggestedItem find(SearchIndex index, String query, SearchableModelObject searchContext) {
+<span class="fc" id="L253">        List&lt;SuggestedItem&gt; r = find(Mode.FIND, index, query, searchContext);</span>
+<span class="pc bpc" id="L254" title="1 of 2 branches missed.">        if(r.isEmpty()){ </span>
+<span class="nc" id="L255">            return null;</span>
+        }
+<span class="pc bpc" id="L257" title="1 of 2 branches missed.">        else if(1==r.size()){</span>
+<span class="fc" id="L258">            return r.get(0);</span>
+        }
+        else  {
+            // we have more than one suggested item, so return the item who's url
+            // contains the query as this is probably the job's name
+<span class="nc" id="L263">            return findClosestSuggestedItem(r, query);</span>
+        }
+                    
+    }
+
+    /**
+     * @deprecated use {@link Search#suggest(SearchIndex, String, SearchableModelObject)} instead. 
+     */
+    @Deprecated
+    public static List&lt;SuggestedItem&gt; suggest(SearchIndex index, final String tokenList) {
+<span class="fc" id="L273">        return suggest(index, tokenList, null);</span>
+    }
+
+    /**
+     * @since 1.527
+     */
+    public static List&lt;SuggestedItem&gt; suggest(SearchIndex index, final String tokenList, SearchableModelObject searchContext) {
+
+        class Tag implements Comparable&lt;Tag&gt;{
+            final SuggestedItem item;
+            final int distance;
+            /** If the path to this suggestion starts with the token list, 1. Otherwise 0. */
+            final int prefixMatch;
+
+<span class="fc" id="L287">            Tag(SuggestedItem i) {</span>
+<span class="fc" id="L288">                item = i;</span>
+<span class="fc" id="L289">                distance = EditDistance.editDistance(i.getPath(),tokenList);</span>
+<span class="pc bpc" id="L290" title="1 of 2 branches missed.">                prefixMatch = i.getPath().startsWith(tokenList)?1:0;</span>
+<span class="fc" id="L291">            }</span>
+
+            public int compareTo(Tag that) {
+<span class="fc" id="L294">                int r = this.prefixMatch -that.prefixMatch;</span>
+<span class="pc bpc" id="L295" title="1 of 2 branches missed.">                if(r!=0)    return -r;  // ones with head match should show up earlier</span>
+<span class="fc" id="L296">                return this.distance-that.distance;</span>
+            }
+        }
+
+<span class="fc" id="L300">        List&lt;Tag&gt; buf = new ArrayList&lt;Tag&gt;();</span>
+<span class="fc" id="L301">        List&lt;SuggestedItem&gt; items = find(Mode.SUGGEST, index, tokenList, searchContext);</span>
+
+        // sort them
+<span class="fc bfc" id="L304" title="All 2 branches covered.">        for( SuggestedItem i : items)</span>
+<span class="fc" id="L305">            buf.add(new Tag(i));</span>
+<span class="fc" id="L306">        Collections.sort(buf);</span>
+<span class="fc" id="L307">        items.clear();</span>
+<span class="fc bfc" id="L308" title="All 2 branches covered.">        for (Tag t : buf)</span>
+<span class="fc" id="L309">            items.add(t.item);</span>
+
+<span class="fc" id="L311">        return items;</span>
+    }
+
+    static final class TokenList {
+        private final String[] tokens;
+
+<span class="fc" id="L317">        private final static String[] EMPTY = new String[0];</span>
+
+<span class="fc" id="L319">        public TokenList(String tokenList) {</span>
+<span class="pc bpc" id="L320" title="1 of 2 branches missed.">            tokens = tokenList!=null ? tokenList.split(&quot;(?&lt;=\\s)(?=\\S)&quot;) : EMPTY;</span>
+<span class="fc" id="L321">        }</span>
+
+<span class="fc" id="L323">        public int length() { return tokens.length; }</span>
+
+        /**
+         * Returns {@link List} such that its &lt;tt&gt;get(end)&lt;/tt&gt;
+         * returns the concatanation of [token_start,...,token_end]
+         * (both end inclusive.)
+         */
+        public List&lt;String&gt; subSequence(final int start) {
+<span class="fc" id="L331">            return new AbstractList&lt;String&gt;() {</span>
+                public String get(int index) {
+<span class="fc" id="L333">                    StringBuilder buf = new StringBuilder();</span>
+<span class="fc bfc" id="L334" title="All 2 branches covered.">                    for(int i=start; i&lt;=start+index; i++ )</span>
+<span class="fc" id="L335">                        buf.append(tokens[i]);</span>
+<span class="fc" id="L336">                    return buf.toString().trim();</span>
+                }
+
+                public int size() {
+<span class="fc" id="L340">                    return tokens.length-start;</span>
+                }
+            };
+        }
+        
+        
+        public String toString() {
+<span class="nc" id="L347">            StringBuilder s = new StringBuilder(&quot;TokenList{&quot;);</span>
+<span class="nc bnc" id="L348" title="All 2 branches missed.">            for(String token : tokens) {</span>
+<span class="nc" id="L349">                s.append(token);</span>
+<span class="nc" id="L350">                s.append(&quot;,&quot;);</span>
+            }
+<span class="nc" id="L352">            s.append('}');</span>
+            
+<span class="nc" id="L354">            return s.toString();</span>
+        }
+    }
+
+    private static List&lt;SuggestedItem&gt; find(Mode m, SearchIndex index, String tokenList, SearchableModelObject searchContext) {
+<span class="fc" id="L359">        TokenList tokens = new TokenList(tokenList);</span>
+<span class="pc bpc" id="L360" title="1 of 2 branches missed.">        if(tokens.length()==0) return Collections.emptyList();   // no tokens given</span>
+
+<span class="fc" id="L362">        List&lt;SuggestedItem&gt;[] paths = new List[tokens.length()+1]; // we won't use [0].</span>
+<span class="fc bfc" id="L363" title="All 2 branches covered.">        for(int i=1;i&lt;=tokens.length();i++)</span>
+<span class="fc" id="L364">            paths[i] = new ArrayList&lt;SuggestedItem&gt;();</span>
+
+<span class="fc" id="L366">        List&lt;SearchItem&gt; items = new ArrayList&lt;SearchItem&gt;(); // items found in 1 step</span>
+
+<span class="fc" id="L368">        LOGGER.log(Level.FINE, &quot;tokens={0}&quot;, tokens);</span>
+        
+        // first token
+<span class="fc" id="L371">        int w=1;    // width of token</span>
+<span class="fc bfc" id="L372" title="All 2 branches covered.">        for (String token : tokens.subSequence(0)) {</span>
+<span class="fc" id="L373">            items.clear();</span>
+<span class="fc" id="L374">            m.find(index,token,items);</span>
+<span class="fc bfc" id="L375" title="All 2 branches covered.">            for (SearchItem si : items) {</span>
+<span class="fc" id="L376">                paths[w].add(SuggestedItem.build(searchContext ,si));</span>
+<span class="fc" id="L377">                LOGGER.log(Level.FINE, &quot;found search item: {0}&quot;, si.getSearchName());</span>
+            }
+<span class="fc" id="L379">            w++;</span>
+        }
+
+        // successive tokens
+<span class="fc bfc" id="L383" title="All 2 branches covered.">        for (int j=1; j&lt;tokens.length(); j++) {</span>
+            // for each length
+<span class="fc" id="L385">            w=1;</span>
+<span class="fc bfc" id="L386" title="All 2 branches covered.">            for (String token : tokens.subSequence(j)) {</span>
+                // for each candidate
+<span class="fc bfc" id="L388" title="All 2 branches covered.">                for (SuggestedItem r : paths[j]) {</span>
+<span class="fc" id="L389">                    items.clear();</span>
+<span class="fc" id="L390">                    m.find(r.item.getSearchIndex(),token,items);</span>
+<span class="fc bfc" id="L391" title="All 2 branches covered.">                    for (SearchItem i : items)</span>
+<span class="fc" id="L392">                        paths[j+w].add(new SuggestedItem(r,i));</span>
+                }
+<span class="fc" id="L394">                w++;</span>
+            }
+        }
+
+<span class="fc" id="L398">        return paths[tokens.length()];</span>
+    }
+    
+<span class="fc" id="L401">    private final static Logger LOGGER = Logger.getLogger(Search.class.getName());</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>
