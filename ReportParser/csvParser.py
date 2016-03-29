@@ -79,6 +79,35 @@ def plotOverallGraph(branchData, mutData):
 
 	return (branchCoverage, mutationCoverage, classNames)
 
+def plotGraphPerClass(branchData, mutData):
+	for className in branchData:
+		branchCoverage = []
+		mutationCoverage = []
+		
+		for mutOp in mutData:
+			killed = 0
+			survived = 0
+			if className in mutData[mutOp]:
+				killed += mutData[mutOp][className][KILLED]
+				survived += mutData[mutOp][className][SURVIVED]
+
+			if branchData[className][COVERED]+branchData[className][MISSED] > 0 and killed + survived > 0:
+				branchCov = 100*branchData[className][COVERED]/(branchData[className][COVERED]+branchData[className][MISSED])
+				branchCoverage.append(branchCov)
+				mutCov = 100 * killed / (killed + survived)
+				mutationCoverage.append(mutCov)
+
+		if len(branchCoverage) > 0:
+			plt.cla()
+			plt.clf()
+			plt.axis((0,110,0,110))
+			plt.scatter(branchCoverage, mutationCoverage)
+			plt.xlabel('Branch Coverage')
+			plt.ylabel('Mutation Coverage')
+			plt.title(className)
+			plt.savefig(className+".png")
+			plt.close()
+
 
 def parseJacocoCSV(file, data):
 	if os.path.isfile(file):
@@ -137,6 +166,8 @@ else:
 	pitestfile = sys.argv[2]
 	parsePitestCSV(pitestfile, mutData, branchData)
 	parseJacocoCSV(jacocofile, branchData)
+
+	plotGraphPerClass(branchData, mutData)
 
 	(branchCoverage, mutationCoverage, classNames) = plotOverallGraph(branchData, mutData)
 
