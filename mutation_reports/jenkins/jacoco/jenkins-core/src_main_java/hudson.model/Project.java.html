@@ -1,0 +1,277 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>Project.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.model</a> &gt; <span class="el_source">Project.java</span></div><h1>Project.java</h1><pre class="source lang-java linenums">/*
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2011, Sun Microsystems, Inc., Kohsuke Kawaguchi,
+ * Jorg Heymans, Stephen Connolly, Tom Huybrechts
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.model;
+
+import hudson.Util;
+import hudson.model.Descriptor.FormException;
+import hudson.model.queue.QueueTaskFuture;
+import hudson.scm.SCM;
+import hudson.tasks.BuildStep;
+import hudson.tasks.BuildWrapper;
+import hudson.tasks.BuildWrappers;
+import hudson.tasks.Builder;
+import hudson.tasks.Fingerprinter;
+import hudson.tasks.Publisher;
+import hudson.tasks.Maven;
+import hudson.tasks.Maven.ProjectWithMaven;
+import hudson.tasks.Maven.MavenInstallation;
+import hudson.triggers.SCMTrigger;
+import hudson.triggers.Trigger;
+import hudson.util.DescribableList;
+import net.sf.json.JSONObject;
+import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.StaplerResponse;
+
+import javax.servlet.ServletException;
+import java.io.IOException;
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+import jenkins.triggers.SCMTriggerItem;
+
+/**
+ * Buildable software project.
+ *
+ * @author Kohsuke Kawaguchi
+ */
+public abstract class Project&lt;P extends Project&lt;P,B&gt;,B extends Build&lt;P,B&gt;&gt;
+    extends AbstractProject&lt;P,B&gt; implements SCMTriggerItem, Saveable, ProjectWithMaven, BuildableItemWithBuildWrappers {
+
+    /**
+     * List of active {@link Builder}s configured for this project.
+     */
+    private volatile DescribableList&lt;Builder,Descriptor&lt;Builder&gt;&gt; builders;
+<span class="nc" id="L72">    private static final AtomicReferenceFieldUpdater&lt;Project,DescribableList&gt; buildersSetter</span>
+<span class="nc" id="L73">            = AtomicReferenceFieldUpdater.newUpdater(Project.class,DescribableList.class,&quot;builders&quot;);</span>
+
+    /**
+     * List of active {@link Publisher}s configured for this project.
+     */
+    private volatile DescribableList&lt;Publisher,Descriptor&lt;Publisher&gt;&gt; publishers;
+<span class="nc" id="L79">    private static final AtomicReferenceFieldUpdater&lt;Project,DescribableList&gt; publishersSetter</span>
+<span class="nc" id="L80">            = AtomicReferenceFieldUpdater.newUpdater(Project.class,DescribableList.class,&quot;publishers&quot;);</span>
+
+    /**
+     * List of active {@link BuildWrapper}s configured for this project.
+     */
+    private volatile DescribableList&lt;BuildWrapper,Descriptor&lt;BuildWrapper&gt;&gt; buildWrappers;
+<span class="nc" id="L86">    private static final AtomicReferenceFieldUpdater&lt;Project,DescribableList&gt; buildWrappersSetter</span>
+<span class="nc" id="L87">            = AtomicReferenceFieldUpdater.newUpdater(Project.class,DescribableList.class,&quot;buildWrappers&quot;);</span>
+
+    /**
+     * Creates a new project.
+     */
+    public Project(ItemGroup parent,String name) {
+<span class="nc" id="L93">        super(parent,name);</span>
+<span class="nc" id="L94">    }</span>
+
+    @Override
+    public void onLoad(ItemGroup&lt;? extends Item&gt; parent, String name) throws IOException {
+<span class="nc" id="L98">        super.onLoad(parent, name);</span>
+<span class="nc" id="L99">        getBuildersList().setOwner(this);</span>
+<span class="nc" id="L100">        getPublishersList().setOwner(this);</span>
+<span class="nc" id="L101">        getBuildWrappersList().setOwner(this);</span>
+<span class="nc" id="L102">    }</span>
+
+    public AbstractProject&lt;?, ?&gt; asProject() {
+<span class="nc" id="L105">        return this;</span>
+    }
+
+    @Override public Item asItem() {
+<span class="nc" id="L109">        return this;</span>
+    }
+
+    @Override public QueueTaskFuture&lt;?&gt; scheduleBuild2(int quietPeriod, Action... actions) {
+<span class="nc" id="L113">        return scheduleBuild2(quietPeriod, null, actions);</span>
+    }
+
+    @Override public SCMTrigger getSCMTrigger() {
+<span class="nc" id="L117">        return getTrigger(SCMTrigger.class);</span>
+    }
+
+    @Override public Collection&lt;? extends SCM&gt; getSCMs() {
+<span class="nc" id="L121">        return SCMTriggerItem.SCMTriggerItems.resolveMultiScmIfConfigured(getScm());</span>
+    }
+
+    public List&lt;Builder&gt; getBuilders() {
+<span class="nc" id="L125">        return getBuildersList().toList();</span>
+    }
+
+    /**
+     * @deprecated as of 1.463
+     *      We will be soon removing the restriction that only one instance of publisher is allowed per type.
+     *      Use {@link #getPublishersList()} instead.
+     */
+    @Deprecated
+    public Map&lt;Descriptor&lt;Publisher&gt;,Publisher&gt; getPublishers() {
+<span class="nc" id="L135">        return getPublishersList().toMap();</span>
+    }
+
+    public DescribableList&lt;Builder,Descriptor&lt;Builder&gt;&gt; getBuildersList() {
+<span class="nc bnc" id="L139" title="All 2 branches missed.">        if (builders == null) {</span>
+<span class="nc" id="L140">            buildersSetter.compareAndSet(this,null,new DescribableList&lt;Builder,Descriptor&lt;Builder&gt;&gt;(this));</span>
+        }
+<span class="nc" id="L142">        return builders;</span>
+    }
+    
+    public DescribableList&lt;Publisher,Descriptor&lt;Publisher&gt;&gt; getPublishersList() {
+<span class="nc bnc" id="L146" title="All 2 branches missed.">        if (publishers == null) {</span>
+<span class="nc" id="L147">            publishersSetter.compareAndSet(this,null,new DescribableList&lt;Publisher,Descriptor&lt;Publisher&gt;&gt;(this));</span>
+        }
+<span class="nc" id="L149">        return publishers;</span>
+    }
+
+    public Map&lt;Descriptor&lt;BuildWrapper&gt;,BuildWrapper&gt; getBuildWrappers() {
+<span class="nc" id="L153">        return getBuildWrappersList().toMap();</span>
+    }
+
+    public DescribableList&lt;BuildWrapper, Descriptor&lt;BuildWrapper&gt;&gt; getBuildWrappersList() {
+<span class="nc bnc" id="L157" title="All 2 branches missed.">        if (buildWrappers == null) {</span>
+<span class="nc" id="L158">            buildWrappersSetter.compareAndSet(this,null,new DescribableList&lt;BuildWrapper,Descriptor&lt;BuildWrapper&gt;&gt;(this));</span>
+        }
+<span class="nc" id="L160">        return buildWrappers;</span>
+    }
+
+    @Override
+    protected Set&lt;ResourceActivity&gt; getResourceActivities() {
+<span class="nc" id="L165">        final Set&lt;ResourceActivity&gt; activities = new HashSet&lt;ResourceActivity&gt;();</span>
+
+<span class="nc" id="L167">        activities.addAll(super.getResourceActivities());</span>
+<span class="nc" id="L168">        activities.addAll(Util.filter(getBuildersList(),ResourceActivity.class));</span>
+<span class="nc" id="L169">        activities.addAll(Util.filter(getPublishersList(),ResourceActivity.class));</span>
+<span class="nc" id="L170">        activities.addAll(Util.filter(getBuildWrappersList(),ResourceActivity.class));</span>
+
+<span class="nc" id="L172">        return activities;</span>
+    }
+
+    /**
+     * Adds a new {@link BuildStep} to this {@link Project} and saves the configuration.
+     *
+     * @deprecated as of 1.290
+     *      Use {@code getPublishersList().add(x)}
+     */
+    @Deprecated
+    public void addPublisher(Publisher buildStep) throws IOException {
+<span class="nc" id="L183">        getPublishersList().add(buildStep);</span>
+<span class="nc" id="L184">    }</span>
+
+    /**
+     * Removes a publisher from this project, if it's active.
+     *
+     * @deprecated as of 1.290
+     *      Use {@code getPublishersList().remove(x)}
+     */
+    @Deprecated
+    public void removePublisher(Descriptor&lt;Publisher&gt; descriptor) throws IOException {
+<span class="nc" id="L194">        getPublishersList().remove(descriptor);</span>
+<span class="nc" id="L195">    }</span>
+
+    public Publisher getPublisher(Descriptor&lt;Publisher&gt; descriptor) {
+<span class="nc bnc" id="L198" title="All 2 branches missed.">        for (Publisher p : getPublishersList()) {</span>
+<span class="nc bnc" id="L199" title="All 2 branches missed.">            if(p.getDescriptor()==descriptor)</span>
+<span class="nc" id="L200">                return p;</span>
+        }
+<span class="nc" id="L202">        return null;</span>
+    }
+
+    @Override protected void buildDependencyGraph(DependencyGraph graph) {
+<span class="nc" id="L206">        super.buildDependencyGraph(graph);</span>
+<span class="nc" id="L207">        getPublishersList().buildDependencyGraph(this,graph);</span>
+<span class="nc" id="L208">        getBuildersList().buildDependencyGraph(this,graph);</span>
+<span class="nc" id="L209">        getBuildWrappersList().buildDependencyGraph(this,graph);</span>
+<span class="nc" id="L210">    }</span>
+
+    @Override
+    public boolean isFingerprintConfigured() {
+<span class="nc bnc" id="L214" title="All 2 branches missed.">        return getPublishersList().get(Fingerprinter.class)!=null;</span>
+    }
+
+    public MavenInstallation inferMavenInstallation() {
+<span class="nc" id="L218">        Maven m = getBuildersList().get(Maven.class);</span>
+<span class="nc bnc" id="L219" title="All 2 branches missed.">        if (m!=null)    return m.getMaven();</span>
+<span class="nc" id="L220">        return null;</span>
+    }
+
+//
+//
+// actions
+//
+//
+    @Override
+    protected void submit( StaplerRequest req, StaplerResponse rsp ) throws IOException, ServletException, FormException {
+<span class="nc" id="L230">        super.submit(req,rsp);</span>
+
+<span class="nc" id="L232">        JSONObject json = req.getSubmittedForm();</span>
+
+<span class="nc" id="L234">        getBuildWrappersList().rebuild(req,json, BuildWrappers.getFor(this));</span>
+<span class="nc" id="L235">        getBuildersList().rebuildHetero(req,json, Builder.all(), &quot;builder&quot;);</span>
+<span class="nc" id="L236">        getPublishersList().rebuildHetero(req, json, Publisher.all(), &quot;publisher&quot;);</span>
+<span class="nc" id="L237">    }</span>
+
+    @Override
+    protected List&lt;Action&gt; createTransientActions() {
+<span class="nc" id="L241">        List&lt;Action&gt; r = super.createTransientActions();</span>
+
+<span class="nc bnc" id="L243" title="All 2 branches missed.">        for (BuildStep step : getBuildersList()) {</span>
+            try {
+<span class="nc" id="L245">                r.addAll(step.getProjectActions(this));</span>
+<span class="nc" id="L246">            } catch (Exception e) {</span>
+<span class="nc" id="L247">                LOGGER.log(Level.SEVERE, &quot;Error loading build step.&quot;, e);</span>
+            }
+        }
+<span class="nc bnc" id="L250" title="All 2 branches missed.">        for (BuildStep step : getPublishersList()) {</span>
+            try {
+<span class="nc" id="L252">                r.addAll(step.getProjectActions(this));</span>
+<span class="nc" id="L253">            } catch (Exception e) {</span>
+<span class="nc" id="L254">                LOGGER.log(Level.SEVERE, &quot;Error loading publisher.&quot;, e);</span>
+            }
+        }
+<span class="nc bnc" id="L257" title="All 2 branches missed.">        for (BuildWrapper step : getBuildWrappers().values()) {</span>
+            try {
+<span class="nc" id="L259">                r.addAll(step.getProjectActions(this));</span>
+<span class="nc" id="L260">            } catch (Exception e) {</span>
+<span class="nc" id="L261">                LOGGER.log(Level.SEVERE, &quot;Error loading build wrapper.&quot;, e);</span>
+            }
+        }
+<span class="nc bnc" id="L264" title="All 2 branches missed.">        for (Trigger trigger : triggers()) {</span>
+            try {
+<span class="nc" id="L266">                r.addAll(trigger.getProjectActions());</span>
+<span class="nc" id="L267">            } catch (Exception e) {</span>
+<span class="nc" id="L268">                LOGGER.log(Level.SEVERE, &quot;Error loading trigger.&quot;, e);</span>
+            }
+        }
+
+<span class="nc" id="L272">        return r;</span>
+    }
+
+<span class="nc" id="L275">    private static final Logger LOGGER = Logger.getLogger(Project.class.getName());</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

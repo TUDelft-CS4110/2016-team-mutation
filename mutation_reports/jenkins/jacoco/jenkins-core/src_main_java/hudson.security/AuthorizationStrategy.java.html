@@ -1,0 +1,248 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>AuthorizationStrategy.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.security</a> &gt; <span class="el_source">AuthorizationStrategy.java</span></div><h1>AuthorizationStrategy.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">/*</span>
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc., Kohsuke Kawaguchi, Seiji Sogabe, Tom Huybrechts
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.security;
+
+import hudson.DescriptorExtensionList;
+import hudson.Extension;
+import hudson.ExtensionPoint;
+import hudson.model.*;
+import hudson.slaves.Cloud;
+import hudson.util.DescriptorList;
+
+import java.io.Serializable;
+import java.util.Collection;
+import java.util.Collections;
+import javax.annotation.Nonnull;
+
+import jenkins.model.Jenkins;
+import net.sf.json.JSONObject;
+
+import org.acegisecurity.Authentication;
+import org.kohsuke.stapler.StaplerRequest;
+
+/**
+ * Controls authorization throughout Hudson.
+ *
+ * &lt;h2&gt;Persistence&lt;/h2&gt;
+ * &lt;p&gt;
+ * This object will be persisted along with {@link jenkins.model.Jenkins} object.
+ * Hudson by itself won't put the ACL returned from {@link #getRootACL()} into the serialized object graph,
+ * so if that object contains state and needs to be persisted, it's the responsibility of
+ * {@link AuthorizationStrategy} to do so (by keeping them in an instance field.)
+ *
+ * &lt;h2&gt;Re-configuration&lt;/h2&gt;
+ * &lt;p&gt;
+ * The corresponding {@link Describable} instance will be asked to create a new {@link AuthorizationStrategy}
+ * every time the system configuration is updated. Implementations that keep more state in ACL beyond
+ * the system configuration should use {@link jenkins.model.Jenkins#getAuthorizationStrategy()} to talk to the current
+ * instance to carry over the state. 
+ *
+ * @author Kohsuke Kawaguchi
+ * @see SecurityRealm
+ */
+<span class="nc" id="L64">public abstract class AuthorizationStrategy extends AbstractDescribableImpl&lt;AuthorizationStrategy&gt; implements ExtensionPoint {</span>
+    /**
+     * Returns the instance of {@link ACL} where all the other {@link ACL} instances
+     * for all the other model objects eventually delegate.
+     * &lt;p&gt;
+     * IOW, this ACL will have the ultimate say on the access control.
+     */
+    public abstract @Nonnull ACL getRootACL();
+
+    /**
+     * @deprecated since 1.277
+     *      Override {@link #getACL(Job)} instead.
+     */
+    @Deprecated
+    public @Nonnull ACL getACL(@Nonnull AbstractProject&lt;?,?&gt; project) {
+<span class="nc" id="L79">    	return getACL((Job)project);</span>
+    }
+
+    public @Nonnull ACL getACL(@Nonnull Job&lt;?,?&gt; project) {
+<span class="nc" id="L83">    	return getRootACL();</span>
+    }
+
+    /**
+     * Implementation can choose to provide different ACL for different views.
+     * This can be used as a basis for more fine-grained access control.
+     *
+     * &lt;p&gt;
+     * The default implementation makes the view visible if any of the items are visible
+     * or the view is configurable.
+     *
+     * @since 1.220
+     */
+    public @Nonnull ACL getACL(final @Nonnull View item) {
+<span class="nc" id="L97">        return new ACL() {</span>
+            @Override
+            public boolean hasPermission(Authentication a, Permission permission) {
+<span class="nc" id="L100">                ACL base = item.getOwner().getACL();</span>
+
+<span class="nc" id="L102">                boolean hasPermission = base.hasPermission(a, permission);</span>
+<span class="nc bnc" id="L103" title="All 4 branches missed.">                if (!hasPermission &amp;&amp; permission == View.READ) {</span>
+<span class="nc bnc" id="L104" title="All 4 branches missed.">                    return base.hasPermission(a,View.CONFIGURE) || !item.getItems().isEmpty();</span>
+                }
+
+<span class="nc" id="L107">                return hasPermission;</span>
+            }
+        };
+    }
+    
+    /**
+     * Implementation can choose to provide different ACL for different items.
+     * This can be used as a basis for more fine-grained access control.
+     *
+     * &lt;p&gt;
+     * The default implementation returns {@link #getRootACL()}.
+     *
+     * @since 1.220
+     */
+    public @Nonnull ACL getACL(@Nonnull AbstractItem item) {
+<span class="nc" id="L122">        return getRootACL();</span>
+    }
+
+    /**
+     * Implementation can choose to provide different ACL per user.
+     * This can be used as a basis for more fine-grained access control.
+     *
+     * &lt;p&gt;
+     * The default implementation returns {@link #getRootACL()}.
+     *
+     * @since 1.221
+     */
+    public @Nonnull ACL getACL(@Nonnull User user) {
+<span class="nc" id="L135">        return getRootACL();</span>
+    }
+
+    /**
+     * Implementation can choose to provide different ACL for different computers.
+     * This can be used as a basis for more fine-grained access control.
+     *
+     * &lt;p&gt;
+     * The default implementation delegates to {@link #getACL(Node)}
+     *
+     * @since 1.220
+     */
+    public @Nonnull ACL getACL(@Nonnull Computer computer) {
+<span class="nc" id="L148">        return getACL(computer.getNode());</span>
+    }
+
+    /**
+     * Implementation can choose to provide different ACL for different {@link Cloud}s.
+     * This can be used as a basis for more fine-grained access control.
+     *
+     * &lt;p&gt;
+     * The default implementation returns {@link #getRootACL()}.
+     *
+     * @since 1.252
+     */
+    public @Nonnull ACL getACL(@Nonnull Cloud cloud) {
+<span class="nc" id="L161">        return getRootACL();</span>
+    }
+
+    public @Nonnull ACL getACL(@Nonnull Node node) {
+<span class="nc" id="L165">        return getRootACL();</span>
+    }
+
+    /**
+     * Returns the list of all group/role names used in this authorization strategy,
+     * and the ACL returned from the {@link #getRootACL()} method.
+     * &lt;p&gt;
+     * This method is used by {@link ContainerAuthentication} to work around the servlet API issue
+     * that prevents us from enumerating roles that the user has.
+     * &lt;p&gt;
+     * If such enumeration is impossible, do the best to list as many as possible, then
+     * return it. In the worst case, just return an empty list. Doing so would prevent
+     * users from using role names as group names (see HUDSON-2716 for such one such report.)
+     *
+     * @return
+     *      never null.
+     */
+    public abstract @Nonnull Collection&lt;String&gt; getGroups();
+
+    /**
+     * Returns all the registered {@link AuthorizationStrategy} descriptors.
+     */
+    public static @Nonnull DescriptorExtensionList&lt;AuthorizationStrategy,Descriptor&lt;AuthorizationStrategy&gt;&gt; all() {
+<span class="nc" id="L188">        return Jenkins.getInstance().&lt;AuthorizationStrategy,Descriptor&lt;AuthorizationStrategy&gt;&gt;getDescriptorList(AuthorizationStrategy.class);</span>
+    }
+
+    /**
+     * All registered {@link SecurityRealm} implementations.
+     *
+     * @deprecated since 1.286
+     *      Use {@link #all()} for read access, and {@link Extension} for registration.
+     */
+    @Deprecated
+<span class="nc" id="L198">    public static final DescriptorList&lt;AuthorizationStrategy&gt; LIST = new DescriptorList&lt;AuthorizationStrategy&gt;(AuthorizationStrategy.class);</span>
+    
+    /**
+     * {@link AuthorizationStrategy} that implements the semantics
+     * of unsecured Hudson where everyone has full control.
+     *
+     * &lt;p&gt;
+     * This singleton is safe because {@link Unsecured} is stateless.
+     */
+<span class="nc" id="L207">    public static final AuthorizationStrategy UNSECURED = new Unsecured();</span>
+
+<span class="nc" id="L209">    public static final class Unsecured extends AuthorizationStrategy implements Serializable {</span>
+        /**
+         * Maintains the singleton semantics.
+         */
+        private Object readResolve() {
+<span class="nc" id="L214">            return UNSECURED;</span>
+        }
+
+        @Override
+        public @Nonnull ACL getRootACL() {
+<span class="nc" id="L219">            return UNSECURED_ACL;</span>
+        }
+
+        @Override
+        public @Nonnull Collection&lt;String&gt; getGroups() {
+<span class="nc" id="L224">            return Collections.emptySet();</span>
+        }
+
+<span class="nc" id="L227">        private static final ACL UNSECURED_ACL = new ACL() {</span>
+            @Override
+            public boolean hasPermission(Authentication a, Permission permission) {
+<span class="nc" id="L230">                return true;</span>
+            }
+<span class="nc" id="L232">        };</span>
+
+        @Extension
+<span class="nc" id="L235">        public static final class DescriptorImpl extends Descriptor&lt;AuthorizationStrategy&gt; {</span>
+            @Override
+            public String getDisplayName() {
+<span class="nc" id="L238">                return Messages.AuthorizationStrategy_DisplayName();</span>
+            }
+
+            @Override
+            public @Nonnull AuthorizationStrategy newInstance(StaplerRequest req, JSONObject formData) throws FormException {
+<span class="nc" id="L243">                return UNSECURED;</span>
+            }
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

@@ -1,0 +1,254 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>TcpSlaveAgentListener.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson</a> &gt; <span class="el_source">TcpSlaveAgentListener.java</span></div><h1>TcpSlaveAgentListener.java</h1><pre class="source lang-java linenums">/*
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc., Kohsuke Kawaguchi, Stephen Connolly
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson;
+
+import hudson.slaves.OfflineCause;
+import jenkins.AgentProtocol;
+
+import java.io.BufferedWriter;
+import java.io.DataInputStream;
+import java.io.IOException;
+import java.io.OutputStreamWriter;
+import java.io.PrintWriter;
+import java.net.BindException;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.nio.channels.ServerSocketChannel;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+/**
+ * Listens to incoming TCP connections from JNLP slave agents and CLI.
+ *
+ * &lt;p&gt;
+ * Aside from the HTTP endpoint, Jenkins runs {@link TcpSlaveAgentListener} that listens on a TCP socket.
+ * Historically  this was used for inbound connection from slave agents (hence the name), but over time
+ * it was extended and made generic, so that multiple protocols of different purposes can co-exist on the
+ * same socket.
+ *
+ * &lt;p&gt;
+ * This class accepts the socket, then after a short handshaking, it dispatches to appropriate
+ * {@link AgentProtocol}s.
+ *
+ * @author Kohsuke Kawaguchi
+ * @see AgentProtocol
+ */
+public final class TcpSlaveAgentListener extends Thread {
+
+    private final ServerSocketChannel serverSocket;
+    private volatile boolean shuttingDown;
+
+    public final int configuredPort;
+
+    /**
+     * @param port
+     *      Use 0 to choose a random port.
+     */
+    public TcpSlaveAgentListener(int port) throws IOException {
+<span class="nc" id="L69">        super(&quot;TCP slave agent listener port=&quot;+port);</span>
+        try {
+<span class="nc" id="L71">            serverSocket = ServerSocketChannel.open();</span>
+<span class="nc" id="L72">            serverSocket.socket().bind(new InetSocketAddress(port));</span>
+<span class="nc" id="L73">        } catch (BindException e) {</span>
+<span class="nc" id="L74">            throw (BindException)new BindException(&quot;Failed to listen on port &quot;+port+&quot; because it's already in use.&quot;).initCause(e);</span>
+        }
+<span class="nc" id="L76">        this.configuredPort = port;</span>
+
+<span class="nc" id="L78">        LOGGER.log(Level.FINE, &quot;JNLP slave agent listener started on TCP port {0}&quot;, getPort());</span>
+
+<span class="nc" id="L80">        start();</span>
+<span class="nc" id="L81">    }</span>
+
+    /**
+     * Gets the TCP port number in which we are listening.
+     */
+    public int getPort() {
+<span class="nc" id="L87">        return serverSocket.socket().getLocalPort();</span>
+    }
+
+    @Override
+    public void run() {
+        try {
+            // the loop eventually terminates when the socket is closed.
+<span class="nc" id="L94">            while (true) {</span>
+<span class="nc" id="L95">                Socket s = serverSocket.accept().socket();</span>
+
+                // this prevents a connection from silently terminated by the router in between or the other peer
+                // and that goes without unnoticed. However, the time out is often very long (for example 2 hours
+                // by default in Linux) that this alone is enough to prevent that.
+<span class="nc" id="L100">                s.setKeepAlive(true);</span>
+                // we take care of buffering on our own
+<span class="nc" id="L102">                s.setTcpNoDelay(true);</span>
+
+<span class="nc" id="L104">                new ConnectionHandler(s).start();</span>
+            }
+<span class="nc" id="L106">        } catch (IOException e) {</span>
+<span class="nc bnc" id="L107" title="All 2 branches missed.">            if(!shuttingDown) {</span>
+<span class="nc" id="L108">                LOGGER.log(Level.SEVERE,&quot;Failed to accept JNLP slave agent connections&quot;,e);</span>
+            }
+        }
+<span class="nc" id="L111">    }</span>
+
+    /**
+     * Initiates the shuts down of the listener.
+     */
+    public void shutdown() {
+<span class="nc" id="L117">        shuttingDown = true;</span>
+        try {
+<span class="nc" id="L119">            serverSocket.close();</span>
+<span class="nc" id="L120">        } catch (IOException e) {</span>
+<span class="nc" id="L121">            LOGGER.log(Level.WARNING, &quot;Failed to close down TCP port&quot;,e);</span>
+        }
+<span class="nc" id="L123">    }</span>
+
+    private final class ConnectionHandler extends Thread {
+        private final Socket s;
+        /**
+         * Unique number to identify this connection. Used in the log.
+         */
+        private final int id;
+
+<span class="nc" id="L132">        public ConnectionHandler(Socket s) {</span>
+<span class="nc" id="L133">            this.s = s;</span>
+<span class="nc" id="L134">            synchronized(getClass()) {</span>
+<span class="nc" id="L135">                id = iotaGen++;</span>
+            }
+<span class="nc" id="L137">            setName(&quot;TCP slave agent connection handler #&quot;+id+&quot; with &quot;+s.getRemoteSocketAddress());</span>
+<span class="nc" id="L138">        }</span>
+
+        @Override
+        public void run() {
+            try {
+<span class="nc" id="L143">                LOGGER.info(&quot;Accepted connection #&quot;+id+&quot; from &quot;+s.getRemoteSocketAddress());</span>
+
+<span class="nc" id="L145">                DataInputStream in = new DataInputStream(s.getInputStream());</span>
+<span class="nc" id="L146">                PrintWriter out = new PrintWriter(</span>
+<span class="nc" id="L147">                        new BufferedWriter(new OutputStreamWriter(s.getOutputStream(),&quot;UTF-8&quot;)),</span>
+<span class="nc" id="L148">                        true); // DEPRECATED: newer protocol shouldn't use PrintWriter but should use DataOutputStream</span>
+
+<span class="nc" id="L150">                String s = in.readUTF();</span>
+
+<span class="nc bnc" id="L152" title="All 2 branches missed.">                if(s.startsWith(&quot;Protocol:&quot;)) {</span>
+<span class="nc" id="L153">                    String protocol = s.substring(9);</span>
+<span class="nc" id="L154">                    AgentProtocol p = AgentProtocol.of(protocol);</span>
+<span class="nc bnc" id="L155" title="All 2 branches missed.">                    if (p!=null)</span>
+<span class="nc" id="L156">                        p.handle(this.s);</span>
+                    else
+<span class="nc" id="L158">                        error(out, &quot;Unknown protocol:&quot; + s);</span>
+<span class="nc" id="L159">                } else {</span>
+<span class="nc" id="L160">                    error(out, &quot;Unrecognized protocol: &quot;+s);</span>
+                }
+<span class="nc" id="L162">            } catch (InterruptedException e) {</span>
+<span class="nc" id="L163">                LOGGER.log(Level.WARNING,&quot;Connection #&quot;+id+&quot; aborted&quot;,e);</span>
+                try {
+<span class="nc" id="L165">                    s.close();</span>
+<span class="nc" id="L166">                } catch (IOException _) {</span>
+                    // try to clean up the socket
+                }
+<span class="nc" id="L169">            } catch (IOException e) {</span>
+<span class="nc" id="L170">                LOGGER.log(Level.WARNING,&quot;Connection #&quot;+id+&quot; failed&quot;,e);</span>
+                try {
+<span class="nc" id="L172">                    s.close();</span>
+<span class="nc" id="L173">                } catch (IOException _) {</span>
+                    // try to clean up the socket
+                }
+            }
+<span class="nc" id="L177">        }</span>
+
+        private void error(PrintWriter out, String msg) throws IOException {
+<span class="nc" id="L180">            out.println(msg);</span>
+<span class="nc" id="L181">            LOGGER.log(Level.WARNING,&quot;Connection #&quot;+id+&quot; is aborted: &quot;+msg);</span>
+<span class="nc" id="L182">            s.close();</span>
+<span class="nc" id="L183">        }</span>
+    }
+
+    /**
+     * Connection terminated because we are reconnected from the current peer.
+     */
+<span class="nc" id="L189">    public static class ConnectionFromCurrentPeer extends OfflineCause {</span>
+        public String toString() {
+<span class="nc" id="L191">            return &quot;The current peer is reconnecting&quot;;</span>
+        }
+    }
+
+<span class="nc" id="L195">    private static int iotaGen=1;</span>
+
+<span class="nc" id="L197">    private static final Logger LOGGER = Logger.getLogger(TcpSlaveAgentListener.class.getName());</span>
+
+    /**
+     * Host name that we advertise the CLI client to connect to.
+     * This is primarily for those who have reverse proxies in place such that the HTTP host name
+     * and the CLI TCP/IP connection host names are different.
+     *
+     * TODO: think about how to expose this (including whether this needs to be exposed at all.)
+     */
+<span class="nc" id="L206">    public static String CLI_HOST_NAME = System.getProperty(TcpSlaveAgentListener.class.getName()+&quot;.hostName&quot;);</span>
+
+    /**
+     * Port number that we advertise the CLI client to connect to.
+     * This is primarily for the case where the port that Jenkins runs is different from the port
+     * that external world should connect to, because of the presence of NAT / port-forwarding / TCP reverse
+     * proxy.
+     *
+     * If left to null, fall back to {@link #getPort()}
+     *
+     * @since 1.611
+     */
+<span class="nc" id="L218">    public static Integer CLI_PORT = Integer.getInteger(TcpSlaveAgentListener.class.getName()+&quot;.port&quot;);</span>
+}
+
+/*
+Pasted from http://today.java.net/pub/a/today/2005/09/01/webstart.html
+
+    Is it unrealistic to try to control access to JWS files?
+    Is anyone doing this?
+
+It is not unrealistic, and we are doing it. Create a protected web page
+with a download button or link that makes a servlet call. If the user has
+already logged in to your website, of course they can go there without
+further authentication. The servlet reads the cookies sent by the browser
+when the link is activated. It then generates a dynamic JNLP file adding
+the authentication cookie and any other required cookies (JSESSIONID, etc.)
+via &lt;argument&gt; tags. Write the WebStart application so that it picks up
+any required cookies from the argument list, and adds these cookies to its
+request headers on subsequent calls to the server. (Note: in the dynamic
+JNLP file, do NOT put href= in the opening jnlp tag. If you do, JWS will
+try to reload the JNLP from disk and since it's dynamic, it won't be there.
+Leave it off and JWS will be happy.)
+
+When returning the dynamic JNLP, the servlet should invoke setHeader(
+&quot;Expires&quot;, 0 ) and addDateHeader() twice on the servlet response to set
+both &quot;Date&quot; and &quot;Last-Modified&quot; to the current date. This keeps the browser
+from using a cached copy of a prior dynamic JNLP obtained from the same URL.
+
+Note also that the JAR file(s) for the JWS application should not be on
+a password-protected path - the launcher won't know about the authentication
+cookie. But once the application starts, you can run all its requests
+through a protected path requiring the authentication cookie, because
+the application gets it from the dynamic JNLP. Just write it so that it
+can't do anything useful without going through a protected path or doing
+something to present credentials that could only have come from a valid
+user.
+*/
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

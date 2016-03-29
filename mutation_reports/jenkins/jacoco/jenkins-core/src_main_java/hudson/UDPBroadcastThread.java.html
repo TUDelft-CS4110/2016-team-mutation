@@ -1,0 +1,148 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>UDPBroadcastThread.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson</a> &gt; <span class="el_source">UDPBroadcastThread.java</span></div><h1>UDPBroadcastThread.java</h1><pre class="source lang-java linenums">/*
+ * The MIT License
+ *
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson;
+
+import edu.umd.cs.findbugs.annotations.SuppressWarnings;
+import hudson.model.Hudson;
+import jenkins.model.Jenkins;
+import hudson.util.OneShotEvent;
+
+import java.io.IOException;
+import java.net.DatagramPacket;
+import java.net.InetAddress;
+import java.net.MulticastSocket;
+import java.net.SocketAddress;
+import java.net.SocketException;
+import java.net.UnknownHostException;
+import java.nio.channels.ClosedByInterruptException;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+/**
+ * Monitors a UDP multicast broadcast and respond with the location of the Hudson service.
+ *
+ * &lt;p&gt;
+ * Useful for auto-discovery of Hudson in the network.
+ *
+ * @author Kohsuke Kawaguchi
+ */
+public class UDPBroadcastThread extends Thread {
+    private final Jenkins jenkins;
+
+<span class="nc" id="L53">    public final OneShotEvent ready = new OneShotEvent();</span>
+    private MulticastSocket mcs;
+    private boolean shutdown;
+    static boolean udpHandlingProblem; // for tests
+
+    /**
+     * @deprecated as of 1.416
+     *      Use {@link #UDPBroadcastThread(Jenkins)}
+     */
+    @Deprecated
+    public UDPBroadcastThread(Hudson jenkins) throws IOException {
+<span class="nc" id="L64">        this((Jenkins)jenkins);</span>
+<span class="nc" id="L65">    }</span>
+
+    public UDPBroadcastThread(Jenkins jenkins) throws IOException {
+<span class="nc" id="L68">        super(&quot;Jenkins UDP &quot;+PORT+&quot; monitoring thread&quot;);</span>
+<span class="nc" id="L69">        this.jenkins = jenkins;</span>
+<span class="nc" id="L70">        mcs = new MulticastSocket(PORT);</span>
+<span class="nc" id="L71">    }</span>
+
+    @SuppressWarnings(&quot;ST_WRITE_TO_STATIC_FROM_INSTANCE_METHOD&quot;)
+    @Override
+    public void run() {
+        try {
+<span class="nc" id="L77">            mcs.joinGroup(MULTICAST);</span>
+<span class="nc" id="L78">            ready.signal();</span>
+
+<span class="nc" id="L80">            while(true) {</span>
+<span class="nc" id="L81">                byte[] buf = new byte[2048];</span>
+<span class="nc" id="L82">                DatagramPacket p = new DatagramPacket(buf,buf.length);</span>
+<span class="nc" id="L83">                mcs.receive(p);</span>
+
+<span class="nc" id="L85">                SocketAddress sender = p.getSocketAddress();</span>
+
+                // prepare a response
+<span class="nc" id="L88">                TcpSlaveAgentListener tal = jenkins.getTcpSlaveAgentListener();</span>
+
+<span class="nc" id="L90">                StringBuilder rsp = new StringBuilder(&quot;&lt;hudson&gt;&quot;);</span>
+<span class="nc" id="L91">                tag(rsp,&quot;version&quot;, Jenkins.VERSION);</span>
+<span class="nc" id="L92">                tag(rsp,&quot;url&quot;, jenkins.getRootUrl());</span>
+<span class="nc" id="L93">                tag(rsp,&quot;server-id&quot;, jenkins.getLegacyInstanceId());</span>
+<span class="nc bnc" id="L94" title="All 2 branches missed.">                tag(rsp,&quot;slave-port&quot;,tal==null?null:tal.getPort());</span>
+
+<span class="nc bnc" id="L96" title="All 2 branches missed.">                for (UDPBroadcastFragment f : UDPBroadcastFragment.all())</span>
+<span class="nc" id="L97">                    f.buildFragment(rsp,sender);</span>
+
+<span class="nc" id="L99">                rsp.append(&quot;&lt;/hudson&gt;&quot;);</span>
+
+<span class="nc" id="L101">                byte[] response = rsp.toString().getBytes(&quot;UTF-8&quot;);</span>
+<span class="nc" id="L102">                mcs.send(new DatagramPacket(response,response.length,sender));</span>
+            }
+<span class="nc" id="L104">        } catch (ClosedByInterruptException e) {</span>
+            // shut down
+<span class="nc" id="L106">        } catch (SocketException e) {</span>
+<span class="nc bnc" id="L107" title="All 2 branches missed.">            if (shutdown) { // forcibly closed</span>
+<span class="nc" id="L108">                return;</span>
+            }            // if we failed to listen to UDP, just silently abandon it, as a stack trace
+            // makes people unnecessarily concerned, for a feature that currently does no good.
+<span class="nc" id="L111">            LOGGER.log(Level.INFO, &quot;Cannot listen to UDP port {0}, skipping: {1}&quot;, new Object[] {PORT, e});</span>
+<span class="nc" id="L112">            LOGGER.log(Level.FINE, null, e);</span>
+<span class="nc" id="L113">        } catch (IOException e) {</span>
+<span class="nc bnc" id="L114" title="All 2 branches missed.">            if (shutdown)   return; // forcibly closed</span>
+<span class="nc" id="L115">            LOGGER.log(Level.WARNING, &quot;UDP handling problem&quot;,e);</span>
+<span class="nc" id="L116">            udpHandlingProblem = true;</span>
+        }
+<span class="nc" id="L118">    }</span>
+
+    private void tag(StringBuilder buf, String tag, Object value) {
+<span class="nc bnc" id="L121" title="All 2 branches missed.">        if(value==null) return;</span>
+<span class="nc" id="L122">        buf.append('&lt;').append(tag).append('&gt;').append(value).append(&quot;&lt;/&quot;).append(tag).append('&gt;');</span>
+<span class="nc" id="L123">    }</span>
+
+    public void shutdown() {
+<span class="nc" id="L126">        shutdown = true;</span>
+<span class="nc" id="L127">        mcs.close();</span>
+<span class="nc" id="L128">        interrupt();</span>
+<span class="nc" id="L129">    }</span>
+
+<span class="nc" id="L131">    public static final int PORT = Integer.getInteger(&quot;hudson.udp&quot;,33848);</span>
+
+<span class="nc" id="L133">    private static final Logger LOGGER = Logger.getLogger(UDPBroadcastThread.class.getName());</span>
+
+    /**
+     * Multicast socket address.
+     */
+    public static InetAddress MULTICAST;
+
+    static {
+        try {
+<span class="nc" id="L142">            MULTICAST = InetAddress.getByAddress(new byte[]{(byte)239, (byte)77, (byte)124, (byte)213});</span>
+<span class="nc" id="L143">        } catch (UnknownHostException e) {</span>
+<span class="nc" id="L144">            throw new Error(e);</span>
+        }
+<span class="nc" id="L146">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

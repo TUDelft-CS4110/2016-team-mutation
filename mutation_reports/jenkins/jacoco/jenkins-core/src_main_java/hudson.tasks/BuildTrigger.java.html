@@ -1,0 +1,441 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>BuildTrigger.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.tasks</a> &gt; <span class="el_source">BuildTrigger.java</span></div><h1>BuildTrigger.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">/*</span>
+ * The MIT License
+ *
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc., Kohsuke Kawaguchi, Brian Westrich, Martin Eigenbrodt
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.tasks;
+
+import hudson.Extension;
+import hudson.Launcher;
+import hudson.Util;
+import hudson.console.ModelHyperlinkNote;
+import hudson.model.AbstractBuild;
+import hudson.model.AbstractProject;
+import hudson.model.Action;
+import hudson.model.AutoCompletionCandidates;
+import hudson.model.BuildListener;
+import hudson.model.Cause.UpstreamCause;
+import hudson.model.DependencyGraph;
+import hudson.model.DependencyGraph.Dependency;
+import hudson.model.Item;
+import hudson.model.ItemGroup;
+import hudson.model.Items;
+import hudson.model.Job;
+import hudson.model.Project;
+import hudson.model.Result;
+import hudson.model.Run;
+import hudson.model.TaskListener;
+import hudson.model.listeners.ItemListener;
+import hudson.model.queue.Tasks;
+import hudson.security.ACL;
+import hudson.util.FormValidation;
+import java.io.IOException;
+import java.io.PrintStream;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.List;
+import java.util.StringTokenizer;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import javax.annotation.CheckForNull;
+import jenkins.model.DependencyDeclarer;
+import jenkins.model.Jenkins;
+import jenkins.security.QueueItemAuthenticatorConfiguration;
+import jenkins.security.QueueItemAuthenticatorDescriptor;
+import jenkins.triggers.ReverseBuildTrigger;
+import net.sf.json.JSONObject;
+import org.acegisecurity.Authentication;
+import org.acegisecurity.context.SecurityContext;
+import org.acegisecurity.context.SecurityContextHolder;
+import org.apache.commons.lang.StringUtils;
+import org.kohsuke.stapler.AncestorInPath;
+import org.kohsuke.stapler.DataBoundConstructor;
+import org.kohsuke.stapler.QueryParameter;
+import org.kohsuke.stapler.StaplerRequest;
+
+/**
+ * Triggers builds of other projects.
+ *
+ * &lt;p&gt;
+ * Despite what the name suggests, this class doesn't actually trigger other jobs
+ * as a part of {@link #perform} method. Its main job is to simply augment
+ * {@link DependencyGraph}. Jobs are responsible for triggering downstream jobs
+ * on its own, because dependencies may come from other sources.
+ *
+ * &lt;p&gt;
+ * This class, however, does provide the {@link #execute(AbstractBuild, BuildListener, BuildTrigger)}
+ * method as a convenience method to invoke downstream builds.
+ *
+ * &lt;p&gt;Its counterpart is {@link ReverseBuildTrigger}.
+ *
+ * @author Kohsuke Kawaguchi
+ */
+public class BuildTrigger extends Recorder implements DependencyDeclarer {
+
+    /**
+     * Comma-separated list of other projects to be scheduled.
+     */
+    private String childProjects;
+
+    /**
+     * Threshold status to trigger other builds.
+     *
+     * For compatibility reasons, this field could be null, in which case
+     * it should read as &quot;SUCCESS&quot;.
+     */
+    private final Result threshold;
+
+    public BuildTrigger(String childProjects, boolean evenIfUnstable) {
+<span class="nc bnc" id="L109" title="All 2 branches missed.">        this(childProjects,evenIfUnstable ? Result.UNSTABLE : Result.SUCCESS);</span>
+<span class="nc" id="L110">    }</span>
+
+    @DataBoundConstructor
+    public BuildTrigger(String childProjects, String threshold) {
+<span class="nc" id="L114">        this(childProjects, Result.fromString(StringUtils.defaultString(threshold, Result.SUCCESS.toString())));</span>
+<span class="nc" id="L115">    }</span>
+
+<span class="nc" id="L117">    public BuildTrigger(String childProjects, Result threshold) {</span>
+<span class="nc bnc" id="L118" title="All 2 branches missed.">        if(childProjects==null)</span>
+<span class="nc" id="L119">            throw new IllegalArgumentException();</span>
+<span class="nc" id="L120">        this.childProjects = childProjects;</span>
+<span class="nc" id="L121">        this.threshold = threshold;</span>
+<span class="nc" id="L122">    }</span>
+
+    public BuildTrigger(List&lt;AbstractProject&gt; childProjects, Result threshold) {
+<span class="nc" id="L125">        this((Collection&lt;AbstractProject&gt;)childProjects,threshold);</span>
+<span class="nc" id="L126">    }</span>
+
+    public BuildTrigger(Collection&lt;? extends AbstractProject&gt; childProjects, Result threshold) {
+<span class="nc" id="L129">        this(Items.toNameList(childProjects),threshold);</span>
+<span class="nc" id="L130">    }</span>
+
+    public String getChildProjectsValue() {
+<span class="nc" id="L133">        return childProjects;</span>
+    }
+
+    public Result getThreshold() {
+<span class="nc bnc" id="L137" title="All 2 branches missed.">        if(threshold==null)</span>
+<span class="nc" id="L138">            return Result.SUCCESS;</span>
+        else
+<span class="nc" id="L140">            return threshold;</span>
+    }
+
+    /**
+     * @deprecated as of 1.406
+     *      Use {@link #getChildProjects(ItemGroup)}
+     */
+    @Deprecated
+    public List&lt;AbstractProject&gt; getChildProjects() {
+<span class="nc" id="L149">        return getChildProjects(Jenkins.getInstance());</span>
+    }
+
+    public List&lt;AbstractProject&gt; getChildProjects(AbstractProject owner) {
+<span class="nc bnc" id="L153" title="All 2 branches missed.">        return getChildProjects(owner==null?null:owner.getParent());</span>
+    }
+
+    public List&lt;AbstractProject&gt; getChildProjects(ItemGroup base) {
+<span class="nc" id="L157">        return Items.fromNameList(base,childProjects,AbstractProject.class);</span>
+    }
+
+    public BuildStepMonitor getRequiredMonitorService() {
+<span class="nc" id="L161">        return BuildStepMonitor.NONE;</span>
+    }
+
+    /**
+     * Checks if this trigger has the exact same set of children as the given list.
+     */
+    public boolean hasSame(AbstractProject owner, Collection&lt;? extends AbstractProject&gt; projects) {
+<span class="nc" id="L168">        List&lt;AbstractProject&gt; children = getChildProjects(owner);</span>
+<span class="nc bnc" id="L169" title="All 4 branches missed.">        return children.size()==projects.size() &amp;&amp; children.containsAll(projects);</span>
+    }
+
+    /**
+     * @deprecated as of 1.406
+     *      Use {@link #hasSame(AbstractProject, Collection)}
+     */
+    @Deprecated
+    public boolean hasSame(Collection&lt;? extends AbstractProject&gt; projects) {
+<span class="nc" id="L178">        return hasSame(null,projects);</span>
+    }
+
+    @Override
+    public boolean perform(AbstractBuild build, Launcher launcher, BuildListener listener) {
+<span class="nc" id="L183">        return true;</span>
+    }
+
+    /**
+     * @deprecated since 1.341; use {@link #execute(AbstractBuild,BuildListener)}
+     */
+    @Deprecated
+    public static boolean execute(AbstractBuild build, BuildListener listener, BuildTrigger trigger) {
+<span class="nc" id="L191">        return execute(build, listener);</span>
+    }
+
+    /**
+     * Convenience method to trigger downstream builds.
+     *
+     * @param build
+     *      The current build. Its downstreams will be triggered.
+     * @param listener
+     *      Receives the progress report.
+     */
+    public static boolean execute(AbstractBuild build, BuildListener listener) {
+<span class="nc" id="L203">        PrintStream logger = listener.getLogger();</span>
+        // Check all downstream Project of the project, not just those defined by BuildTrigger
+        // TODO this may not yet be up to date if rebuildDependencyGraphAsync has been used; need a method to wait for the last call made before now to finish
+<span class="nc" id="L206">        final DependencyGraph graph = Jenkins.getInstance().getDependencyGraph();</span>
+<span class="nc" id="L207">        List&lt;Dependency&gt; downstreamProjects = new ArrayList&lt;Dependency&gt;(</span>
+<span class="nc" id="L208">                graph.getDownstreamDependencies(build.getProject()));</span>
+        // Sort topologically
+<span class="nc" id="L210">        Collections.sort(downstreamProjects, new Comparator&lt;Dependency&gt;() {</span>
+            public int compare(Dependency lhs, Dependency rhs) {
+                // Swapping lhs/rhs to get reverse sort:
+<span class="nc" id="L213">                return graph.compare(rhs.getDownstreamProject(), lhs.getDownstreamProject());</span>
+            }
+        });
+
+<span class="nc" id="L217">        Authentication auth = Jenkins.getAuthentication(); // from build</span>
+<span class="nc bnc" id="L218" title="All 2 branches missed.">        if (auth.equals(ACL.SYSTEM)) { // i.e., unspecified</span>
+<span class="nc bnc" id="L219" title="All 2 branches missed.">            if (QueueItemAuthenticatorDescriptor.all().isEmpty()) {</span>
+<span class="nc bnc" id="L220" title="All 2 branches missed.">                if (downstreamProjects.isEmpty()) {</span>
+<span class="nc" id="L221">                    return true;</span>
+                }
+<span class="nc" id="L223">                logger.println(Messages.BuildTrigger_warning_you_have_no_plugins_providing_ac());</span>
+<span class="nc bnc" id="L224" title="All 2 branches missed.">            } else if (QueueItemAuthenticatorConfiguration.get().getAuthenticators().isEmpty()) {</span>
+<span class="nc bnc" id="L225" title="All 2 branches missed.">                if (downstreamProjects.isEmpty()) {</span>
+<span class="nc" id="L226">                    return true;</span>
+                }
+<span class="nc" id="L228">                logger.println(Messages.BuildTrigger_warning_access_control_for_builds_in_glo());</span>
+<span class="nc" id="L229">            } else {</span>
+                // This warning must be printed even if downstreamProjects is empty.
+                // Otherwise you could effectively escalate DISCOVER to READ just by trying different project names and checking whether a warning was printed or not.
+                // If there were an API to determine whether any DependencyDeclarer’s in this project requested downstream project names,
+                // then we could suppress the warnings in case none did; but if any do, yet Items.fromNameList etc. ignore unknown projects,
+                // that has to be treated the same as if there really are downstream projects but the anonymous user cannot see them.
+                // For the above two cases, it is OK to suppress the warning when there are no downstream projects, since running as SYSTEM we would be able to see them anyway.
+<span class="nc" id="L236">                logger.println(Messages.BuildTrigger_warning_this_build_has_no_associated_aut());</span>
+<span class="nc" id="L237">                auth = Jenkins.ANONYMOUS;</span>
+            }
+        }
+
+<span class="nc bnc" id="L241" title="All 2 branches missed.">        for (Dependency dep : downstreamProjects) {</span>
+<span class="nc" id="L242">            List&lt;Action&gt; buildActions = new ArrayList&lt;Action&gt;();</span>
+<span class="nc" id="L243">            SecurityContext orig = ACL.impersonate(auth);</span>
+            try {
+<span class="nc bnc" id="L245" title="All 2 branches missed.">                if (dep.shouldTriggerBuild(build, listener, buildActions)) {</span>
+<span class="nc" id="L246">                    AbstractProject p = dep.getDownstreamProject();</span>
+                    // Allow shouldTriggerBuild to return false first, in case it is skipping because of a lack of Item.READ/DISCOVER permission:
+<span class="nc bnc" id="L248" title="All 2 branches missed.">                    if (p.isDisabled()) {</span>
+<span class="nc" id="L249">                        logger.println(Messages.BuildTrigger_Disabled(ModelHyperlinkNote.encodeTo(p)));</span>
+<span class="nc" id="L250">                        continue;</span>
+                    }
+<span class="nc" id="L252">                    boolean scheduled = p.scheduleBuild(p.getQuietPeriod(), new UpstreamCause((Run)build), buildActions.toArray(new Action[buildActions.size()]));</span>
+<span class="nc bnc" id="L253" title="All 2 branches missed.">                    if (Jenkins.getInstance().getItemByFullName(p.getFullName()) == p) {</span>
+<span class="nc" id="L254">                        String name = ModelHyperlinkNote.encodeTo(p);</span>
+<span class="nc bnc" id="L255" title="All 2 branches missed.">                        if (scheduled) {</span>
+<span class="nc" id="L256">                            logger.println(Messages.BuildTrigger_Triggering(name));</span>
+<span class="nc" id="L257">                        } else {</span>
+<span class="nc" id="L258">                            logger.println(Messages.BuildTrigger_InQueue(name));</span>
+                        }
+                    } // otherwise upstream users should not know that it happened
+                }
+<span class="nc" id="L262">            } finally {</span>
+<span class="nc" id="L263">                SecurityContextHolder.setContext(orig);</span>
+<span class="nc" id="L264">            }</span>
+        }
+
+<span class="nc" id="L267">        return true;</span>
+    }
+
+    public void buildDependencyGraph(AbstractProject owner, DependencyGraph graph) {
+<span class="nc bnc" id="L271" title="All 2 branches missed.">        for (AbstractProject p : getChildProjects(owner))</span>
+<span class="nc" id="L272">            graph.addDependency(new Dependency(owner, p) {</span>
+                @Override
+                public boolean shouldTriggerBuild(AbstractBuild build, TaskListener listener,
+                                                  List&lt;Action&gt; actions) {
+<span class="nc" id="L276">                    AbstractProject downstream = getDownstreamProject();</span>
+<span class="nc bnc" id="L277" title="All 2 branches missed.">                    if (Jenkins.getInstance().getItemByFullName(downstream.getFullName()) != downstream) { // this checks Item.READ also on parent folders</span>
+<span class="nc" id="L278">                        LOGGER.log(Level.WARNING, &quot;Running as {0} cannot even see {1} for trigger from {2}&quot;, new Object[] {Jenkins.getAuthentication().getName(), downstream, getUpstreamProject()});</span>
+<span class="nc" id="L279">                        return false; // do not even issue a warning to build log</span>
+                    }
+<span class="nc bnc" id="L281" title="All 2 branches missed.">                    if (!downstream.hasPermission(Item.BUILD)) {</span>
+<span class="nc" id="L282">                        listener.getLogger().println(Messages.BuildTrigger_you_have_no_permission_to_build_(ModelHyperlinkNote.encodeTo(downstream)));</span>
+<span class="nc" id="L283">                        return false;</span>
+                    }
+<span class="nc" id="L285">                    return build.getResult().isBetterOrEqualTo(threshold);</span>
+                }
+            });
+<span class="nc" id="L288">    }</span>
+
+    @Override
+    public boolean needsToRunAfterFinalized() {
+<span class="nc" id="L292">        return true;</span>
+    }
+
+    /** @deprecated Does not handle folder moves. */
+    @Deprecated
+    public boolean onJobRenamed(String oldName, String newName) {
+        // quick test
+<span class="nc bnc" id="L299" title="All 2 branches missed.">        if(!childProjects.contains(oldName))</span>
+<span class="nc" id="L300">            return false;</span>
+
+<span class="nc" id="L302">        boolean changed = false;</span>
+
+        // we need to do this per string, since old Project object is already gone.
+<span class="nc" id="L305">        String[] projects = childProjects.split(&quot;,&quot;);</span>
+<span class="nc bnc" id="L306" title="All 2 branches missed.">        for( int i=0; i&lt;projects.length; i++ ) {</span>
+<span class="nc bnc" id="L307" title="All 2 branches missed.">            if(projects[i].trim().equals(oldName)) {</span>
+<span class="nc" id="L308">                projects[i] = newName;</span>
+<span class="nc" id="L309">                changed = true;</span>
+            }
+        }
+
+<span class="nc bnc" id="L313" title="All 2 branches missed.">        if(changed) {</span>
+<span class="nc" id="L314">            StringBuilder b = new StringBuilder();</span>
+<span class="nc bnc" id="L315" title="All 2 branches missed.">            for (String p : projects) {</span>
+<span class="nc bnc" id="L316" title="All 2 branches missed.">                if(b.length()&gt;0)    b.append(',');</span>
+<span class="nc" id="L317">                b.append(p);</span>
+            }
+<span class="nc" id="L319">            childProjects = b.toString();</span>
+        }
+
+<span class="nc" id="L322">        return changed;</span>
+    }
+
+    /**
+     * Correct broken data gracefully (#1537)
+     */
+    private Object readResolve() {
+<span class="nc bnc" id="L329" title="All 2 branches missed.">        if(childProjects==null)</span>
+<span class="nc" id="L330">            return childProjects=&quot;&quot;;</span>
+<span class="nc" id="L331">        return this;</span>
+    }
+
+    @Extension
+<span class="nc" id="L335">    public static class DescriptorImpl extends BuildStepDescriptor&lt;Publisher&gt; {</span>
+        public String getDisplayName() {
+<span class="nc" id="L337">            return Messages.BuildTrigger_DisplayName();</span>
+        }
+
+        @Override
+        public String getHelpFile() {
+<span class="nc" id="L342">            return &quot;/help/project-config/downstream.html&quot;;</span>
+        }
+
+        @Override
+        public BuildTrigger newInstance(StaplerRequest req, JSONObject formData) throws FormException {
+<span class="nc" id="L347">            String childProjectsString = formData.getString(&quot;childProjects&quot;).trim();</span>
+<span class="nc bnc" id="L348" title="All 2 branches missed.">            if (childProjectsString.endsWith(&quot;,&quot;)) {</span>
+<span class="nc" id="L349">                childProjectsString = childProjectsString.substring(0, childProjectsString.length() - 1).trim();</span>
+            }
+<span class="nc" id="L351">            return new BuildTrigger(</span>
+<span class="nc" id="L352">                childProjectsString,</span>
+<span class="nc" id="L353">                formData.optString(&quot;threshold&quot;, Result.SUCCESS.toString()));</span>
+        }
+
+        @Override
+        public boolean isApplicable(Class&lt;? extends AbstractProject&gt; jobType) {
+<span class="nc" id="L358">            return true;</span>
+        }
+
+        public boolean showEvenIfUnstableOption(@CheckForNull Class&lt;? extends AbstractProject&lt;?,?&gt;&gt; jobType) {
+            // UGLY: for promotion process, this option doesn't make sense.
+<span class="nc bnc" id="L363" title="All 4 branches missed.">            return jobType == null || !jobType.getName().contains(&quot;PromotionProcess&quot;);</span>
+        }
+
+        /**
+         * Form validation method.
+         */
+        public FormValidation doCheck(@AncestorInPath AbstractProject project, @QueryParameter String value) {
+            // Require CONFIGURE permission on this project
+<span class="nc bnc" id="L371" title="All 2 branches missed.">            if(!project.hasPermission(Item.CONFIGURE))      return FormValidation.ok();</span>
+
+<span class="nc" id="L373">            StringTokenizer tokens = new StringTokenizer(Util.fixNull(value),&quot;,&quot;);</span>
+<span class="nc" id="L374">            boolean hasProjects = false;</span>
+<span class="nc bnc" id="L375" title="All 2 branches missed.">            while(tokens.hasMoreTokens()) {</span>
+<span class="nc" id="L376">                String projectName = tokens.nextToken().trim();</span>
+<span class="nc bnc" id="L377" title="All 2 branches missed.">                if (StringUtils.isNotBlank(projectName)) {</span>
+<span class="nc" id="L378">                    Item item = Jenkins.getInstance().getItem(projectName,project,Item.class);</span>
+<span class="nc bnc" id="L379" title="All 2 branches missed.">                    if (item == null) {</span>
+<span class="nc" id="L380">                        AbstractProject nearest = AbstractProject.findNearest(projectName,project.getParent());</span>
+<span class="nc bnc" id="L381" title="All 2 branches missed.">                        String alternative = nearest != null ? nearest.getRelativeNameFrom(project) : &quot;?&quot;;</span>
+<span class="nc" id="L382">                        return FormValidation.error(Messages.BuildTrigger_NoSuchProject(projectName, alternative));</span>
+                    }
+<span class="nc bnc" id="L384" title="All 2 branches missed.">                    if(!(item instanceof AbstractProject))</span>
+<span class="nc" id="L385">                        return FormValidation.error(Messages.BuildTrigger_NotBuildable(projectName));</span>
+                    // check whether the supposed user is expected to be able to build
+<span class="nc" id="L387">                    Authentication auth = Tasks.getAuthenticationOf(project);</span>
+<span class="nc bnc" id="L388" title="All 4 branches missed.">                    if (auth.equals(ACL.SYSTEM) &amp;&amp; !QueueItemAuthenticatorConfiguration.get().getAuthenticators().isEmpty()) {</span>
+<span class="nc" id="L389">                        auth = Jenkins.ANONYMOUS; // compare behavior in execute, above</span>
+                    }
+<span class="nc bnc" id="L391" title="All 2 branches missed.">                    if (!item.getACL().hasPermission(auth, Item.BUILD)) {</span>
+<span class="nc" id="L392">                        return FormValidation.error(Messages.BuildTrigger_you_have_no_permission_to_build_(projectName));</span>
+                    }
+<span class="nc" id="L394">                    hasProjects = true;</span>
+                }
+            }
+<span class="nc bnc" id="L397" title="All 2 branches missed.">            if (!hasProjects) {</span>
+<span class="nc" id="L398">                return FormValidation.error(Messages.BuildTrigger_NoProjectSpecified());</span>
+            }
+
+<span class="nc" id="L401">            return FormValidation.ok();</span>
+        }
+
+        public AutoCompletionCandidates doAutoCompleteChildProjects(@QueryParameter String value, @AncestorInPath Item self, @AncestorInPath ItemGroup container) {
+<span class="nc" id="L405">            return AutoCompletionCandidates.ofJobNames(Job.class,value,self,container);</span>
+        }
+
+        @Extension
+<span class="nc" id="L409">        public static class ItemListenerImpl extends ItemListener {</span>
+            @Override
+            public void onLocationChanged(final Item item, final String oldFullName, final String newFullName) {
+<span class="nc" id="L412">                ACL.impersonate(ACL.SYSTEM, new Runnable() {</span>
+                    @Override public void run() {
+<span class="nc" id="L414">                        locationChanged(item, oldFullName, newFullName);</span>
+<span class="nc" id="L415">                    }</span>
+                });
+<span class="nc" id="L417">            }</span>
+            private void locationChanged(Item item, String oldFullName, String newFullName) {
+                // update BuildTrigger of other projects that point to this object.
+                // can't we generalize this?
+<span class="nc bnc" id="L421" title="All 2 branches missed.">                for( Project&lt;?,?&gt; p : Jenkins.getInstance().getAllItems(Project.class) ) {</span>
+<span class="nc" id="L422">                    BuildTrigger t = p.getPublishersList().get(BuildTrigger.class);</span>
+<span class="nc bnc" id="L423" title="All 2 branches missed.">                    if(t!=null) {</span>
+<span class="nc" id="L424">                        String cp2 = Items.computeRelativeNamesAfterRenaming(oldFullName, newFullName, t.childProjects, p.getParent());</span>
+<span class="nc bnc" id="L425" title="All 2 branches missed.">                        if (!cp2.equals(t.childProjects)) {</span>
+<span class="nc" id="L426">                            t.childProjects = cp2;</span>
+                            try {
+<span class="nc" id="L428">                                p.save();</span>
+<span class="nc" id="L429">                            } catch (IOException e) {</span>
+<span class="nc" id="L430">                                LOGGER.log(Level.WARNING, &quot;Failed to persist project setting during rename from &quot;+oldFullName+&quot; to &quot;+newFullName,e);</span>
+                            }
+                        }
+                    }
+                }
+<span class="nc" id="L435">            }</span>
+        }
+    }
+
+<span class="nc" id="L439">    private static final Logger LOGGER = Logger.getLogger(BuildTrigger.class.getName());</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

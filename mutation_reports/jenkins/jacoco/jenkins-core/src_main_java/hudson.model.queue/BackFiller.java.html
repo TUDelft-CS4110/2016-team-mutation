@@ -1,0 +1,212 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>BackFiller.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.model.queue</a> &gt; <span class="el_source">BackFiller.java</span></div><h1>BackFiller.java</h1><pre class="source lang-java linenums">package hudson.model.queue;
+
+import com.google.common.collect.Iterables;
+import hudson.Extension;
+import hudson.model.Computer;
+import hudson.model.Executor;
+import jenkins.model.Jenkins;
+import hudson.model.InvisibleAction;
+import hudson.model.Queue.BuildableItem;
+import hudson.model.queue.MappingWorksheet.ExecutorChunk;
+import hudson.model.queue.MappingWorksheet.ExecutorSlot;
+import hudson.model.queue.MappingWorksheet.Mapping;
+import hudson.model.queue.MappingWorksheet.WorkChunk;
+import hudson.util.TimeUnit2;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+
+/**
+ * Experimental.
+ *
+ * @author Kohsuke Kawaguchi
+ */
+<span class="nc" id="L28">public class BackFiller extends LoadPredictor {</span>
+<span class="nc" id="L29">    private boolean recursion = false;</span>
+
+    @Override
+    public Iterable&lt;FutureLoad&gt; predict(MappingWorksheet plan, Computer computer, long start, long end) {
+<span class="nc" id="L33">        TimeRange timeRange = new TimeRange(start, end - start);</span>
+<span class="nc" id="L34">        List&lt;FutureLoad&gt; loads = new ArrayList&lt;FutureLoad&gt;();</span>
+
+<span class="nc bnc" id="L36" title="All 2 branches missed.">        for (BuildableItem bi : Jenkins.getInstance().getQueue().getBuildableItems()) {</span>
+<span class="nc" id="L37">            TentativePlan tp = bi.getAction(TentativePlan.class);</span>
+<span class="nc bnc" id="L38" title="All 2 branches missed.">            if (tp==null) {// do this even for bi==plan.item ensures that we have FIFO semantics in tentative plans.</span>
+<span class="nc" id="L39">                tp = makeTentativePlan(bi);</span>
+<span class="nc bnc" id="L40" title="All 2 branches missed.">                if (tp==null)   continue;   // no viable plan.</span>
+            }
+
+<span class="nc bnc" id="L43" title="All 2 branches missed.">            if (tp.isStale()) {</span>
+                // if the tentative plan is stale, just keep on pushing it to the current time
+                // (if we recreate the plan, it'll be put at the end of the queue, whereas this job
+                // should actually get priority over others)
+<span class="nc" id="L47">                tp.range.shiftTo(System.currentTimeMillis());</span>
+            }
+
+            // don't let its own tentative plan count when considering a scheduling for a job
+<span class="nc bnc" id="L51" title="All 2 branches missed.">            if (plan.item==bi)  continue;</span>
+
+
+            // no overlap in the time span, meaning this plan is for a distant future
+<span class="nc bnc" id="L55" title="All 2 branches missed.">            if (!timeRange.overlapsWith(tp.range)) continue;</span>
+
+            // if this tentative plan has no baring on this computer, that's ignorable
+<span class="nc" id="L58">            Integer i = tp.footprint.get(computer);</span>
+<span class="nc bnc" id="L59" title="All 2 branches missed.">            if (i==null)    continue;</span>
+
+<span class="nc" id="L61">            return Collections.singleton(tp.range.toFutureLoad(i));</span>
+        }
+
+<span class="nc" id="L64">        return loads;</span>
+    }
+
+    private static final class PseudoExecutorSlot extends ExecutorSlot {
+        private Executor executor;
+
+<span class="nc" id="L70">        private PseudoExecutorSlot(Executor executor) {</span>
+<span class="nc" id="L71">            this.executor = executor;</span>
+<span class="nc" id="L72">        }</span>
+
+        @Override
+        public Executor getExecutor() {
+<span class="nc" id="L76">            return executor;</span>
+        }
+
+        @Override
+        public boolean isAvailable() {
+<span class="nc" id="L81">            return true;</span>
+        }
+
+        // this slot isn't executable
+        @Override
+        protected void set(WorkUnit p) {
+<span class="nc" id="L87">            throw new UnsupportedOperationException();</span>
+        }
+    }
+
+    private TentativePlan makeTentativePlan(BuildableItem bi) {
+<span class="nc bnc" id="L92" title="All 2 branches missed.">        if (recursion)  return null;</span>
+<span class="nc" id="L93">        recursion = true;</span>
+        try {
+            // pretend for now that all executors are available and decide some assignment that's executable.
+<span class="nc" id="L96">            List&lt;PseudoExecutorSlot&gt; slots = new ArrayList&lt;PseudoExecutorSlot&gt;();</span>
+<span class="nc bnc" id="L97" title="All 2 branches missed.">            for (Computer c : Jenkins.getInstance().getComputers()) {</span>
+<span class="nc bnc" id="L98" title="All 2 branches missed.">                if (c.isOffline())  continue;</span>
+<span class="nc bnc" id="L99" title="All 2 branches missed.">                for (Executor e : c.getExecutors()) {</span>
+<span class="nc" id="L100">                    slots.add(new PseudoExecutorSlot(e));</span>
+                }
+            }
+
+            // also ignore all load predictions as we just want to figure out some executable assignment
+            // and we are not trying to figure out if this task is executable right now.
+<span class="nc" id="L106">            MappingWorksheet worksheet = new MappingWorksheet(bi, slots, Collections.&lt;LoadPredictor&gt;emptyList());</span>
+<span class="nc" id="L107">            Mapping m = Jenkins.getInstance().getQueue().getLoadBalancer().map(bi.task, worksheet);</span>
+<span class="nc bnc" id="L108" title="All 2 branches missed.">            if (m==null)    return null;</span>
+
+            // figure out how many executors we need on each computer?
+<span class="nc" id="L111">            Map&lt;Computer,Integer&gt; footprint = new HashMap&lt;Computer, Integer&gt;();</span>
+<span class="nc bnc" id="L112" title="All 2 branches missed.">            for (Entry&lt;WorkChunk, ExecutorChunk&gt; e : m.toMap().entrySet()) {</span>
+<span class="nc" id="L113">                Computer c = e.getValue().computer;</span>
+<span class="nc" id="L114">                Integer v = footprint.get(c);</span>
+<span class="nc bnc" id="L115" title="All 2 branches missed.">                if (v==null)    v = 0;</span>
+<span class="nc" id="L116">                v += e.getKey().size();</span>
+<span class="nc" id="L117">                footprint.put(c,v);</span>
+            }
+
+            // the point of a tentative plan is to displace other jobs to create a point in time
+            // where this task can start executing. An incorrectly estimated duration is not
+            // a problem in this regard, as we just need enough idle executors in the right moment.
+            // The downside of guessing the duration wrong is that we can end up creating tentative plans
+            // afterward that may be incorrect, but those plans will be rebuilt.
+<span class="nc" id="L125">            long d = bi.task.getEstimatedDuration();</span>
+<span class="nc bnc" id="L126" title="All 2 branches missed.">            if (d&lt;=0)    d = TimeUnit2.MINUTES.toMillis(5);</span>
+
+<span class="nc" id="L128">            TimeRange slot = new TimeRange(System.currentTimeMillis(), d);</span>
+
+            // now, based on the real predicted loads, figure out the approximation of when we can
+            // start executing this guy.
+<span class="nc bnc" id="L132" title="All 2 branches missed.">            for (Entry&lt;Computer, Integer&gt; e : footprint.entrySet()) {</span>
+<span class="nc" id="L133">                Computer computer = e.getKey();</span>
+<span class="nc" id="L134">                Timeline timeline = new Timeline();</span>
+<span class="nc bnc" id="L135" title="All 2 branches missed.">                for (LoadPredictor lp : LoadPredictor.all()) {</span>
+<span class="nc bnc" id="L136" title="All 2 branches missed.">                    for (FutureLoad fl : Iterables.limit(lp.predict(worksheet, computer, slot.start, slot.end),100)) {</span>
+<span class="nc" id="L137">                        timeline.insert(fl.startTime, fl.startTime+fl.duration, fl.numExecutors);</span>
+                    }
+                }
+
+<span class="nc" id="L141">                Long x = timeline.fit(slot.start, slot.duration, computer.countExecutors()-e.getValue());</span>
+                // if no suitable range was found in [slot.start,slot.end), slot.end would be a good approximation
+<span class="nc bnc" id="L143" title="All 2 branches missed.">                if (x==null)    x = slot.end;</span>
+<span class="nc" id="L144">                slot = slot.shiftTo(x);</span>
+            }
+
+<span class="nc" id="L147">            TentativePlan tp = new TentativePlan(footprint, slot);</span>
+<span class="nc" id="L148">            bi.addAction(tp);</span>
+<span class="nc" id="L149">            return tp;</span>
+<span class="nc" id="L150">        } finally {</span>
+<span class="nc" id="L151">            recursion = false;</span>
+<span class="nc" id="L152">        }</span>
+    }
+
+    /**
+     * Represents a duration in time.
+     */
+    private static final class TimeRange {
+        public final long start;
+        public final long duration;
+        public final long end;
+
+<span class="nc" id="L163">        private TimeRange(long start, long duration) {</span>
+<span class="nc" id="L164">            this.start = start;</span>
+<span class="nc" id="L165">            this.duration = duration;</span>
+<span class="nc" id="L166">            this.end = start+duration;</span>
+<span class="nc" id="L167">        }</span>
+
+        public boolean overlapsWith(TimeRange that) {
+<span class="nc bnc" id="L170" title="All 6 branches missed.">            return (this.start &lt;= that.start &amp;&amp; that.start &lt;=this.end)</span>
+<span class="nc bnc" id="L171" title="All 2 branches missed.">                || (that.start &lt;= this.start &amp;&amp; this.start &lt;=that.end);</span>
+        }
+
+        public FutureLoad toFutureLoad(int size) {
+<span class="nc" id="L175">            return new FutureLoad(start,duration,size);</span>
+        }
+
+        public TimeRange shiftTo(long newStart) {
+<span class="nc bnc" id="L179" title="All 2 branches missed.">            if (newStart==start)    return this;</span>
+<span class="nc" id="L180">            return new TimeRange(newStart,duration);</span>
+        }
+    }
+
+    public static final class TentativePlan extends InvisibleAction {
+        private final Map&lt;Computer,Integer&gt; footprint;
+        public final TimeRange range;
+
+<span class="nc" id="L188">        public TentativePlan(Map&lt;Computer, Integer&gt; footprint, TimeRange range) {</span>
+<span class="nc" id="L189">            this.footprint = footprint;</span>
+<span class="nc" id="L190">            this.range = range;</span>
+<span class="nc" id="L191">        }</span>
+
+        public Object writeReplace() {// don't persist
+<span class="nc" id="L194">            return null;</span>
+        }
+
+        public boolean isStale() {
+<span class="nc bnc" id="L198" title="All 2 branches missed.">            return range.end &lt; System.currentTimeMillis();</span>
+        }
+    }
+
+    /**
+     * Once this feature stabilizes, move it to the heavyjob plugin
+     */
+    @Extension
+    public static BackFiller newInstance() {
+<span class="nc bnc" id="L207" title="All 2 branches missed.">        if (Boolean.getBoolean(BackFiller.class.getName()))</span>
+<span class="nc" id="L208">            return new BackFiller();</span>
+<span class="nc" id="L209">        return null;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

@@ -1,0 +1,2871 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>Queue.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.model</a> &gt; <span class="el_source">Queue.java</span></div><h1>Queue.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">/*</span>
+ * The MIT License
+ *
+ * Copyright (c) 2004-2010, Sun Microsystems, Inc., Kohsuke Kawaguchi,
+ * Stephen Connolly, Tom Huybrechts, InfraDNA, Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.model;
+
+import com.google.common.cache.Cache;
+import com.google.common.cache.CacheBuilder;
+import com.google.common.collect.ImmutableList;
+import com.infradna.tool.bridge_method_injector.WithBridgeMethods;
+import hudson.BulkChange;
+import hudson.CopyOnWrite;
+import hudson.ExtensionList;
+import hudson.ExtensionPoint;
+import hudson.Util;
+import hudson.XmlFile;
+import hudson.init.Initializer;
+import static hudson.init.InitMilestone.JOB_LOADED;
+import static hudson.util.Iterators.reverse;
+
+import hudson.cli.declarative.CLIMethod;
+import hudson.cli.declarative.CLIResolver;
+import hudson.model.labels.LabelAssignmentAction;
+import hudson.model.queue.AbstractQueueTask;
+import hudson.model.queue.Executables;
+import hudson.model.queue.QueueListener;
+import hudson.model.queue.QueueTaskFuture;
+import hudson.model.queue.ScheduleResult;
+import hudson.model.queue.ScheduleResult.Created;
+import hudson.model.queue.SubTask;
+import hudson.model.queue.FutureImpl;
+import hudson.model.queue.MappingWorksheet;
+import hudson.model.queue.MappingWorksheet.Mapping;
+import hudson.model.queue.QueueSorter;
+import hudson.model.queue.QueueTaskDispatcher;
+import hudson.model.queue.Tasks;
+import hudson.model.queue.WorkUnit;
+import hudson.model.Node.Mode;
+import hudson.model.listeners.SaveableListener;
+import hudson.model.queue.CauseOfBlockage;
+import hudson.model.queue.FoldableAction;
+import hudson.model.queue.CauseOfBlockage.BecauseLabelIsBusy;
+import hudson.model.queue.CauseOfBlockage.BecauseNodeIsOffline;
+import hudson.model.queue.CauseOfBlockage.BecauseLabelIsOffline;
+import hudson.model.queue.CauseOfBlockage.BecauseNodeIsBusy;
+import hudson.model.queue.WorkUnitContext;
+import hudson.security.AccessControlled;
+import hudson.security.Permission;
+import jenkins.security.QueueItemAuthenticatorProvider;
+import jenkins.util.Timer;
+import hudson.triggers.SafeTimerTask;
+import hudson.util.TimeUnit2;
+import hudson.util.XStream2;
+import hudson.util.ConsistentHash;
+import hudson.util.ConsistentHash.Hash;
+
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.lang.ref.WeakReference;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Calendar;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.GregorianCalendar;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.NoSuchElementException;
+import java.util.Set;
+import java.util.TreeSet;
+import java.util.concurrent.Callable;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+import javax.annotation.Nonnull;
+import javax.servlet.ServletException;
+
+import jenkins.model.Jenkins;
+import jenkins.security.QueueItemAuthenticator;
+import jenkins.util.AtmostOneTaskExecutor;
+import org.acegisecurity.AccessDeniedException;
+import org.acegisecurity.Authentication;
+import org.jenkinsci.bytecode.AdaptField;
+import org.jenkinsci.remoting.RoleChecker;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
+import org.kohsuke.stapler.HttpResponse;
+import org.kohsuke.stapler.HttpResponses;
+import org.kohsuke.stapler.export.Exported;
+import org.kohsuke.stapler.export.ExportedBean;
+
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.DoNotUse;
+
+import com.thoughtworks.xstream.XStream;
+import com.thoughtworks.xstream.converters.basic.AbstractSingleValueConverter;
+import javax.annotation.CheckForNull;
+import javax.annotation.Nonnegative;
+import jenkins.model.queue.AsynchronousExecution;
+import org.kohsuke.stapler.QueryParameter;
+import org.kohsuke.stapler.interceptor.RequirePOST;
+
+/**
+ * Build queue.
+ *
+ * &lt;p&gt;
+ * This class implements the core scheduling logic. {@link Task} represents the executable
+ * task that are placed in the queue. While in the queue, it's wrapped into {@link Item}
+ * so that we can keep track of additional data used for deciding what to execute when.
+ *
+ * &lt;p&gt;
+ * Items in queue goes through several stages, as depicted below:
+ * &lt;pre&gt;
+ * (enter) --&gt; waitingList --+--&gt; blockedProjects
+ *                           |        ^
+ *                           |        |
+ *                           |        v
+ *                           +--&gt; buildables ---&gt; pending ---&gt; left
+ *                                    ^              |
+ *                                    |              |
+ *                                    +---(rarely)---+
+ * &lt;/pre&gt;
+ *
+ * &lt;p&gt;
+ * Note: In the normal case of events pending items only move to left. However they can move back
+ * if the node they are assigned to execute on disappears before their {@link Executor} thread
+ * starts, where the node is removed before the {@link Executable} has been instantiated it
+ * is safe to move the pending item back to buildable. Once the {@link Executable} has been
+ * instantiated the only option is to let the {@link Executable} bomb out as soon as it starts
+ * to try an execute on the node that no longer exists.
+ *
+ * &lt;p&gt;
+ * In addition, at any stage, an item can be removed from the queue (for example, when the user
+ * cancels a job in the queue.) See the corresponding field for their exact meanings.
+ *
+ * @author Kohsuke Kawaguchi
+ * @see QueueListener
+ * @see QueueTaskDispatcher
+ */
+@ExportedBean
+public class Queue extends ResourceController implements Saveable {
+
+    /**
+     * Items that are waiting for its quiet period to pass.
+     *
+     * &lt;p&gt;
+     * This consists of {@link Item}s that cannot be run yet
+     * because its time has not yet come.
+     */
+<span class="nc" id="L181">    private final Set&lt;WaitingItem&gt; waitingList = new TreeSet&lt;WaitingItem&gt;();</span>
+
+    /**
+     * {@link Task}s that can be built immediately
+     * but blocked because another build is in progress,
+     * required {@link Resource}s are not available,
+     * blocked via {@link QueueTaskDispatcher#canRun(Item)},
+     * or otherwise blocked by {@link Task#isBuildBlocked()}.
+     */
+<span class="nc" id="L190">    private final ItemList&lt;BlockedItem&gt; blockedProjects = new ItemList&lt;BlockedItem&gt;();</span>
+
+    /**
+     * {@link Task}s that can be built immediately
+     * that are waiting for available {@link Executor}.
+     * This list is sorted in such a way that earlier items are built earlier.
+     */
+<span class="nc" id="L197">    private final ItemList&lt;BuildableItem&gt; buildables = new ItemList&lt;BuildableItem&gt;();</span>
+
+    /**
+     * {@link Task}s that are being handed over to the executor, but execution
+     * has not started yet.
+     */
+<span class="nc" id="L203">    private final ItemList&lt;BuildableItem&gt; pendings = new ItemList&lt;BuildableItem&gt;();</span>
+
+<span class="nc" id="L205">    private transient volatile Snapshot snapshot = new Snapshot(waitingList, blockedProjects, buildables, pendings);</span>
+
+    /**
+     * Items that left queue would stay here for a while to enable tracking via {@link Item#getId()}.
+     *
+     * This map is forgetful, since we can't remember everything that executed in the past.
+     */
+<span class="nc" id="L212">    private final Cache&lt;Long,LeftItem&gt; leftItems = CacheBuilder.newBuilder().expireAfterWrite(5*60, TimeUnit.SECONDS).build();</span>
+
+    /**
+     * Data structure created for each idle {@link Executor}.
+     * This is a job offer from the queue to an executor.
+     *
+     * &lt;p&gt;
+     * For each idle executor, this gets created to allow the scheduling logic
+     * to assign a work. Once a work is assigned, the executor actually gets
+     * started to carry out the task in question.
+     */
+<span class="nc bnc" id="L223" title="All 2 branches missed.">    public class JobOffer extends MappingWorksheet.ExecutorSlot {</span>
+        public final Executor executor;
+
+        /**
+         * The work unit that this {@link Executor} is going to handle.
+         */
+        private WorkUnit workUnit;
+
+<span class="nc" id="L231">        private JobOffer(Executor executor) {</span>
+<span class="nc" id="L232">            this.executor = executor;</span>
+<span class="nc" id="L233">        }</span>
+
+        @Override
+        protected void set(WorkUnit p) {
+<span class="nc bnc" id="L237" title="All 4 branches missed.">            assert this.workUnit == null;</span>
+<span class="nc" id="L238">            this.workUnit = p;</span>
+<span class="nc bnc" id="L239" title="All 4 branches missed.">            assert executor.isParking();</span>
+<span class="nc" id="L240">            executor.start(workUnit);</span>
+            // LOGGER.info(&quot;Starting &quot;+executor.getName());
+<span class="nc" id="L242">        }</span>
+
+        @Override
+        public Executor getExecutor() {
+<span class="nc" id="L246">            return executor;</span>
+        }
+
+        /**
+         * Verifies that the {@link Executor} represented by this object is capable of executing the given task.
+         */
+        public boolean canTake(BuildableItem item) {
+<span class="nc" id="L253">            Node node = getNode();</span>
+<span class="nc bnc" id="L254" title="All 2 branches missed.">            if (node==null)     return false;   // this executor is about to die</span>
+
+<span class="nc bnc" id="L256" title="All 2 branches missed.">            if(node.canTake(item)!=null)</span>
+<span class="nc" id="L257">                return false;   // this node is not able to take the task</span>
+
+<span class="nc bnc" id="L259" title="All 2 branches missed.">            for (QueueTaskDispatcher d : QueueTaskDispatcher.all())</span>
+<span class="nc bnc" id="L260" title="All 2 branches missed.">                if (d.canTake(node,item)!=null)</span>
+<span class="nc" id="L261">                    return false;</span>
+
+<span class="nc" id="L263">            return isAvailable();</span>
+        }
+
+        /**
+         * Is this executor ready to accept some tasks?
+         */
+        public boolean isAvailable() {
+<span class="nc bnc" id="L270" title="All 6 branches missed.">            return workUnit == null &amp;&amp; !executor.getOwner().isOffline() &amp;&amp; executor.getOwner().isAcceptingTasks();</span>
+        }
+
+        @CheckForNull
+        public Node getNode() {
+<span class="nc" id="L275">            return executor.getOwner().getNode();</span>
+        }
+
+        public boolean isNotExclusive() {
+<span class="nc bnc" id="L279" title="All 2 branches missed.">            return getNode().getMode() == Mode.NORMAL;</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="nc" id="L284">            return String.format(&quot;JobOffer[%s #%d]&quot;,executor.getOwner().getName(), executor.getNumber());</span>
+        }
+    }
+
+    private volatile transient LoadBalancer loadBalancer;
+
+    private volatile transient QueueSorter sorter;
+
+<span class="nc" id="L292">    private transient final AtmostOneTaskExecutor&lt;Void&gt; maintainerThread = new AtmostOneTaskExecutor&lt;Void&gt;(new Callable&lt;Void&gt;() {</span>
+        @Override
+        public Void call() throws Exception {
+<span class="nc" id="L295">            maintain();</span>
+<span class="nc" id="L296">            return null;</span>
+        }
+    });
+
+<span class="nc" id="L300">    private transient final ReentrantLock lock = new ReentrantLock();</span>
+
+<span class="nc" id="L302">    private transient final Condition condition = lock.newCondition();</span>
+
+<span class="nc" id="L304">    public Queue(@Nonnull LoadBalancer loadBalancer) {</span>
+<span class="nc" id="L305">        this.loadBalancer =  loadBalancer.sanitize();</span>
+        // if all the executors are busy doing something, then the queue won't be maintained in
+        // timely fashion, so use another thread to make sure it happens.
+<span class="nc" id="L308">        new MaintainTask(this).periodic();</span>
+<span class="nc" id="L309">    }</span>
+
+    public LoadBalancer getLoadBalancer() {
+<span class="nc" id="L312">        return loadBalancer;</span>
+    }
+
+    public void setLoadBalancer(@Nonnull LoadBalancer loadBalancer) {
+<span class="nc bnc" id="L316" title="All 2 branches missed.">        if(loadBalancer==null)  throw new IllegalArgumentException();</span>
+<span class="nc" id="L317">        this.loadBalancer = loadBalancer.sanitize();</span>
+<span class="nc" id="L318">    }</span>
+
+    public QueueSorter getSorter() {
+<span class="nc" id="L321">        return sorter;</span>
+    }
+
+    public void setSorter(QueueSorter sorter) {
+<span class="nc" id="L325">        this.sorter = sorter;</span>
+<span class="nc" id="L326">    }</span>
+
+    /**
+     * Simple queue state persistence object.
+     */
+<span class="nc" id="L331">    static class State {</span>
+        public long counter;
+<span class="nc" id="L333">        public List&lt;Item&gt; items = new ArrayList&lt;Item&gt;();</span>
+    }
+
+    /**
+     * Loads the queue contents that was {@link #save() saved}.
+     */
+    public void load() {
+<span class="nc" id="L340">        lock.lock();</span>
+        try { try {
+            // first try the old format
+<span class="nc" id="L343">            File queueFile = getQueueFile();</span>
+<span class="nc bnc" id="L344" title="All 2 branches missed.">            if (queueFile.exists()) {</span>
+<span class="nc" id="L345">                BufferedReader in = new BufferedReader(new InputStreamReader(new FileInputStream(queueFile)));</span>
+                try {
+                    String line;
+<span class="nc bnc" id="L348" title="All 2 branches missed.">                    while ((line = in.readLine()) != null) {</span>
+<span class="nc" id="L349">                        AbstractProject j = Jenkins.getInstance().getItemByFullName(line, AbstractProject.class);</span>
+<span class="nc bnc" id="L350" title="All 2 branches missed.">                        if (j != null)</span>
+<span class="nc" id="L351">                            j.scheduleBuild();</span>
+                    }
+<span class="nc" id="L353">                } finally {</span>
+<span class="nc" id="L354">                    in.close();</span>
+<span class="nc" id="L355">                }</span>
+                // discard the queue file now that we are done
+<span class="nc" id="L357">                queueFile.delete();</span>
+<span class="nc" id="L358">            } else {</span>
+<span class="nc" id="L359">                queueFile = getXMLQueueFile();</span>
+<span class="nc bnc" id="L360" title="All 2 branches missed.">                if (queueFile.exists()) {</span>
+<span class="nc" id="L361">                    Object unmarshaledObj = new XmlFile(XSTREAM, queueFile).read();</span>
+                    List items;
+
+<span class="nc bnc" id="L364" title="All 2 branches missed.">                    if (unmarshaledObj instanceof State) {</span>
+<span class="nc" id="L365">                        State state = (State) unmarshaledObj;</span>
+<span class="nc" id="L366">                        items = state.items;</span>
+<span class="nc" id="L367">                        WaitingItem.COUNTER.set(state.counter);</span>
+<span class="nc" id="L368">                    } else {</span>
+                        // backward compatibility - it's an old List queue.xml
+<span class="nc" id="L370">                        items = (List) unmarshaledObj;</span>
+<span class="nc" id="L371">                        long maxId = 0;</span>
+<span class="nc bnc" id="L372" title="All 2 branches missed.">                        for (Object o : items) {</span>
+<span class="nc bnc" id="L373" title="All 2 branches missed.">                            if (o instanceof Item) {</span>
+<span class="nc" id="L374">                                maxId = Math.max(maxId, ((Item)o).id);</span>
+                            }
+                        }
+<span class="nc" id="L377">                        WaitingItem.COUNTER.set(maxId);</span>
+                    }
+
+<span class="nc bnc" id="L380" title="All 2 branches missed.">                    for (Object o : items) {</span>
+<span class="nc bnc" id="L381" title="All 2 branches missed.">                        if (o instanceof Task) {</span>
+                            // backward compatibility
+<span class="nc" id="L383">                            schedule((Task)o, 0);</span>
+<span class="nc bnc" id="L384" title="All 2 branches missed.">                        } else if (o instanceof Item) {</span>
+<span class="nc" id="L385">                            Item item = (Item)o;</span>
+
+<span class="nc bnc" id="L387" title="All 2 branches missed.">                            if (item.task == null) {</span>
+<span class="nc" id="L388">                                continue;   // botched persistence. throw this one away</span>
+                            }
+
+<span class="nc bnc" id="L391" title="All 2 branches missed.">                            if (item instanceof WaitingItem) {</span>
+<span class="nc" id="L392">                                item.enter(this);</span>
+<span class="nc bnc" id="L393" title="All 2 branches missed.">                            } else if (item instanceof BlockedItem) {</span>
+<span class="nc" id="L394">                                item.enter(this);</span>
+<span class="nc bnc" id="L395" title="All 2 branches missed.">                            } else if (item instanceof BuildableItem) {</span>
+<span class="nc" id="L396">                                item.enter(this);</span>
+<span class="nc" id="L397">                            } else {</span>
+<span class="nc" id="L398">                                throw new IllegalStateException(&quot;Unknown item type! &quot; + item);</span>
+                            }
+                        }
+                    }
+
+                    // I just had an incident where all the executors are dead at AbstractProject._getRuns()
+                    // because runs is null. Debugger revealed that this is caused by a MatrixConfiguration
+                    // object that doesn't appear to be de-serialized properly.
+                    // I don't know how this problem happened, but to diagnose this problem better
+                    // when it happens again, save the old queue file for introspection.
+<span class="nc" id="L408">                    File bk = new File(queueFile.getPath() + &quot;.bak&quot;);</span>
+<span class="nc" id="L409">                    bk.delete();</span>
+<span class="nc" id="L410">                    queueFile.renameTo(bk);</span>
+<span class="nc" id="L411">                    queueFile.delete();</span>
+                }
+            }
+<span class="nc" id="L414">        } catch (IOException e) {</span>
+<span class="nc" id="L415">            LOGGER.log(Level.WARNING, &quot;Failed to load the queue file &quot; + getXMLQueueFile(), e);</span>
+<span class="nc" id="L416">        } finally { updateSnapshot(); } } finally {</span>
+<span class="nc" id="L417">            lock.unlock();</span>
+<span class="nc" id="L418">        }</span>
+<span class="nc" id="L419">    }</span>
+
+    /**
+     * Persists the queue contents to the disk.
+     */
+    public void save() {
+<span class="nc bnc" id="L425" title="All 2 branches missed.">        if(BulkChange.contains(this))  return;</span>
+
+<span class="nc" id="L427">        XmlFile queueFile = new XmlFile(XSTREAM, getXMLQueueFile());</span>
+<span class="nc" id="L428">        lock.lock();</span>
+        try {
+            // write out the queue state we want to save
+<span class="nc" id="L431">            State state = new State();</span>
+<span class="nc" id="L432">            state.counter = WaitingItem.COUNTER.longValue();</span>
+
+            // write out the tasks on the queue
+<span class="nc bnc" id="L435" title="All 2 branches missed.">            for (Item item: getItems()) {</span>
+<span class="nc bnc" id="L436" title="All 2 branches missed.">                if(item.task instanceof TransientTask)  continue;</span>
+<span class="nc" id="L437">                state.items.add(item);</span>
+            }
+
+            try {
+<span class="nc" id="L441">                queueFile.write(state);</span>
+<span class="nc" id="L442">            } catch (IOException e) {</span>
+<span class="nc" id="L443">                LOGGER.log(Level.WARNING, &quot;Failed to write out the queue file &quot; + getXMLQueueFile(), e);</span>
+            }
+<span class="nc" id="L445">        } finally {</span>
+<span class="nc" id="L446">            lock.unlock();</span>
+<span class="nc" id="L447">        }</span>
+<span class="nc" id="L448">        SaveableListener.fireOnChange(this, queueFile);</span>
+<span class="nc" id="L449">    }</span>
+
+    /**
+     * Wipes out all the items currently in the queue, as if all of them are cancelled at once.
+     */
+    @CLIMethod(name=&quot;clear-queue&quot;)
+    public void clear() {
+<span class="nc" id="L456">        Jenkins.getInstance().checkPermission(Jenkins.ADMINISTER);</span>
+<span class="nc" id="L457">        lock.lock();</span>
+        try { try {
+<span class="nc bnc" id="L459" title="All 2 branches missed.">            for (WaitingItem i : new ArrayList&lt;WaitingItem&gt;(</span>
+<span class="nc" id="L460">                    waitingList))   // copy the list as we'll modify it in the loop</span>
+<span class="nc" id="L461">                i.cancel(this);</span>
+<span class="nc" id="L462">            blockedProjects.cancelAll();</span>
+<span class="nc" id="L463">            pendings.cancelAll();</span>
+<span class="nc" id="L464">            buildables.cancelAll();</span>
+<span class="nc" id="L465">        } finally { updateSnapshot(); } } finally {</span>
+<span class="nc" id="L466">            lock.unlock();</span>
+<span class="nc" id="L467">        }</span>
+<span class="nc" id="L468">        scheduleMaintenance();</span>
+<span class="nc" id="L469">    }</span>
+
+    private File getQueueFile() {
+<span class="nc" id="L472">        return new File(Jenkins.getInstance().getRootDir(), &quot;queue.txt&quot;);</span>
+    }
+
+    /*package*/ File getXMLQueueFile() {
+<span class="nc" id="L476">        return new File(Jenkins.getInstance().getRootDir(), &quot;queue.xml&quot;);</span>
+    }
+
+    /**
+     * @deprecated as of 1.311
+     *      Use {@link #schedule(AbstractProject)}
+     */
+    @Deprecated
+    public boolean add(AbstractProject p) {
+<span class="nc bnc" id="L485" title="All 2 branches missed.">        return schedule(p)!=null;</span>
+    }
+
+    /**
+     * Schedule a new build for this project.
+     * @see #schedule(Task, int)
+     */
+    public @CheckForNull WaitingItem schedule(AbstractProject p) {
+<span class="nc" id="L493">        return schedule(p, p.getQuietPeriod());</span>
+    }
+
+    /**
+     * Schedules a new build with a custom quiet period.
+     *
+     * &lt;p&gt;
+     * Left for backward compatibility with &amp;lt;1.114.
+     *
+     * @since 1.105
+     * @deprecated as of 1.311
+     *      Use {@link #schedule(Task, int)}
+     */
+    @Deprecated
+    public boolean add(AbstractProject p, int quietPeriod) {
+<span class="nc bnc" id="L508" title="All 2 branches missed.">        return schedule(p, quietPeriod)!=null;</span>
+    }
+
+    /**
+     * @deprecated as of 1.521
+     *  Use {@link #schedule2(Task, int, List)}
+     */
+    @Deprecated
+    public WaitingItem schedule(Task p, int quietPeriod, List&lt;Action&gt; actions) {
+<span class="nc" id="L517">        return schedule2(p, quietPeriod, actions).getCreateItem();</span>
+    }
+
+    /**
+     * Schedules an execution of a task.
+     *
+     * @param actions
+     *      These actions can be used for associating information scoped to a particular build, to
+     *      the task being queued. Upon the start of the build, these {@link Action}s will be automatically
+     *      added to the {@link Run} object, and hence avaialable to everyone.
+     *      For the convenience of the caller, this list can contain null, and those will be silently ignored.
+     * @since 1.311
+     * @return
+     *      {@link hudson.model.queue.ScheduleResult.Refused} if Jenkins refused to add this task into the queue (for example because the system
+     *      is about to shutdown.) Otherwise the task is either merged into existing items in the queue
+     *      (in which case you get {@link hudson.model.queue.ScheduleResult.Existing} instance back), or a new item
+     *      gets created in the queue (in which case you get {@link Created}.
+     *
+     *      Note the nature of the queue
+     *      is that such {@link Item} only captures the state of the item at a particular moment,
+     *      and by the time you inspect the object, some of its information can be already stale.
+     *
+     *      That said, one can still look at {@link Queue.Item#future}, {@link Queue.Item#getId()}, etc.
+     */
+    public @Nonnull ScheduleResult schedule2(Task p, int quietPeriod, List&lt;Action&gt; actions) {
+        // remove nulls
+<span class="nc" id="L543">        actions = new ArrayList&lt;Action&gt;(actions);</span>
+<span class="nc bnc" id="L544" title="All 2 branches missed.">        for (Iterator&lt;Action&gt; itr = actions.iterator(); itr.hasNext();) {</span>
+<span class="nc" id="L545">            Action a =  itr.next();</span>
+<span class="nc bnc" id="L546" title="All 2 branches missed.">            if (a==null)    itr.remove();</span>
+        }
+
+<span class="nc" id="L549">        lock.lock();</span>
+        try { try {
+<span class="nc bnc" id="L551" title="All 2 branches missed.">            for (QueueDecisionHandler h : QueueDecisionHandler.all())</span>
+<span class="nc bnc" id="L552" title="All 2 branches missed.">                if (!h.shouldSchedule(p, actions))</span>
+<span class="nc" id="L553">                    return ScheduleResult.refused();    // veto</span>
+
+<span class="nc" id="L555">            return scheduleInternal(p, quietPeriod, actions);</span>
+<span class="nc" id="L556">        } finally { updateSnapshot(); } } finally {</span>
+<span class="nc" id="L557">            lock.unlock();</span>
+<span class="nc" id="L558">        }</span>
+    }
+
+    /**
+     * Schedules an execution of a task.
+     *
+     * @since 1.311
+     * @return
+     *      {@link hudson.model.queue.ScheduleResult.Existing} if this task is already in the queue and
+     *      therefore the add operation was no-op. Otherwise {@link hudson.model.queue.ScheduleResult.Created}
+     *      indicates the {@link WaitingItem} object added, although the nature of the queue
+     *      is that such {@link Item} only captures the state of the item at a particular moment,
+     *      and by the time you inspect the object, some of its information can be already stale.
+     *
+     *      That said, one can still look at {@link WaitingItem#future}, {@link WaitingItem#getId()}, etc.
+     */
+    private @Nonnull ScheduleResult scheduleInternal(Task p, int quietPeriod, List&lt;Action&gt; actions) {
+<span class="nc" id="L575">        lock.lock();</span>
+        try { try {
+<span class="nc" id="L577">            Calendar due = new GregorianCalendar();</span>
+<span class="nc" id="L578">            due.add(Calendar.SECOND, quietPeriod);</span>
+
+            // Do we already have this task in the queue? Because if so, we won't schedule a new one.
+<span class="nc" id="L581">            List&lt;Item&gt; duplicatesInQueue = new ArrayList&lt;Item&gt;();</span>
+<span class="nc bnc" id="L582" title="All 2 branches missed.">            for (Item item : liveGetItems(p)) {</span>
+<span class="nc" id="L583">                boolean shouldScheduleItem = false;</span>
+<span class="nc bnc" id="L584" title="All 2 branches missed.">                for (QueueAction action : item.getActions(QueueAction.class)) {</span>
+<span class="nc" id="L585">                    shouldScheduleItem |= action.shouldSchedule(actions);</span>
+                }
+<span class="nc bnc" id="L587" title="All 2 branches missed.">                for (QueueAction action : Util.filter(actions, QueueAction.class)) {</span>
+<span class="nc" id="L588">                    shouldScheduleItem |= action.shouldSchedule((new ArrayList&lt;Action&gt;(item.getAllActions())));</span>
+                }
+<span class="nc bnc" id="L590" title="All 2 branches missed.">                if (!shouldScheduleItem) {</span>
+<span class="nc" id="L591">                    duplicatesInQueue.add(item);</span>
+                }
+            }
+<span class="nc bnc" id="L594" title="All 2 branches missed.">            if (duplicatesInQueue.isEmpty()) {</span>
+<span class="nc" id="L595">                LOGGER.log(Level.FINE, &quot;{0} added to queue&quot;, p);</span>
+
+                // put the item in the queue
+<span class="nc" id="L598">                WaitingItem added = new WaitingItem(due, p, actions);</span>
+<span class="nc" id="L599">                added.enter(this);</span>
+<span class="nc" id="L600">                scheduleMaintenance();   // let an executor know that a new item is in the queue.</span>
+<span class="nc" id="L601">                return ScheduleResult.created(added);</span>
+            }
+
+<span class="nc" id="L604">            LOGGER.log(Level.FINE, &quot;{0} is already in the queue&quot;, p);</span>
+
+            // but let the actions affect the existing stuff.
+<span class="nc bnc" id="L607" title="All 2 branches missed.">            for (Item item : duplicatesInQueue) {</span>
+<span class="nc bnc" id="L608" title="All 2 branches missed.">                for (FoldableAction a : Util.filter(actions, FoldableAction.class)) {</span>
+<span class="nc" id="L609">                    a.foldIntoExisting(item, p, actions);</span>
+                }
+            }
+
+<span class="nc" id="L613">            boolean queueUpdated = false;</span>
+<span class="nc bnc" id="L614" title="All 2 branches missed.">            for (WaitingItem wi : Util.filter(duplicatesInQueue, WaitingItem.class)) {</span>
+                // make sure to always use the shorter of the available due times
+<span class="nc bnc" id="L616" title="All 2 branches missed.">                if (wi.timestamp.before(due))</span>
+<span class="nc" id="L617">                    continue;</span>
+
+                // waitingList is sorted, so when we change a timestamp we need to maintain order
+<span class="nc" id="L620">                wi.leave(this);</span>
+<span class="nc" id="L621">                wi.timestamp = due;</span>
+<span class="nc" id="L622">                wi.enter(this);</span>
+<span class="nc" id="L623">                queueUpdated = true;</span>
+            }
+
+<span class="nc bnc" id="L626" title="All 2 branches missed.">            if (queueUpdated) scheduleMaintenance();</span>
+
+            // REVISIT: when there are multiple existing items in the queue that matches the incoming one,
+            // whether the new one should affect all existing ones or not is debatable. I for myself
+            // thought this would only affect one, so the code was bit of surprise, but I'm keeping the current
+            // behaviour.
+<span class="nc" id="L632">            return ScheduleResult.existing(duplicatesInQueue.get(0));</span>
+<span class="nc" id="L633">        } finally { updateSnapshot(); } } finally {</span>
+<span class="nc" id="L634">            lock.unlock();</span>
+<span class="nc" id="L635">        }</span>
+    }
+
+
+    /**
+     * @deprecated as of 1.311
+     *      Use {@link #schedule(Task, int)}
+     */
+    @Deprecated
+    public boolean add(Task p, int quietPeriod) {
+<span class="nc bnc" id="L645" title="All 2 branches missed.">    	return schedule(p, quietPeriod)!=null;</span>
+    }
+
+    public @CheckForNull WaitingItem schedule(Task p, int quietPeriod) {
+<span class="nc" id="L649">    	return schedule(p, quietPeriod, new Action[0]);</span>
+    }
+
+    /**
+     * @deprecated as of 1.311
+     *      Use {@link #schedule(Task, int, Action...)}
+     */
+    @Deprecated
+    public boolean add(Task p, int quietPeriod, Action... actions) {
+<span class="nc bnc" id="L658" title="All 2 branches missed.">    	return schedule(p, quietPeriod, actions)!=null;</span>
+    }
+
+    /**
+     * Convenience wrapper method around {@link #schedule(Task, int, List)}
+     */
+    public @CheckForNull WaitingItem schedule(Task p, int quietPeriod, Action... actions) {
+<span class="nc" id="L665">    	return schedule2(p, quietPeriod, actions).getCreateItem();</span>
+    }
+
+    /**
+     * Convenience wrapper method around {@link #schedule2(Task, int, List)}
+     */
+    public @Nonnull ScheduleResult schedule2(Task p, int quietPeriod, Action... actions) {
+<span class="nc" id="L672">    	return schedule2(p, quietPeriod, Arrays.asList(actions));</span>
+    }
+
+    /**
+     * Cancels the item in the queue. If the item is scheduled more than once, cancels the first occurrence.
+     *
+     * @return true if the project was indeed in the queue and was removed.
+     *         false if this was no-op.
+     */
+    public boolean cancel(Task p) {
+<span class="nc" id="L682">        lock.lock();</span>
+        try { try {
+<span class="nc" id="L684">            LOGGER.log(Level.FINE, &quot;Cancelling {0}&quot;, p);</span>
+<span class="nc bnc" id="L685" title="All 2 branches missed.">            for (WaitingItem item : waitingList) {</span>
+<span class="nc bnc" id="L686" title="All 2 branches missed.">                if (item.task.equals(p)) {</span>
+<span class="nc" id="L687">                    return item.cancel(this);</span>
+                }
+            }
+            // use bitwise-OR to make sure that both branches get evaluated all the time
+<span class="nc bnc" id="L691" title="All 4 branches missed.">            return blockedProjects.cancel(p) != null | buildables.cancel(p) != null;</span>
+<span class="nc" id="L692">        } finally { updateSnapshot(); } } finally {</span>
+<span class="nc" id="L693">            lock.unlock();</span>
+<span class="nc" id="L694">        }</span>
+    }
+
+    private void updateSnapshot() {
+<span class="nc" id="L698">        snapshot = new Snapshot(waitingList, blockedProjects, buildables, pendings);</span>
+<span class="nc" id="L699">    }</span>
+
+    public boolean cancel(Item item) {
+<span class="nc" id="L702">        LOGGER.log(Level.FINE, &quot;Cancelling {0} item#{1}&quot;, new Object[] {item.task, item.id});</span>
+<span class="nc" id="L703">        lock.lock();</span>
+        try { try {
+<span class="nc" id="L705">            return item.cancel(this);</span>
+<span class="nc" id="L706">        } finally { updateSnapshot(); } } finally {</span>
+<span class="nc" id="L707">            lock.unlock();</span>
+<span class="nc" id="L708">        }</span>
+    }
+
+    /**
+     * Called from {@code queue.jelly} and {@code entries.jelly}.
+     */
+    @RequirePOST
+    public HttpResponse doCancelItem(@QueryParameter long id) throws IOException, ServletException {
+<span class="nc" id="L716">        Item item = getItem(id);</span>
+<span class="nc bnc" id="L717" title="All 2 branches missed.">        if (item != null) {</span>
+<span class="nc" id="L718">            cancel(item);</span>
+        } // else too late, ignore (JENKINS-14813)
+<span class="nc" id="L720">        return HttpResponses.forwardToPreviousPage();</span>
+    }
+
+    public boolean isEmpty() {
+<span class="nc" id="L724">        Snapshot snapshot = this.snapshot;</span>
+<span class="nc bnc" id="L725" title="All 6 branches missed.">        return snapshot.waitingList.isEmpty() &amp;&amp; snapshot.blockedProjects.isEmpty() &amp;&amp; snapshot.buildables.isEmpty()</span>
+<span class="nc bnc" id="L726" title="All 2 branches missed.">                &amp;&amp; snapshot.pendings.isEmpty();</span>
+    }
+
+    private WaitingItem peek() {
+<span class="nc" id="L730">        return waitingList.iterator().next();</span>
+    }
+
+    /**
+     * Gets a snapshot of items in the queue.
+     *
+     * Generally speaking the array is sorted such that the items that are most likely built sooner are
+     * at the end.
+     */
+    @Exported(inline=true)
+    public Item[] getItems() {
+<span class="nc" id="L741">        Snapshot s = this.snapshot;</span>
+<span class="nc" id="L742">        List&lt;Item&gt; r = new ArrayList&lt;Item&gt;();</span>
+
+<span class="nc bnc" id="L744" title="All 2 branches missed.">        for(WaitingItem p : s.waitingList) {</span>
+<span class="nc" id="L745">            r = checkPermissionsAndAddToList(r, p);</span>
+        }
+<span class="nc bnc" id="L747" title="All 2 branches missed.">        for (BlockedItem p : s.blockedProjects){</span>
+<span class="nc" id="L748">            r = checkPermissionsAndAddToList(r, p);</span>
+        }
+<span class="nc bnc" id="L750" title="All 2 branches missed.">        for (BuildableItem p : reverse(s.buildables)) {</span>
+<span class="nc" id="L751">            r = checkPermissionsAndAddToList(r, p);</span>
+        }
+<span class="nc bnc" id="L753" title="All 2 branches missed.">        for (BuildableItem p : reverse(s.pendings)) {</span>
+<span class="nc" id="L754">            r= checkPermissionsAndAddToList(r, p);</span>
+        }
+<span class="nc" id="L756">        Item[] items = new Item[r.size()];</span>
+<span class="nc" id="L757">        r.toArray(items);</span>
+<span class="nc" id="L758">        return items;</span>
+    }
+
+    private List&lt;Item&gt; checkPermissionsAndAddToList(List&lt;Item&gt; r, Item t) {
+<span class="nc bnc" id="L762" title="All 2 branches missed.">        if (t.task instanceof hudson.security.AccessControlled) {</span>
+<span class="nc bnc" id="L763" title="All 2 branches missed.">            if (((hudson.security.AccessControlled)t.task).hasPermission(hudson.model.Item.READ)</span>
+<span class="nc bnc" id="L764" title="All 2 branches missed.">                    || ((hudson.security.AccessControlled) t.task).hasPermission(hudson.security.Permission.READ)) {</span>
+<span class="nc" id="L765">                r.add(t);</span>
+            }
+        }
+<span class="nc" id="L768">        return r;</span>
+    }
+
+    /**
+     * Returns an array of Item for which it is only visible the name of the task.
+     *
+     * Generally speaking the array is sorted such that the items that are most likely built sooner are
+     * at the end.
+     */
+    @Restricted(NoExternalUse.class)
+    @Exported(inline=true)
+    public StubItem[] getDiscoverableItems() {
+<span class="nc" id="L780">        Snapshot s = this.snapshot;</span>
+<span class="nc" id="L781">        List&lt;StubItem&gt; r = new ArrayList&lt;StubItem&gt;();</span>
+
+<span class="nc bnc" id="L783" title="All 2 branches missed.">        for(WaitingItem p : s.waitingList) {</span>
+<span class="nc" id="L784">            r = filterDiscoverableItemListBasedOnPermissions(r, p);</span>
+        }
+<span class="nc bnc" id="L786" title="All 2 branches missed.">        for (BlockedItem p : s.blockedProjects){</span>
+<span class="nc" id="L787">            r = filterDiscoverableItemListBasedOnPermissions(r, p);</span>
+        }
+<span class="nc bnc" id="L789" title="All 2 branches missed.">        for (BuildableItem p : reverse(s.buildables)) {</span>
+<span class="nc" id="L790">            r = filterDiscoverableItemListBasedOnPermissions(r, p);</span>
+        }
+<span class="nc bnc" id="L792" title="All 2 branches missed.">        for (BuildableItem p : reverse(s.pendings)) {</span>
+<span class="nc" id="L793">            r= filterDiscoverableItemListBasedOnPermissions(r, p);</span>
+        }
+<span class="nc" id="L795">        StubItem[] items = new StubItem[r.size()];</span>
+<span class="nc" id="L796">        r.toArray(items);</span>
+<span class="nc" id="L797">        return items;</span>
+    }
+
+    private List&lt;StubItem&gt; filterDiscoverableItemListBasedOnPermissions(List&lt;StubItem&gt; r, Item t) {
+<span class="nc bnc" id="L801" title="All 2 branches missed.">        if (t.task instanceof hudson.model.Item) {</span>
+<span class="nc bnc" id="L802" title="All 4 branches missed.">            if (!((hudson.model.Item)t.task).hasPermission(hudson.model.Item.READ) &amp;&amp; ((hudson.model.Item)t.task).hasPermission(hudson.model.Item.DISCOVER)) {</span>
+<span class="nc" id="L803">                r.add(new StubItem(new StubTask(t.task)));</span>
+            }
+        }
+<span class="nc" id="L806">        return r;</span>
+    }
+
+    /**
+     * Like {@link #getItems()}, but returns an approximation that might not be completely up-to-date.
+     *
+     * &lt;p&gt;
+     * At the expense of accuracy, this method does not usually lock {@link Queue} and therefore is faster
+     * in a highly concurrent situation.
+     *
+     * &lt;p&gt;
+     * The list obtained is an accurate snapshot of the queue at some point in the past. The snapshot
+     * is updated and normally no more than one second old, but this is a soft commitment that might
+     * get violated when the lock on {@link Queue} is highly contended.
+     *
+     * &lt;p&gt;
+     * This method is primarily added to make UI threads run faster.
+     *
+     * @since 1.483
+     * @deprecated Use {@link #getItems()} directly. As of 1.607 the approximation is no longer needed.
+     */
+    @Deprecated
+    public List&lt;Item&gt; getApproximateItemsQuickly() {
+<span class="nc" id="L829">        return Arrays.asList(getItems());</span>
+    }
+
+    public Item getItem(long id) {
+<span class="nc" id="L833">        Snapshot snapshot = this.snapshot;</span>
+<span class="nc bnc" id="L834" title="All 2 branches missed.">        for (Item item : snapshot.blockedProjects) {</span>
+<span class="nc bnc" id="L835" title="All 2 branches missed.">            if (item.id == id)</span>
+<span class="nc" id="L836">                return item;</span>
+        }
+<span class="nc bnc" id="L838" title="All 2 branches missed.">        for (Item item : snapshot.buildables) {</span>
+<span class="nc bnc" id="L839" title="All 2 branches missed.">            if (item.id == id)</span>
+<span class="nc" id="L840">                return item;</span>
+        }
+<span class="nc bnc" id="L842" title="All 2 branches missed.">        for (Item item : snapshot.pendings) {</span>
+<span class="nc bnc" id="L843" title="All 2 branches missed.">            if (item.id == id)</span>
+<span class="nc" id="L844">                return item;</span>
+        }
+<span class="nc bnc" id="L846" title="All 2 branches missed.">        for (Item item : snapshot.waitingList) {</span>
+<span class="nc bnc" id="L847" title="All 2 branches missed.">            if (item.id == id) {</span>
+<span class="nc" id="L848">                return item;</span>
+            }
+        }
+<span class="nc" id="L851">        return leftItems.getIfPresent(id);</span>
+    }
+
+    /**
+     * Gets all the {@link BuildableItem}s that are waiting for an executor in the given {@link Computer}.
+     */
+    public List&lt;BuildableItem&gt; getBuildableItems(Computer c) {
+<span class="nc" id="L858">        Snapshot snapshot = this.snapshot;</span>
+<span class="nc" id="L859">        List&lt;BuildableItem&gt; result = new ArrayList&lt;BuildableItem&gt;();</span>
+<span class="nc" id="L860">        _getBuildableItems(c, snapshot.buildables, result);</span>
+<span class="nc" id="L861">        _getBuildableItems(c, snapshot.pendings, result);</span>
+<span class="nc" id="L862">        return result;</span>
+    }
+
+    private void _getBuildableItems(Computer c, List&lt;BuildableItem&gt; col, List&lt;BuildableItem&gt; result) {
+<span class="nc" id="L866">        Node node = c.getNode();</span>
+<span class="nc bnc" id="L867" title="All 2 branches missed.">        if (node == null)   // Deleted computers cannot take build items...</span>
+<span class="nc" id="L868">            return;</span>
+<span class="nc bnc" id="L869" title="All 2 branches missed.">        for (BuildableItem p : col) {</span>
+<span class="nc bnc" id="L870" title="All 2 branches missed.">            if (node.canTake(p) == null)</span>
+<span class="nc" id="L871">                result.add(p);</span>
+        }
+<span class="nc" id="L873">    }</span>
+
+    /**
+     * Gets the snapshot of all {@link BuildableItem}s.
+     */
+    public List&lt;BuildableItem&gt; getBuildableItems() {
+<span class="nc" id="L879">        Snapshot snapshot = this.snapshot;</span>
+<span class="nc" id="L880">        ArrayList&lt;BuildableItem&gt; r = new ArrayList&lt;BuildableItem&gt;(snapshot.buildables);</span>
+<span class="nc" id="L881">        r.addAll(snapshot.pendings);</span>
+<span class="nc" id="L882">        return r;</span>
+    }
+
+    /**
+     * Gets the snapshot of all {@link BuildableItem}s.
+     */
+    public List&lt;BuildableItem&gt; getPendingItems() {
+<span class="nc" id="L889">        return new ArrayList&lt;BuildableItem&gt;(snapshot.pendings);</span>
+    }
+
+    /**
+     * Gets the snapshot of all {@link BlockedItem}s.
+     */
+    protected List&lt;BlockedItem&gt; getBlockedItems() {
+<span class="nc" id="L896">        return new ArrayList&lt;BlockedItem&gt;(snapshot.blockedProjects);</span>
+    }
+    
+    /**
+     * Returns the snapshot of all {@link LeftItem}s.
+     *
+     * @since 1.519
+     */
+    public Collection&lt;LeftItem&gt; getLeftItems() {
+<span class="nc" id="L905">        return Collections.unmodifiableCollection(leftItems.asMap().values());</span>
+    }
+
+    /**
+     * Immediately clear the {@link #getLeftItems} cache.
+     * Useful for tests which need to verify that no links to a build remain.
+     * @since 1.519
+     */
+    public void clearLeftItems() {
+<span class="nc" id="L914">        leftItems.invalidateAll();</span>
+<span class="nc" id="L915">    }</span>
+
+    /**
+     * Gets all items that are in the queue but not blocked
+     *
+     * @since 1.402
+     */
+    public List&lt;Item&gt; getUnblockedItems() {
+<span class="nc" id="L923">        Snapshot snapshot = this.snapshot;</span>
+<span class="nc" id="L924">        List&lt;Item&gt; queuedNotBlocked = new ArrayList&lt;Item&gt;();</span>
+<span class="nc" id="L925">        queuedNotBlocked.addAll(snapshot.waitingList);</span>
+<span class="nc" id="L926">        queuedNotBlocked.addAll(snapshot.buildables);</span>
+<span class="nc" id="L927">        queuedNotBlocked.addAll(snapshot.pendings);</span>
+        // but not 'blockedProjects'
+<span class="nc" id="L929">        return queuedNotBlocked;</span>
+    }
+
+    /**
+     * Works just like {@link #getUnblockedItems()} but return tasks.
+     *
+     * @since 1.402
+     */
+    public Set&lt;Task&gt; getUnblockedTasks() {
+<span class="nc" id="L938">        List&lt;Item&gt; items = getUnblockedItems();</span>
+<span class="nc" id="L939">        Set&lt;Task&gt; unblockedTasks = new HashSet&lt;Task&gt;(items.size());</span>
+<span class="nc bnc" id="L940" title="All 2 branches missed.">        for (Queue.Item t : items)</span>
+<span class="nc" id="L941">            unblockedTasks.add(t.task);</span>
+<span class="nc" id="L942">        return unblockedTasks;</span>
+    }
+
+    /**
+     * Is the given task currently pending execution?
+     */
+    public boolean isPending(Task t) {
+<span class="nc" id="L949">        Snapshot snapshot = this.snapshot;</span>
+<span class="nc bnc" id="L950" title="All 2 branches missed.">        for (BuildableItem i : snapshot.pendings)</span>
+<span class="nc bnc" id="L951" title="All 2 branches missed.">            if (i.task.equals(t))</span>
+<span class="nc" id="L952">                return true;</span>
+<span class="nc" id="L953">        return false;</span>
+    }
+
+    /**
+     * How many {@link BuildableItem}s are assigned for the given label?
+     * @param l Label to be checked. If null, any label will be accepted.
+     *    If you want to count {@link BuildableItem}s without assigned labels,
+     *    use {@link #strictCountBuildableItemsFor(hudson.model.Label)}.
+     * @return Number of {@link BuildableItem}s for the specified label. 
+     */
+    public @Nonnegative int countBuildableItemsFor(@CheckForNull Label l) {
+<span class="nc" id="L964">        Snapshot snapshot = this.snapshot;</span>
+<span class="nc" id="L965">        int r = 0;</span>
+<span class="nc bnc" id="L966" title="All 2 branches missed.">        for (BuildableItem bi : snapshot.buildables)</span>
+<span class="nc bnc" id="L967" title="All 2 branches missed.">            for (SubTask st : bi.task.getSubTasks())</span>
+<span class="nc bnc" id="L968" title="All 4 branches missed.">                if (null == l || bi.getAssignedLabelFor(st) == l)</span>
+<span class="nc" id="L969">                    r++;</span>
+<span class="nc bnc" id="L970" title="All 2 branches missed.">        for (BuildableItem bi : snapshot.pendings)</span>
+<span class="nc bnc" id="L971" title="All 2 branches missed.">            for (SubTask st : bi.task.getSubTasks())</span>
+<span class="nc bnc" id="L972" title="All 4 branches missed.">                if (null == l || bi.getAssignedLabelFor(st) == l)</span>
+<span class="nc" id="L973">                    r++;</span>
+<span class="nc" id="L974">        return r;</span>
+    }
+    
+    /**
+     * How many {@link BuildableItem}s are assigned for the given label?
+     * &lt;p/&gt;
+     * The implementation is quite similar to {@link #countBuildableItemsFor(hudson.model.Label)},
+     * but it has another behavior for null parameters.
+     * @param l Label to be checked. If null, only jobs without assigned labels
+     *      will be taken into the account.
+     * @return Number of {@link BuildableItem}s for the specified label.
+     * @since 1.615
+     */
+    public @Nonnegative int strictCountBuildableItemsFor(@CheckForNull Label l) {
+<span class="nc" id="L988">        Snapshot _snapshot = this.snapshot;</span>
+<span class="nc" id="L989">        int r = 0;</span>
+<span class="nc bnc" id="L990" title="All 2 branches missed.">        for (BuildableItem bi : _snapshot.buildables)</span>
+<span class="nc bnc" id="L991" title="All 2 branches missed.">            for (SubTask st : bi.task.getSubTasks())</span>
+<span class="nc bnc" id="L992" title="All 2 branches missed.">                if (bi.getAssignedLabelFor(st) == l)</span>
+<span class="nc" id="L993">                    r++;</span>
+<span class="nc bnc" id="L994" title="All 2 branches missed.">        for (BuildableItem bi : _snapshot.pendings)</span>
+<span class="nc bnc" id="L995" title="All 2 branches missed.">            for (SubTask st : bi.task.getSubTasks())</span>
+<span class="nc bnc" id="L996" title="All 2 branches missed.">                if (bi.getAssignedLabelFor(st) == l)</span>
+<span class="nc" id="L997">                    r++;</span>
+<span class="nc" id="L998">        return r;</span>
+    }
+
+    /**
+     * Counts all the {@link BuildableItem}s currently in the queue.
+     */
+    public int countBuildableItems() {
+<span class="nc" id="L1005">        return countBuildableItemsFor(null);</span>
+    }
+
+    /**
+     * Gets the information about the queue item for the given project.
+     *
+     * @return null if the project is not in the queue.
+     */
+    public Item getItem(Task t) {
+<span class="nc" id="L1014">        Snapshot snapshot = this.snapshot;</span>
+<span class="nc bnc" id="L1015" title="All 2 branches missed.">        for (Item item : snapshot.blockedProjects) {</span>
+<span class="nc bnc" id="L1016" title="All 2 branches missed.">            if (item.task.equals(t))</span>
+<span class="nc" id="L1017">                return item;</span>
+        }
+<span class="nc bnc" id="L1019" title="All 2 branches missed.">        for (Item item : snapshot.buildables) {</span>
+<span class="nc bnc" id="L1020" title="All 2 branches missed.">            if (item.task.equals(t))</span>
+<span class="nc" id="L1021">                return item;</span>
+        }
+<span class="nc bnc" id="L1023" title="All 2 branches missed.">        for (Item item : snapshot.pendings) {</span>
+<span class="nc bnc" id="L1024" title="All 2 branches missed.">            if (item.task.equals(t))</span>
+<span class="nc" id="L1025">                return item;</span>
+        }
+<span class="nc bnc" id="L1027" title="All 2 branches missed.">        for (Item item : snapshot.waitingList) {</span>
+<span class="nc bnc" id="L1028" title="All 2 branches missed.">            if (item.task.equals(t)) {</span>
+<span class="nc" id="L1029">                return item;</span>
+            }
+        }
+<span class="nc" id="L1032">        return null;</span>
+    }
+
+    /**
+     * Gets the information about the queue item for the given project.
+     *
+     * @return null if the project is not in the queue.
+     * @since 1.607
+     */
+    private List&lt;Item&gt; liveGetItems(Task t) {
+<span class="nc" id="L1042">        lock.lock();</span>
+        try {
+<span class="nc" id="L1044">            List&lt;Item&gt; result = new ArrayList&lt;Item&gt;();</span>
+<span class="nc" id="L1045">            result.addAll(blockedProjects.getAll(t));</span>
+<span class="nc" id="L1046">            result.addAll(buildables.getAll(t));</span>
+<span class="nc" id="L1047">            result.addAll(pendings.getAll(t));</span>
+<span class="nc bnc" id="L1048" title="All 2 branches missed.">            for (Item item : waitingList) {</span>
+<span class="nc bnc" id="L1049" title="All 2 branches missed.">                if (item.task.equals(t)) {</span>
+<span class="nc" id="L1050">                    result.add(item);</span>
+                }
+            }
+<span class="nc" id="L1053">            return result;</span>
+<span class="nc" id="L1054">        } finally {</span>
+<span class="nc" id="L1055">            lock.unlock();</span>
+<span class="nc" id="L1056">        }</span>
+    }
+
+    /**
+     * Gets the information about the queue item for the given project.
+     *
+     * @return null if the project is not in the queue.
+     */
+    public List&lt;Item&gt; getItems(Task t) {
+<span class="nc" id="L1065">        Snapshot snapshot = this.snapshot;</span>
+<span class="nc" id="L1066">        List&lt;Item&gt; result = new ArrayList&lt;Item&gt;();</span>
+<span class="nc bnc" id="L1067" title="All 2 branches missed.">        for (Item item : snapshot.blockedProjects) {</span>
+<span class="nc bnc" id="L1068" title="All 2 branches missed.">            if (item.task.equals(t)) {</span>
+<span class="nc" id="L1069">                result.add(item);</span>
+            }
+        }
+<span class="nc bnc" id="L1072" title="All 2 branches missed.">        for (Item item : snapshot.buildables) {</span>
+<span class="nc bnc" id="L1073" title="All 2 branches missed.">            if (item.task.equals(t)) {</span>
+<span class="nc" id="L1074">                result.add(item);</span>
+            }
+        }
+<span class="nc bnc" id="L1077" title="All 2 branches missed.">        for (Item item : snapshot.pendings) {</span>
+<span class="nc bnc" id="L1078" title="All 2 branches missed.">            if (item.task.equals(t)) {</span>
+<span class="nc" id="L1079">                result.add(item);</span>
+            }
+        }
+<span class="nc bnc" id="L1082" title="All 2 branches missed.">        for (Item item : snapshot.waitingList) {</span>
+<span class="nc bnc" id="L1083" title="All 2 branches missed.">            if (item.task.equals(t)) {</span>
+<span class="nc" id="L1084">                result.add(item);</span>
+            }
+        }
+<span class="nc" id="L1087">        return result;</span>
+    }
+
+    /**
+     * Returns true if this queue contains the said project.
+     */
+    public boolean contains(Task t) {
+<span class="nc" id="L1094">        final Snapshot snapshot = this.snapshot;</span>
+<span class="nc bnc" id="L1095" title="All 2 branches missed.">        for (Item item : snapshot.blockedProjects) {</span>
+<span class="nc bnc" id="L1096" title="All 2 branches missed.">            if (item.task.equals(t))</span>
+<span class="nc" id="L1097">                return true;</span>
+        }
+<span class="nc bnc" id="L1099" title="All 2 branches missed.">        for (Item item : snapshot.buildables) {</span>
+<span class="nc bnc" id="L1100" title="All 2 branches missed.">            if (item.task.equals(t))</span>
+<span class="nc" id="L1101">                return true;</span>
+        }
+<span class="nc bnc" id="L1103" title="All 2 branches missed.">        for (Item item : snapshot.pendings) {</span>
+<span class="nc bnc" id="L1104" title="All 2 branches missed.">            if (item.task.equals(t))</span>
+<span class="nc" id="L1105">                return true;</span>
+        }
+<span class="nc bnc" id="L1107" title="All 2 branches missed.">        for (Item item : snapshot.waitingList) {</span>
+<span class="nc bnc" id="L1108" title="All 2 branches missed.">            if (item.task.equals(t)) {</span>
+<span class="nc" id="L1109">                return true;</span>
+            }
+        }
+<span class="nc" id="L1112">        return false;</span>
+    }
+
+    /**
+     * Called when the executor actually starts executing the assigned work unit.
+     *
+     * This moves the task from the pending state to the &quot;left the queue&quot; state.
+     */
+    /*package*/ void onStartExecuting(Executor exec) throws InterruptedException {
+<span class="nc" id="L1121">        lock.lock();</span>
+        try { try {
+<span class="nc" id="L1123">            final WorkUnit wu = exec.getCurrentWorkUnit();</span>
+<span class="nc" id="L1124">            pendings.remove(wu.context.item);</span>
+
+<span class="nc" id="L1126">            LeftItem li = new LeftItem(wu.context);</span>
+<span class="nc" id="L1127">            li.enter(this);</span>
+<span class="nc" id="L1128">        } finally { updateSnapshot(); } } finally {</span>
+<span class="nc" id="L1129">            lock.unlock();</span>
+<span class="nc" id="L1130">        }</span>
+<span class="nc" id="L1131">    }</span>
+
+    /**
+     * Checks the queue and runs anything that can be run.
+     *
+     * &lt;p&gt;
+     * When conditions are changed, this method should be invoked.
+     * &lt;p&gt;
+     * This wakes up one {@link Executor} so that it will maintain a queue.
+     */
+    @WithBridgeMethods(void.class)
+    public Future&lt;?&gt; scheduleMaintenance() {
+        // LOGGER.info(&quot;Scheduling maintenance&quot;);
+<span class="nc" id="L1144">        return maintainerThread.submit();</span>
+    }
+
+    /**
+     * Checks if the given item should be prevented from entering into the {@link #buildables} state
+     * and instead stay in the {@link #blockedProjects} state.
+     */
+    private boolean isBuildBlocked(Item i) {
+<span class="nc bnc" id="L1152" title="All 4 branches missed.">        if (i.task.isBuildBlocked() || !canRun(i.task.getResourceList()))</span>
+<span class="nc" id="L1153">            return true;</span>
+
+<span class="nc bnc" id="L1155" title="All 2 branches missed.">        for (QueueTaskDispatcher d : QueueTaskDispatcher.all()) {</span>
+<span class="nc bnc" id="L1156" title="All 2 branches missed.">            if (d.canRun(i)!=null)</span>
+<span class="nc" id="L1157">                return true;</span>
+        }
+
+<span class="nc" id="L1160">        return false;</span>
+    }
+
+    /**
+     * Make sure we don't queue two tasks of the same project to be built
+     * unless that project allows concurrent builds.
+     */
+    private boolean allowNewBuildableTask(Task t) {
+        try {
+<span class="nc bnc" id="L1169" title="All 2 branches missed.">            if (t.isConcurrentBuild())</span>
+<span class="nc" id="L1170">                return true;</span>
+<span class="nc" id="L1171">        } catch (AbstractMethodError e) {</span>
+            // earlier versions don't have the &quot;isConcurrentBuild&quot; method, so fall back gracefully
+        }
+<span class="nc bnc" id="L1174" title="All 4 branches missed.">        return !buildables.containsKey(t) &amp;&amp; !pendings.containsKey(t);</span>
+    }
+
+    /**
+     * Some operations require to be performed with the {@link Queue} lock held. Use one of these methods rather
+     * than locking directly on Queue in order to allow for future refactoring.
+     * @param runnable the operation to perform.
+     * @since 1.592
+     */
+    public static void withLock(Runnable runnable) {
+<span class="nc" id="L1184">        final Jenkins jenkins = Jenkins.getInstance();</span>
+<span class="nc bnc" id="L1185" title="All 2 branches missed.">        final Queue queue = jenkins == null ? null : jenkins.getQueue();</span>
+<span class="nc bnc" id="L1186" title="All 2 branches missed.">        if (queue == null) {</span>
+<span class="nc" id="L1187">            runnable.run();</span>
+<span class="nc" id="L1188">        } else {</span>
+<span class="nc" id="L1189">            queue._withLock(runnable);</span>
+        }
+<span class="nc" id="L1191">    }</span>
+
+    /**
+     * Some operations require the {@link Queue} lock held. Use one of these methods rather
+     * than locking directly on Queue in order to allow for future refactoring.
+     *
+     * @param callable the operation to perform.
+     * @param &lt;V&gt;      the type of return value
+     * @param &lt;T&gt;      the type of exception.
+     * @return the result of the callable.
+     * @throws T the exception of the callable
+     * @since 1.592
+     */
+    public static &lt;V, T extends Throwable&gt; V withLock(hudson.remoting.Callable&lt;V, T&gt; callable) throws T {
+<span class="nc" id="L1205">        final Jenkins jenkins = Jenkins.getInstance();</span>
+<span class="nc bnc" id="L1206" title="All 2 branches missed.">        final Queue queue = jenkins == null ? null : jenkins.getQueue();</span>
+<span class="nc bnc" id="L1207" title="All 2 branches missed.">        if (queue == null) {</span>
+<span class="nc" id="L1208">            return callable.call();</span>
+        } else {
+<span class="nc" id="L1210">            return queue._withLock(callable);</span>
+        }
+    }
+
+    /**
+     * Some operations require to be performed with the {@link Queue} lock held. Use one of these methods rather
+     * than locking directly on Queue in order to allow for future refactoring.
+     *
+     * @param callable the operation to perform.
+     * @param &lt;V&gt;      the type of return value
+     * @return the result of the callable.
+     * @throws Exception if the callable throws an exception.
+     * @since 1.592
+     */
+    public static &lt;V&gt; V withLock(java.util.concurrent.Callable&lt;V&gt; callable) throws Exception {
+<span class="nc" id="L1225">        final Jenkins jenkins = Jenkins.getInstance();</span>
+<span class="nc bnc" id="L1226" title="All 2 branches missed.">        final Queue queue = jenkins == null ? null : jenkins.getQueue();</span>
+<span class="nc bnc" id="L1227" title="All 2 branches missed.">        if (queue == null) {</span>
+<span class="nc" id="L1228">            return callable.call();</span>
+        } else {
+<span class="nc" id="L1230">            return queue._withLock(callable);</span>
+        }
+    }
+
+    /**
+     * Invokes the supplied {@link Runnable} if the {@link Queue} lock was obtained without blocking.
+     *
+     * @param runnable the operation to perform.
+     * @return {@code true} if the lock was available and the operation was performed.
+     * @since 1.618
+     */
+    public static boolean tryWithLock(Runnable runnable) {
+<span class="nc" id="L1242">        final Jenkins jenkins = Jenkins.getInstance();</span>
+<span class="nc bnc" id="L1243" title="All 2 branches missed.">        final Queue queue = jenkins == null ? null : jenkins.getQueue();</span>
+<span class="nc bnc" id="L1244" title="All 2 branches missed.">        if (queue == null) {</span>
+<span class="nc" id="L1245">            runnable.run();</span>
+<span class="nc" id="L1246">            return true;</span>
+        } else {
+<span class="nc" id="L1248">            return queue._tryWithLock(runnable);</span>
+        }
+    }
+    /**
+     * Wraps a {@link Runnable} with the  {@link Queue} lock held. 
+     *
+     * @param runnable the operation to wrap.
+     * @since 1.618
+     */
+    public static Runnable wrapWithLock(Runnable runnable) {
+<span class="nc" id="L1258">        final Jenkins jenkins = Jenkins.getInstance();</span>
+<span class="nc bnc" id="L1259" title="All 2 branches missed.">        final Queue queue = jenkins == null ? null : jenkins.getQueue();</span>
+<span class="nc bnc" id="L1260" title="All 2 branches missed.">        return queue == null ? runnable : new LockedRunnable(runnable);</span>
+    }
+
+    /**
+     * Wraps a {@link hudson.remoting.Callable} with the  {@link Queue} lock held. 
+     *
+     * @param callable the operation to wrap.
+     * @since 1.618
+     */
+    public static &lt;V, T extends Throwable&gt; hudson.remoting.Callable&lt;V, T&gt; wrapWithLock(hudson.remoting.Callable&lt;V, T&gt; callable) {
+<span class="nc" id="L1270">        final Jenkins jenkins = Jenkins.getInstance();</span>
+<span class="nc bnc" id="L1271" title="All 2 branches missed.">        final Queue queue = jenkins == null ? null : jenkins.getQueue();</span>
+<span class="nc bnc" id="L1272" title="All 2 branches missed.">        return queue == null ? callable : new LockedHRCallable&lt;&gt;(callable);</span>
+    }
+
+    /**
+     * Wraps a {@link java.util.concurrent.Callable} with the {@link Queue} lock held. 
+     *
+     * @param callable the operation to wrap.
+     * @since 1.618
+     */
+    public static &lt;V&gt; java.util.concurrent.Callable&lt;V&gt; wrapWithLock(java.util.concurrent.Callable&lt;V&gt; callable) {
+<span class="nc" id="L1282">        final Jenkins jenkins = Jenkins.getInstance();</span>
+<span class="nc bnc" id="L1283" title="All 2 branches missed.">        final Queue queue = jenkins == null ? null : jenkins.getQueue();</span>
+<span class="nc bnc" id="L1284" title="All 2 branches missed.">        return queue == null ? callable : new LockedJUCCallable&lt;V&gt;(callable);</span>
+    }
+
+    @Override
+    protected void _await() throws InterruptedException {
+<span class="nc" id="L1289">        condition.await();</span>
+<span class="nc" id="L1290">    }</span>
+
+    @Override
+    protected void _signalAll() {
+<span class="nc" id="L1294">        condition.signalAll();</span>
+<span class="nc" id="L1295">    }</span>
+
+    /**
+     * Some operations require to be performed with the {@link Queue} lock held. Use one of these methods rather
+     * than locking directly on Queue in order to allow for future refactoring.
+     * @param runnable the operation to perform.
+     * @since 1.592
+     */
+    protected void _withLock(Runnable runnable) {
+<span class="nc" id="L1304">        lock.lock();</span>
+        try {
+<span class="nc" id="L1306">            runnable.run();</span>
+<span class="nc" id="L1307">        } finally {</span>
+<span class="nc" id="L1308">            lock.unlock();</span>
+<span class="nc" id="L1309">        }</span>
+<span class="nc" id="L1310">    }</span>
+
+    /**
+     * Invokes the supplied {@link Runnable} if the {@link Queue} lock was obtained without blocking.
+     *
+     * @param runnable the operation to perform.
+     * @return {@code true} if the lock was available and the operation was performed.
+     * @since 1.618
+     */
+    protected boolean _tryWithLock(Runnable runnable) {
+<span class="nc bnc" id="L1320" title="All 2 branches missed.">        if (lock.tryLock()) {</span>
+            try {
+<span class="nc" id="L1322">                runnable.run();</span>
+<span class="nc" id="L1323">            } finally {</span>
+<span class="nc" id="L1324">                lock.unlock();</span>
+<span class="nc" id="L1325">            }</span>
+<span class="nc" id="L1326">            return true;</span>
+        } else {
+<span class="nc" id="L1328">            return false;</span>
+        }
+    }
+
+    /**
+     * Some operations require to be performed with the {@link Queue} lock held. Use one of these methods rather
+     * than locking directly on Queue in order to allow for future refactoring.
+     *
+     * @param callable the operation to perform.
+     * @param &lt;V&gt;      the type of return value
+     * @param &lt;T&gt;      the type of exception.
+     * @return the result of the callable.
+     * @throws T the exception of the callable
+     * @since 1.592
+     */
+    protected &lt;V, T extends Throwable&gt; V _withLock(hudson.remoting.Callable&lt;V, T&gt; callable) throws T {
+<span class="nc" id="L1344">        lock.lock();</span>
+        try {
+<span class="nc" id="L1346">            return callable.call();</span>
+<span class="nc" id="L1347">        } finally {</span>
+<span class="nc" id="L1348">            lock.unlock();</span>
+<span class="nc" id="L1349">        }</span>
+    }
+
+    /**
+     * Some operations require to be performed with the {@link Queue} lock held. Use one of these methods rather
+     * than locking directly on Queue in order to allow for future refactoring.
+     *
+     * @param callable the operation to perform.
+     * @param &lt;V&gt;      the type of return value
+     * @return the result of the callable.
+     * @throws Exception if the callable throws an exception.
+     * @since 1.592
+     */
+    protected &lt;V&gt; V _withLock(java.util.concurrent.Callable&lt;V&gt; callable) throws Exception {
+<span class="nc" id="L1363">        lock.lock();</span>
+        try {
+<span class="nc" id="L1365">            return callable.call();</span>
+<span class="nc" id="L1366">        } finally {</span>
+<span class="nc" id="L1367">            lock.unlock();</span>
+<span class="nc" id="L1368">        }</span>
+    }
+
+    /**
+     * Queue maintenance.
+     *
+     * &lt;p&gt;
+     * Move projects between {@link #waitingList}, {@link #blockedProjects}, {@link #buildables}, and {@link #pendings}
+     * appropriately.
+     *
+     * &lt;p&gt;
+     * Jenkins internally invokes this method by itself whenever there's a change that can affect
+     * the scheduling (such as new node becoming online, # of executors change, a task completes execution, etc.),
+     * and it also gets invoked periodically (see {@link Queue.MaintainTask}.)
+     */
+    public void maintain() {
+<span class="nc" id="L1384">        lock.lock();</span>
+        try { try {
+
+<span class="nc" id="L1387">            LOGGER.log(Level.FINE, &quot;Queue maintenance started {0}&quot;, this);</span>
+
+            // The executors that are currently waiting for a job to run.
+<span class="nc" id="L1390">            Map&lt;Executor, JobOffer&gt; parked = new HashMap&lt;Executor, JobOffer&gt;();</span>
+
+            {// update parked (and identify any pending items whose executor has disappeared)
+<span class="nc" id="L1393">                List&lt;BuildableItem&gt; lostPendings = new ArrayList&lt;BuildableItem&gt;(pendings);</span>
+<span class="nc bnc" id="L1394" title="All 2 branches missed.">                for (Computer c : Jenkins.getInstance().getComputers()) {</span>
+<span class="nc bnc" id="L1395" title="All 2 branches missed.">                    for (Executor e : c.getExecutors()) {</span>
+<span class="nc bnc" id="L1396" title="All 2 branches missed.">                        if (e.isInterrupted()) {</span>
+                            // JENKINS-28840 we will deadlock if we try to touch this executor while interrupt flag set
+                            // we need to clear lost pendings as we cannot know what work unit was on this executor
+                            // while it is interrupted. (All this dancing is a result of Executor extending Thread)
+<span class="nc" id="L1400">                            lostPendings.clear(); // we'll get them next time around when the flag is cleared.</span>
+<span class="nc" id="L1401">                            LOGGER.log(Level.FINEST,</span>
+<span class="nc" id="L1402">                                    &quot;Interrupt thread for executor {0} is set and we do not know what work unit was on the executor.&quot;,</span>
+<span class="nc" id="L1403">                                    e.getDisplayName());</span>
+<span class="nc" id="L1404">                            continue;</span>
+                        }
+<span class="nc bnc" id="L1406" title="All 2 branches missed.">                        if (e.isParking()) {</span>
+<span class="nc" id="L1407">                            LOGGER.log(Level.FINEST, &quot;{0} is parking and is waiting for a job to execute.&quot;, e.getDisplayName());</span>
+<span class="nc" id="L1408">                            parked.put(e, new JobOffer(e));</span>
+                        }
+<span class="nc" id="L1410">                        final WorkUnit workUnit = e.getCurrentWorkUnit();</span>
+<span class="nc bnc" id="L1411" title="All 2 branches missed.">                        if (workUnit != null) {</span>
+<span class="nc" id="L1412">                            lostPendings.remove(workUnit.context.item);</span>
+                        }
+                    }
+                }
+                // pending -&gt; buildable
+<span class="nc bnc" id="L1417" title="All 2 branches missed.">                for (BuildableItem p: lostPendings) {</span>
+<span class="nc" id="L1418">                    LOGGER.log(Level.INFO,</span>
+<span class="nc" id="L1419">                            &quot;BuildableItem {0}: pending -&gt; buildable as the assigned executor disappeared&quot;,</span>
+<span class="nc" id="L1420">                            p.task.getFullDisplayName());</span>
+<span class="nc" id="L1421">                    p.isPending = false;</span>
+<span class="nc" id="L1422">                    pendings.remove(p);</span>
+<span class="nc" id="L1423">                    makeBuildable(p);</span>
+                }
+            }
+
+<span class="nc" id="L1427">            final QueueSorter s = sorter;</span>
+
+            {// blocked -&gt; buildable
+                // copy as we'll mutate the list and we want to process in a potentially different order
+<span class="nc" id="L1431">                List&lt;BlockedItem&gt; blockedItems = new ArrayList&lt;&gt;(blockedProjects.values());</span>
+                // if facing a cycle of blocked tasks, ensure we process in the desired sort order
+<span class="nc bnc" id="L1433" title="All 2 branches missed.">                if (s != null) {</span>
+<span class="nc" id="L1434">                    s.sortBlockedItems(blockedItems);</span>
+<span class="nc" id="L1435">                } else {</span>
+<span class="nc" id="L1436">                    Collections.sort(blockedItems, QueueSorter.DEFAULT_BLOCKED_ITEM_COMPARATOR);</span>
+                }
+<span class="nc bnc" id="L1438" title="All 2 branches missed.">                for (BlockedItem p : blockedItems) {</span>
+<span class="nc" id="L1439">                    String taskDisplayName = p.task.getFullDisplayName();</span>
+<span class="nc" id="L1440">                    LOGGER.log(Level.FINEST, &quot;Current blocked item: {0}&quot;, taskDisplayName);</span>
+<span class="nc bnc" id="L1441" title="All 4 branches missed.">                    if (!isBuildBlocked(p) &amp;&amp; allowNewBuildableTask(p.task)) {</span>
+<span class="nc" id="L1442">                        LOGGER.log(Level.FINEST,</span>
+<span class="nc" id="L1443">                                &quot;BlockedItem {0}: blocked -&gt; buildable as the build is not blocked and new tasks are allowed&quot;,</span>
+<span class="nc" id="L1444">                                taskDisplayName);</span>
+
+                        // ready to be executed
+<span class="nc" id="L1447">                        Runnable r = makeBuildable(new BuildableItem(p));</span>
+<span class="nc bnc" id="L1448" title="All 2 branches missed.">                        if (r != null) {</span>
+<span class="nc" id="L1449">                            p.leave(this);</span>
+<span class="nc" id="L1450">                            r.run();</span>
+                            // JENKINS-28926 we have removed a task from the blocked projects and added to building
+                            // thus we should update the snapshot so that subsequent blocked projects can correctly
+                            // determine if they are blocked by the lucky winner
+<span class="nc" id="L1454">                            updateSnapshot();</span>
+                        }
+                    }
+                }
+            }
+
+            // waitingList -&gt; buildable/blocked
+<span class="nc bnc" id="L1461" title="All 2 branches missed.">            while (!waitingList.isEmpty()) {</span>
+<span class="nc" id="L1462">                WaitingItem top = peek();</span>
+
+<span class="nc bnc" id="L1464" title="All 2 branches missed.">                if (top.timestamp.compareTo(new GregorianCalendar()) &gt; 0) {</span>
+<span class="nc" id="L1465">                    LOGGER.log(Level.FINEST, &quot;Finished moving all ready items from queue.&quot;);</span>
+<span class="nc" id="L1466">                    break; // finished moving all ready items from queue</span>
+                }
+
+<span class="nc" id="L1469">                top.leave(this);</span>
+<span class="nc" id="L1470">                Task p = top.task;</span>
+<span class="nc bnc" id="L1471" title="All 4 branches missed.">                if (!isBuildBlocked(top) &amp;&amp; allowNewBuildableTask(p)) {</span>
+                    // ready to be executed immediately
+<span class="nc" id="L1473">                    Runnable r = makeBuildable(new BuildableItem(top));</span>
+<span class="nc" id="L1474">                    String topTaskDisplayName = top.task.getFullDisplayName();</span>
+<span class="nc bnc" id="L1475" title="All 2 branches missed.">                    if (r != null) {</span>
+<span class="nc" id="L1476">                        LOGGER.log(Level.FINEST, &quot;Executing runnable {0}&quot;, topTaskDisplayName);</span>
+<span class="nc" id="L1477">                        r.run();</span>
+<span class="nc" id="L1478">                    } else {</span>
+<span class="nc" id="L1479">                        LOGGER.log(Level.FINEST, &quot;Item {0} was unable to be made a buildable and is now a blocked item.&quot;, topTaskDisplayName);</span>
+<span class="nc" id="L1480">                        new BlockedItem(top).enter(this);</span>
+                    }
+<span class="nc" id="L1482">                } else {</span>
+                    // this can't be built now because another build is in progress
+                    // set this project aside.
+<span class="nc" id="L1485">                    new BlockedItem(top).enter(this);</span>
+                }
+            }
+
+<span class="nc bnc" id="L1489" title="All 2 branches missed.">            if (s != null)</span>
+<span class="nc" id="L1490">                s.sortBuildableItems(buildables);</span>
+            
+            // Ensure that identification of blocked tasks is using the live state: JENKINS-27708 &amp; JENKINS-27871
+<span class="nc" id="L1493">            updateSnapshot();</span>
+            
+            // allocate buildable jobs to executors
+<span class="nc bnc" id="L1496" title="All 2 branches missed.">            for (BuildableItem p : new ArrayList&lt;BuildableItem&gt;(</span>
+<span class="nc" id="L1497">                    buildables)) {// copy as we'll mutate the list in the loop</span>
+                // one last check to make sure this build is not blocked.
+<span class="nc bnc" id="L1499" title="All 2 branches missed.">                if (isBuildBlocked(p)) {</span>
+<span class="nc" id="L1500">                    p.leave(this);</span>
+<span class="nc" id="L1501">                    new BlockedItem(p).enter(this);</span>
+<span class="nc" id="L1502">                    LOGGER.log(Level.FINE, &quot;Catching that {0} is blocked in the last minute&quot;, p);</span>
+                    // JENKINS-28926 we have moved an unblocked task into the blocked state, update snapshot
+                    // so that other buildables which might have been blocked by this can see the state change
+<span class="nc" id="L1505">                    updateSnapshot();</span>
+<span class="nc" id="L1506">                    continue;</span>
+                }
+
+<span class="nc" id="L1509">                String taskDisplayName = p.task.getFullDisplayName();</span>
+
+<span class="nc bnc" id="L1511" title="All 2 branches missed.">                if (p.task instanceof FlyweightTask) {</span>
+<span class="nc" id="L1512">                    Runnable r = makeFlyWeightTaskBuildable(new BuildableItem(p));</span>
+<span class="nc bnc" id="L1513" title="All 2 branches missed.">                    if (r != null) {</span>
+<span class="nc" id="L1514">                        p.leave(this);</span>
+<span class="nc" id="L1515">                        LOGGER.log(Level.FINEST, &quot;Executing flyweight task {0}&quot;, taskDisplayName);</span>
+<span class="nc" id="L1516">                        r.run();</span>
+<span class="nc" id="L1517">                        updateSnapshot();</span>
+                    }
+<span class="nc" id="L1519">                } else {</span>
+
+<span class="nc" id="L1521">                    List&lt;JobOffer&gt; candidates = new ArrayList&lt;JobOffer&gt;(parked.size());</span>
+<span class="nc bnc" id="L1522" title="All 2 branches missed.">                    for (JobOffer j : parked.values()) {</span>
+<span class="nc bnc" id="L1523" title="All 2 branches missed.">                        if (j.canTake(p)) {</span>
+<span class="nc" id="L1524">                            LOGGER.log(Level.FINEST,</span>
+<span class="nc" id="L1525">                                    &quot;{0} is a potential candidate for task {1}&quot;,</span>
+<span class="nc" id="L1526">                                    new Object[]{j.executor.getDisplayName(), taskDisplayName});</span>
+<span class="nc" id="L1527">                            candidates.add(j);</span>
+                        }
+                    }
+
+<span class="nc" id="L1531">                    MappingWorksheet ws = new MappingWorksheet(p, candidates);</span>
+<span class="nc" id="L1532">                    Mapping m = loadBalancer.map(p.task, ws);</span>
+<span class="nc bnc" id="L1533" title="All 2 branches missed.">                    if (m == null) {</span>
+                        // if we couldn't find the executor that fits,
+                        // just leave it in the buildables list and
+                        // check if we can execute other projects
+<span class="nc" id="L1537">                        LOGGER.log(Level.FINER, &quot;Failed to map {0} to executors. candidates={1} parked={2}&quot;,</span>
+<span class="nc" id="L1538">                                new Object[]{p, candidates, parked.values()});</span>
+<span class="nc" id="L1539">                        continue;</span>
+                    }
+
+                    // found a matching executor. use it.
+<span class="nc" id="L1543">                    WorkUnitContext wuc = new WorkUnitContext(p);</span>
+<span class="nc" id="L1544">                    LOGGER.log(Level.FINEST, &quot;Found a matching executor for {0}. Using it.&quot;, taskDisplayName);</span>
+<span class="nc" id="L1545">                    m.execute(wuc);</span>
+
+<span class="nc" id="L1547">                    p.leave(this);</span>
+<span class="nc bnc" id="L1548" title="All 2 branches missed.">                    if (!wuc.getWorkUnits().isEmpty()) {</span>
+<span class="nc" id="L1549">                        LOGGER.log(Level.FINEST, &quot;BuildableItem {0} marked as pending.&quot;, taskDisplayName);</span>
+<span class="nc" id="L1550">                        makePending(p);</span>
+<span class="nc" id="L1551">                    }</span>
+                    else
+<span class="nc" id="L1553">                        LOGGER.log(Level.FINEST, &quot;BuildableItem {0} with empty work units!?&quot;, p);</span>
+
+                    // Ensure that identification of blocked tasks is using the live state: JENKINS-27708 &amp; JENKINS-27871
+                    // The creation of a snapshot itself should be relatively cheap given the expected rate of
+                    // job execution. You probably would need 100's of jobs starting execution every iteration
+                    // of maintain() before this could even start to become an issue and likely the calculation
+                    // of isBuildBlocked(p) will become a bottleneck before updateSnapshot() will. Additionally
+                    // since the snapshot itself only ever has at most one reference originating outside of the stack
+                    // it should remain in the eden space and thus be cheap to GC.
+                    // See https://issues.jenkins-ci.org/browse/JENKINS-27708?focusedCommentId=225819&amp;page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-225819
+                    // or https://issues.jenkins-ci.org/browse/JENKINS-27708?focusedCommentId=225906&amp;page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-225906
+                    // for alternative fixes of this issue.
+<span class="nc" id="L1565">                    updateSnapshot();</span>
+                }
+            }
+<span class="nc" id="L1568">        } finally { updateSnapshot(); } } finally {</span>
+<span class="nc" id="L1569">            lock.unlock();</span>
+<span class="nc" id="L1570">        }</span>
+<span class="nc" id="L1571">    }</span>
+
+    /**
+     * Tries to make an item ready to build.
+     * @param p a proposed buildable item
+     * @return a thunk to actually prepare it (after leaving an earlier list), or null if it cannot be run now
+     */
+    private @CheckForNull Runnable makeBuildable(final BuildableItem p) {
+<span class="nc bnc" id="L1579" title="All 2 branches missed.">        if (p.task instanceof FlyweightTask) {</span>
+<span class="nc" id="L1580">            String taskDisplayName = p.task.getFullDisplayName();</span>
+<span class="nc bnc" id="L1581" title="All 2 branches missed.">            if (!isBlockedByShutdown(p.task)) {</span>
+
+<span class="nc" id="L1583">                Runnable runnable = makeFlyWeightTaskBuildable(p);</span>
+<span class="nc" id="L1584">                LOGGER.log(Level.FINEST, &quot;Converting flyweight task: {0} into a BuildableRunnable&quot;, taskDisplayName);</span>
+<span class="nc bnc" id="L1585" title="All 2 branches missed.">                if(runnable != null){</span>
+<span class="nc" id="L1586">                    return runnable;</span>
+                }
+
+                //this is to solve JENKINS-30084: the task has to be buildable to force the provisioning of nodes.
+                //if the execution gets here, it means the task could not be scheduled since the node
+                //the task is supposed to run on is offline or not available.
+                //Thus, the flyweighttask enters the buildables queue and will ask Jenkins to provision a node
+<span class="nc" id="L1593">                LOGGER.log(Level.FINEST, &quot;Flyweight task {0} is entering as buildable to provision a node.&quot;, taskDisplayName);</span>
+<span class="nc" id="L1594">                return new BuildableRunnable(p);</span>
+            }
+            // if the execution gets here, it means the task is blocked by shutdown and null is returned.
+<span class="nc" id="L1597">            LOGGER.log(Level.FINEST, &quot;Task {0} is blocked by shutdown.&quot;, taskDisplayName);</span>
+<span class="nc" id="L1598">            return null;</span>
+        } else {
+            // regular heavyweight task
+<span class="nc" id="L1601">            return new BuildableRunnable(p);</span>
+        }
+    }
+
+    /**
+     * This method checks if the flyweight task can be run on any of the available executors
+     * @param p - the flyweight task to be scheduled
+     * @return a Runnable if there is an executor that can take the task, null otherwise
+     */
+    @CheckForNull
+    private Runnable makeFlyWeightTaskBuildable(final BuildableItem p){
+        //we double check if this is a flyweight task
+<span class="nc bnc" id="L1613" title="All 2 branches missed.">        if (p.task instanceof FlyweightTask) {</span>
+<span class="nc" id="L1614">            Jenkins h = Jenkins.getInstance();</span>
+<span class="nc" id="L1615">            Map&lt;Node, Integer&gt; hashSource = new HashMap&lt;Node, Integer&gt;(h.getNodes().size());</span>
+
+            // Even if master is configured with zero executors, we may need to run a flyweight task like MatrixProject on it.
+<span class="nc" id="L1618">            hashSource.put(h, Math.max(h.getNumExecutors() * 100, 1));</span>
+
+<span class="nc bnc" id="L1620" title="All 2 branches missed.">            for (Node n : h.getNodes()) {</span>
+<span class="nc" id="L1621">                hashSource.put(n, n.getNumExecutors() * 100);</span>
+            }
+
+<span class="nc" id="L1624">            ConsistentHash&lt;Node&gt; hash = new ConsistentHash&lt;Node&gt;(NODE_HASH);</span>
+<span class="nc" id="L1625">            hash.addAll(hashSource);</span>
+
+<span class="nc" id="L1627">            Label lbl = p.getAssignedLabel();</span>
+<span class="nc bnc" id="L1628" title="All 2 branches missed.">            for (Node n : hash.list(p.task.getFullDisplayName())) {</span>
+<span class="nc" id="L1629">                final Computer c = n.toComputer();</span>
+<span class="nc bnc" id="L1630" title="All 4 branches missed.">                if (c == null || c.isOffline()) {</span>
+<span class="nc" id="L1631">                    continue;</span>
+                }
+<span class="nc bnc" id="L1633" title="All 4 branches missed.">                if (lbl!=null &amp;&amp; !lbl.contains(n)) {</span>
+<span class="nc" id="L1634">                    continue;</span>
+                }
+<span class="nc bnc" id="L1636" title="All 2 branches missed.">                if (n.canTake(p) != null) {</span>
+<span class="nc" id="L1637">                    continue;</span>
+                }
+
+<span class="nc" id="L1640">                LOGGER.log(Level.FINEST, &quot;Creating flyweight task {0} for computer {1}&quot;, new Object[]{p.task.getFullDisplayName(), c.getName()});</span>
+<span class="nc" id="L1641">                return new Runnable() {</span>
+                    @Override public void run() {
+<span class="nc" id="L1643">                        c.startFlyWeightTask(new WorkUnitContext(p).createWorkUnit(p.task));</span>
+<span class="nc" id="L1644">                        makePending(p);</span>
+<span class="nc" id="L1645">                    }</span>
+                };
+            }
+        }
+<span class="nc" id="L1649">        return null;</span>
+    }
+
+<span class="nc" id="L1652">    private static Hash&lt;Node&gt; NODE_HASH = new Hash&lt;Node&gt;() {</span>
+        public String hash(Node node) {
+<span class="nc" id="L1654">            return node.getNodeName();</span>
+        }
+    };
+
+    private boolean makePending(BuildableItem p) {
+        // LOGGER.info(&quot;Making &quot;+p.task+&quot; pending&quot;); // REMOVE
+<span class="nc" id="L1660">        p.isPending = true;</span>
+<span class="nc" id="L1661">        return pendings.add(p);</span>
+    }
+
+    /** @deprecated Use {@link #isBlockedByShutdown} instead. */
+    @Deprecated
+    public static boolean ifBlockedByHudsonShutdown(Task task) {
+<span class="nc" id="L1667">        return isBlockedByShutdown(task);</span>
+    }
+
+    /**
+     * Checks whether a task should not be scheduled because {@link Jenkins#isQuietingDown()}.
+     * @param task some queue task
+     * @return true if {@link Jenkins#isQuietingDown()} unless this is a {@link NonBlockingTask}
+     * @since 1.598
+     */
+    public static boolean isBlockedByShutdown(Task task) {
+<span class="nc bnc" id="L1677" title="All 4 branches missed.">        return Jenkins.getInstance().isQuietingDown() &amp;&amp; !(task instanceof NonBlockingTask);</span>
+    }
+
+    public Api getApi() {
+<span class="nc" id="L1681">        return new Api(this);</span>
+    }
+
+    /**
+     * Marks {@link Task}s that are not persisted.
+     * @since 1.311
+     */
+    public interface TransientTask extends Task {}
+
+    /**
+     * Marks {@link Task}s that do not consume {@link Executor}.
+     * @see OneOffExecutor
+     * @since 1.318
+     */
+    public interface FlyweightTask extends Task {}
+
+    /**
+     * Marks {@link Task}s that are not affected by the {@linkplain Jenkins#isQuietingDown()}  quieting down},
+     * because these tasks keep other tasks executing.
+     * @see #isBlockedByShutdown
+     * @since 1.336
+     */
+    public interface NonBlockingTask extends Task {}
+
+    /**
+     * Task whose execution is controlled by the queue.
+     *
+     * &lt;p&gt;
+     * {@link #equals(Object) Value equality} of {@link Task}s is used
+     * to collapse two tasks into one. This is used to avoid infinite
+     * queue backlog.
+     *
+     * &lt;p&gt;
+     * Pending {@link Task}s are persisted when Hudson shuts down, so
+     * it needs to be persistable via XStream. To create a non-persisted
+     * transient Task, extend {@link TransientTask} marker interface.
+     *
+     * &lt;p&gt;
+     * Plugins are encouraged to extend from {@link AbstractQueueTask}
+     * instead of implementing this interface directly, to maintain
+     * compatibility with future changes to this interface.
+     *
+     * &lt;p&gt;
+     * Plugins are encouraged to implement {@link AccessControlled} otherwise
+     * the tasks will be hidden from display in the queue.
+     *
+     * &lt;p&gt;
+     * For historical reasons, {@link Task} object by itself
+     * also represents the &quot;primary&quot; sub-task (and as implied by this
+     * design, a {@link Task} must have at least one sub-task.)
+     * Most of the time, the primary subtask is the only sub task.
+     */
+    public interface Task extends ModelObject, SubTask {
+        /**
+         * Returns true if the execution should be blocked
+         * for temporary reasons.
+         *
+         * &lt;p&gt;
+         * Short-hand for {@code getCauseOfBlockage()!=null}.
+         */
+        boolean isBuildBlocked();
+
+        /**
+         * @deprecated as of 1.330
+         *      Use {@link CauseOfBlockage#getShortDescription()} instead.
+         */
+        @Deprecated
+        String getWhyBlocked();
+
+        /**
+         * If the execution of this task should be blocked for temporary reasons,
+         * this method returns a non-null object explaining why.
+         *
+         * &lt;p&gt;
+         * Otherwise this method returns null, indicating that the build can proceed right away.
+         *
+         * &lt;p&gt;
+         * This can be used to define mutual exclusion that goes beyond
+         * {@link #getResourceList()}.
+         */
+        CauseOfBlockage getCauseOfBlockage();
+
+        /**
+         * Unique name of this task.
+         *
+         * &lt;p&gt;
+         * This method is no longer used, left here for compatibility. Just return {@link #getDisplayName()}.
+         */
+        String getName();
+
+        /**
+         * @see hudson.model.Item#getFullDisplayName()
+         */
+        String getFullDisplayName();
+
+        /**
+         * Checks the permission to see if the current user can abort this executable.
+         * Returns normally from this method if it's OK.
+         * &lt;p&gt;
+         * NOTE: If you have implemented {@link AccessControlled} this should just be
+         * {@code checkPermission(hudson.model.Item.CANCEL);}
+         *
+         * @throws AccessDeniedException if the permission is not granted.
+         */
+        void checkAbortPermission();
+
+        /**
+         * Works just like {@link #checkAbortPermission()} except it indicates the status by a return value,
+         * instead of exception.
+         * Also used by default for {@link hudson.model.Queue.Item#hasCancelPermission}.
+         * &lt;p&gt;
+         * NOTE: If you have implemented {@link AccessControlled} this should just be
+         * {@code return hasPermission(hudson.model.Item.CANCEL);}
+         *
+         * @return false
+         *      if the user doesn't have the permission.
+         */
+        boolean hasAbortPermission();
+
+        /**
+         * Returns the URL of this task relative to the context root of the application.
+         *
+         * &lt;p&gt;
+         * When the user clicks an item in the queue, this is the page where the user is taken to.
+         * Hudson expects the current instance to be bound to the URL returned by this method.
+         *
+         * @return
+         *      URL that ends with '/'.
+         */
+        String getUrl();
+
+        /**
+         * True if the task allows concurrent builds, where the same {@link Task} is executed
+         * by multiple executors concurrently on the same or different nodes.
+         *
+         * @since 1.338
+         */
+        boolean isConcurrentBuild();
+
+        /**
+         * Obtains the {@link SubTask}s that constitute this task.
+         *
+         * &lt;p&gt;
+         * The collection returned by this method must also contain the primary {@link SubTask}
+         * represented by this {@link Task} object itself as the first element.
+         * The returned value is read-only.
+         *
+         * &lt;p&gt;
+         * At least size 1.
+         *
+         * &lt;p&gt;
+         * Since this is a newly added method, the invocation may results in {@link AbstractMethodError}.
+         * Use {@link Tasks#getSubTasksOf(Queue.Task)} that avoids this.
+         *
+         * @since 1.377
+         */
+        Collection&lt;? extends SubTask&gt; getSubTasks();
+
+        /**
+         * This method allows the task to provide the default fallback authentication object to be used
+         * when {@link QueueItemAuthenticator} fails to authenticate the build.
+         *
+         * &lt;p&gt;
+         * When the task execution touches other objects inside Jenkins, the access control is performed
+         * based on whether this {@link Authentication} is allowed to use them.
+         *
+         * &lt;p&gt;
+         * This method was added to an interface after it was created, so plugins built against
+         * older versions of Jenkins may not have this method implemented. Called private method _getDefaultAuthenticationOf(Task) on {@link Tasks}
+         * to avoid {@link AbstractMethodError}.
+         *
+         * @since 1.520
+         * @see QueueItemAuthenticator
+         * @see Tasks#getDefaultAuthenticationOf(Queue.Task)
+         */
+        @Nonnull Authentication getDefaultAuthentication();
+
+        /**
+         * This method allows the task to provide the default fallback authentication object to be used
+         * when {@link QueueItemAuthenticator} fails to authenticate the build.
+         *
+         * &lt;p&gt;
+         * When the task execution touches other objects inside Jenkins, the access control is performed
+         * based on whether this {@link Authentication} is allowed to use them.
+         *
+         * &lt;p&gt;
+         * This method was added to an interface after it was created, so plugins built against
+         * older versions of Jenkins may not have this method implemented. Called private method _getDefaultAuthenticationOf(Task) on {@link Tasks}
+         * to avoid {@link AbstractMethodError}.
+         *
+         * @since 1.592
+         * @see QueueItemAuthenticator
+         * @see Tasks#getDefaultAuthenticationOf(Queue.Task, Queue.Item)
+         */
+        @Nonnull Authentication getDefaultAuthentication(Queue.Item item);
+    }
+
+    /**
+     * Represents the real meat of the computation run by {@link Executor}.
+     *
+     * &lt;h2&gt;Views&lt;/h2&gt;
+     * &lt;p&gt;
+     * Implementation must have &lt;tt&gt;executorCell.jelly&lt;/tt&gt;, which is
+     * used to render the HTML that indicates this executable is executing.
+     */
+    public interface Executable extends Runnable {
+        /**
+         * Task from which this executable was created.
+         *
+         * &lt;p&gt;
+         * Since this method went through a signature change in 1.377, the invocation may results in
+         * {@link AbstractMethodError}.
+         * Use {@link Executables#getParentOf(Queue.Executable)} that avoids this.
+         */
+        @Nonnull SubTask getParent();
+
+        /**
+         * Called by {@link Executor} to perform the task.
+         * @throws AsynchronousExecution if you would like to continue without consuming a thread
+         */
+        @Override void run() throws AsynchronousExecution;
+
+        /**
+         * Estimate of how long will it take to execute this executable.
+         * Measured in milliseconds.
+         *
+         * Please, consider using {@link Executables#getEstimatedDurationFor(Queue.Executable)}
+         * to protected against AbstractMethodErrors!
+         *
+         * @return -1 if it's impossible to estimate.
+         * @since 1.383
+         */
+        long getEstimatedDuration();
+
+        /**
+         * Used to render the HTML. Should be a human readable text of what this executable is.
+         */
+        @Override String toString();
+    }
+
+    /**
+     * Item in a queue.
+     */
+    @ExportedBean(defaultVisibility = 999)
+    public static abstract class Item extends Actionable {
+
+        private final long id;
+
+        /**
+         * Unique ID (per master) that tracks the {@link Task} as it moves through different stages
+         * in the queue (each represented by different subtypes of {@link Item} and into any subsequent
+         * {@link Run} instance (see {@link Run#getQueueId()}).
+         * @return
+         * @since 1.601
+         */
+        @Exported
+        public long getId() {
+<span class="fc" id="L1938">            return id;</span>
+        }
+
+        @AdaptField(was=int.class, name=&quot;id&quot;)
+        @Deprecated
+        public int getIdLegacy() {
+<span class="nc bnc" id="L1944" title="All 2 branches missed.">            if (id &gt; Integer.MAX_VALUE) {</span>
+<span class="nc" id="L1945">                throw new IllegalStateException(&quot;Sorry, you need to update any Plugins attempting to &quot; +</span>
+                        &quot;assign 'Queue.Item.id' to an int value. 'Queue.Item.id' is now a long value and &quot; +
+                        &quot;has incremented to a value greater than Integer.MAX_VALUE (2^31 - 1).&quot;);
+            }
+<span class="nc" id="L1949">            return (int) id;</span>
+        }
+
+
+		/**
+         * Project to be built.
+         */
+        @Exported
+        public final Task task;
+
+        private /*almost final*/ transient FutureImpl future;
+
+        private final long inQueueSince;
+
+        /**
+         * Build is blocked because another build is in progress,
+         * required {@link Resource}s are not available, or otherwise blocked
+         * by {@link Task#isBuildBlocked()}.
+         */
+        @Exported
+<span class="nc" id="L1969">        public boolean isBlocked() { return this instanceof BlockedItem; }</span>
+
+        /**
+         * Build is waiting the executor to become available.
+         * This flag is only used in {@link Queue#getItems()} for
+         * 'pseudo' items that are actually not really in the queue.
+         */
+        @Exported
+<span class="nc" id="L1977">        public boolean isBuildable() { return this instanceof BuildableItem; }</span>
+
+        /**
+         * True if the item is starving for an executor for too long.
+         */
+        @Exported
+<span class="nc" id="L1983">        public boolean isStuck() { return false; }</span>
+
+        /**
+         * Since when is this item in the queue.
+         * @return Unix timestamp
+         */
+        @Exported
+        public long getInQueueSince() {
+<span class="nc" id="L1991">            return this.inQueueSince;</span>
+        }
+
+        /**
+         * Returns a human readable presentation of how long this item is already in the queue.
+         * E.g. something like '3 minutes 40 seconds'
+         */
+        public String getInQueueForString() {
+<span class="nc" id="L1999">            long duration = System.currentTimeMillis() - this.inQueueSince;</span>
+<span class="nc" id="L2000">            return Util.getTimeSpanString(duration);</span>
+        }
+
+        /**
+         * Can be used to wait for the completion (either normal, abnormal, or cancellation) of the {@link Task}.
+         * &lt;p&gt;
+         * Just like {@link #getId()}, the same object tracks various stages of the queue.
+         */
+        @WithBridgeMethods(Future.class)
+<span class="nc" id="L2009">        public QueueTaskFuture&lt;Executable&gt; getFuture() { return future; }</span>
+
+        /**
+         * If this task needs to be run on a node with a particular label,
+         * return that {@link Label}. Otherwise null, indicating
+         * it can run on anywhere.
+         *
+         * &lt;p&gt;
+         * This code takes {@link LabelAssignmentAction} into account, then fall back to {@link SubTask#getAssignedLabel()}
+         */
+        public Label getAssignedLabel() {
+<span class="nc bnc" id="L2020" title="All 2 branches missed.">            for (LabelAssignmentAction laa : getActions(LabelAssignmentAction.class)) {</span>
+<span class="nc" id="L2021">                Label l = laa.getAssignedLabel(task);</span>
+<span class="nc bnc" id="L2022" title="All 2 branches missed.">                if (l!=null)    return l;</span>
+            }
+<span class="nc" id="L2024">            return task.getAssignedLabel();</span>
+        }
+
+        /**
+         * Test if the specified {@link SubTask} needs to be run on a node with a particular label.
+         * &lt;p&gt;
+         * This method takes {@link LabelAssignmentAction} into account, the first
+         * non-null assignment will be returned. 
+         * Otherwise falls back to {@link SubTask#getAssignedLabel()}
+         * @param st {@link SubTask} to be checked.
+         * @return Required {@link Label}. Otherwise null, indicating it can run on anywhere.
+
+         */
+        public @CheckForNull Label getAssignedLabelFor(@Nonnull SubTask st) {
+<span class="nc bnc" id="L2038" title="All 2 branches missed.">            for (LabelAssignmentAction laa : getActions(LabelAssignmentAction.class)) {</span>
+<span class="nc" id="L2039">                Label l = laa.getAssignedLabel(st);</span>
+<span class="nc bnc" id="L2040" title="All 2 branches missed.">                if (l!=null)    return l;</span>
+            }
+<span class="nc" id="L2042">            return st.getAssignedLabel();</span>
+        }
+
+        /**
+         * Convenience method that returns a read only view of the {@link Cause}s associated with this item in the queue.
+         *
+         * @return can be empty but never null
+         * @since 1.343
+         */
+        public final List&lt;Cause&gt; getCauses() {
+<span class="nc" id="L2052">            CauseAction ca = getAction(CauseAction.class);</span>
+<span class="nc bnc" id="L2053" title="All 2 branches missed.">            if (ca!=null)</span>
+<span class="nc" id="L2054">                return Collections.unmodifiableList(ca.getCauses());</span>
+<span class="nc" id="L2055">            return Collections.emptyList();</span>
+        }
+
+        @Restricted(DoNotUse.class) // used from Jelly
+        public String getCausesDescription() {
+<span class="nc" id="L2060">            List&lt;Cause&gt; causes = getCauses();</span>
+<span class="nc" id="L2061">            StringBuilder s = new StringBuilder();</span>
+<span class="nc bnc" id="L2062" title="All 2 branches missed.">            for (Cause c : causes) {</span>
+<span class="nc" id="L2063">                s.append(c.getShortDescription()).append('\n');</span>
+            }
+<span class="nc" id="L2065">            return s.toString();</span>
+        }
+
+<span class="fc" id="L2068">        protected Item(Task task, List&lt;Action&gt; actions, long id, FutureImpl future) {</span>
+<span class="fc" id="L2069">            this.task = task;</span>
+<span class="fc" id="L2070">            this.id = id;</span>
+<span class="fc" id="L2071">            this.future = future;</span>
+<span class="fc" id="L2072">            this.inQueueSince = System.currentTimeMillis();</span>
+<span class="pc bpc" id="L2073" title="1 of 2 branches missed.">            for (Action action: actions) addAction(action);</span>
+<span class="fc" id="L2074">        }</span>
+
+<span class="nc" id="L2076">        protected Item(Task task, List&lt;Action&gt; actions, long id, FutureImpl future, long inQueueSince) {</span>
+<span class="nc" id="L2077">            this.task = task;</span>
+<span class="nc" id="L2078">            this.id = id;</span>
+<span class="nc" id="L2079">            this.future = future;</span>
+<span class="nc" id="L2080">            this.inQueueSince = inQueueSince;</span>
+<span class="nc bnc" id="L2081" title="All 2 branches missed.">            for (Action action: actions) addAction(action);</span>
+<span class="nc" id="L2082">        }</span>
+
+        protected Item(Item item) {
+<span class="nc" id="L2085">        	this(item.task, new ArrayList&lt;Action&gt;(item.getAllActions()), item.id, item.future, item.inQueueSince);</span>
+<span class="nc" id="L2086">        }</span>
+
+        /**
+         * Returns the URL of this {@link Item} relative to the context path of Jenkins
+         *
+         * @return
+         *      URL that ends with '/'.
+         * @since 1.519
+         */
+        @Exported
+        public String getUrl() {
+<span class="nc" id="L2097">            return &quot;queue/item/&quot;+id+'/';</span>
+        }
+
+        /**
+         * Gets a human-readable status message describing why it's in the queue.
+         */
+        @Exported
+        public final String getWhy() {
+<span class="nc" id="L2105">            CauseOfBlockage cob = getCauseOfBlockage();</span>
+<span class="nc bnc" id="L2106" title="All 2 branches missed.">            return cob!=null ? cob.getShortDescription() : null;</span>
+        }
+
+        /**
+         * Gets an object that describes why this item is in the queue.
+         */
+        public abstract CauseOfBlockage getCauseOfBlockage();
+
+        /**
+         * Gets a human-readable message about the parameters of this item
+         * @return String
+         */
+        @Exported
+        public String getParams() {
+<span class="nc" id="L2120">        	StringBuilder s = new StringBuilder();</span>
+<span class="nc bnc" id="L2121" title="All 2 branches missed.">        	for (ParametersAction pa : getActions(ParametersAction.class)) {</span>
+<span class="nc bnc" id="L2122" title="All 2 branches missed.">                for (ParameterValue p : pa.getParameters()) {</span>
+<span class="nc" id="L2123">                    s.append('\n').append(p.getShortDescription());</span>
+                }
+        	}
+<span class="nc" id="L2126">        	return s.toString();</span>
+        }
+
+        /**
+         * Checks whether a scheduled item may be canceled.
+         * @return by default, the same as {@link hudson.model.Queue.Task#hasAbortPermission}
+         */
+        public boolean hasCancelPermission() {
+<span class="nc" id="L2134">            return task.hasAbortPermission();</span>
+        }
+
+        public String getDisplayName() {
+			// TODO Auto-generated method stub
+<span class="nc" id="L2139">			return null;</span>
+		}
+
+		public String getSearchUrl() {
+			// TODO Auto-generated method stub
+<span class="nc" id="L2144">			return null;</span>
+		}
+
+        /** @deprecated Use {@link #doCancelItem} instead. */
+        @Deprecated
+        @RequirePOST
+        public HttpResponse doCancelQueue() throws IOException, ServletException {
+<span class="nc" id="L2151">        	Jenkins.getInstance().getQueue().cancel(this);</span>
+<span class="nc" id="L2152">            return HttpResponses.forwardToPreviousPage();</span>
+        }
+
+        /**
+         * Returns the identity that this task carries when it runs, for the purpose of access control.
+         *
+         * When the task execution touches other objects inside Jenkins, the access control is performed
+         * based on whether this {@link Authentication} is allowed to use them. Implementers, if you are unsure,
+         * return the identity of the user who queued the task, or {@link ACL#SYSTEM} to bypass the access control
+         * and run as the super user.
+         *
+         * @since 1.520
+         */
+        @Nonnull
+        public Authentication authenticate() {
+<span class="nc bnc" id="L2167" title="All 2 branches missed.">            for (QueueItemAuthenticator auth : QueueItemAuthenticatorProvider.authenticators()) {</span>
+<span class="nc" id="L2168">                Authentication a = auth.authenticate(this);</span>
+<span class="nc bnc" id="L2169" title="All 2 branches missed.">                if (a!=null)</span>
+<span class="nc" id="L2170">                    return a;</span>
+            }
+<span class="nc" id="L2172">            return Tasks.getDefaultAuthenticationOf(task, this);</span>
+        }
+
+
+        public Api getApi() {
+<span class="nc" id="L2177">            return new Api(this);</span>
+        }
+
+        private Object readResolve() {
+<span class="nc" id="L2181">            this.future = new FutureImpl(task);</span>
+<span class="nc" id="L2182">            return this;</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="nc" id="L2187">            return getClass().getName() + ':' + task + ':' + id;</span>
+        }
+
+        /**
+         * Enters the appropriate queue for this type of item.
+         */
+        /*package*/ abstract void enter(Queue q);
+
+        /**
+         * Leaves the appropriate queue for this type of item.
+         */
+        /*package*/ abstract boolean leave(Queue q);
+
+        /**
+         * Cancels this item, which updates {@link #future} to notify the listener, and
+         * also leaves the queue.
+         *
+         * @return true
+         *      if the item was successfully cancelled.
+         */
+        /*package*/ boolean cancel(Queue q) {
+<span class="nc" id="L2208">            boolean r = leave(q);</span>
+<span class="nc bnc" id="L2209" title="All 2 branches missed.">            if (r) {</span>
+<span class="nc" id="L2210">                future.setAsCancelled();</span>
+<span class="nc" id="L2211">                LeftItem li = new LeftItem(this);</span>
+<span class="nc" id="L2212">                li.enter(q);</span>
+            }
+<span class="nc" id="L2214">            return r;</span>
+        }
+
+    }
+
+    /**
+     * A Stub class for {@link Task} which exposes only the name of the Task to be displayed when the user
+     * has DISCOVERY permissions only.
+     */
+    @Restricted(NoExternalUse.class)
+    @ExportedBean(defaultVisibility = 999)
+    public static class StubTask {
+
+        private String name;
+
+<span class="nc" id="L2229">        public StubTask(@Nonnull Queue.Task base) {</span>
+<span class="nc" id="L2230">            this.name = base.getName();</span>
+<span class="nc" id="L2231">        }</span>
+
+        @Exported
+        public String getName() {
+<span class="nc" id="L2235">            return name;</span>
+        }
+    }
+
+    /**
+     * A Stub class for {@link Item} which exposes only the name of the Task to be displayed when the user
+     * has DISCOVERY permissions only.
+     */
+    @Restricted(NoExternalUse.class)
+    @ExportedBean(defaultVisibility = 999)
+    public class StubItem {
+
+        @Exported public StubTask task;
+
+<span class="nc" id="L2249">        public StubItem(StubTask task) {</span>
+<span class="nc" id="L2250">            this.task = task;</span>
+<span class="nc" id="L2251">        }</span>
+
+    }
+    
+    /**
+     * An optional interface for actions on Queue.Item.
+     * Lets the action cooperate in queue management.
+     *
+     * @since 1.300-ish.
+     */
+    public interface QueueAction extends Action {
+    	/**
+    	 * Returns whether the new item should be scheduled.
+    	 * An action should return true if the associated task is 'different enough' to warrant a separate execution.
+    	 */
+	    boolean shouldSchedule(List&lt;Action&gt; actions);
+    }
+
+    /**
+     * Extension point for deciding if particular job should be scheduled or not.
+     *
+     * &lt;p&gt;
+     * This handler is consulted every time someone tries to submit a task to the queue.
+     * If any of the registered handlers returns false, the task will not be added
+     * to the queue, and the task will never get executed.
+     *
+     * &lt;p&gt;
+     * The other use case is to add additional {@link Action}s to the task
+     * (for example {@link LabelAssignmentAction}) to tasks that are submitted to the queue.
+     *
+     * @since 1.316
+     */
+<span class="nc" id="L2283">    public static abstract class QueueDecisionHandler implements ExtensionPoint {</span>
+    	/**
+    	 * Returns whether the new item should be scheduled.
+         *
+         * @param actions
+         *      List of actions that are to be made available as {@link AbstractBuild#getActions()}
+         *      upon the start of the build. This list is live, and can be mutated.
+    	 */
+    	public abstract boolean shouldSchedule(Task p, List&lt;Action&gt; actions);
+
+    	/**
+    	 * All registered {@link QueueDecisionHandler}s
+    	 */
+    	public static ExtensionList&lt;QueueDecisionHandler&gt; all() {
+<span class="nc" id="L2297">    		return ExtensionList.lookup(QueueDecisionHandler.class);</span>
+    	}
+    }
+
+    /**
+     * {@link Item} in the {@link Queue#waitingList} stage.
+     */
+    public static final class WaitingItem extends Item implements Comparable&lt;WaitingItem&gt; {
+<span class="nc" id="L2305">	private static final AtomicLong COUNTER = new AtomicLong(0);</span>
+
+        /**
+         * This item can be run after this time.
+         */
+        @Exported
+        public Calendar timestamp;
+
+        public WaitingItem(Calendar timestamp, Task project, List&lt;Action&gt; actions) {
+<span class="nc" id="L2314">            super(project, actions, COUNTER.incrementAndGet(), new FutureImpl(project));</span>
+<span class="nc" id="L2315">            this.timestamp = timestamp;</span>
+<span class="nc" id="L2316">        }</span>
+
+        static int getCurrentCounterValue() {
+<span class="nc" id="L2319">            return COUNTER.intValue();</span>
+        }
+
+        public int compareTo(WaitingItem that) {
+<span class="nc" id="L2323">            int r = this.timestamp.getTime().compareTo(that.timestamp.getTime());</span>
+<span class="nc bnc" id="L2324" title="All 2 branches missed.">            if (r != 0) return r;</span>
+
+<span class="nc bnc" id="L2326" title="All 2 branches missed.">            if (this.getId() &lt; that.getId()) {</span>
+<span class="nc" id="L2327">                return -1;</span>
+<span class="nc bnc" id="L2328" title="All 2 branches missed.">            } else if (this.getId() == that.getId()) {</span>
+<span class="nc" id="L2329">                return 0;</span>
+            } else {
+<span class="nc" id="L2331">                return 1;</span>
+            }
+        }
+
+        public CauseOfBlockage getCauseOfBlockage() {
+<span class="nc" id="L2336">            long diff = timestamp.getTimeInMillis() - System.currentTimeMillis();</span>
+<span class="nc bnc" id="L2337" title="All 2 branches missed.">            if (diff &gt; 0)</span>
+<span class="nc" id="L2338">                return CauseOfBlockage.fromMessage(Messages._Queue_InQuietPeriod(Util.getTimeSpanString(diff)));</span>
+            else
+<span class="nc" id="L2340">                return CauseOfBlockage.fromMessage(Messages._Queue_Unknown());</span>
+        }
+
+        @Override
+        /*package*/ void enter(Queue q) {
+<span class="nc bnc" id="L2345" title="All 2 branches missed.">            if (q.waitingList.add(this)) {</span>
+<span class="nc bnc" id="L2346" title="All 2 branches missed.">                for (QueueListener ql : QueueListener.all()) {</span>
+                    try {
+<span class="nc" id="L2348">                        ql.onEnterWaiting(this);</span>
+<span class="nc" id="L2349">                    } catch (Throwable e) {</span>
+                        // don't let this kill the queue
+<span class="nc" id="L2351">                        LOGGER.log(Level.WARNING, &quot;QueueListener failed while processing &quot;+this,e);</span>
+                    }
+                }
+            }
+<span class="nc" id="L2355">        }</span>
+
+        @Override
+        /*package*/ boolean leave(Queue q) {
+<span class="nc" id="L2359">            boolean r = q.waitingList.remove(this);</span>
+<span class="nc bnc" id="L2360" title="All 2 branches missed.">            if (r) {</span>
+<span class="nc bnc" id="L2361" title="All 2 branches missed.">                for (QueueListener ql : QueueListener.all()) {</span>
+                    try {
+<span class="nc" id="L2363">                        ql.onLeaveWaiting(this);</span>
+<span class="nc" id="L2364">                    } catch (Throwable e) {</span>
+                        // don't let this kill the queue
+<span class="nc" id="L2366">                        LOGGER.log(Level.WARNING, &quot;QueueListener failed while processing &quot;+this,e);</span>
+                    }
+                }
+            }
+<span class="nc" id="L2370">            return r;</span>
+        }
+
+
+    }
+
+    /**
+     * Common part between {@link BlockedItem} and {@link BuildableItem}.
+     */
+    public static abstract class NotWaitingItem extends Item {
+        /**
+         * When did this job exit the {@link Queue#waitingList} phase?
+         */
+        @Exported
+        public final long buildableStartMilliseconds;
+
+        protected NotWaitingItem(WaitingItem wi) {
+<span class="nc" id="L2387">            super(wi);</span>
+<span class="nc" id="L2388">            buildableStartMilliseconds = System.currentTimeMillis();</span>
+<span class="nc" id="L2389">        }</span>
+
+        protected NotWaitingItem(NotWaitingItem ni) {
+<span class="nc" id="L2392">            super(ni);</span>
+<span class="nc" id="L2393">            buildableStartMilliseconds = ni.buildableStartMilliseconds;</span>
+<span class="nc" id="L2394">        }</span>
+    }
+
+    /**
+     * {@link Item} in the {@link Queue#blockedProjects} stage.
+     */
+    public final class BlockedItem extends NotWaitingItem {
+<span class="nc" id="L2401">        public BlockedItem(WaitingItem wi) {</span>
+<span class="nc" id="L2402">            super(wi);</span>
+<span class="nc" id="L2403">        }</span>
+
+<span class="nc" id="L2405">        public BlockedItem(NotWaitingItem ni) {</span>
+<span class="nc" id="L2406">            super(ni);</span>
+<span class="nc" id="L2407">        }</span>
+
+        public CauseOfBlockage getCauseOfBlockage() {
+<span class="nc" id="L2410">            ResourceActivity r = getBlockingActivity(task);</span>
+<span class="nc bnc" id="L2411" title="All 2 branches missed.">            if (r != null) {</span>
+<span class="nc bnc" id="L2412" title="All 2 branches missed.">                if (r == task) // blocked by itself, meaning another build is in progress</span>
+<span class="nc" id="L2413">                    return CauseOfBlockage.fromMessage(Messages._Queue_InProgress());</span>
+<span class="nc" id="L2414">                return CauseOfBlockage.fromMessage(Messages._Queue_BlockedBy(r.getDisplayName()));</span>
+            }
+
+<span class="nc bnc" id="L2417" title="All 2 branches missed.">            for (QueueTaskDispatcher d : QueueTaskDispatcher.all()) {</span>
+<span class="nc" id="L2418">                CauseOfBlockage cause = d.canRun(this);</span>
+<span class="nc bnc" id="L2419" title="All 2 branches missed.">                if (cause != null)</span>
+<span class="nc" id="L2420">                    return cause;</span>
+            }
+
+<span class="nc" id="L2423">            return task.getCauseOfBlockage();</span>
+        }
+
+        /*package*/ void enter(Queue q) {
+<span class="nc" id="L2427">            LOGGER.log(Level.FINE, &quot;{0} is blocked&quot;, this);</span>
+<span class="nc" id="L2428">            blockedProjects.add(this);</span>
+<span class="nc bnc" id="L2429" title="All 2 branches missed.">            for (QueueListener ql : QueueListener.all()) {</span>
+                try {
+<span class="nc" id="L2431">                    ql.onEnterBlocked(this);</span>
+<span class="nc" id="L2432">                } catch (Throwable e) {</span>
+                    // don't let this kill the queue
+<span class="nc" id="L2434">                    LOGGER.log(Level.WARNING, &quot;QueueListener failed while processing &quot;+this,e);</span>
+                }
+            }
+<span class="nc" id="L2437">        }</span>
+
+        /*package*/ boolean leave(Queue q) {
+<span class="nc" id="L2440">            boolean r = blockedProjects.remove(this);</span>
+<span class="nc bnc" id="L2441" title="All 2 branches missed.">            if (r) {</span>
+<span class="nc" id="L2442">                LOGGER.log(Level.FINE, &quot;{0} no longer blocked&quot;, this);</span>
+<span class="nc bnc" id="L2443" title="All 2 branches missed.">                for (QueueListener ql : QueueListener.all()) {</span>
+                    try {
+<span class="nc" id="L2445">                        ql.onLeaveBlocked(this);</span>
+<span class="nc" id="L2446">                    } catch (Throwable e) {</span>
+                        // don't let this kill the queue
+<span class="nc" id="L2448">                        LOGGER.log(Level.WARNING, &quot;QueueListener failed while processing &quot;+this,e);</span>
+                    }
+                }
+            }
+<span class="nc" id="L2452">            return r;</span>
+        }
+    }
+
+    /**
+     * {@link Item} in the {@link Queue#buildables} stage.
+     */
+    public final static class BuildableItem extends NotWaitingItem {
+        /**
+         * Set to true when this is added to the {@link Queue#pendings} list.
+         */
+        private boolean isPending;
+
+        public BuildableItem(WaitingItem wi) {
+<span class="nc" id="L2466">            super(wi);</span>
+<span class="nc" id="L2467">        }</span>
+
+        public BuildableItem(NotWaitingItem ni) {
+<span class="nc" id="L2470">            super(ni);</span>
+<span class="nc" id="L2471">        }</span>
+
+        public CauseOfBlockage getCauseOfBlockage() {
+<span class="nc" id="L2474">            Jenkins jenkins = Jenkins.getInstance();</span>
+<span class="nc bnc" id="L2475" title="All 2 branches missed.">            if(isBlockedByShutdown(task))</span>
+<span class="nc" id="L2476">                return CauseOfBlockage.fromMessage(Messages._Queue_HudsonIsAboutToShutDown());</span>
+
+<span class="nc" id="L2478">            Label label = getAssignedLabel();</span>
+<span class="nc" id="L2479">            List&lt;Node&gt; allNodes = jenkins.getNodes();</span>
+<span class="nc bnc" id="L2480" title="All 2 branches missed.">            if (allNodes.isEmpty())</span>
+<span class="nc" id="L2481">                label = null;    // no master/slave. pointless to talk about nodes</span>
+
+<span class="nc bnc" id="L2483" title="All 2 branches missed.">            if (label != null) {</span>
+<span class="nc" id="L2484">                Set&lt;Node&gt; nodes = label.getNodes();</span>
+<span class="nc bnc" id="L2485" title="All 2 branches missed.">                if (label.isOffline()) {</span>
+<span class="nc bnc" id="L2486" title="All 2 branches missed.">                    if (nodes.size() != 1)      return new BecauseLabelIsOffline(label);</span>
+<span class="nc" id="L2487">                    else                        return new BecauseNodeIsOffline(nodes.iterator().next());</span>
+                } else {
+<span class="nc bnc" id="L2489" title="All 2 branches missed.">                    if (nodes.size() != 1)      return new BecauseLabelIsBusy(label);</span>
+<span class="nc" id="L2490">                    else                        return new BecauseNodeIsBusy(nodes.iterator().next());</span>
+                }
+            } else {
+<span class="nc" id="L2493">                return CauseOfBlockage.createNeedsMoreExecutor(Messages._Queue_WaitingForNextAvailableExecutor());</span>
+            }
+        }
+
+        @Override
+        public boolean isStuck() {
+<span class="nc" id="L2499">            Label label = getAssignedLabel();</span>
+<span class="nc bnc" id="L2500" title="All 4 branches missed.">            if(label!=null &amp;&amp; label.isOffline())</span>
+                // no executor online to process this job. definitely stuck.
+<span class="nc" id="L2502">                return true;</span>
+
+<span class="nc" id="L2504">            long d = task.getEstimatedDuration();</span>
+<span class="nc" id="L2505">            long elapsed = System.currentTimeMillis()-buildableStartMilliseconds;</span>
+<span class="nc bnc" id="L2506" title="All 2 branches missed.">            if(d&gt;=0) {</span>
+                // if we were running elsewhere, we would have done this build ten times.
+<span class="nc bnc" id="L2508" title="All 2 branches missed.">                return elapsed &gt; Math.max(d,60000L)*10;</span>
+            } else {
+                // more than a day in the queue
+<span class="nc bnc" id="L2511" title="All 2 branches missed.">                return TimeUnit2.MILLISECONDS.toHours(elapsed)&gt;24;</span>
+            }
+        }
+
+        @Exported
+        public boolean isPending() {
+<span class="nc" id="L2517">            return isPending;</span>
+        }
+
+        @Override
+        /*package*/ void enter(Queue q) {
+<span class="nc" id="L2522">            q.buildables.add(this);</span>
+<span class="nc bnc" id="L2523" title="All 2 branches missed.">            for (QueueListener ql : QueueListener.all()) {</span>
+                try {
+<span class="nc" id="L2525">                    ql.onEnterBuildable(this);</span>
+<span class="nc" id="L2526">                } catch (Throwable e) {</span>
+                    // don't let this kill the queue
+<span class="nc" id="L2528">                    LOGGER.log(Level.WARNING, &quot;QueueListener failed while processing &quot;+this,e);</span>
+                }
+            }
+<span class="nc" id="L2531">        }</span>
+
+        @Override
+        /*package*/ boolean leave(Queue q) {
+<span class="nc" id="L2535">            boolean r = q.buildables.remove(this);</span>
+<span class="nc bnc" id="L2536" title="All 2 branches missed.">            if (r) {</span>
+<span class="nc" id="L2537">                LOGGER.log(Level.FINE, &quot;{0} no longer blocked&quot;, this);</span>
+<span class="nc bnc" id="L2538" title="All 2 branches missed.">                for (QueueListener ql : QueueListener.all()) {</span>
+                    try {
+<span class="nc" id="L2540">                        ql.onLeaveBuildable(this);</span>
+<span class="nc" id="L2541">                    } catch (Throwable e) {</span>
+                        // don't let this kill the queue
+<span class="nc" id="L2543">                        LOGGER.log(Level.WARNING, &quot;QueueListener failed while processing &quot;+this,e);</span>
+                    }
+                }
+            }
+<span class="nc" id="L2547">            return r;</span>
+        }
+    }
+
+    /**
+     * {@link Item} in the {@link Queue#leftItems} stage. These are items that had left the queue
+     * by either began executing or by getting cancelled.
+     *
+     * @since 1.519
+     */
+    public final static class LeftItem extends Item {
+        public final WorkUnitContext outcome;
+
+        /**
+         * When item has left the queue and begin executing.
+         */
+        public LeftItem(WorkUnitContext wuc) {
+<span class="nc" id="L2564">            super(wuc.item);</span>
+<span class="nc" id="L2565">            this.outcome = wuc;</span>
+<span class="nc" id="L2566">        }</span>
+
+        /**
+         * When item is cancelled.
+         */
+        public LeftItem(Item cancelled) {
+<span class="nc" id="L2572">            super(cancelled);</span>
+<span class="nc" id="L2573">            this.outcome = null;</span>
+<span class="nc" id="L2574">        }</span>
+
+        @Override
+        public CauseOfBlockage getCauseOfBlockage() {
+<span class="nc" id="L2578">            return null;</span>
+        }
+
+        /**
+         * If this is representing an item that started executing, this property returns
+         * the primary executable (such as {@link AbstractBuild}) that created out of it.
+         */
+        @Exported
+        public @CheckForNull Executable getExecutable() {
+<span class="nc bnc" id="L2587" title="All 2 branches missed.">            return outcome!=null ? outcome.getPrimaryWorkUnit().getExecutable() : null;</span>
+        }
+
+        /**
+         * Is this representing a cancelled item?
+         */
+        @Exported
+        public boolean isCancelled() {
+<span class="nc bnc" id="L2595" title="All 2 branches missed.">            return outcome==null;</span>
+        }
+
+        @Override
+        void enter(Queue q) {
+<span class="nc" id="L2600">            q.leftItems.put(getId(),this);</span>
+<span class="nc bnc" id="L2601" title="All 2 branches missed.">            for (QueueListener ql : QueueListener.all()) {</span>
+                try {
+<span class="nc" id="L2603">                    ql.onLeft(this);</span>
+<span class="nc" id="L2604">                } catch (Throwable e) {</span>
+                    // don't let this kill the queue
+<span class="nc" id="L2606">                    LOGGER.log(Level.WARNING, &quot;QueueListener failed while processing &quot;+this,e);</span>
+                }
+            }
+<span class="nc" id="L2609">        }</span>
+
+        @Override
+        boolean leave(Queue q) {
+            // there's no leave operation
+<span class="nc" id="L2614">            return false;</span>
+        }
+    }
+
+<span class="nc" id="L2618">    private static final Logger LOGGER = Logger.getLogger(Queue.class.getName());</span>
+
+    /**
+     * This {@link XStream} instance is used to persist {@link Task}s.
+     */
+<span class="nc" id="L2623">    public static final XStream XSTREAM = new XStream2();</span>
+
+    static {
+<span class="nc" id="L2626">        XSTREAM.registerConverter(new AbstractSingleValueConverter() {</span>
+
+			@Override
+			@SuppressWarnings(&quot;unchecked&quot;)
+			public boolean canConvert(Class klazz) {
+<span class="nc" id="L2631">				return hudson.model.Item.class.isAssignableFrom(klazz);</span>
+			}
+
+			@Override
+			public Object fromString(String string) {
+<span class="nc" id="L2636">                Object item = Jenkins.getInstance().getItemByFullName(string);</span>
+<span class="nc bnc" id="L2637" title="All 2 branches missed.">                if(item==null)  throw new NoSuchElementException(&quot;No such job exists: &quot;+string);</span>
+<span class="nc" id="L2638">                return item;</span>
+			}
+
+			@Override
+			public String toString(Object item) {
+<span class="nc" id="L2643">				return ((hudson.model.Item) item).getFullName();</span>
+			}
+        });
+<span class="nc" id="L2646">        XSTREAM.registerConverter(new AbstractSingleValueConverter() {</span>
+
+			@SuppressWarnings(&quot;unchecked&quot;)
+			@Override
+			public boolean canConvert(Class klazz) {
+<span class="nc" id="L2651">				return Run.class.isAssignableFrom(klazz);</span>
+			}
+
+			@Override
+			public Object fromString(String string) {
+<span class="nc" id="L2656">				String[] split = string.split(&quot;#&quot;);</span>
+<span class="nc" id="L2657">				String projectName = split[0];</span>
+<span class="nc" id="L2658">				int buildNumber = Integer.parseInt(split[1]);</span>
+<span class="nc" id="L2659">				Job&lt;?,?&gt; job = (Job&lt;?,?&gt;) Jenkins.getInstance().getItemByFullName(projectName);</span>
+<span class="nc bnc" id="L2660" title="All 2 branches missed.">                if(job==null)  throw new NoSuchElementException(&quot;No such job exists: &quot;+projectName);</span>
+<span class="nc" id="L2661">				Run&lt;?,?&gt; run = job.getBuildByNumber(buildNumber);</span>
+<span class="nc bnc" id="L2662" title="All 2 branches missed.">                if(run==null)  throw new NoSuchElementException(&quot;No such build: &quot;+string);</span>
+<span class="nc" id="L2663">				return run;</span>
+			}
+
+			@Override
+			public String toString(Object object) {
+<span class="nc" id="L2668">				Run&lt;?,?&gt; run = (Run&lt;?,?&gt;) object;</span>
+<span class="nc" id="L2669">				return run.getParent().getFullName() + &quot;#&quot; + run.getNumber();</span>
+			}
+        });
+
+        /**
+         * Reconnect every reference to {@link Queue} by the singleton.
+         */
+<span class="nc" id="L2676">        XSTREAM.registerConverter(new AbstractSingleValueConverter() {</span>
+			@Override
+			public boolean canConvert(Class klazz) {
+<span class="nc" id="L2679">				return Queue.class.isAssignableFrom(klazz);</span>
+			}
+
+			@Override
+			public Object fromString(String string) {
+<span class="nc" id="L2684">                return Jenkins.getInstance().getQueue();</span>
+			}
+
+			@Override
+			public String toString(Object item) {
+<span class="nc" id="L2689">                return &quot;queue&quot;;</span>
+			}
+        });
+<span class="nc" id="L2692">    }</span>
+
+    /**
+     * Regularly invokes {@link Queue#maintain()} and clean itself up when
+     * {@link Queue} gets GC-ed.
+     */
+    private static class MaintainTask extends SafeTimerTask {
+        private final WeakReference&lt;Queue&gt; queue;
+
+<span class="nc" id="L2701">        MaintainTask(Queue queue) {</span>
+<span class="nc" id="L2702">            this.queue = new WeakReference&lt;Queue&gt;(queue);</span>
+<span class="nc" id="L2703">        }</span>
+
+        private void periodic() {
+<span class="nc" id="L2706">            long interval = 5000;</span>
+<span class="nc" id="L2707">            Timer.get().scheduleWithFixedDelay(this, interval, interval, TimeUnit.MILLISECONDS);</span>
+<span class="nc" id="L2708">        }</span>
+
+        protected void doRun() {
+<span class="nc" id="L2711">            Queue q = queue.get();</span>
+<span class="nc bnc" id="L2712" title="All 2 branches missed.">            if (q != null)</span>
+<span class="nc" id="L2713">                q.maintain();</span>
+            else
+<span class="nc" id="L2715">                cancel();</span>
+<span class="nc" id="L2716">        }</span>
+    }
+
+    /**
+     * {@link ArrayList} of {@link Item} with more convenience methods.
+     */
+<span class="nc bnc" id="L2722" title="All 2 branches missed.">    private class ItemList&lt;T extends Item&gt; extends ArrayList&lt;T&gt; {</span>
+    	public T get(Task task) {
+<span class="nc bnc" id="L2724" title="All 2 branches missed.">    		for (T item: this) {</span>
+<span class="nc bnc" id="L2725" title="All 2 branches missed.">    			if (item.task.equals(task)) {</span>
+<span class="nc" id="L2726">    				return item;</span>
+    			}
+    		}
+<span class="nc" id="L2729">    		return null;</span>
+    	}
+
+    	public List&lt;T&gt; getAll(Task task) {
+<span class="nc" id="L2733">    		List&lt;T&gt; result = new ArrayList&lt;T&gt;();</span>
+<span class="nc bnc" id="L2734" title="All 2 branches missed.">    		for (T item: this) {</span>
+<span class="nc bnc" id="L2735" title="All 2 branches missed.">    			if (item.task.equals(task)) {</span>
+<span class="nc" id="L2736">    				result.add(item);</span>
+    			}
+    		}
+<span class="nc" id="L2739">    		return result;</span>
+    	}
+
+    	public boolean containsKey(Task task) {
+<span class="nc bnc" id="L2743" title="All 2 branches missed.">    		return get(task) != null;</span>
+    	}
+
+    	public T remove(Task task) {
+<span class="nc" id="L2747">    		Iterator&lt;T&gt; it = iterator();</span>
+<span class="nc bnc" id="L2748" title="All 2 branches missed.">    		while (it.hasNext()) {</span>
+<span class="nc" id="L2749">    			T t = it.next();</span>
+<span class="nc bnc" id="L2750" title="All 2 branches missed.">    			if (t.task.equals(task)) {</span>
+<span class="nc" id="L2751">    				it.remove();</span>
+<span class="nc" id="L2752">    				return t;</span>
+    			}
+    		}
+<span class="nc" id="L2755">    		return null;</span>
+    	}
+
+    	public void put(Task task, T item) {
+<span class="nc bnc" id="L2759" title="All 4 branches missed.">    		assert item.task.equals(task);</span>
+<span class="nc" id="L2760">    		add(item);</span>
+<span class="nc" id="L2761">    	}</span>
+
+    	public ItemList&lt;T&gt; values() {
+<span class="nc" id="L2764">    		return this;</span>
+    	}
+
+        /**
+         * Works like {@link #remove(Task)} but also marks the {@link Item} as cancelled.
+         */
+        public T cancel(Task p) {
+<span class="nc" id="L2771">            T x = get(p);</span>
+<span class="nc bnc" id="L2772" title="All 2 branches missed.">            if(x!=null) x.cancel(Queue.this);</span>
+<span class="nc" id="L2773">            return x;</span>
+        }
+
+        public void cancelAll() {
+<span class="nc bnc" id="L2777" title="All 2 branches missed.">            for (T t : new ArrayList&lt;T&gt;(this))</span>
+<span class="nc" id="L2778">                t.cancel(Queue.this);</span>
+
+<span class="nc" id="L2780">            clear();    // just to be sure</span>
+<span class="nc" id="L2781">        }</span>
+    }
+
+    private static class Snapshot {
+        private final Set&lt;WaitingItem&gt; waitingList;
+        private final List&lt;BlockedItem&gt; blockedProjects;
+        private final List&lt;BuildableItem&gt; buildables;
+        private final List&lt;BuildableItem&gt; pendings;
+
+<span class="nc" id="L2790">        public Snapshot(Set&lt;WaitingItem&gt; waitingList, List&lt;BlockedItem&gt; blockedProjects, List&lt;BuildableItem&gt; buildables,</span>
+                        List&lt;BuildableItem&gt; pendings) {
+<span class="nc" id="L2792">            this.waitingList = new LinkedHashSet&lt;WaitingItem&gt;(waitingList);</span>
+<span class="nc" id="L2793">            this.blockedProjects = new ArrayList&lt;BlockedItem&gt;(blockedProjects);</span>
+<span class="nc" id="L2794">            this.buildables = new ArrayList&lt;BuildableItem&gt;(buildables);</span>
+<span class="nc" id="L2795">            this.pendings = new ArrayList&lt;BuildableItem&gt;(pendings);</span>
+<span class="nc" id="L2796">        }</span>
+    }
+    
+    private static class LockedRunnable implements Runnable  {
+        private final Runnable delegate;
+
+<span class="nc" id="L2802">        private LockedRunnable(Runnable delegate) {</span>
+<span class="nc" id="L2803">            this.delegate = delegate;</span>
+<span class="nc" id="L2804">        }</span>
+
+        @Override
+        public void run() {
+<span class="nc" id="L2808">            withLock(delegate);</span>
+<span class="nc" id="L2809">        }</span>
+    }
+
+    private class BuildableRunnable implements Runnable  {
+        private final BuildableItem buildableItem;
+
+<span class="nc" id="L2815">        private BuildableRunnable(BuildableItem p) {</span>
+<span class="nc" id="L2816">            this.buildableItem = p;</span>
+<span class="nc" id="L2817">        }</span>
+
+        @Override
+        public void run() {
+            //the flyweighttask enters the buildables queue and will ask Jenkins to provision a node
+<span class="nc" id="L2822">            buildableItem.enter(Queue.this);</span>
+<span class="nc" id="L2823">        }</span>
+    }
+
+    private static class LockedJUCCallable&lt;V&gt; implements java.util.concurrent.Callable&lt;V&gt; {
+        private final java.util.concurrent.Callable&lt;V&gt; delegate;
+
+<span class="nc" id="L2829">        private LockedJUCCallable(java.util.concurrent.Callable&lt;V&gt; delegate) {</span>
+<span class="nc" id="L2830">            this.delegate = delegate;</span>
+<span class="nc" id="L2831">        }</span>
+
+        @Override
+        public V call() throws Exception {
+<span class="nc" id="L2835">            return withLock(delegate);</span>
+        }
+    }
+
+    private static class LockedHRCallable&lt;V,T extends Throwable&gt; implements hudson.remoting.Callable&lt;V,T&gt; {
+        private static final long serialVersionUID = 1L;
+        private final hudson.remoting.Callable&lt;V,T&gt; delegate;
+
+<span class="nc" id="L2843">        private LockedHRCallable(hudson.remoting.Callable&lt;V,T&gt; delegate) {</span>
+<span class="nc" id="L2844">            this.delegate = delegate;</span>
+<span class="nc" id="L2845">        }</span>
+
+        @Override
+        public V call() throws T {
+<span class="nc" id="L2849">            return withLock(delegate);</span>
+        }
+
+        @Override
+        public void checkRoles(RoleChecker checker) throws SecurityException {
+<span class="nc" id="L2854">            delegate.checkRoles(checker);</span>
+<span class="nc" id="L2855">        }</span>
+    }
+
+    @CLIResolver
+    public static Queue getInstance() {
+<span class="nc" id="L2860">        return Jenkins.getInstance().getQueue();</span>
+    }
+
+    /**
+     * Restores the queue content during the start up.
+     */
+    @Initializer(after=JOB_LOADED)
+    public static void init(Jenkins h) {
+<span class="nc" id="L2868">        h.getQueue().load();</span>
+<span class="nc" id="L2869">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

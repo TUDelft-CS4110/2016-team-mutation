@@ -1,0 +1,553 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>Node.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.model</a> &gt; <span class="el_source">Node.java</span></div><h1>Node.java</h1><pre class="source lang-java linenums"><span class="pc" id="L1">/*</span>
+ * The MIT License
+ *
+ * Copyright (c) 2004-2010, Sun Microsystems, Inc., Kohsuke Kawaguchi,
+ * Seiji Sogabe, Stephen Connolly
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.model;
+
+import com.infradna.tool.bridge_method_injector.WithBridgeMethods;
+import hudson.Extension;
+import hudson.ExtensionPoint;
+import hudson.FilePath;
+import hudson.FileSystemProvisioner;
+import hudson.Launcher;
+import hudson.Util;
+import hudson.model.Descriptor.FormException;
+import hudson.model.Queue.Task;
+import hudson.model.labels.LabelAtom;
+import hudson.model.queue.CauseOfBlockage;
+import hudson.remoting.Callable;
+import hudson.remoting.VirtualChannel;
+import hudson.security.ACL;
+import hudson.security.AccessControlled;
+import hudson.security.Permission;
+import hudson.slaves.ComputerListener;
+import hudson.slaves.NodeDescriptor;
+import hudson.slaves.NodeProperty;
+import hudson.slaves.NodePropertyDescriptor;
+import hudson.slaves.OfflineCause;
+import hudson.util.ClockDifference;
+import hudson.util.DescribableList;
+import hudson.util.EnumConverter;
+import hudson.util.TagCloud;
+import hudson.util.TagCloud.WeightFunction;
+import java.io.IOException;
+import java.lang.reflect.Type;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.logging.Logger;
+import javax.annotation.CheckForNull;
+import javax.annotation.Nonnull;
+import jenkins.model.Jenkins;
+import jenkins.util.io.OnMaster;
+import net.sf.json.JSONObject;
+import org.acegisecurity.Authentication;
+import org.jvnet.localizer.Localizable;
+import org.kohsuke.stapler.BindInterceptor;
+import org.kohsuke.stapler.Stapler;
+import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.export.Exported;
+import org.kohsuke.stapler.export.ExportedBean;
+
+/**
+ * Base type of Jenkins slaves (although in practice, you probably extend {@link Slave} to define a new slave type).
+ *
+ * &lt;p&gt;
+ * As a special case, {@link Jenkins} extends from here.
+ *
+ * &lt;p&gt;
+ * Nodes are persisted objects that capture user configurations, and instances get thrown away and recreated whenever
+ * the configuration changes. Running state of nodes are captured by {@link Computer}s.
+ *
+ * &lt;p&gt;
+ * There is no URL binding for {@link Node}. {@link Computer} and {@link TransientComputerActionFactory} must
+ * be used to associate new {@link Action}s to slaves.
+ *
+ * @author Kohsuke Kawaguchi
+ * @see NodeDescriptor
+ * @see Computer
+ */
+@ExportedBean
+<span class="fc" id="L93">public abstract class Node extends AbstractModelObject implements ReconfigurableDescribable&lt;Node&gt;, ExtensionPoint, AccessControlled, OnMaster, Saveable {</span>
+
+<span class="fc" id="L95">    private static final Logger LOGGER = Logger.getLogger(Node.class.getName());</span>
+
+    /**
+     * Newly copied slaves get this flag set, so that Jenkins doesn't try to start/remove this node until its configuration
+     * is saved once.
+     */
+    protected volatile transient boolean holdOffLaunchUntilSave;
+
+    public String getDisplayName() {
+<span class="nc" id="L104">        return getNodeName(); // default implementation</span>
+    }
+
+    public String getSearchUrl() {
+<span class="nc" id="L108">        Computer c = toComputer();</span>
+<span class="nc bnc" id="L109" title="All 2 branches missed.">        if (c != null) {</span>
+<span class="nc" id="L110">            return c.getUrl();</span>
+        }
+<span class="nc" id="L112">        return &quot;computer/&quot; + Util.rawEncode(getNodeName());</span>
+    }
+
+    public boolean isHoldOffLaunchUntilSave() {
+<span class="nc" id="L116">        return holdOffLaunchUntilSave;</span>
+    }
+
+    /**
+     * {@inheritDoc}
+     * @since 1.635.
+     */
+    @Override
+    public void save() throws IOException {
+        // this should be a no-op unless this node instance is the node instance in Jenkins' list of nodes
+        // thus where Jenkins.getInstance() == null there is no list of nodes, so we do a no-op
+        // Nodes.updateNode(n) will only persist the node record if the node instance is in the list of nodes
+        // so either path results in the same behaviour: the node instance is only saved if it is in the list of nodes
+        // for all other cases we do not know where to persist the node record and hence we follow the default
+        // no-op of a Saveable.NOOP
+<span class="nc" id="L131">        final Jenkins jenkins = Jenkins.getInstance();</span>
+<span class="nc bnc" id="L132" title="All 2 branches missed.">        if (jenkins != null) {</span>
+<span class="nc" id="L133">            jenkins.updateNode(this);</span>
+        }
+<span class="nc" id="L135">    }</span>
+
+    /**
+     * Name of this node.
+     *
+     * @return
+     *      &quot;&quot; if this is master
+     */
+    @Exported(visibility=999)
+    public abstract @Nonnull String getNodeName();
+
+    /**
+     * When the user clones a {@link Node}, Hudson uses this method to change the node name right after
+     * the cloned {@link Node} object is instantiated.
+     *
+     * &lt;p&gt;
+     * This method is never used for any other purpose, and as such for all practical intents and purposes,
+     * the node name should be treated like immutable.
+     *
+     * @deprecated to indicate that this method isn't really meant to be called by random code.
+     */
+    @Deprecated
+    public abstract void setNodeName(String name);
+
+    /**
+     * Human-readable description of this node.
+     */
+    @Exported
+    public abstract String getNodeDescription();
+
+    /**
+     * Returns a {@link Launcher} for executing programs on this node.
+     *
+     * &lt;p&gt;
+     * The callee must call {@link Launcher#decorateFor(Node)} before returning to complete the decoration.
+     */
+    public abstract Launcher createLauncher(TaskListener listener);
+
+    /**
+     * Returns the number of {@link Executor}s.
+     *
+     * This may be different from &lt;code&gt;getExecutors().size()&lt;/code&gt;
+     * because it takes time to adjust the number of executors.
+     */
+    @Exported
+    public abstract int getNumExecutors();
+
+    /**
+     * Returns {@link Mode#EXCLUSIVE} if this node is only available
+     * for those jobs that exclusively specifies this node
+     * as the assigned node.
+     */
+    @Exported
+    public abstract Mode getMode();
+
+    /**
+     * Gets the corresponding {@link Computer} object.
+     *
+     * @return
+     *      this method can return null if there's no {@link Computer} object for this node,
+     *      such as when this node has no executors at all.
+     */
+    public final @CheckForNull Computer toComputer() {
+<span class="nc" id="L198">        AbstractCIBase ciBase = Jenkins.getInstance();</span>
+<span class="nc" id="L199">        return ciBase.getComputer(this);</span>
+    }
+
+    /**
+     * Gets the current channel, if the node is connected and online, or null.
+     *
+     * This is just a convenience method for {@link Computer#getChannel()} with null check.
+     */
+    public final @CheckForNull VirtualChannel getChannel() {
+<span class="nc" id="L208">        Computer c = toComputer();</span>
+<span class="nc bnc" id="L209" title="All 2 branches missed.">        return c==null ? null : c.getChannel();</span>
+    }
+
+    /**
+     * Creates a new {@link Computer} object that acts as the UI peer of this {@link Node}.
+     * Nobody but {@link Jenkins#updateComputerList()} should call this method.
+     */
+    protected abstract Computer createComputer();
+
+    /**
+     * Returns {@code true} if the node is accepting tasks. Needed to allow slaves programmatic suspension of task
+     * scheduling that does not overlap with being offline. Called by {@link Computer#isAcceptingTasks()}.
+     * This method is distinct from {@link Computer#isAcceptingTasks()} as sometimes the {@link Node} concrete
+     * class may not have control over the {@link hudson.model.Computer} concrete class associated with it.
+     *
+     * @return {@code true} if the node is accepting tasks.
+     * @see Computer#isAcceptingTasks()
+     * @since 1.586
+     */
+    public boolean isAcceptingTasks() {
+<span class="nc" id="L229">        return true;</span>
+    }
+
+    /**
+     * Let Nodes be aware of the lifecycle of their own {@link Computer}.
+     */
+    @Extension
+<span class="nc" id="L236">    public static class InternalComputerListener extends ComputerListener {</span>
+        @Override
+        public void onOnline(Computer c, TaskListener listener) {
+<span class="nc" id="L239">            Node node = c.getNode();</span>
+
+            // At startup, we need to restore any previously in-effect temp offline cause.
+            // We wait until the computer is started rather than getting the data to it sooner
+            // so that the normal computer start up processing works as expected.
+<span class="nc bnc" id="L244" title="All 6 branches missed.">            if (node!= null &amp;&amp; node.temporaryOfflineCause != null &amp;&amp; node.temporaryOfflineCause != c.getOfflineCause()) {</span>
+<span class="nc" id="L245">                c.setTemporarilyOffline(true, node.temporaryOfflineCause);</span>
+            }
+<span class="nc" id="L247">        }</span>
+    }
+
+    private OfflineCause temporaryOfflineCause;
+
+    /**
+     * Enable a {@link Computer} to inform its node when it is taken
+     * temporarily offline.
+     */
+    void setTemporaryOfflineCause(OfflineCause cause) {
+        try {
+<span class="nc bnc" id="L258" title="All 2 branches missed.">            if (temporaryOfflineCause != cause) {</span>
+<span class="nc" id="L259">                temporaryOfflineCause = cause;</span>
+<span class="nc" id="L260">                save();</span>
+            }
+<span class="nc" id="L262">        } catch (java.io.IOException e) {</span>
+<span class="nc" id="L263">            LOGGER.warning(&quot;Unable to complete save, temporary offline status will not be persisted: &quot; + e.getMessage());</span>
+        }
+<span class="nc" id="L265">    }</span>
+
+    /**
+     * Return the possibly empty tag cloud for the labels of this node.
+     */
+    public TagCloud&lt;LabelAtom&gt; getLabelCloud() {
+<span class="nc" id="L271">        return new TagCloud&lt;LabelAtom&gt;(getAssignedLabels(),new WeightFunction&lt;LabelAtom&gt;() {</span>
+            public float weight(LabelAtom item) {
+<span class="nc" id="L273">                return item.getTiedJobCount();</span>
+            }
+        });
+    }
+    /**
+     * Returns the possibly empty set of labels that are assigned to this node,
+     * including the automatic {@link #getSelfLabel() self label}, manually
+     * assigned labels and dynamically assigned labels via the
+     * {@link LabelFinder} extension point.
+     *
+     * This method has a side effect of updating the hudson-wide set of labels
+     * and should be called after events that will change that - e.g. a slave
+     * connecting.
+     */
+    @Exported
+    public Set&lt;LabelAtom&gt; getAssignedLabels() {
+<span class="nc" id="L289">        Set&lt;LabelAtom&gt; r = Label.parse(getLabelString());</span>
+<span class="nc" id="L290">        r.add(getSelfLabel());</span>
+<span class="nc" id="L291">        r.addAll(getDynamicLabels());</span>
+<span class="nc" id="L292">        return Collections.unmodifiableSet(r);</span>
+    }
+
+    /**
+     * Return all the labels assigned dynamically to this node.
+     * This calls all the LabelFinder implementations with the node converts
+     * the results into Labels.
+     * @return HashSet&lt;Label&gt;.
+     */
+    private HashSet&lt;LabelAtom&gt; getDynamicLabels() {
+<span class="nc" id="L302">        HashSet&lt;LabelAtom&gt; result = new HashSet&lt;LabelAtom&gt;();</span>
+<span class="nc bnc" id="L303" title="All 2 branches missed.">        for (LabelFinder labeler : LabelFinder.all()) {</span>
+            // Filter out any bad(null) results from plugins
+            // for compatibility reasons, findLabels may return LabelExpression and not atom.
+<span class="nc bnc" id="L306" title="All 2 branches missed.">            for (Label label : labeler.findLabels(this))</span>
+<span class="nc bnc" id="L307" title="All 2 branches missed.">                if (label instanceof LabelAtom) result.add((LabelAtom)label);</span>
+        }
+<span class="nc" id="L309">        return result;</span>
+    }
+
+
+    /**
+     * Returns the manually configured label for a node. The list of assigned
+     * and dynamically determined labels is available via
+     * {@link #getAssignedLabels()} and includes all labels that have been
+     * manually configured.
+     *
+     * Mainly for form binding.
+     */
+    public abstract String getLabelString();
+
+    /**
+     * Sets the label string for a node. This value will be returned by {@link #getLabelString()}.
+     *
+     * @param labelString
+     *      The new label string to use.
+     * @since 1.477
+     */
+    public void setLabelString(String labelString) throws IOException {
+<span class="nc" id="L331">        throw new UnsupportedOperationException();</span>
+    }
+
+    /**
+     * Gets the special label that represents this node itself.
+     */
+    @WithBridgeMethods(Label.class)
+    public LabelAtom getSelfLabel() {
+<span class="nc" id="L339">        return LabelAtom.get(getNodeName());</span>
+    }
+
+    /**
+     * Called by the {@link Queue} to determine whether or not this node can
+     * take the given task. The default checks include whether or not this node
+     * is part of the task's assigned label, whether this node is in
+     * {@link Mode#EXCLUSIVE} mode if it is not in the task's assigned label,
+     * and whether or not any of this node's {@link NodeProperty}s say that the
+     * task cannot be run.
+     *
+     * @since 1.360
+     * @deprecated as of 1.413
+     *      Use {@link #canTake(Queue.BuildableItem)}
+     */
+    @Deprecated
+    public CauseOfBlockage canTake(Task task) {
+<span class="nc" id="L356">        return null;</span>
+    }
+
+    /**
+     * Called by the {@link Queue} to determine whether or not this node can
+     * take the given task. The default checks include whether or not this node
+     * is part of the task's assigned label, whether this node is in
+     * {@link Mode#EXCLUSIVE} mode if it is not in the task's assigned label,
+     * and whether or not any of this node's {@link NodeProperty}s say that the
+     * task cannot be run.
+     *
+     * @since 1.413
+     */
+    public CauseOfBlockage canTake(Queue.BuildableItem item) {
+<span class="nc" id="L370">        Label l = item.getAssignedLabel();</span>
+<span class="nc bnc" id="L371" title="All 4 branches missed.">        if(l!=null &amp;&amp; !l.contains(this))</span>
+<span class="nc" id="L372">            return CauseOfBlockage.fromMessage(Messages._Node_LabelMissing(getNodeName(),l));   // the task needs to be executed on label that this node doesn't have.</span>
+
+<span class="nc bnc" id="L374" title="All 4 branches missed.">        if(l==null &amp;&amp; getMode()== Mode.EXCLUSIVE) {</span>
+            // flyweight tasks need to get executed somewhere, if every node
+<span class="nc bnc" id="L376" title="All 2 branches missed.">            if (!(item.task instanceof Queue.FlyweightTask &amp;&amp; (</span>
+<span class="nc bnc" id="L377" title="All 2 branches missed.">                    this instanceof Jenkins</span>
+<span class="nc bnc" id="L378" title="All 2 branches missed.">                            || Jenkins.getInstance().getNumExecutors() &lt; 1</span>
+<span class="nc bnc" id="L379" title="All 2 branches missed.">                            || Jenkins.getInstance().getMode() == Mode.EXCLUSIVE)</span>
+            )) {
+<span class="nc" id="L381">                return CauseOfBlockage.fromMessage(Messages._Node_BecauseNodeIsReserved(getNodeName()));   // this node is reserved for tasks that are tied to it</span>
+            }
+        }
+
+<span class="nc" id="L385">        Authentication identity = item.authenticate();</span>
+<span class="nc bnc" id="L386" title="All 2 branches missed.">        if (!getACL().hasPermission(identity,Computer.BUILD)) {</span>
+            // doesn't have a permission
+<span class="nc" id="L388">            return CauseOfBlockage.fromMessage(Messages._Node_LackingBuildPermission(identity.getName(),getNodeName()));</span>
+        }
+
+        // Check each NodeProperty to see whether they object to this node
+        // taking the task
+<span class="nc bnc" id="L393" title="All 2 branches missed.">        for (NodeProperty prop: getNodeProperties()) {</span>
+<span class="nc" id="L394">            CauseOfBlockage c = prop.canTake(item);</span>
+<span class="nc bnc" id="L395" title="All 2 branches missed.">            if (c!=null)    return c;</span>
+        }
+
+<span class="nc bnc" id="L398" title="All 2 branches missed.">        if (!isAcceptingTasks()) {</span>
+<span class="nc" id="L399">            return CauseOfBlockage.fromMessage(Messages._Node_BecauseNodeIsNotAcceptingTasks(getNodeName()));</span>
+        }
+
+        // Looks like we can take the task
+<span class="nc" id="L403">        return null;</span>
+    }
+
+    /**
+     * Returns a &quot;workspace&quot; directory for the given {@link TopLevelItem}.
+     *
+     * &lt;p&gt;
+     * Workspace directory is usually used for keeping out the checked out
+     * source code, but it can be used for anything.
+     *
+     * @return
+     *      null if this node is not connected hence the path is not available
+     */
+    // TODO: should this be modified now that getWorkspace is moved from AbstractProject to AbstractBuild?
+    public abstract @CheckForNull FilePath getWorkspaceFor(TopLevelItem item);
+
+    /**
+     * Gets the root directory of this node.
+     *
+     * &lt;p&gt;
+     * Hudson always owns a directory on every node. This method
+     * returns that.
+     *
+     * @return
+     *      null if the node is offline and hence the {@link FilePath}
+     *      object is not available.
+     */
+    public abstract @CheckForNull FilePath getRootPath();
+
+    /**
+     * Gets the {@link FilePath} on this node.
+     */
+    public @CheckForNull FilePath createPath(String absolutePath) {
+<span class="nc" id="L436">        VirtualChannel ch = getChannel();</span>
+<span class="nc bnc" id="L437" title="All 2 branches missed.">        if(ch==null)    return null;    // offline</span>
+<span class="nc" id="L438">        return new FilePath(ch,absolutePath);</span>
+    }
+
+    public FileSystemProvisioner getFileSystemProvisioner() {
+        // TODO: make this configurable or auto-detectable or something else
+<span class="nc" id="L443">        return FileSystemProvisioner.DEFAULT;</span>
+    }
+
+    /**
+     * Gets the {@link NodeProperty} instances configured for this {@link Node}.
+     */
+    public abstract @Nonnull DescribableList&lt;NodeProperty&lt;?&gt;, NodePropertyDescriptor&gt; getNodeProperties();
+
+    // used in the Jelly script to expose descriptors
+    public List&lt;NodePropertyDescriptor&gt; getNodePropertyDescriptors() {
+<span class="nc" id="L453">        return NodeProperty.for_(this);</span>
+    }
+
+    public ACL getACL() {
+<span class="nc" id="L457">        return Jenkins.getInstance().getAuthorizationStrategy().getACL(this);</span>
+    }
+
+    public final void checkPermission(Permission permission) {
+<span class="nc" id="L461">        getACL().checkPermission(permission);</span>
+<span class="nc" id="L462">    }</span>
+
+    public final boolean hasPermission(Permission permission) {
+<span class="nc" id="L465">        return getACL().hasPermission(permission);</span>
+    }
+
+    public Node reconfigure(final StaplerRequest req, JSONObject form) throws FormException {
+<span class="nc bnc" id="L469" title="All 2 branches missed.">        if (form==null)     return null;</span>
+
+<span class="nc" id="L471">        final JSONObject jsonForProperties = form.optJSONObject(&quot;nodeProperties&quot;);</span>
+<span class="nc" id="L472">        final AtomicReference&lt;BindInterceptor&gt; old = new AtomicReference&lt;&gt;();</span>
+<span class="nc" id="L473">        old.set(req.setBindListener(new BindInterceptor() {</span>
+            @Override
+            public Object onConvert(Type targetType, Class targetTypeErasure, Object jsonSource) {
+<span class="nc bnc" id="L476" title="All 2 branches missed.">                if (jsonForProperties != jsonSource) {</span>
+<span class="nc" id="L477">                    return old.get().onConvert(targetType, targetTypeErasure, jsonSource);</span>
+                }
+
+                try {
+<span class="nc" id="L481">                    DescribableList&lt;NodeProperty&lt;?&gt;, NodePropertyDescriptor&gt; tmp = new DescribableList&lt;NodeProperty&lt;?&gt;, NodePropertyDescriptor&gt;(Saveable.NOOP,getNodeProperties().toList());</span>
+<span class="nc" id="L482">                    tmp.rebuild(req, jsonForProperties, NodeProperty.all());</span>
+<span class="nc" id="L483">                    return tmp.toList();</span>
+<span class="nc" id="L484">                } catch (FormException e) {</span>
+<span class="nc" id="L485">                    throw new IllegalArgumentException(e);</span>
+<span class="nc" id="L486">                } catch (IOException e) {</span>
+<span class="nc" id="L487">                    throw new IllegalArgumentException(e);</span>
+                }
+            }
+        }));
+
+        try {
+<span class="nc" id="L493">            return getDescriptor().newInstance(req, form);</span>
+<span class="nc" id="L494">        } finally {</span>
+<span class="nc" id="L495">            req.setBindListener(old.get());</span>
+<span class="nc" id="L496">        }</span>
+    }
+
+    public abstract NodeDescriptor getDescriptor();
+
+    /**
+     * Estimates the clock difference with this slave.
+     *
+     * @return
+     *      always non-null.
+     * @throws InterruptedException
+     *      if the operation is aborted.
+     */
+    public ClockDifference getClockDifference() throws IOException, InterruptedException {
+<span class="nc" id="L510">        VirtualChannel channel = getChannel();</span>
+<span class="nc bnc" id="L511" title="All 2 branches missed.">        if(channel==null)</span>
+<span class="nc" id="L512">            throw new IOException(getNodeName()+&quot; is offline&quot;);</span>
+
+<span class="nc" id="L514">        return channel.call(getClockDifferenceCallable());</span>
+    }
+
+    /**
+     * Returns a {@link Callable} that when run on the channel, estimates the clock difference.
+     *
+     * @return
+     *      always non-null.
+     * @since 1.522
+     */
+    public abstract Callable&lt;ClockDifference,IOException&gt; getClockDifferenceCallable();
+
+    /**
+     * Constants that control how Hudson allocates jobs to slaves.
+     */
+    public enum Mode {
+<span class="fc" id="L530">        NORMAL(Messages._Node_Mode_NORMAL()),</span>
+<span class="fc" id="L531">        EXCLUSIVE(Messages._Node_Mode_EXCLUSIVE());</span>
+
+        private final Localizable description;
+
+        public String getDescription() {
+<span class="nc" id="L536">            return description.toString();</span>
+        }
+
+        public String getName() {
+<span class="nc" id="L540">            return name();</span>
+        }
+
+<span class="fc" id="L543">        Mode(Localizable description) {</span>
+<span class="fc" id="L544">            this.description = description;</span>
+<span class="fc" id="L545">        }</span>
+
+        static {
+<span class="fc" id="L548">            Stapler.CONVERT_UTILS.register(new EnumConverter(), Mode.class);</span>
+<span class="fc" id="L549">        }</span>
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

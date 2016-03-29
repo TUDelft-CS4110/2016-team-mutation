@@ -1,0 +1,204 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>ApiTokenProperty.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">jenkins.security</a> &gt; <span class="el_source">ApiTokenProperty.java</span></div><h1>ApiTokenProperty.java</h1><pre class="source lang-java linenums">/*
+ * The MIT License
+ *
+ * Copyright (c) 2011, CloudBees, Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package jenkins.security;
+
+import hudson.Extension;
+import hudson.Util;
+import hudson.model.Descriptor.FormException;
+import hudson.model.User;
+import hudson.model.UserProperty;
+import hudson.model.UserPropertyDescriptor;
+import hudson.security.ACL;
+import hudson.util.HttpResponses;
+import hudson.util.Secret;
+import jenkins.model.Jenkins;
+import net.sf.json.JSONObject;
+import org.kohsuke.stapler.AncestorInPath;
+import org.kohsuke.stapler.DataBoundConstructor;
+import org.kohsuke.stapler.HttpResponse;
+import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.StaplerResponse;
+
+import java.io.IOException;
+import java.nio.charset.Charset;
+import java.security.MessageDigest;
+import java.security.SecureRandom;
+import javax.annotation.Nonnull;
+import org.apache.commons.lang.StringUtils;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
+
+/**
+ * Remembers the API token for this user, that can be used like a password to login.
+ *
+ *
+ * @author Kohsuke Kawaguchi
+ * @see ApiTokenFilter
+ * @since 1.426
+ */
+public class ApiTokenProperty extends UserProperty {
+    private volatile Secret apiToken;
+
+    /**
+     * If enabled, shows API tokens to users with {@link Jenkins#ADMINISTER) permissions.
+     * Disabled by default due to the security reasons.
+     * If enabled, it restores the original Jenkins behavior (SECURITY-200).
+     * @since TODO
+     */
+<span class="nc" id="L69">    private static final boolean SHOW_TOKEN_TO_ADMINS = </span>
+<span class="nc" id="L70">            Boolean.getBoolean(ApiTokenProperty.class.getName() + &quot;.showTokenToAdmins&quot;);</span>
+    
+    
+    @DataBoundConstructor
+<span class="nc" id="L74">    public ApiTokenProperty() {</span>
+<span class="nc" id="L75">        _changeApiToken();</span>
+<span class="nc" id="L76">    }</span>
+
+    /**
+     * We don't let the external code set the API token,
+     * but for the initial value of the token we need to compute the seed by ourselves.
+     */
+<span class="nc" id="L82">    /*package*/ ApiTokenProperty(String seed) {</span>
+<span class="nc" id="L83">        apiToken = Secret.fromString(seed);</span>
+<span class="nc" id="L84">    }</span>
+
+    /**
+     * Gets the API token.
+     * The method performs security checks. Only the current user and SYSTEM may see it.
+     * Users with {@link Jenkins#ADMINISTER} may be allowed to do it using {@link #SHOW_TOKEN_TO_ADMINS}.
+     * 
+     * @return API Token. Never null, but may be {@link Messages#ApiTokenProperty_ChangeToken_TokenIsHidden()}
+     *         if the user has no appropriate permissions.
+     * @since TODO: the method performs security checks
+     */
+    @Nonnull
+    public String getApiToken() {
+<span class="nc bnc" id="L97" title="All 2 branches missed.">        return hasPermissionToSeeToken() ? getApiTokenInsecure() </span>
+<span class="nc" id="L98">                : Messages.ApiTokenProperty_ChangeToken_TokenIsHidden();</span>
+    }
+    
+    @Nonnull
+    @Restricted(NoExternalUse.class)
+    /*package*/ String getApiTokenInsecure() {
+<span class="nc" id="L104">        String p = apiToken.getPlainText();</span>
+<span class="nc bnc" id="L105" title="All 2 branches missed.">        if (p.equals(Util.getDigestOf(Jenkins.getInstance().getSecretKey()+&quot;:&quot;+user.getId()))) {</span>
+            // if the current token is the initial value created by pre SECURITY-49 Jenkins, we can't use that.
+            // force using the newer value
+<span class="nc" id="L108">            apiToken = Secret.fromString(p=API_KEY_SEED.mac(user.getId()));</span>
+        }
+<span class="nc" id="L110">        return Util.getDigestOf(p);</span>
+    }
+
+    public boolean matchesPassword(String password) {
+<span class="nc" id="L114">        String token = getApiTokenInsecure();</span>
+        // String.equals isn't constant time, but this is
+<span class="nc" id="L116">        return MessageDigest.isEqual(password.getBytes(Charset.forName(&quot;US-ASCII&quot;)),</span>
+<span class="nc" id="L117">                token.getBytes(Charset.forName(&quot;US-ASCII&quot;)));</span>
+    }
+    
+    private boolean hasPermissionToSeeToken() {
+<span class="nc" id="L121">        final Jenkins jenkins = Jenkins.getInstance();</span>
+<span class="nc bnc" id="L122" title="All 2 branches missed.">        if (jenkins == null) {</span>
+<span class="nc" id="L123">            return false; // Should not happen - we don't display UIs in this stage</span>
+        }
+        
+        // Administrators can do whatever they want
+<span class="nc bnc" id="L127" title="All 4 branches missed.">        if (SHOW_TOKEN_TO_ADMINS &amp;&amp; jenkins.hasPermission(Jenkins.ADMINISTER)) {</span>
+<span class="nc" id="L128">            return true;</span>
+        }
+        
+        
+<span class="nc" id="L132">        final User current = User.current();</span>
+<span class="nc bnc" id="L133" title="All 2 branches missed.">        if (current == null) { // Anonymous</span>
+<span class="nc" id="L134">            return false;</span>
+        }
+        
+        // SYSTEM user is always eligible to see tokens
+<span class="nc bnc" id="L138" title="All 2 branches missed.">        if (Jenkins.getAuthentication() == ACL.SYSTEM) {</span>
+<span class="nc" id="L139">            return true;</span>
+        }
+             
+        //TODO: replace by IdStrategy in newer Jenkins versions
+        //return User.idStrategy().equals(user.getId(), current.getId());
+<span class="nc" id="L144">        return StringUtils.equals(user.getId(), current.getId());</span>
+    }
+
+    public void changeApiToken() throws IOException {
+<span class="nc" id="L148">        user.checkPermission(Jenkins.ADMINISTER);</span>
+<span class="nc" id="L149">        _changeApiToken();</span>
+<span class="nc" id="L150">        user.save();</span>
+<span class="nc" id="L151">    }</span>
+
+    private void _changeApiToken() {
+<span class="nc" id="L154">        byte[] random = new byte[16];   // 16x8=128bit worth of randomness, since we use md5 digest as the API token</span>
+<span class="nc" id="L155">        RANDOM.nextBytes(random);</span>
+<span class="nc" id="L156">        apiToken = Secret.fromString(Util.toHexString(random));</span>
+<span class="nc" id="L157">    }</span>
+
+    @Override
+    public UserProperty reconfigure(StaplerRequest req, JSONObject form) throws FormException {
+<span class="nc" id="L161">        return this;</span>
+    }
+
+    @Extension
+<span class="nc" id="L165">    public static final class DescriptorImpl extends UserPropertyDescriptor {</span>
+        public String getDisplayName() {
+<span class="nc" id="L167">            return Messages.ApiTokenProperty_DisplayName();</span>
+        }
+
+        /**
+         * When we are creating a default {@link ApiTokenProperty} for User,
+         * we need to make sure it yields the same value for the same user,
+         * because there's no guarantee that the property is saved.
+         *
+         * But we also need to make sure that an attacker won't be able to guess
+         * the initial API token value. So we take the seed by hashing the secret + user ID.
+         */
+        public ApiTokenProperty newInstance(User user) {
+<span class="nc" id="L179">            return new ApiTokenProperty(API_KEY_SEED.mac(user.getId()));</span>
+        }
+
+        public HttpResponse doChangeToken(@AncestorInPath User u, StaplerResponse rsp) throws IOException {
+<span class="nc" id="L183">            ApiTokenProperty p = u.getProperty(ApiTokenProperty.class);</span>
+<span class="nc bnc" id="L184" title="All 2 branches missed.">            if (p==null) {</span>
+<span class="nc" id="L185">                p = newInstance(u);</span>
+<span class="nc" id="L186">                u.addProperty(p);</span>
+<span class="nc" id="L187">            } else {</span>
+<span class="nc" id="L188">                p.changeApiToken();</span>
+            }
+<span class="nc" id="L190">            rsp.setHeader(&quot;script&quot;,&quot;document.getElementById('apiToken').value='&quot;+p.getApiToken()+&quot;'&quot;);</span>
+<span class="nc bnc" id="L191" title="All 2 branches missed.">            return HttpResponses.html(p.hasPermissionToSeeToken() </span>
+<span class="nc" id="L192">                    ? Messages.ApiTokenProperty_ChangeToken_Success() </span>
+<span class="nc" id="L193">                    : Messages.ApiTokenProperty_ChangeToken_SuccessHidden());</span>
+        }
+    }
+
+<span class="nc" id="L197">    private static final SecureRandom RANDOM = new SecureRandom();</span>
+
+    /**
+     * We don't want an API key that's too long, so cut the length to 16 (which produces 32-letter MAC code in hexdump)
+     */
+<span class="nc" id="L202">    private static final HMACConfidentialKey API_KEY_SEED = new HMACConfidentialKey(ApiTokenProperty.class,&quot;seed&quot;,16);</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

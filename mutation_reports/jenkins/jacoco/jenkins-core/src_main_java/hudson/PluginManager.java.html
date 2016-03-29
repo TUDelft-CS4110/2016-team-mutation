@@ -1,0 +1,1394 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>PluginManager.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson</a> &gt; <span class="el_source">PluginManager.java</span></div><h1>PluginManager.java</h1><pre class="source lang-java linenums"><span class="pc" id="L1">/*</span>
+ * The MIT License
+ *
+ * Copyright (c) 2004-2010, Sun Microsystems, Inc., Kohsuke Kawaguchi, Stephen Connolly, Tom Huybrechts
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson;
+
+import hudson.PluginWrapper.Dependency;
+import hudson.init.InitMilestone;
+import hudson.init.InitStrategy;
+import hudson.init.InitializerFinder;
+import hudson.model.AbstractItem;
+import hudson.model.AbstractModelObject;
+import hudson.model.AdministrativeMonitor;
+import hudson.model.Api;
+import hudson.model.Descriptor;
+import hudson.model.Failure;
+import hudson.model.ItemGroupMixIn;
+import hudson.model.UpdateCenter;
+import hudson.model.UpdateSite;
+import hudson.security.Permission;
+import hudson.security.PermissionScope;
+import hudson.util.CyclicGraphDetector;
+import hudson.util.CyclicGraphDetector.CycleDetectedException;
+import hudson.util.IOUtils;
+import hudson.util.PersistedList;
+import hudson.util.Service;
+import hudson.util.VersionNumber;
+import hudson.util.XStream2;
+import jenkins.ClassLoaderReflectionToolkit;
+import jenkins.InitReactorRunner;
+import jenkins.RestartRequiredException;
+import jenkins.YesNoMaybe;
+import jenkins.model.Jenkins;
+import jenkins.util.io.OnMaster;
+import jenkins.util.xml.RestrictiveEntityResolver;
+
+import net.sf.json.JSONArray;
+import net.sf.json.JSONObject;
+import org.apache.commons.fileupload.FileItem;
+import org.apache.commons.fileupload.disk.DiskFileItemFactory;
+import org.apache.commons.fileupload.servlet.ServletFileUpload;
+import org.apache.commons.io.FileUtils;
+import org.apache.commons.io.FilenameUtils;
+import org.apache.commons.logging.LogFactory;
+import org.jenkinsci.bytecode.Transformer;
+import org.jvnet.hudson.reactor.Executable;
+import org.jvnet.hudson.reactor.Reactor;
+import org.jvnet.hudson.reactor.ReactorException;
+import org.jvnet.hudson.reactor.TaskBuilder;
+import org.jvnet.hudson.reactor.TaskGraphBuilder;
+import org.kohsuke.stapler.HttpRedirect;
+import org.kohsuke.stapler.HttpResponse;
+import org.kohsuke.stapler.HttpResponses;
+import org.kohsuke.stapler.QueryParameter;
+import org.kohsuke.stapler.StaplerOverridable;
+import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.StaplerResponse;
+import org.kohsuke.stapler.export.Exported;
+import org.kohsuke.stapler.export.ExportedBean;
+import org.kohsuke.stapler.interceptor.RequirePOST;
+
+import javax.annotation.CheckForNull;
+import javax.servlet.ServletContext;
+import javax.servlet.ServletException;
+import javax.xml.parsers.ParserConfigurationException;
+import javax.xml.parsers.SAXParserFactory;
+import java.io.Closeable;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.lang.ref.WeakReference;
+import java.lang.reflect.Method;
+import java.net.URL;
+import java.net.URLClassLoader;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Enumeration;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Hashtable;
+import java.util.List;
+import java.util.ListIterator;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.Future;
+import java.util.jar.JarFile;
+import java.util.jar.Manifest;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import org.xml.sax.Attributes;
+import org.xml.sax.InputSource;
+import org.xml.sax.SAXException;
+import org.xml.sax.helpers.DefaultHandler;
+
+import static hudson.init.InitMilestone.*;
+import hudson.model.DownloadService;
+import hudson.util.FormValidation;
+
+import static java.util.logging.Level.SEVERE;
+import static java.util.logging.Level.WARNING;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
+
+/**
+ * Manages {@link PluginWrapper}s.
+ *
+ * @author Kohsuke Kawaguchi
+ */
+@ExportedBean
+public abstract class PluginManager extends AbstractModelObject implements OnMaster, StaplerOverridable {
+    /**
+     * All discovered plugins.
+     */
+<span class="fc" id="L138">    protected final List&lt;PluginWrapper&gt; plugins = new ArrayList&lt;PluginWrapper&gt;();</span>
+
+    /**
+     * All active plugins, topologically sorted so that when X depends on Y, Y appears in the list before X does.
+     */
+<span class="fc" id="L143">    protected final List&lt;PluginWrapper&gt; activePlugins = new CopyOnWriteArrayList&lt;PluginWrapper&gt;();</span>
+
+<span class="fc" id="L145">    protected final List&lt;FailedPlugin&gt; failedPlugins = new ArrayList&lt;FailedPlugin&gt;();</span>
+
+    /**
+     * Plug-in root directory.
+     */
+    public final File rootDir;
+
+    /**
+     * If non-null, the base directory for all exploded .hpi/.jpi plugins. Controlled by the system property / servlet
+     * context parameter {@literal hudson.PluginManager.workDir}.
+     */
+    @CheckForNull
+    private final File workDir;
+
+    /**
+     * @deprecated as of 1.355
+     *      {@link PluginManager} can now live longer than {@link jenkins.model.Jenkins} instance, so
+     *      use {@code Hudson.getInstance().servletContext} instead.
+     */
+    @Deprecated
+    public final ServletContext context;
+
+    /**
+     * {@link ClassLoader} that can load all the publicly visible classes from plugins
+     * (and including the classloader that loads Hudson itself.)
+     *
+     */
+    // implementation is minimal --- just enough to run XStream
+    // and load plugin-contributed classes.
+<span class="fc" id="L174">    public final ClassLoader uberClassLoader = new UberClassLoader();</span>
+
+<span class="fc" id="L176">    private final Transformer compatibilityTransformer = new Transformer();</span>
+
+    /**
+     * Once plugin is uploaded, this flag becomes true.
+     * This is used to report a message that Jenkins needs to be restarted
+     * for new plugins to take effect.
+     */
+<span class="fc" id="L183">    public volatile boolean pluginUploaded = false;</span>
+
+    /**
+     * The initialization of {@link PluginManager} splits into two parts;
+     * one is the part about listing them, extracting them, and preparing classloader for them.
+     * The 2nd part is about creating instances. Once the former completes this flags become true,
+     * as the 2nd part can be repeated for each Hudson instance.
+     */
+<span class="fc" id="L191">    private boolean pluginListed = false;</span>
+
+    /**
+     * Strategy for creating and initializing plugins
+     */
+    private final PluginStrategy strategy;
+
+    /**
+     * Manifest of the plugin binaries that are bundled with core.
+     */
+<span class="fc" id="L201">    private final Map&lt;String,Manifest&gt; bundledPluginManifests = new HashMap&lt;String, Manifest&gt;();</span>
+
+<span class="fc" id="L203">    public PluginManager(ServletContext context, File rootDir) {</span>
+<span class="fc" id="L204">        this.context = context;</span>
+
+<span class="fc" id="L206">        this.rootDir = rootDir;</span>
+<span class="pc bpc" id="L207" title="1 of 2 branches missed.">        if(!rootDir.exists())</span>
+<span class="fc" id="L208">            rootDir.mkdirs();</span>
+<span class="fc" id="L209">        String workDir = System.getProperty(PluginManager.class.getName()+&quot;.workDir&quot;);</span>
+<span class="pc bpc" id="L210" title="2 of 4 branches missed.">        if (workDir == null &amp;&amp; context != null) {</span>
+<span class="nc" id="L211">            workDir = context.getInitParameter(PluginManager.class.getName() + &quot;.workDir&quot;);</span>
+        }
+<span class="pc bpc" id="L213" title="1 of 2 branches missed.">        this.workDir = workDir == null ? null : new File(workDir);</span>
+
+<span class="fc" id="L215">        strategy = createPluginStrategy();</span>
+
+        // load up rules for the core first
+        try {
+<span class="fc" id="L219">            compatibilityTransformer.loadRules(getClass().getClassLoader());</span>
+<span class="pc" id="L220">        } catch (IOException e) {</span>
+<span class="nc" id="L221">            LOGGER.log(Level.WARNING, &quot;Failed to load compatibility rewrite rules&quot;,e);</span>
+        }
+<span class="fc" id="L223">    }</span>
+
+    public Transformer getCompatibilityTransformer() {
+<span class="nc" id="L226">        return compatibilityTransformer;</span>
+    }
+
+    public Api getApi() {
+<span class="nc" id="L230">        return new Api(this);</span>
+    }
+
+    /**
+     * If non-null, the base directory for all exploded .hpi/.jpi plugins.
+     * @return the base directory for all exploded .hpi/.jpi plugins or {@code null} to leave this up to the strategy.
+     */
+    @CheckForNull
+    public File getWorkDir() {
+<span class="nc" id="L239">        return workDir;</span>
+    }
+
+    /**
+     * Find all registered overrides (intended to allow overriding/adding views)
+     * @return List of extensions
+     * @since 1.627
+     */
+    @Override
+    public Collection&lt;PluginManagerStaplerOverride&gt; getOverrides() {
+<span class="nc" id="L249">        return PluginManagerStaplerOverride.all();</span>
+    }
+
+    /**
+     * Called immediately after the construction.
+     * This is a separate method so that code executed from here will see a valid value in
+     * {@link jenkins.model.Jenkins#pluginManager}.
+     */
+    public TaskBuilder initTasks(final InitStrategy initStrategy) {
+        TaskBuilder builder;
+<span class="nc bnc" id="L259" title="All 2 branches missed.">        if (!pluginListed) {</span>
+<span class="nc" id="L260">            builder = new TaskGraphBuilder() {</span>
+                List&lt;File&gt; archives;
+                Collection&lt;String&gt; bundledPlugins;
+
+                {
+<span class="nc" id="L265">                    Handle loadBundledPlugins = add(&quot;Loading bundled plugins&quot;, new Executable() {</span>
+                        public void run(Reactor session) throws Exception {
+<span class="nc" id="L267">                            bundledPlugins = loadBundledPlugins();</span>
+<span class="nc" id="L268">                        }</span>
+                    });
+
+<span class="nc" id="L271">                    Handle listUpPlugins = requires(loadBundledPlugins).add(&quot;Listing up plugins&quot;, new Executable() {</span>
+                        public void run(Reactor session) throws Exception {
+<span class="nc" id="L273">                            archives = initStrategy.listPluginArchives(PluginManager.this);</span>
+<span class="nc" id="L274">                        }</span>
+                    });
+
+<span class="nc" id="L277">                    requires(listUpPlugins).attains(PLUGINS_LISTED).add(&quot;Preparing plugins&quot;,new Executable() {</span>
+                        public void run(Reactor session) throws Exception {
+                            // once we've listed plugins, we can fill in the reactor with plugin-specific initialization tasks
+<span class="nc" id="L280">                            TaskGraphBuilder g = new TaskGraphBuilder();</span>
+
+<span class="nc" id="L282">                            final Map&lt;String,File&gt; inspectedShortNames = new HashMap&lt;String,File&gt;();</span>
+
+<span class="nc bnc" id="L284" title="All 2 branches missed.">                            for( final File arc : archives ) {</span>
+<span class="nc" id="L285">                                g.followedBy().notFatal().attains(PLUGINS_LISTED).add(&quot;Inspecting plugin &quot; + arc, new Executable() {</span>
+                                    public void run(Reactor session1) throws Exception {
+                                        try {
+<span class="nc" id="L288">                                            PluginWrapper p = strategy.createPluginWrapper(arc);</span>
+<span class="nc bnc" id="L289" title="All 2 branches missed.">                                            if (isDuplicate(p)) return;</span>
+
+<span class="nc" id="L291">                                            p.isBundled = containsHpiJpi(bundledPlugins, arc.getName());</span>
+<span class="nc" id="L292">                                            plugins.add(p);</span>
+<span class="nc" id="L293">                                        } catch (IOException e) {</span>
+<span class="nc" id="L294">                                            failedPlugins.add(new FailedPlugin(arc.getName(),e));</span>
+<span class="nc" id="L295">                                            throw e;</span>
+                                        }
+<span class="nc" id="L297">                                    }</span>
+
+                                    /**
+                                     * Inspects duplication. this happens when you run hpi:run on a bundled plugin,
+                                     * as well as putting numbered jpi files, like &quot;cobertura-1.0.jpi&quot; and &quot;cobertura-1.1.jpi&quot;
+                                     */
+                                    private boolean isDuplicate(PluginWrapper p) {
+<span class="nc" id="L304">                                        String shortName = p.getShortName();</span>
+<span class="nc bnc" id="L305" title="All 2 branches missed.">                                        if (inspectedShortNames.containsKey(shortName)) {</span>
+<span class="nc" id="L306">                                            LOGGER.info(&quot;Ignoring &quot;+arc+&quot; because &quot;+inspectedShortNames.get(shortName)+&quot; is already loaded&quot;);</span>
+<span class="nc" id="L307">                                            return true;</span>
+                                        }
+
+<span class="nc" id="L310">                                        inspectedShortNames.put(shortName,arc);</span>
+<span class="nc" id="L311">                                        return false;</span>
+                                    }
+                                });
+                            }
+
+<span class="nc" id="L316">                            g.followedBy().attains(PLUGINS_LISTED).add(&quot;Checking cyclic dependencies&quot;, new Executable() {</span>
+                                /**
+                                 * Makes sure there's no cycle in dependencies.
+                                 */
+                                public void run(Reactor reactor) throws Exception {
+                                    try {
+<span class="nc" id="L322">                                        CyclicGraphDetector&lt;PluginWrapper&gt; cgd = new CyclicGraphDetector&lt;PluginWrapper&gt;() {</span>
+                                            @Override
+                                            protected List&lt;PluginWrapper&gt; getEdges(PluginWrapper p) {
+<span class="nc" id="L325">                                                List&lt;PluginWrapper&gt; next = new ArrayList&lt;PluginWrapper&gt;();</span>
+<span class="nc" id="L326">                                                addTo(p.getDependencies(), next);</span>
+<span class="nc" id="L327">                                                addTo(p.getOptionalDependencies(), next);</span>
+<span class="nc" id="L328">                                                return next;</span>
+                                            }
+
+                                            private void addTo(List&lt;Dependency&gt; dependencies, List&lt;PluginWrapper&gt; r) {
+<span class="nc bnc" id="L332" title="All 2 branches missed.">                                                for (Dependency d : dependencies) {</span>
+<span class="nc" id="L333">                                                    PluginWrapper p = getPlugin(d.shortName);</span>
+<span class="nc bnc" id="L334" title="All 2 branches missed.">                                                    if (p != null)</span>
+<span class="nc" id="L335">                                                        r.add(p);</span>
+                                                }
+<span class="nc" id="L337">                                            }</span>
+
+                                            @Override
+                                            protected void reactOnCycle(PluginWrapper q, List&lt;PluginWrapper&gt; cycle)
+                                                    throws hudson.util.CyclicGraphDetector.CycleDetectedException {
+
+<span class="nc" id="L343">                                                LOGGER.log(Level.SEVERE, &quot;found cycle in plugin dependencies: (root=&quot;+q+&quot;, deactivating all involved) &quot;+Util.join(cycle,&quot; -&gt; &quot;));</span>
+<span class="nc bnc" id="L344" title="All 2 branches missed.">                                                for (PluginWrapper pluginWrapper : cycle) {</span>
+<span class="nc" id="L345">                                                    pluginWrapper.setHasCycleDependency(true);</span>
+<span class="nc" id="L346">                                                    failedPlugins.add(new FailedPlugin(pluginWrapper.getShortName(), new CycleDetectedException(cycle)));</span>
+                                                }
+<span class="nc" id="L348">                                            }</span>
+
+                                        };
+<span class="nc" id="L351">                                        cgd.run(getPlugins());</span>
+
+                                        // obtain topologically sorted list and overwrite the list
+<span class="nc" id="L354">                                        ListIterator&lt;PluginWrapper&gt; litr = getPlugins().listIterator();</span>
+<span class="nc bnc" id="L355" title="All 2 branches missed.">                                        for (PluginWrapper p : cgd.getSorted()) {</span>
+<span class="nc" id="L356">                                            litr.next();</span>
+<span class="nc" id="L357">                                            litr.set(p);</span>
+<span class="nc bnc" id="L358" title="All 2 branches missed.">                                            if(p.isActive())</span>
+<span class="nc" id="L359">                                                activePlugins.add(p);</span>
+                                        }
+<span class="nc" id="L361">                                    } catch (CycleDetectedException e) {</span>
+<span class="nc" id="L362">                                        stop(); // disable all plugins since classloading from them can lead to StackOverflow</span>
+<span class="nc" id="L363">                                        throw e;    // let Hudson fail</span>
+                                    }
+<span class="nc" id="L365">                                }</span>
+                            });
+
+                            // Let's see for a while until we open this functionality up to plugins
+//                            g.followedBy().attains(PLUGINS_LISTED).add(&quot;Load compatibility rules&quot;, new Executable() {
+//                                public void run(Reactor reactor) throws Exception {
+//                                    compatibilityTransformer.loadRules(uberClassLoader);
+//                                }
+//                            });
+
+<span class="nc" id="L375">                            session.addAll(g.discoverTasks(session));</span>
+
+<span class="nc" id="L377">                            pluginListed = true; // technically speaking this is still too early, as at this point tasks are merely scheduled, not necessarily executed.</span>
+<span class="nc" id="L378">                        }</span>
+                    });
+                }
+            };
+<span class="nc" id="L382">        } else {</span>
+<span class="nc" id="L383">            builder = TaskBuilder.EMPTY_BUILDER;</span>
+        }
+
+<span class="nc" id="L386">        final InitializerFinder initializerFinder = new InitializerFinder(uberClassLoader);        // misc. stuff</span>
+
+        // lists up initialization tasks about loading plugins.
+<span class="nc" id="L389">        return TaskBuilder.union(initializerFinder, // this scans @Initializer in the core once</span>
+<span class="nc" id="L390">            builder,new TaskGraphBuilder() {{</span>
+<span class="nc" id="L391">            requires(PLUGINS_LISTED).attains(PLUGINS_PREPARED).add(&quot;Loading plugins&quot;,new Executable() {</span>
+                /**
+                 * Once the plugins are listed, schedule their initialization.
+                 */
+                public void run(Reactor session) throws Exception {
+<span class="nc" id="L396">                    Jenkins.getInstance().lookup.set(PluginInstanceStore.class,new PluginInstanceStore());</span>
+<span class="nc" id="L397">                    TaskGraphBuilder g = new TaskGraphBuilder();</span>
+
+                    // schedule execution of loading plugins
+<span class="nc bnc" id="L400" title="All 2 branches missed.">                    for (final PluginWrapper p : activePlugins.toArray(new PluginWrapper[activePlugins.size()])) {</span>
+<span class="nc" id="L401">                        g.followedBy().notFatal().attains(PLUGINS_PREPARED).add(&quot;Loading plugin &quot; + p.getShortName(), new Executable() {</span>
+                            public void run(Reactor session) throws Exception {
+                                try {
+<span class="nc" id="L404">                                    p.resolvePluginDependencies();</span>
+<span class="nc" id="L405">                                    strategy.load(p);</span>
+<span class="nc" id="L406">                                } catch (IOException e) {</span>
+<span class="nc" id="L407">                                    failedPlugins.add(new FailedPlugin(p.getShortName(), e));</span>
+<span class="nc" id="L408">                                    activePlugins.remove(p);</span>
+<span class="nc" id="L409">                                    plugins.remove(p);</span>
+<span class="nc" id="L410">                                    throw e;</span>
+                                }
+<span class="nc" id="L412">                            }</span>
+                        });
+                    }
+
+                    // schedule execution of initializing plugins
+<span class="nc bnc" id="L417" title="All 2 branches missed.">                    for (final PluginWrapper p : activePlugins.toArray(new PluginWrapper[activePlugins.size()])) {</span>
+<span class="nc" id="L418">                        g.followedBy().notFatal().attains(PLUGINS_STARTED).add(&quot;Initializing plugin &quot; + p.getShortName(), new Executable() {</span>
+                            public void run(Reactor session) throws Exception {
+<span class="nc bnc" id="L420" title="All 2 branches missed.">                                if (!activePlugins.contains(p)) {</span>
+<span class="nc" id="L421">                                    return;</span>
+                                }
+                                try {
+<span class="nc" id="L424">                                    p.getPlugin().postInitialize();</span>
+<span class="nc" id="L425">                                } catch (Exception e) {</span>
+<span class="nc" id="L426">                                    failedPlugins.add(new FailedPlugin(p.getShortName(), e));</span>
+<span class="nc" id="L427">                                    activePlugins.remove(p);</span>
+<span class="nc" id="L428">                                    plugins.remove(p);</span>
+<span class="nc" id="L429">                                    throw e;</span>
+                                }
+<span class="nc" id="L431">                            }</span>
+                        });
+                    }
+
+<span class="nc" id="L435">                    g.followedBy().attains(PLUGINS_STARTED).add(&quot;Discovering plugin initialization tasks&quot;, new Executable() {</span>
+                        public void run(Reactor reactor) throws Exception {
+                            // rescan to find plugin-contributed @Initializer
+<span class="nc" id="L438">                            reactor.addAll(initializerFinder.discoverTasks(reactor));</span>
+<span class="nc" id="L439">                        }</span>
+                    });
+
+                    // register them all
+<span class="nc" id="L443">                    session.addAll(g.discoverTasks(session));</span>
+<span class="nc" id="L444">                }</span>
+            });
+        }});
+    }
+
+    /*
+     * contains operation that considers xxx.hpi and xxx.jpi as equal
+     * this is necessary since the bundled plugins are still called *.hpi
+     */
+    private boolean containsHpiJpi(Collection&lt;String&gt; bundledPlugins, String name) {
+<span class="nc bnc" id="L454" title="All 2 branches missed.">        return bundledPlugins.contains(name.replaceAll(&quot;\\.hpi&quot;,&quot;.jpi&quot;))</span>
+<span class="nc bnc" id="L455" title="All 2 branches missed.">                || bundledPlugins.contains(name.replaceAll(&quot;\\.jpi&quot;,&quot;.hpi&quot;));</span>
+    }
+
+    /**
+     * Returns the manifest of a bundled but not-extracted plugin.
+     */
+    public @CheckForNull Manifest getBundledPluginManifest(String shortName) {
+<span class="nc" id="L462">        return bundledPluginManifests.get(shortName);</span>
+    }
+
+    /**
+     * TODO: revisit where/how to expose this. This is an experiment.
+     */
+    public void dynamicLoad(File arc) throws IOException, InterruptedException, RestartRequiredException {
+<span class="nc" id="L469">        LOGGER.info(&quot;Attempting to dynamic load &quot;+arc);</span>
+<span class="nc" id="L470">        PluginWrapper p = null;</span>
+        String sn;
+        try {
+<span class="nc" id="L473">            sn = strategy.getShortName(arc);</span>
+<span class="nc" id="L474">        } catch (AbstractMethodError x) {</span>
+<span class="nc" id="L475">            LOGGER.log(WARNING, &quot;JENKINS-12753 fix not active: {0}&quot;, x.getMessage());</span>
+<span class="nc" id="L476">            p = strategy.createPluginWrapper(arc);</span>
+<span class="nc" id="L477">            sn = p.getShortName();</span>
+        }
+<span class="nc bnc" id="L479" title="All 2 branches missed.">        if (getPlugin(sn)!=null)</span>
+<span class="nc" id="L480">            throw new RestartRequiredException(Messages._PluginManager_PluginIsAlreadyInstalled_RestartRequired(sn));</span>
+
+<span class="nc bnc" id="L482" title="All 2 branches missed.">        if (p == null) {</span>
+<span class="nc" id="L483">            p = strategy.createPluginWrapper(arc);</span>
+        }
+<span class="nc bnc" id="L485" title="All 2 branches missed.">        if (p.supportsDynamicLoad()== YesNoMaybe.NO)</span>
+<span class="nc" id="L486">            throw new RestartRequiredException(Messages._PluginManager_PluginDoesntSupportDynamicLoad_RestartRequired(sn));</span>
+
+        // there's no need to do cyclic dependency check, because we are deploying one at a time,
+        // so existing plugins can't be depending on this newly deployed one.
+
+<span class="nc" id="L491">        plugins.add(p);</span>
+<span class="nc" id="L492">        activePlugins.add(p);</span>
+<span class="nc" id="L493">        synchronized (((UberClassLoader) uberClassLoader).loaded) {</span>
+<span class="nc" id="L494">            ((UberClassLoader) uberClassLoader).loaded.clear();</span>
+        }
+
+        try {
+<span class="nc" id="L498">            p.resolvePluginDependencies();</span>
+<span class="nc" id="L499">            strategy.load(p);</span>
+
+<span class="nc" id="L501">            Jenkins.getInstance().refreshExtensions();</span>
+
+<span class="nc" id="L503">            p.getPlugin().postInitialize();</span>
+<span class="nc" id="L504">        } catch (Exception e) {</span>
+<span class="nc" id="L505">            failedPlugins.add(new FailedPlugin(sn, e));</span>
+<span class="nc" id="L506">            activePlugins.remove(p);</span>
+<span class="nc" id="L507">            plugins.remove(p);</span>
+<span class="nc" id="L508">            throw new IOException(&quot;Failed to install &quot;+ sn +&quot; plugin&quot;,e);</span>
+        }
+
+        // run initializers in the added plugin
+<span class="nc" id="L512">        Reactor r = new Reactor(InitMilestone.ordering());</span>
+<span class="nc" id="L513">        final ClassLoader loader = p.classLoader;</span>
+<span class="nc" id="L514">        r.addAll(new InitializerFinder(loader) {</span>
+            @Override
+            protected boolean filter(Method e) {
+<span class="nc bnc" id="L517" title="All 4 branches missed.">                return e.getDeclaringClass().getClassLoader() != loader || super.filter(e);</span>
+            }
+<span class="nc" id="L519">        }.discoverTasks(r));</span>
+        try {
+<span class="nc" id="L521">            new InitReactorRunner().run(r);</span>
+<span class="nc" id="L522">        } catch (ReactorException e) {</span>
+<span class="nc" id="L523">            throw new IOException(&quot;Failed to initialize &quot;+ sn +&quot; plugin&quot;,e);</span>
+        }
+
+        // recalculate dependencies of plugins optionally depending the newly deployed one.
+<span class="nc bnc" id="L527" title="All 2 branches missed.">        for (PluginWrapper depender: plugins) {</span>
+<span class="nc bnc" id="L528" title="All 2 branches missed.">            if (depender.equals(p)) {</span>
+                // skip itself.
+<span class="nc" id="L530">                continue;</span>
+            }
+<span class="nc bnc" id="L532" title="All 2 branches missed.">            for (Dependency d: depender.getOptionalDependencies()) {</span>
+<span class="nc bnc" id="L533" title="All 2 branches missed.">                if (d.shortName.equals(p.getShortName())) {</span>
+                    // this plugin depends on the newly loaded one!
+                    // recalculate dependencies!
+                    try {
+<span class="nc" id="L537">                        getPluginStrategy().updateDependency(depender, p);</span>
+<span class="nc" id="L538">                    } catch (AbstractMethodError x) {</span>
+<span class="nc" id="L539">                        LOGGER.log(WARNING, &quot;{0} does not yet implement updateDependency&quot;, getPluginStrategy().getClass());</span>
+                    }
+<span class="nc" id="L541">                    break;</span>
+                }
+            }
+        }
+
+        // Redo who depends on who.
+<span class="nc" id="L547">        resolveDependantPlugins();</span>
+
+<span class="nc" id="L549">        LOGGER.info(&quot;Plugin &quot; + p.getShortName()+&quot;:&quot;+p.getVersion() + &quot; dynamically installed&quot;);</span>
+<span class="nc" id="L550">    }</span>
+
+    @Restricted(NoExternalUse.class)
+    public synchronized void resolveDependantPlugins() {
+<span class="nc bnc" id="L554" title="All 2 branches missed.">        for (PluginWrapper plugin : plugins) {</span>
+<span class="nc" id="L555">            Set&lt;String&gt; dependants = new HashSet&lt;&gt;();</span>
+<span class="nc bnc" id="L556" title="All 2 branches missed.">            for (PluginWrapper possibleDependant : plugins) {</span>
+                // The plugin could have just been deleted. If so, it doesn't
+                // count as a dependant.
+<span class="nc bnc" id="L559" title="All 2 branches missed.">                if (possibleDependant.isDeleted()) {</span>
+<span class="nc" id="L560">                    continue;</span>
+                }
+<span class="nc" id="L562">                List&lt;Dependency&gt; dependencies = possibleDependant.getDependencies();</span>
+<span class="nc bnc" id="L563" title="All 2 branches missed.">                for (Dependency dependency : dependencies) {</span>
+<span class="nc bnc" id="L564" title="All 2 branches missed.">                    if (dependency.shortName.equals(plugin.getShortName())) {</span>
+<span class="nc" id="L565">                        dependants.add(possibleDependant.getShortName());</span>
+                    }
+                }
+            }
+<span class="nc" id="L569">            plugin.setDependants(dependants);</span>
+        }
+<span class="nc" id="L571">    }</span>
+
+    /**
+     * If the war file has any &quot;/WEB-INF/plugins/[*.jpi | *.hpi]&quot;, extract them into the plugin directory.
+     *
+     * @return
+     *      File names of the bundled plugins. Like {&quot;ssh-slaves.hpi&quot;,&quot;subvesrion.jpi&quot;}
+     * @throws Exception
+     *      Any exception will be reported and halt the startup.
+     */
+    protected abstract Collection&lt;String&gt; loadBundledPlugins() throws Exception;
+
+    /**
+     * Copies the bundled plugin from the given URL to the destination of the given file name (like 'abc.jpi'),
+     * with a reasonable up-to-date check. A convenience method to be used by the {@link #loadBundledPlugins()}.
+     */
+    protected void copyBundledPlugin(URL src, String fileName) throws IOException {
+<span class="nc" id="L588">        fileName = fileName.replace(&quot;.hpi&quot;,&quot;.jpi&quot;); // normalize fileNames to have the correct suffix</span>
+<span class="nc" id="L589">        String legacyName = fileName.replace(&quot;.jpi&quot;,&quot;.hpi&quot;);</span>
+<span class="nc" id="L590">        long lastModified = src.openConnection().getLastModified();</span>
+<span class="nc" id="L591">        File file = new File(rootDir, fileName);</span>
+<span class="nc" id="L592">        File pinFile = new File(rootDir, fileName+&quot;.pinned&quot;);</span>
+
+        // normalization first, if the old file exists.
+<span class="nc" id="L595">        rename(new File(rootDir,legacyName),file);</span>
+<span class="nc" id="L596">        rename(new File(rootDir,legacyName+&quot;.pinned&quot;),pinFile);</span>
+
+        // update file if:
+        //  - no file exists today
+        //  - bundled version and current version differs (by timestamp), and the file isn't pinned.
+<span class="nc bnc" id="L601" title="All 6 branches missed.">        if (!file.exists() || (file.lastModified() != lastModified &amp;&amp; !pinFile.exists())) {</span>
+<span class="nc" id="L602">            FileUtils.copyURLToFile(src, file);</span>
+<span class="nc" id="L603">            file.setLastModified(src.openConnection().getLastModified());</span>
+            // lastModified is set for two reasons:
+            // - to avoid unpacking as much as possible, but still do it on both upgrade and downgrade
+            // - to make sure the value is not changed after each restart, so we can avoid
+            // unpacking the plugin itself in ClassicPluginStrategy.explode
+        }
+<span class="nc bnc" id="L609" title="All 2 branches missed.">        if (pinFile.exists())</span>
+<span class="nc" id="L610">            parsePinnedBundledPluginManifest(src);</span>
+<span class="nc" id="L611">    }</span>
+
+    /**
+     * When a pin file prevented a bundled plugin from getting extracted, check if the one we currently have
+     * is older than we bundled.
+     */
+    private void parsePinnedBundledPluginManifest(URL bundledJpi) {
+        try {
+<span class="nc" id="L619">            URLClassLoader cl = new URLClassLoader(new URL[]{bundledJpi});</span>
+<span class="nc" id="L620">            InputStream in=null;</span>
+            try {
+<span class="nc" id="L622">                URL res = cl.findResource(PluginWrapper.MANIFEST_FILENAME);</span>
+<span class="nc bnc" id="L623" title="All 2 branches missed.">                if (res!=null) {</span>
+<span class="nc" id="L624">                    in = res.openStream();</span>
+<span class="nc" id="L625">                    Manifest manifest = new Manifest(in);</span>
+<span class="nc" id="L626">                    String shortName = PluginWrapper.computeShortName(manifest, FilenameUtils.getName(bundledJpi.getPath()));</span>
+<span class="nc" id="L627">                    bundledPluginManifests.put(shortName, manifest);</span>
+                }
+<span class="nc" id="L629">            } finally {</span>
+<span class="nc" id="L630">                IOUtils.closeQuietly(in);</span>
+<span class="nc bnc" id="L631" title="All 4 branches missed.">                if (cl instanceof Closeable)</span>
+<span class="nc" id="L632">                    ((Closeable)cl).close();</span>
+<span class="nc" id="L633">            }</span>
+<span class="nc" id="L634">        } catch (IOException e) {</span>
+<span class="nc" id="L635">            LOGGER.log(WARNING, &quot;Failed to parse manifest of &quot;+bundledJpi, e);</span>
+        }
+<span class="nc" id="L637">    }</span>
+
+    /**
+     * Rename a legacy file to a new name, with care to Windows where {@link File#renameTo(File)}
+     * doesn't work if the destination already exists.
+     */
+    private void rename(File legacyFile, File newFile) throws IOException {
+<span class="nc bnc" id="L644" title="All 2 branches missed.">        if (!legacyFile.exists())   return;</span>
+<span class="nc bnc" id="L645" title="All 2 branches missed.">        if (newFile.exists()) {</span>
+<span class="nc" id="L646">            Util.deleteFile(newFile);</span>
+        }
+<span class="nc bnc" id="L648" title="All 2 branches missed.">        if (!legacyFile.renameTo(newFile)) {</span>
+<span class="nc" id="L649">            LOGGER.warning(&quot;Failed to rename &quot; + legacyFile + &quot; to &quot; + newFile);</span>
+        }
+<span class="nc" id="L651">    }</span>
+
+    /**
+     * Creates a hudson.PluginStrategy, looking at the corresponding system property.
+     */
+    protected PluginStrategy createPluginStrategy() {
+<span class="fc" id="L657">		String strategyName = System.getProperty(PluginStrategy.class.getName());</span>
+<span class="pc bpc" id="L658" title="1 of 2 branches missed.">		if (strategyName != null) {</span>
+			try {
+<span class="nc" id="L660">				Class&lt;?&gt; klazz = getClass().getClassLoader().loadClass(strategyName);</span>
+<span class="nc" id="L661">				Object strategy = klazz.getConstructor(PluginManager.class)</span>
+<span class="nc" id="L662">						.newInstance(this);</span>
+<span class="nc bnc" id="L663" title="All 2 branches missed.">				if (strategy instanceof PluginStrategy) {</span>
+<span class="nc" id="L664">					LOGGER.info(&quot;Plugin strategy: &quot; + strategyName);</span>
+<span class="nc" id="L665">					return (PluginStrategy) strategy;</span>
+				} else {
+<span class="nc" id="L667">					LOGGER.warning(&quot;Plugin strategy (&quot; + strategyName +</span>
+<span class="nc" id="L668">							&quot;) is not an instance of hudson.PluginStrategy&quot;);</span>
+				}
+<span class="nc" id="L670">			} catch (ClassNotFoundException e) {</span>
+<span class="nc" id="L671">				LOGGER.warning(&quot;Plugin strategy class not found: &quot;</span>
+<span class="nc" id="L672">						+ strategyName);</span>
+<span class="nc" id="L673">			} catch (Exception e) {</span>
+<span class="nc" id="L674">				LOGGER.log(WARNING, &quot;Could not instantiate plugin strategy: &quot;</span>
+<span class="nc" id="L675">						+ strategyName + &quot;. Falling back to ClassicPluginStrategy&quot;, e);</span>
+			}
+<span class="nc" id="L677">			LOGGER.info(&quot;Falling back to ClassicPluginStrategy&quot;);</span>
+		}
+
+		// default and fallback
+<span class="fc" id="L681">		return new ClassicPluginStrategy(this);</span>
+    }
+
+    public PluginStrategy getPluginStrategy() {
+<span class="nc" id="L685">        return strategy;</span>
+    }
+
+    /**
+     * Returns true if any new plugin was added.
+     */
+    public boolean isPluginUploaded() {
+<span class="nc" id="L692">        return pluginUploaded;</span>
+    }
+
+    /**
+     * All discovered plugins.
+     */
+    @Exported
+    public List&lt;PluginWrapper&gt; getPlugins() {
+<span class="nc" id="L700">        List&lt;PluginWrapper&gt; out = new ArrayList&lt;PluginWrapper&gt;(plugins.size());</span>
+<span class="nc" id="L701">        out.addAll(plugins);</span>
+<span class="nc" id="L702">        return out;</span>
+    }
+
+    public List&lt;FailedPlugin&gt; getFailedPlugins() {
+<span class="nc" id="L706">        return failedPlugins;</span>
+    }
+
+    /**
+     * Get the plugin instance with the given short name.
+     * @param shortName the short name of the plugin
+     * @return The plugin singleton or &lt;code&gt;null&lt;/code&gt; if a plugin with the given short name does not exist.
+     */
+    public PluginWrapper getPlugin(String shortName) {
+<span class="nc bnc" id="L715" title="All 2 branches missed.">        for (PluginWrapper p : getPlugins()) {</span>
+<span class="nc bnc" id="L716" title="All 2 branches missed.">            if(p.getShortName().equals(shortName))</span>
+<span class="nc" id="L717">                return p;</span>
+        }
+<span class="nc" id="L719">        return null;</span>
+    }
+
+    /**
+     * Get the plugin instance that implements a specific class, use to find your plugin singleton.
+     * Note: beware the classloader fun.
+     * @param pluginClazz The class that your plugin implements.
+     * @return The plugin singleton or &lt;code&gt;null&lt;/code&gt; if for some reason the plugin is not loaded.
+     */
+    public PluginWrapper getPlugin(Class&lt;? extends Plugin&gt; pluginClazz) {
+<span class="nc bnc" id="L729" title="All 2 branches missed.">        for (PluginWrapper p : getPlugins()) {</span>
+<span class="nc bnc" id="L730" title="All 2 branches missed.">            if(pluginClazz.isInstance(p.getPlugin()))</span>
+<span class="nc" id="L731">                return p;</span>
+        }
+<span class="nc" id="L733">        return null;</span>
+    }
+
+    /**
+     * Get the plugin instances that extend a specific class, use to find similar plugins.
+     * Note: beware the classloader fun.
+     * @param pluginSuperclass The class that your plugin is derived from.
+     * @return The list of plugins implementing the specified class.
+     */
+    public List&lt;PluginWrapper&gt; getPlugins(Class&lt;? extends Plugin&gt; pluginSuperclass) {
+<span class="nc" id="L743">        List&lt;PluginWrapper&gt; result = new ArrayList&lt;PluginWrapper&gt;();</span>
+<span class="nc bnc" id="L744" title="All 2 branches missed.">        for (PluginWrapper p : getPlugins()) {</span>
+<span class="nc bnc" id="L745" title="All 2 branches missed.">            if(pluginSuperclass.isInstance(p.getPlugin()))</span>
+<span class="nc" id="L746">                result.add(p);</span>
+        }
+<span class="nc" id="L748">        return Collections.unmodifiableList(result);</span>
+    }
+
+    public String getDisplayName() {
+<span class="nc" id="L752">        return Messages.PluginManager_DisplayName();</span>
+    }
+
+    public String getSearchUrl() {
+<span class="nc" id="L756">        return &quot;pluginManager&quot;;</span>
+    }
+
+    /**
+     * Discover all the service provider implementations of the given class,
+     * via &lt;tt&gt;META-INF/services&lt;/tt&gt;.
+     */
+    public &lt;T&gt; Collection&lt;Class&lt;? extends T&gt;&gt; discover( Class&lt;T&gt; spi ) {
+<span class="nc" id="L764">        Set&lt;Class&lt;? extends T&gt;&gt; result = new HashSet&lt;Class&lt;? extends T&gt;&gt;();</span>
+
+<span class="nc bnc" id="L766" title="All 2 branches missed.">        for (PluginWrapper p : activePlugins) {</span>
+<span class="nc" id="L767">            Service.load(spi, p.classLoader, result);</span>
+        }
+
+<span class="nc" id="L770">        return result;</span>
+    }
+
+    /**
+     * Return the {@link PluginWrapper} that loaded the given class 'c'.
+     *
+     * @since 1.402.
+     */
+    public PluginWrapper whichPlugin(Class c) {
+<span class="nc" id="L779">        PluginWrapper oneAndOnly = null;</span>
+<span class="nc" id="L780">        ClassLoader cl = c.getClassLoader();</span>
+<span class="nc bnc" id="L781" title="All 2 branches missed.">        for (PluginWrapper p : activePlugins) {</span>
+<span class="nc bnc" id="L782" title="All 2 branches missed.">            if (p.classLoader==cl) {</span>
+<span class="nc bnc" id="L783" title="All 2 branches missed.">                if (oneAndOnly!=null)</span>
+<span class="nc" id="L784">                    return null;    // ambigious</span>
+<span class="nc" id="L785">                oneAndOnly = p;</span>
+            }
+        }
+<span class="nc" id="L788">        return oneAndOnly;</span>
+    }
+
+    /**
+     * Orderly terminates all the plugins.
+     */
+    public void stop() {
+<span class="nc bnc" id="L795" title="All 2 branches missed.">        for (PluginWrapper p : activePlugins) {</span>
+<span class="nc" id="L796">            p.stop();</span>
+<span class="nc" id="L797">            p.releaseClassLoader();</span>
+        }
+<span class="nc" id="L799">        activePlugins.clear();</span>
+        // Work around a bug in commons-logging.
+        // See http://www.szegedi.org/articles/memleak.html
+<span class="nc" id="L802">        LogFactory.release(uberClassLoader);</span>
+<span class="nc" id="L803">    }</span>
+
+    public HttpResponse doUpdateSources(StaplerRequest req) throws IOException {
+<span class="nc" id="L806">        Jenkins.getInstance().checkPermission(CONFIGURE_UPDATECENTER);</span>
+
+<span class="nc bnc" id="L808" title="All 2 branches missed.">        if (req.hasParameter(&quot;remove&quot;)) {</span>
+<span class="nc" id="L809">            UpdateCenter uc = Jenkins.getInstance().getUpdateCenter();</span>
+<span class="nc" id="L810">            BulkChange bc = new BulkChange(uc);</span>
+            try {
+<span class="nc bnc" id="L812" title="All 2 branches missed.">                for (String id : req.getParameterValues(&quot;sources&quot;))</span>
+<span class="nc" id="L813">                    uc.getSites().remove(uc.getById(id));</span>
+<span class="nc" id="L814">            } finally {</span>
+<span class="nc" id="L815">                bc.commit();</span>
+<span class="nc" id="L816">            }</span>
+<span class="nc" id="L817">        } else</span>
+<span class="nc bnc" id="L818" title="All 2 branches missed.">        if (req.hasParameter(&quot;add&quot;))</span>
+<span class="nc" id="L819">            return new HttpRedirect(&quot;addSite&quot;);</span>
+
+<span class="nc" id="L821">        return new HttpRedirect(&quot;./sites&quot;);</span>
+    }
+
+    /**
+     * Performs the installation of the plugins.
+     */
+    public void doInstall(StaplerRequest req, StaplerResponse rsp) throws IOException, ServletException {
+<span class="nc bnc" id="L828" title="All 2 branches missed.">        boolean dynamicLoad = req.getParameter(&quot;dynamicLoad&quot;)!=null;</span>
+<span class="nc" id="L829">        final List&lt;Future&lt;UpdateCenter.UpdateCenterJob&gt;&gt; deployJobs = new ArrayList&lt;&gt;();</span>
+
+<span class="nc" id="L831">        Enumeration&lt;String&gt; en = req.getParameterNames();</span>
+<span class="nc bnc" id="L832" title="All 2 branches missed.">        while (en.hasMoreElements()) {</span>
+<span class="nc" id="L833">            String n =  en.nextElement();</span>
+<span class="nc bnc" id="L834" title="All 2 branches missed.">            if(n.startsWith(&quot;plugin.&quot;)) {</span>
+<span class="nc" id="L835">                n = n.substring(7);</span>
+                // JENKINS-22080 plugin names can contain '.' as could (according to rumour) update sites
+<span class="nc" id="L837">                int index = n.indexOf('.');</span>
+<span class="nc" id="L838">                UpdateSite.Plugin p = null;</span>
+<span class="nc bnc" id="L839" title="All 2 branches missed.">                while (index != -1) {</span>
+<span class="nc bnc" id="L840" title="All 2 branches missed.">                    if (index + 1 &gt;= n.length()) {</span>
+<span class="nc" id="L841">                        break;</span>
+                    }
+<span class="nc" id="L843">                    String pluginName = n.substring(0, index);</span>
+<span class="nc" id="L844">                    String siteName = n.substring(index + 1);</span>
+<span class="nc" id="L845">                    UpdateSite updateSite = Jenkins.getInstance().getUpdateCenter().getById(siteName);</span>
+<span class="nc bnc" id="L846" title="All 2 branches missed.">                    if (updateSite == null) {</span>
+<span class="nc" id="L847">                        throw new Failure(&quot;No such update center: &quot; + siteName);</span>
+                    } else {
+<span class="nc" id="L849">                        UpdateSite.Plugin plugin = updateSite.getPlugin(pluginName);</span>
+<span class="nc bnc" id="L850" title="All 2 branches missed.">                        if (plugin != null) {</span>
+<span class="nc bnc" id="L851" title="All 2 branches missed.">                            if (p != null) {</span>
+<span class="nc" id="L852">                                throw new Failure(&quot;Ambiguous plugin: &quot; + n);</span>
+                            }
+<span class="nc" id="L854">                            p = plugin;</span>
+                        }
+                    }
+<span class="nc" id="L857">                    index = n.indexOf('.', index + 1);</span>
+                }
+<span class="nc bnc" id="L859" title="All 2 branches missed.">                if (p == null) {</span>
+<span class="nc" id="L860">                    throw new Failure(&quot;No such plugin: &quot; + n);</span>
+                }
+                
+<span class="nc" id="L863">                deployJobs.add(p.deploy(dynamicLoad));</span>
+            }
+        }
+        
+        // Fire a one-off thread to wait for the plugins to be deployed and then
+        // refresh the dependant plugins list.
+<span class="nc" id="L869">        new Thread() {</span>
+            @Override
+            public void run() {
+                INSTALLING: while (true) {
+<span class="nc bnc" id="L873" title="All 2 branches missed.">                    for (Future&lt;UpdateCenter.UpdateCenterJob&gt; deployJob : deployJobs) {</span>
+                        try {
+<span class="nc" id="L875">                            Thread.sleep(500);</span>
+<span class="nc" id="L876">                        } catch (InterruptedException e) {</span>
+<span class="nc" id="L877">                            LOGGER.log(SEVERE, &quot;Unexpected error while waiting for some plugins to install. Plugin Manager state may be invalid. Please restart Jenkins ASAP.&quot;, e);</span>
+                        }
+<span class="nc bnc" id="L879" title="All 4 branches missed.">                        if (!deployJob.isCancelled() &amp;&amp; !deployJob.isDone()) {</span>
+                            // One of the plugins is not installing/canceled, so
+                            // go back to sleep and try again in a while.
+<span class="nc" id="L882">                            continue INSTALLING;</span>
+                        }
+                    }
+                    // All the plugins are installed. It's now safe to refresh.
+<span class="nc" id="L886">                    resolveDependantPlugins();</span>
+                    break;
+                }
+<span class="nc" id="L889">            }</span>
+<span class="nc" id="L890">        }.start();</span>
+        
+<span class="nc" id="L892">        rsp.sendRedirect(&quot;../updateCenter/&quot;);</span>
+<span class="nc" id="L893">    }</span>
+
+
+    /**
+     * Bare-minimum configuration mechanism to change the update center.
+     */
+    @RequirePOST
+    public HttpResponse doSiteConfigure(@QueryParameter String site) throws IOException {
+<span class="nc" id="L901">        Jenkins hudson = Jenkins.getInstance();</span>
+<span class="nc" id="L902">        hudson.checkPermission(CONFIGURE_UPDATECENTER);</span>
+<span class="nc" id="L903">        UpdateCenter uc = hudson.getUpdateCenter();</span>
+<span class="nc" id="L904">        PersistedList&lt;UpdateSite&gt; sites = uc.getSites();</span>
+<span class="nc bnc" id="L905" title="All 2 branches missed.">        for (UpdateSite s : sites) {</span>
+<span class="nc bnc" id="L906" title="All 2 branches missed.">            if (s.getId().equals(UpdateCenter.ID_DEFAULT))</span>
+<span class="nc" id="L907">                sites.remove(s);</span>
+        }
+<span class="nc" id="L909">        sites.add(new UpdateSite(UpdateCenter.ID_DEFAULT, site));</span>
+
+<span class="nc" id="L911">        return HttpResponses.redirectToContextRoot();</span>
+    }
+
+
+    @RequirePOST
+    public HttpResponse doProxyConfigure(StaplerRequest req) throws IOException, ServletException {
+<span class="nc" id="L917">        Jenkins jenkins = Jenkins.getInstance();</span>
+<span class="nc" id="L918">        jenkins.checkPermission(CONFIGURE_UPDATECENTER);</span>
+
+<span class="nc" id="L920">        ProxyConfiguration pc = req.bindJSON(ProxyConfiguration.class, req.getSubmittedForm());</span>
+<span class="nc bnc" id="L921" title="All 2 branches missed.">        if (pc.name==null) {</span>
+<span class="nc" id="L922">            jenkins.proxy = null;</span>
+<span class="nc" id="L923">            ProxyConfiguration.getXmlFile().delete();</span>
+<span class="nc" id="L924">        } else {</span>
+<span class="nc" id="L925">            jenkins.proxy = pc;</span>
+<span class="nc" id="L926">            jenkins.proxy.save();</span>
+        }
+<span class="nc" id="L928">        return new HttpRedirect(&quot;advanced&quot;);</span>
+    }
+
+    /**
+     * Uploads a plugin.
+     */
+    @RequirePOST
+    public HttpResponse doUploadPlugin(StaplerRequest req) throws IOException, ServletException {
+        try {
+<span class="nc" id="L937">            Jenkins.getInstance().checkPermission(UPLOAD_PLUGINS);</span>
+
+<span class="nc" id="L939">            ServletFileUpload upload = new ServletFileUpload(new DiskFileItemFactory());</span>
+
+            // Parse the request
+<span class="nc" id="L942">            FileItem fileItem = (FileItem) upload.parseRequest(req).get(0);</span>
+<span class="nc" id="L943">            String fileName = Util.getFileName(fileItem.getName());</span>
+<span class="nc bnc" id="L944" title="All 2 branches missed.">            if(&quot;&quot;.equals(fileName)){</span>
+<span class="nc" id="L945">                return new HttpRedirect(&quot;advanced&quot;);</span>
+            }
+            // we allow the upload of the new jpi's and the legacy hpi's
+<span class="nc bnc" id="L948" title="All 4 branches missed.">            if(!fileName.endsWith(&quot;.jpi&quot;) &amp;&amp; !fileName.endsWith(&quot;.hpi&quot;)){</span>
+<span class="nc" id="L949">                throw new Failure(hudson.model.Messages.Hudson_NotAPlugin(fileName));</span>
+            }
+
+            // first copy into a temporary file name
+<span class="nc" id="L953">            File t = File.createTempFile(&quot;uploaded&quot;, &quot;.jpi&quot;);</span>
+<span class="nc" id="L954">            t.deleteOnExit();</span>
+<span class="nc" id="L955">            fileItem.write(t);</span>
+<span class="nc" id="L956">            fileItem.delete();</span>
+
+<span class="nc" id="L958">            final String baseName = identifyPluginShortName(t);</span>
+
+<span class="nc" id="L960">            pluginUploaded = true;</span>
+
+            // Now create a dummy plugin that we can dynamically load (the InstallationJob will force a restart if one is needed):
+<span class="nc" id="L963">            JSONObject cfg = new JSONObject().</span>
+<span class="nc" id="L964">                    element(&quot;name&quot;, baseName).</span>
+<span class="nc" id="L965">                    element(&quot;version&quot;, &quot;0&quot;). // unused but mandatory</span>
+<span class="nc" id="L966">                    element(&quot;url&quot;, t.toURI().toString()).</span>
+<span class="nc" id="L967">                    element(&quot;dependencies&quot;, new JSONArray());</span>
+<span class="nc" id="L968">            new UpdateSite(UpdateCenter.ID_UPLOAD, null).new Plugin(UpdateCenter.ID_UPLOAD, cfg).deploy(true);</span>
+<span class="nc" id="L969">            return new HttpRedirect(&quot;../updateCenter&quot;);</span>
+<span class="nc" id="L970">        } catch (IOException e) {</span>
+<span class="nc" id="L971">            throw e;</span>
+<span class="nc" id="L972">        } catch (Exception e) {// grrr. fileItem.write throws this</span>
+<span class="nc" id="L973">            throw new ServletException(e);</span>
+        }
+    }
+
+    @Restricted(NoExternalUse.class)
+    @RequirePOST public HttpResponse doCheckUpdatesServer() throws IOException {
+<span class="nc bnc" id="L979" title="All 2 branches missed.">        for (UpdateSite site : Jenkins.getInstance().getUpdateCenter().getSites()) {</span>
+<span class="nc" id="L980">            FormValidation v = site.updateDirectlyNow(DownloadService.signatureCheck);</span>
+<span class="nc bnc" id="L981" title="All 2 branches missed.">            if (v.kind != FormValidation.Kind.OK) {</span>
+                // TODO crude but enough for now
+<span class="nc" id="L983">                return v;</span>
+            }
+        }
+<span class="nc bnc" id="L986" title="All 2 branches missed.">        for (DownloadService.Downloadable d : DownloadService.Downloadable.all()) {</span>
+<span class="nc" id="L987">            FormValidation v = d.updateNow();</span>
+<span class="nc bnc" id="L988" title="All 2 branches missed.">            if (v.kind != FormValidation.Kind.OK) {</span>
+<span class="nc" id="L989">                return v;</span>
+            }
+        }
+<span class="nc" id="L992">        return HttpResponses.forwardToPreviousPage();</span>
+    }
+
+    protected String identifyPluginShortName(File t) {
+        try {
+<span class="nc" id="L997">            JarFile j = new JarFile(t);</span>
+            try {
+<span class="nc" id="L999">                String name = j.getManifest().getMainAttributes().getValue(&quot;Short-Name&quot;);</span>
+<span class="nc bnc" id="L1000" title="All 2 branches missed.">                if (name!=null) return name;</span>
+<span class="nc" id="L1001">            } finally {</span>
+<span class="nc" id="L1002">                j.close();</span>
+<span class="nc" id="L1003">            }</span>
+<span class="nc" id="L1004">        } catch (IOException e) {</span>
+<span class="nc" id="L1005">            LOGGER.log(WARNING, &quot;Failed to identify the short name from &quot;+t,e);</span>
+        }
+<span class="nc" id="L1007">        return FilenameUtils.getBaseName(t.getName());    // fall back to the base name of what's uploaded</span>
+    }
+
+    public Descriptor&lt;ProxyConfiguration&gt; getProxyDescriptor() {
+<span class="nc" id="L1011">        return Jenkins.getInstance().getDescriptor(ProxyConfiguration.class);</span>
+    }
+
+    /**
+     * Prepares plugins for some expected XML configuration.
+     * If the configuration (typically a job’s {@code config.xml})
+     * needs some plugins to be installed (or updated), those jobs
+     * will be triggered.
+     * Plugins are dynamically loaded whenever possible.
+     * Requires {@link Jenkins#ADMINISTER}.
+     * @param configXml configuration that might be uploaded
+     * @return an empty list if all is well, else a list of submitted jobs which must be completed before this configuration can be fully read
+     * @throws IOException if loading or parsing the configuration failed
+     * @see ItemGroupMixIn#createProjectFromXML
+     * @see AbstractItem#updateByXml(javax.xml.transform.Source)
+     * @see XStream2
+     * @see hudson.model.UpdateSite.Plugin#deploy(boolean)
+     * @see PluginWrapper#supportsDynamicLoad
+     * @see hudson.model.UpdateCenter.DownloadJob.SuccessButRequiresRestart
+     * @since 1.483
+     */
+    public List&lt;Future&lt;UpdateCenter.UpdateCenterJob&gt;&gt; prevalidateConfig(InputStream configXml) throws IOException {
+<span class="nc" id="L1033">        Jenkins.getInstance().checkPermission(Jenkins.ADMINISTER);</span>
+<span class="nc" id="L1034">        List&lt;Future&lt;UpdateCenter.UpdateCenterJob&gt;&gt; jobs = new ArrayList&lt;Future&lt;UpdateCenter.UpdateCenterJob&gt;&gt;();</span>
+<span class="nc" id="L1035">        UpdateCenter uc = Jenkins.getInstance().getUpdateCenter();</span>
+        // TODO call uc.updateAllSites() when available? perhaps not, since we should not block on network here
+<span class="nc bnc" id="L1037" title="All 2 branches missed.">        for (Map.Entry&lt;String,VersionNumber&gt; requestedPlugin : parseRequestedPlugins(configXml).entrySet()) {</span>
+<span class="nc" id="L1038">            PluginWrapper pw = getPlugin(requestedPlugin.getKey());</span>
+<span class="nc bnc" id="L1039" title="All 2 branches missed.">            if (pw == null) { // install new</span>
+<span class="nc" id="L1040">                UpdateSite.Plugin toInstall = uc.getPlugin(requestedPlugin.getKey());</span>
+<span class="nc bnc" id="L1041" title="All 2 branches missed.">                if (toInstall == null) {</span>
+<span class="nc" id="L1042">                    LOGGER.log(WARNING, &quot;No such plugin {0} to install&quot;, requestedPlugin.getKey());</span>
+<span class="nc" id="L1043">                    continue;</span>
+                }
+<span class="nc bnc" id="L1045" title="All 2 branches missed.">                if (new VersionNumber(toInstall.version).compareTo(requestedPlugin.getValue()) &lt; 0) {</span>
+<span class="nc" id="L1046">                    LOGGER.log(WARNING, &quot;{0} can only be satisfied in @{1}&quot;, new Object[] {requestedPlugin, toInstall.version});</span>
+                }
+<span class="nc bnc" id="L1048" title="All 2 branches missed.">                if (toInstall.isForNewerHudson()) {</span>
+<span class="nc" id="L1049">                    LOGGER.log(WARNING, &quot;{0}@{1} was built for a newer Jenkins&quot;, new Object[] {toInstall.name, toInstall.version});</span>
+                }
+<span class="nc" id="L1051">                jobs.add(toInstall.deploy(true));</span>
+<span class="nc bnc" id="L1052" title="All 2 branches missed.">            } else if (pw.isOlderThan(requestedPlugin.getValue())) { // upgrade</span>
+<span class="nc" id="L1053">                UpdateSite.Plugin toInstall = uc.getPlugin(requestedPlugin.getKey());</span>
+<span class="nc bnc" id="L1054" title="All 2 branches missed.">                if (toInstall == null) {</span>
+<span class="nc" id="L1055">                    LOGGER.log(WARNING, &quot;No such plugin {0} to upgrade&quot;, requestedPlugin.getKey());</span>
+<span class="nc" id="L1056">                    continue;</span>
+                }
+<span class="nc bnc" id="L1058" title="All 2 branches missed.">                if (!pw.isOlderThan(new VersionNumber(toInstall.version))) {</span>
+<span class="nc" id="L1059">                    LOGGER.log(WARNING, &quot;{0}@{1} is no newer than what we already have&quot;, new Object[] {toInstall.name, toInstall.version});</span>
+<span class="nc" id="L1060">                    continue;</span>
+                }
+<span class="nc bnc" id="L1062" title="All 2 branches missed.">                if (new VersionNumber(toInstall.version).compareTo(requestedPlugin.getValue()) &lt; 0) {</span>
+<span class="nc" id="L1063">                    LOGGER.log(WARNING, &quot;{0} can only be satisfied in @{1}&quot;, new Object[] {requestedPlugin, toInstall.version});</span>
+                }
+<span class="nc bnc" id="L1065" title="All 2 branches missed.">                if (toInstall.isForNewerHudson()) {</span>
+<span class="nc" id="L1066">                    LOGGER.log(WARNING, &quot;{0}@{1} was built for a newer Jenkins&quot;, new Object[] {toInstall.name, toInstall.version});</span>
+                }
+<span class="nc bnc" id="L1068" title="All 2 branches missed.">                if (!toInstall.isCompatibleWithInstalledVersion()) {</span>
+<span class="nc" id="L1069">                    LOGGER.log(WARNING, &quot;{0}@{1} is incompatible with the installed @{2}&quot;, new Object[] {toInstall.name, toInstall.version, pw.getVersion()});</span>
+                }
+<span class="nc" id="L1071">                jobs.add(toInstall.deploy(true)); // dynamicLoad=true =&gt; sure to throw RestartRequiredException, but at least message is nicer</span>
+            } // else already good
+        }
+<span class="nc" id="L1074">        return jobs;</span>
+    }
+
+    /**
+     * Like {@link #doInstallNecessaryPlugins(StaplerRequest)} but only checks if everything is installed
+     * or if some plugins need updates or installation.
+     *
+     * This method runs without side-effect. I'm still requiring the ADMINISTER permission since
+     * XML file can contain various external references and we don't configure parsers properly against
+     * that.
+     *
+     * @since 1.483
+     */
+    @RequirePOST
+    public JSONArray doPrevalidateConfig(StaplerRequest req) throws IOException {
+<span class="nc" id="L1089">        Jenkins.getInstance().checkPermission(Jenkins.ADMINISTER);</span>
+
+<span class="nc" id="L1091">        JSONArray response = new JSONArray();</span>
+
+<span class="nc bnc" id="L1093" title="All 2 branches missed.">        for (Map.Entry&lt;String,VersionNumber&gt; p : parseRequestedPlugins(req.getInputStream()).entrySet()) {</span>
+<span class="nc" id="L1094">            PluginWrapper pw = getPlugin(p.getKey());</span>
+<span class="nc" id="L1095">            JSONObject j = new JSONObject()</span>
+<span class="nc" id="L1096">                    .accumulate(&quot;name&quot;, p.getKey())</span>
+<span class="nc" id="L1097">                    .accumulate(&quot;version&quot;, p.getValue().toString());</span>
+<span class="nc bnc" id="L1098" title="All 2 branches missed.">            if (pw == null) { // install new</span>
+<span class="nc" id="L1099">                response.add(j.accumulate(&quot;mode&quot;, &quot;missing&quot;));</span>
+<span class="nc bnc" id="L1100" title="All 2 branches missed.">            } else if (pw.isOlderThan(p.getValue())) { // upgrade</span>
+<span class="nc" id="L1101">                response.add(j.accumulate(&quot;mode&quot;, &quot;old&quot;));</span>
+            } // else already good
+        }
+
+<span class="nc" id="L1105">        return response;</span>
+    }
+
+    /**
+     * Runs {@link #prevalidateConfig} on posted XML and redirects to the {@link UpdateCenter}.
+     * @since 1.483
+     */
+    @RequirePOST
+    public HttpResponse doInstallNecessaryPlugins(StaplerRequest req) throws IOException {
+<span class="nc" id="L1114">        prevalidateConfig(req.getInputStream());</span>
+<span class="nc" id="L1115">        return HttpResponses.redirectViaContextPath(&quot;updateCenter&quot;);</span>
+    }
+
+    /**
+     * Parses configuration XML files and picks up references to XML files.
+     */
+    public Map&lt;String,VersionNumber&gt; parseRequestedPlugins(InputStream configXml) throws IOException {
+<span class="fc" id="L1122">        final Map&lt;String,VersionNumber&gt; requestedPlugins = new TreeMap&lt;String,VersionNumber&gt;();</span>
+        try {
+<span class="fc" id="L1124">            SAXParserFactory.newInstance().newSAXParser().parse(configXml, new DefaultHandler() {</span>
+                @Override public void startElement(String uri, String localName, String qName, Attributes attributes) throws SAXException {
+<span class="fc" id="L1126">                    String plugin = attributes.getValue(&quot;plugin&quot;);</span>
+<span class="fc bfc" id="L1127" title="All 2 branches covered.">                    if (plugin == null) {</span>
+<span class="fc" id="L1128">                        return;</span>
+                    }
+<span class="pc bpc" id="L1130" title="1 of 2 branches missed.">                    if (!plugin.matches(&quot;[^@]+@[^@]+&quot;)) {</span>
+<span class="nc" id="L1131">                        throw new SAXException(&quot;Malformed plugin attribute: &quot; + plugin);</span>
+                    }
+<span class="fc" id="L1133">                    int at = plugin.indexOf('@');</span>
+<span class="fc" id="L1134">                    String shortName = plugin.substring(0, at);</span>
+<span class="fc" id="L1135">                    VersionNumber existing = requestedPlugins.get(shortName);</span>
+<span class="fc" id="L1136">                    VersionNumber requested = new VersionNumber(plugin.substring(at + 1));</span>
+<span class="pc bpc" id="L1137" title="1 of 4 branches missed.">                    if (existing == null || existing.compareTo(requested) &lt; 0) {</span>
+<span class="fc" id="L1138">                        requestedPlugins.put(shortName, requested);</span>
+                    }
+<span class="fc" id="L1140">                }</span>
+
+                @Override public InputSource resolveEntity(String publicId, String systemId) throws IOException,
+                        SAXException {
+<span class="nc" id="L1144">                    return RestrictiveEntityResolver.INSTANCE.resolveEntity(publicId, systemId);</span>
+                }
+
+            });
+<span class="fc" id="L1148">        } catch (SAXException x) {</span>
+<span class="fc" id="L1149">            throw new IOException(&quot;Failed to parse XML&quot;,x);</span>
+<span class="nc" id="L1150">        } catch (ParserConfigurationException e) {</span>
+<span class="nc" id="L1151">            throw new AssertionError(e); // impossible since we don't tweak XMLParser</span>
+        }
+<span class="fc" id="L1153">        return requestedPlugins;</span>
+    }
+
+    /**
+     * {@link ClassLoader} that can see all plugins.
+     */
+    public final class UberClassLoader extends ClassLoader {
+        /**
+         * Make generated types visible.
+         * Keyed by the generated class name.
+         */
+<span class="fc" id="L1164">        private ConcurrentMap&lt;String, WeakReference&lt;Class&gt;&gt; generatedClasses = new ConcurrentHashMap&lt;String, WeakReference&lt;Class&gt;&gt;();</span>
+        /** Cache of loaded, or known to be unloadable, classes. */
+<span class="fc" id="L1166">        private final Map&lt;String,Class&lt;?&gt;&gt; loaded = new HashMap&lt;String,Class&lt;?&gt;&gt;();</span>
+
+<span class="fc" id="L1168">        public UberClassLoader() {</span>
+<span class="fc" id="L1169">            super(PluginManager.class.getClassLoader());</span>
+<span class="fc" id="L1170">        }</span>
+
+        public void addNamedClass(String className, Class c) {
+<span class="nc" id="L1173">            generatedClasses.put(className,new WeakReference&lt;Class&gt;(c));</span>
+<span class="nc" id="L1174">        }</span>
+
+        @Override
+        protected Class&lt;?&gt; findClass(String name) throws ClassNotFoundException {
+<span class="nc" id="L1178">            WeakReference&lt;Class&gt; wc = generatedClasses.get(name);</span>
+<span class="nc bnc" id="L1179" title="All 2 branches missed.">            if (wc!=null) {</span>
+<span class="nc" id="L1180">                Class c = wc.get();</span>
+<span class="nc bnc" id="L1181" title="All 2 branches missed.">                if (c!=null)    return c;</span>
+<span class="nc" id="L1182">                else            generatedClasses.remove(name,wc);</span>
+            }
+
+<span class="nc bnc" id="L1185" title="All 2 branches missed.">            if (name.startsWith(&quot;SimpleTemplateScript&quot;)) { // cf. groovy.text.SimpleTemplateEngine</span>
+<span class="nc" id="L1186">                throw new ClassNotFoundException(&quot;ignoring &quot; + name);</span>
+            }
+<span class="nc" id="L1188">            synchronized (loaded) {</span>
+<span class="nc bnc" id="L1189" title="All 2 branches missed.">                if (loaded.containsKey(name)) {</span>
+<span class="nc" id="L1190">                    Class&lt;?&gt; c = loaded.get(name);</span>
+<span class="nc bnc" id="L1191" title="All 2 branches missed.">                    if (c != null) {</span>
+<span class="nc" id="L1192">                        return c;</span>
+                    } else {
+<span class="nc" id="L1194">                        throw new ClassNotFoundException(&quot;cached miss for &quot; + name);</span>
+                    }
+                }
+            }
+<span class="nc bnc" id="L1198" title="All 2 branches missed.">            if (FAST_LOOKUP) {</span>
+<span class="nc bnc" id="L1199" title="All 2 branches missed.">                for (PluginWrapper p : activePlugins) {</span>
+                    try {
+<span class="nc" id="L1201">                        Class&lt;?&gt; c = ClassLoaderReflectionToolkit._findLoadedClass(p.classLoader, name);</span>
+<span class="nc bnc" id="L1202" title="All 2 branches missed.">                        if (c != null) {</span>
+<span class="nc" id="L1203">                            synchronized (loaded) {</span>
+<span class="nc" id="L1204">                                loaded.put(name, c);</span>
+                            }
+<span class="nc" id="L1206">                            return c;</span>
+                        }
+                        // calling findClass twice appears to cause LinkageError: duplicate class def
+<span class="nc" id="L1209">                        c = ClassLoaderReflectionToolkit._findClass(p.classLoader, name);</span>
+<span class="nc" id="L1210">                        synchronized (loaded) {</span>
+<span class="nc" id="L1211">                            loaded.put(name, c);</span>
+                        }
+<span class="nc" id="L1213">                        return c;</span>
+<span class="nc" id="L1214">                    } catch (ClassNotFoundException e) {</span>
+                        //not found. try next
+                    }
+                }
+<span class="nc" id="L1218">            } else {</span>
+<span class="nc bnc" id="L1219" title="All 2 branches missed.">                for (PluginWrapper p : activePlugins) {</span>
+                    try {
+<span class="nc" id="L1221">                        return p.classLoader.loadClass(name);</span>
+<span class="nc" id="L1222">                    } catch (ClassNotFoundException e) {</span>
+                        //not found. try next
+                    }
+                }
+            }
+<span class="nc" id="L1227">            synchronized (loaded) {</span>
+<span class="nc" id="L1228">                loaded.put(name, null);</span>
+            }
+            // not found in any of the classloader. delegate.
+<span class="nc" id="L1231">            throw new ClassNotFoundException(name);</span>
+        }
+
+        @Override
+        protected URL findResource(String name) {
+<span class="nc bnc" id="L1236" title="All 2 branches missed.">            if (FAST_LOOKUP) {</span>
+<span class="nc bnc" id="L1237" title="All 2 branches missed.">                    for (PluginWrapper p : activePlugins) {</span>
+<span class="nc" id="L1238">                        URL url = ClassLoaderReflectionToolkit._findResource(p.classLoader, name);</span>
+<span class="nc bnc" id="L1239" title="All 2 branches missed.">                        if(url!=null)</span>
+<span class="nc" id="L1240">                            return url;</span>
+                    }
+<span class="nc" id="L1242">            } else {</span>
+<span class="nc bnc" id="L1243" title="All 2 branches missed.">                for (PluginWrapper p : activePlugins) {</span>
+<span class="nc" id="L1244">                    URL url = p.classLoader.getResource(name);</span>
+<span class="nc bnc" id="L1245" title="All 2 branches missed.">                    if(url!=null)</span>
+<span class="nc" id="L1246">                        return url;</span>
+                }
+            }
+<span class="nc" id="L1249">            return null;</span>
+        }
+
+        @Override
+        protected Enumeration&lt;URL&gt; findResources(String name) throws IOException {
+<span class="nc" id="L1254">            List&lt;URL&gt; resources = new ArrayList&lt;URL&gt;();</span>
+<span class="nc bnc" id="L1255" title="All 2 branches missed.">            if (FAST_LOOKUP) {</span>
+<span class="nc bnc" id="L1256" title="All 2 branches missed.">                    for (PluginWrapper p : activePlugins) {</span>
+<span class="nc" id="L1257">                        resources.addAll(Collections.list(ClassLoaderReflectionToolkit._findResources(p.classLoader, name)));</span>
+                    }
+<span class="nc" id="L1259">            } else {</span>
+<span class="nc bnc" id="L1260" title="All 2 branches missed.">                for (PluginWrapper p : activePlugins) {</span>
+<span class="nc" id="L1261">                    resources.addAll(Collections.list(p.classLoader.getResources(name)));</span>
+                }
+            }
+<span class="nc" id="L1264">            return Collections.enumeration(resources);</span>
+        }
+
+        @Override
+        public String toString() {
+            // only for debugging purpose
+<span class="nc" id="L1270">            return &quot;classLoader &quot; +  getClass().getName();</span>
+        }
+    }
+
+<span class="fc" id="L1274">    private static final Logger LOGGER = Logger.getLogger(PluginManager.class.getName());</span>
+
+<span class="pc bpc" id="L1276" title="1 of 2 branches missed.">    public static boolean FAST_LOOKUP = !Boolean.getBoolean(PluginManager.class.getName()+&quot;.noFastLookup&quot;);</span>
+
+<span class="fc" id="L1278">    public static final Permission UPLOAD_PLUGINS = new Permission(Jenkins.PERMISSIONS, &quot;UploadPlugins&quot;, Messages._PluginManager_UploadPluginsPermission_Description(),Jenkins.ADMINISTER,PermissionScope.JENKINS);</span>
+<span class="fc" id="L1279">    public static final Permission CONFIGURE_UPDATECENTER = new Permission(Jenkins.PERMISSIONS, &quot;ConfigureUpdateCenter&quot;, Messages._PluginManager_ConfigureUpdateCenterPermission_Description(),Jenkins.ADMINISTER,PermissionScope.JENKINS);</span>
+
+    /**
+     * Remembers why a plugin failed to deploy.
+     */
+    public static final class FailedPlugin {
+        public final String name;
+        public final Exception cause;
+
+<span class="nc" id="L1288">        public FailedPlugin(String name, Exception cause) {</span>
+<span class="nc" id="L1289">            this.name = name;</span>
+<span class="nc" id="L1290">            this.cause = cause;</span>
+<span class="nc" id="L1291">        }</span>
+
+        public String getExceptionString() {
+<span class="nc" id="L1294">            return Functions.printThrowable(cause);</span>
+        }
+    }
+
+    /**
+     * Stores {@link Plugin} instances.
+     */
+<span class="nc" id="L1301">    /*package*/ static final class PluginInstanceStore {</span>
+<span class="nc" id="L1302">        final Map&lt;PluginWrapper,Plugin&gt; store = new Hashtable&lt;PluginWrapper,Plugin&gt;();</span>
+    }
+
+    /**
+     * {@link AdministrativeMonitor} that checks if there are any plugins with cycle dependencies.
+     */
+    @Extension
+<span class="nc" id="L1309">    public static final class PluginCycleDependenciesMonitor extends AdministrativeMonitor {</span>
+
+<span class="nc" id="L1311">        private transient volatile boolean isActive = false;</span>
+
+        private transient volatile List&lt;String&gt; pluginsWithCycle;
+
+        public boolean isActivated() {
+<span class="nc bnc" id="L1316" title="All 2 branches missed.">            if(pluginsWithCycle == null){</span>
+<span class="nc" id="L1317">                pluginsWithCycle = new ArrayList&lt;String&gt;();</span>
+<span class="nc bnc" id="L1318" title="All 2 branches missed.">                for (PluginWrapper p : Jenkins.getInstance().getPluginManager().getPlugins()) {</span>
+<span class="nc bnc" id="L1319" title="All 2 branches missed.">                    if(p.hasCycleDependency()){</span>
+<span class="nc" id="L1320">                        pluginsWithCycle.add(p.getShortName());</span>
+<span class="nc" id="L1321">                        isActive = true;</span>
+                    }
+                }
+            }
+<span class="nc" id="L1325">            return isActive;</span>
+        }
+
+        public List&lt;String&gt; getPluginsWithCycle() {
+<span class="nc" id="L1329">            return pluginsWithCycle;</span>
+        }
+    }
+
+    /**
+     * {@link AdministrativeMonitor} that informs the administrator about a required plugin update.
+     * @since 1.491
+     */
+    @Extension
+<span class="nc" id="L1338">    public static final class PluginUpdateMonitor extends AdministrativeMonitor {</span>
+
+<span class="nc" id="L1340">        private Map&lt;String, PluginUpdateInfo&gt; pluginsToBeUpdated = new HashMap&lt;String, PluginManager.PluginUpdateMonitor.PluginUpdateInfo&gt;();</span>
+
+        /**
+         * Convenience method to ease access to this monitor, this allows other plugins to register required updates.
+         * @return this monitor.
+         */
+        public static final PluginUpdateMonitor getInstance() {
+<span class="nc" id="L1347">            return ExtensionList.lookup(PluginUpdateMonitor.class).get(0);</span>
+        }
+
+        /**
+         * Report to the administrator if the plugin with the given name is older then the required version.
+         *
+         * @param pluginName shortName of the plugin (artifactId)
+         * @param requiredVersion the lowest version which is OK (e.g. 2.2.2)
+         * @param message the message to show (plain text)
+         */
+        public void ifPluginOlderThenReport(String pluginName, String requiredVersion, String message){
+<span class="nc" id="L1358">            Plugin plugin = Jenkins.getInstance().getPlugin(pluginName);</span>
+<span class="nc bnc" id="L1359" title="All 2 branches missed.">            if(plugin != null){</span>
+<span class="nc bnc" id="L1360" title="All 2 branches missed.">                if(plugin.getWrapper().getVersionNumber().isOlderThan(new VersionNumber(requiredVersion))) {</span>
+<span class="nc" id="L1361">                    pluginsToBeUpdated.put(pluginName, new PluginUpdateInfo(pluginName, message));</span>
+                }
+            }
+<span class="nc" id="L1364">        }</span>
+
+        public boolean isActivated() {
+<span class="nc bnc" id="L1367" title="All 2 branches missed.">            return !pluginsToBeUpdated.isEmpty();</span>
+        }
+
+        /**
+         * adds a message about a plugin to the manage screen
+         * @param pluginName the plugins name
+         * @param message the message to be displayed
+         */
+        public void addPluginToUpdate(String pluginName, String message) {
+<span class="nc" id="L1376">            this.pluginsToBeUpdated.put(pluginName, new PluginUpdateInfo(pluginName, message));</span>
+<span class="nc" id="L1377">        }</span>
+
+        public Collection&lt;PluginUpdateInfo&gt; getPluginsToBeUpdated() {
+<span class="nc" id="L1380">            return pluginsToBeUpdated.values();</span>
+        }
+
+        public static class PluginUpdateInfo {
+            public final String pluginName;
+            public final String message;
+<span class="nc" id="L1386">            private PluginUpdateInfo(String pluginName, String message) {</span>
+<span class="nc" id="L1387">                this.pluginName = pluginName;</span>
+<span class="nc" id="L1388">                this.message = message;</span>
+<span class="nc" id="L1389">            }</span>
+        }
+
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

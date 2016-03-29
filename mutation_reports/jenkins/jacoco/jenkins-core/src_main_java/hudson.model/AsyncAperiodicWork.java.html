@@ -1,0 +1,247 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>AsyncAperiodicWork.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.model</a> &gt; <span class="el_source">AsyncAperiodicWork.java</span></div><h1>AsyncAperiodicWork.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">/*</span>
+ * The MIT License
+ *
+ * Copyright (c) 2011, Vojtech Juranek
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.model;
+
+import hudson.security.ACL;
+import hudson.util.StreamTaskListener;
+import java.io.File;
+import java.io.IOException;
+import java.util.Date;
+import java.util.concurrent.TimeUnit;
+import java.util.logging.Level;
+import jenkins.model.Jenkins;
+
+/**
+ * {@link AperiodicWork} that takes a long time to run. Similar to {@link AsyncPeriodicWork}, see {@link AsyncPeriodicWork} for
+ * details and {@link AperiodicWork} for differences between {@link AperiodicWork} and {@link PeriodicWork}. 
+ * 
+ * @author vjuranek
+ * @since 1.410
+ */
+public abstract class AsyncAperiodicWork extends AperiodicWork {
+    /**
+     * The default number of minutes after which to try and rotate the log file used by {@link #createListener()}.
+     * This value is controlled by the system property {@code hudson.model.AsyncAperiodicWork.logRotateMinutes}.
+     * Each individual AsyncAperiodicWork can also have a per-extension override using the system property
+     * based on their fully qualified class name with {@code .logRotateMinutes} appended.
+     *
+     * @since 1.651
+     */
+<span class="nc" id="L51">    private static final long LOG_ROTATE_MINUTES = Long.getLong(AsyncAperiodicWork.class.getName() +</span>
+<span class="nc" id="L52">            &quot;.logRotateMinutes&quot;, TimeUnit.DAYS.toMinutes(1));</span>
+    /**
+     * The default file size after which to try and rotate the log file used by {@link #createListener()}.
+     * A value of {@code -1L} disables rotation based on file size.
+     * This value is controlled by the system property {@code hudson.model.AsyncAperiodicWork.logRotateSize}.
+     * Each individual AsyncAperiodicWork can also have a per-extension override using the system property
+     * based on their fully qualified class name with {@code .logRotateSize} appended.
+     *
+     * @since 1.651
+     */
+<span class="nc" id="L62">    private static final long LOG_ROTATE_SIZE = Long.getLong(AsyncAperiodicWork.class.getName() + &quot;.logRotateSize&quot;,</span>
+<span class="nc" id="L63">            -1L);</span>
+    /**
+     * The number of milliseconds (since startup or previous rotation) after which to try and rotate the log file.
+     *
+     * @since 1.651
+     */
+    private final long logRotateMillis;
+    /**
+     * {@code -1L} disabled file size based log rotation, otherwise when starting an {@link #execute(TaskListener)},
+     * if the log file size is above this number of bytes then the log file will be rotated beforehand.
+     *
+     * @since 1.651
+     */
+    private final long logRotateSize;
+    /**
+     * The last time the log files were rotated. On start-up this will be {@link Long#MIN_VALUE} to ensure that the
+     * logs are always rotated every time Jenkins starts up to make it easier to correlate events with the main log.
+     *
+     * @since 1.651
+     */
+<span class="nc" id="L83">    private long lastRotateMillis = Long.MIN_VALUE;</span>
+    /**
+     * Name of the work.
+     */
+    public final String name;
+
+    private Thread thread;
+
+<span class="nc" id="L91">    protected AsyncAperiodicWork(String name) {</span>
+<span class="nc" id="L92">        this.name = name;</span>
+<span class="nc" id="L93">        this.logRotateMillis = TimeUnit.MINUTES.toMillis(</span>
+<span class="nc" id="L94">                Long.getLong(getClass().getName()+&quot;.logRotateMinutes&quot;, LOG_ROTATE_MINUTES));</span>
+<span class="nc" id="L95">        this.logRotateSize = Long.getLong(getClass().getName() +&quot;.logRotateSize&quot;, LOG_ROTATE_SIZE);</span>
+<span class="nc" id="L96">    }</span>
+
+    /**
+     * Schedules this periodic work now in a new thread, if one isn't already running.
+     */
+    @Override
+    public final void doAperiodicRun() {
+        try {
+<span class="nc bnc" id="L104" title="All 4 branches missed.">            if(thread!=null &amp;&amp; thread.isAlive()) {</span>
+<span class="nc" id="L105">                logger.log(getSlowLoggingLevel(), &quot;{0} thread is still running. Execution aborted.&quot;, name);</span>
+<span class="nc" id="L106">                return;</span>
+            }
+<span class="nc" id="L108">            thread = new Thread(new Runnable() {</span>
+                public void run() {
+<span class="nc" id="L110">                    logger.log(getNormalLoggingLevel(), &quot;Started {0}&quot;, name);</span>
+<span class="nc" id="L111">                    long startTime = System.currentTimeMillis();</span>
+                    long stopTime;
+
+<span class="nc" id="L114">                    StreamTaskListener l = createListener();</span>
+                    try {
+<span class="nc" id="L116">                        l.getLogger().printf(&quot;Started at %tc%n&quot;, new Date(startTime));</span>
+<span class="nc" id="L117">                        ACL.impersonate(ACL.SYSTEM);</span>
+
+<span class="nc" id="L119">                        execute(l);</span>
+<span class="nc" id="L120">                    } catch (IOException e) {</span>
+<span class="nc" id="L121">                        e.printStackTrace(l.fatalError(e.getMessage()));</span>
+<span class="nc" id="L122">                    } catch (InterruptedException e) {</span>
+<span class="nc" id="L123">                        e.printStackTrace(l.fatalError(&quot;aborted&quot;));</span>
+<span class="nc" id="L124">                    } finally {</span>
+<span class="nc" id="L125">                        stopTime = System.currentTimeMillis();</span>
+                        try {
+<span class="nc" id="L127">                            l.getLogger().printf(&quot;Finished at %tc. %dms%n&quot;, new Date(stopTime), stopTime - startTime);</span>
+<span class="nc" id="L128">                        } finally {</span>
+<span class="nc" id="L129">                            l.closeQuietly();</span>
+<span class="nc" id="L130">                        }</span>
+<span class="nc" id="L131">                    }</span>
+
+<span class="nc" id="L133">                    logger.log(getNormalLoggingLevel(), &quot;Finished {0}. {1,number} ms&quot;,</span>
+<span class="nc" id="L134">                            new Object[]{name, stopTime - startTime});</span>
+<span class="nc" id="L135">                }</span>
+<span class="nc" id="L136">            },name+&quot; thread&quot;);</span>
+<span class="nc" id="L137">            thread.start(); </span>
+<span class="nc" id="L138">        } catch (Throwable t) {</span>
+<span class="nc" id="L139">            logger.log(Level.SEVERE, name+&quot; thread failed with error&quot;, t);</span>
+        }
+<span class="nc" id="L141">    }</span>
+
+    protected StreamTaskListener createListener() {
+<span class="nc" id="L144">        File f = getLogFile();</span>
+<span class="nc bnc" id="L145" title="All 2 branches missed.">        if (!f.getParentFile().isDirectory()) {</span>
+<span class="nc bnc" id="L146" title="All 2 branches missed.">            if (!f.getParentFile().mkdirs()) {</span>
+<span class="nc" id="L147">                logger.log(getErrorLoggingLevel(), &quot;Could not create directory {0}&quot;, f.getParentFile());</span>
+            }
+        }
+<span class="nc bnc" id="L150" title="All 2 branches missed.">        if (f.isFile()) {</span>
+<span class="nc bnc" id="L151" title="All 2 branches missed.">            if ((lastRotateMillis + logRotateMillis &lt; System.currentTimeMillis())</span>
+<span class="nc bnc" id="L152" title="All 4 branches missed.">                    || (logRotateSize &gt; 0 &amp;&amp; f.length() &gt; logRotateSize)) {</span>
+<span class="nc" id="L153">                lastRotateMillis = System.currentTimeMillis();</span>
+<span class="nc" id="L154">                File prev = null;</span>
+<span class="nc bnc" id="L155" title="All 2 branches missed.">                for (int i = 5; i &gt;= 0; i--) {</span>
+<span class="nc bnc" id="L156" title="All 2 branches missed.">                    File curr = i == 0 ? f : new File(f.getParentFile(), f.getName() + &quot;.&quot; + i);</span>
+<span class="nc bnc" id="L157" title="All 2 branches missed.">                    if (curr.isFile()) {</span>
+<span class="nc bnc" id="L158" title="All 4 branches missed.">                        if (prev != null &amp;&amp; !prev.exists()) {</span>
+<span class="nc bnc" id="L159" title="All 2 branches missed.">                            if (!curr.renameTo(prev)) {</span>
+<span class="nc" id="L160">                                logger.log(getErrorLoggingLevel(), &quot;Could not rotate log files {0} to {1}&quot;,</span>
+<span class="nc" id="L161">                                        new Object[]{curr, prev});</span>
+                            }
+<span class="nc" id="L163">                        } else {</span>
+<span class="nc bnc" id="L164" title="All 2 branches missed.">                            if (!curr.delete()) {</span>
+<span class="nc" id="L165">                                logger.log(getErrorLoggingLevel(), &quot;Could not delete log file {0} to enable rotation&quot;,</span>
+<span class="nc" id="L166">                                        curr);</span>
+                            }
+                        }
+                    }
+<span class="nc" id="L170">                    prev = curr;</span>
+                }
+            }
+<span class="nc" id="L173">        } else {</span>
+<span class="nc" id="L174">            lastRotateMillis = System.currentTimeMillis();</span>
+            // migrate old log files the first time we start-up
+<span class="nc" id="L176">            File oldFile = new File(Jenkins.getActiveInstance().getRootDir(), f.getName());</span>
+<span class="nc bnc" id="L177" title="All 2 branches missed.">            if (oldFile.isFile()) {</span>
+<span class="nc" id="L178">                File newFile = new File(f.getParentFile(), f.getName() + &quot;.1&quot;);</span>
+<span class="nc bnc" id="L179" title="All 2 branches missed.">                if (!newFile.isFile()) {</span>
+                    // if there has never been rotation then this is the first time
+<span class="nc bnc" id="L181" title="All 2 branches missed.">                    if (oldFile.renameTo(newFile)) {</span>
+<span class="nc" id="L182">                        logger.log(getNormalLoggingLevel(), &quot;Moved {0} to {1}&quot;, new Object[]{oldFile, newFile});</span>
+<span class="nc" id="L183">                    } else {</span>
+<span class="nc" id="L184">                        logger.log(getErrorLoggingLevel(), &quot;Could not move {0} to {1}&quot;,</span>
+<span class="nc" id="L185">                                new Object[]{oldFile, newFile});</span>
+                    }
+                }
+            }
+        }
+        try {
+<span class="nc" id="L191">            return new StreamTaskListener(f, true, null);</span>
+<span class="nc" id="L192">        } catch (IOException e) {</span>
+<span class="nc" id="L193">            throw new Error(e);</span>
+        }
+    }
+
+    /**
+     * Determines the log file that records the result of this task.
+     */
+    protected File getLogFile() {
+<span class="nc" id="L201">        return new File(Jenkins.getActiveInstance().getRootDir(),&quot;logs/tasks/&quot;+name+&quot;.log&quot;);</span>
+    }
+
+    /**
+     * Returns the logging level at which normal messages are displayed.
+     *
+     * @return The logging level.
+     * @since 1.651
+     */
+    protected Level getNormalLoggingLevel() {
+<span class="nc" id="L211">        return Level.INFO;</span>
+    }
+
+    /**
+     * Returns the logging level at which previous task still executing messages is displayed.
+     *
+     * @return The logging level.
+     * @since 1.651
+     */
+    protected Level getSlowLoggingLevel() {
+<span class="nc" id="L221">        return getNormalLoggingLevel();</span>
+    }
+
+    /**
+     * Returns the logging level at which error messages are displayed.
+     *
+     * @return The logging level.
+     * @since 1.651
+     */
+    protected Level getErrorLoggingLevel() {
+<span class="nc" id="L231">        return Level.SEVERE;</span>
+    }
+
+    /**
+     * Executes the task.
+     *
+     * @param listener
+     *      Output sent will be reported to the users. (this work is TBD.)
+     * @throws InterruptedException
+     *      The caller will record the exception and moves on.
+     * @throws IOException
+     *      The caller will record the exception and moves on.
+     */
+    protected abstract void execute(TaskListener listener) throws IOException, InterruptedException;
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

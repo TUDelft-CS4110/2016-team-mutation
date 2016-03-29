@@ -1,0 +1,1647 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>UpdateCenter.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.model</a> &gt; <span class="el_source">UpdateCenter.java</span></div><h1>UpdateCenter.java</h1><pre class="source lang-java linenums">/*
+ * The MIT License
+ *
+ * Copyright (c) 2004-2010, Sun Microsystems, Inc., Kohsuke Kawaguchi, Yahoo! Inc., Seiji Sogabe
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.model;
+
+import hudson.BulkChange;
+import hudson.Extension;
+import hudson.ExtensionPoint;
+import hudson.Functions;
+import hudson.PluginManager;
+import hudson.PluginWrapper;
+import hudson.ProxyConfiguration;
+import hudson.Util;
+import hudson.XmlFile;
+import static hudson.init.InitMilestone.PLUGINS_STARTED;
+import hudson.init.Initializer;
+import hudson.lifecycle.Lifecycle;
+import hudson.lifecycle.RestartNotSupportedException;
+import hudson.model.UpdateSite.Data;
+import hudson.model.UpdateSite.Plugin;
+import hudson.model.listeners.SaveableListener;
+import hudson.remoting.AtmostOneThreadExecutor;
+import hudson.security.ACL;
+import hudson.util.DaemonThreadFactory;
+import hudson.util.FormValidation;
+import hudson.util.HttpResponses;
+import hudson.util.NamingThreadFactory;
+import hudson.util.IOException2;
+import hudson.util.IOUtils;
+import hudson.util.PersistedList;
+import hudson.util.XStream2;
+import jenkins.RestartRequiredException;
+import jenkins.model.Jenkins;
+import jenkins.util.io.OnMaster;
+import org.acegisecurity.Authentication;
+import org.acegisecurity.context.SecurityContext;
+import org.apache.commons.codec.binary.Base64;
+import org.apache.commons.io.input.CountingInputStream;
+import org.apache.commons.io.output.NullOutputStream;
+import org.jvnet.localizer.Localizable;
+import org.kohsuke.stapler.HttpResponse;
+import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.StaplerResponse;
+
+import javax.annotation.Nonnull;
+import javax.net.ssl.SSLHandshakeException;
+import javax.servlet.ServletException;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.net.MalformedURLException;
+import java.net.URL;
+import java.net.URLConnection;
+import java.net.UnknownHostException;
+import java.security.DigestInputStream;
+import java.security.DigestOutputStream;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeSet;
+import java.util.Vector;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.jar.Attributes;
+import java.util.jar.JarFile;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import javax.annotation.CheckForNull;
+import org.acegisecurity.context.SecurityContextHolder;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
+import org.kohsuke.stapler.export.Exported;
+import org.kohsuke.stapler.export.ExportedBean;
+import org.kohsuke.stapler.interceptor.RequirePOST;
+
+
+/**
+ * Controls update center capability.
+ *
+ * &lt;p&gt;
+ * The main job of this class is to keep track of the latest update center metadata file, and perform installations.
+ * Much of the UI about choosing plugins to install is done in {@link PluginManager}.
+ * &lt;p&gt;
+ * The update center can be configured to contact alternate servers for updates
+ * and plugins, and to use alternate strategies for downloading, installing
+ * and updating components. See the Javadocs for {@link UpdateCenterConfiguration}
+ * for more information.
+ *
+ * @author Kohsuke Kawaguchi
+ * @since 1.220
+ */
+@ExportedBean
+public class UpdateCenter extends AbstractModelObject implements Saveable, OnMaster {
+	
+<span class="nc" id="L126">    private static final String UPDATE_CENTER_URL = System.getProperty(UpdateCenter.class.getName()+&quot;.updateCenterUrl&quot;,&quot;http://updates.jenkins-ci.org/&quot;);</span>
+
+    /**
+     * {@linkplain UpdateSite#getId() ID} of the default update site.
+     * @since 1.483
+     */
+    public static final String ID_DEFAULT = &quot;default&quot;;
+
+    @Restricted(NoExternalUse.class)
+    public static final String ID_UPLOAD = &quot;_upload&quot;;
+	
+    /**
+     * {@link ExecutorService} that performs installation.
+     * @since 1.501
+     */
+<span class="nc" id="L141">    private final ExecutorService installerService = new AtmostOneThreadExecutor(</span>
+<span class="nc" id="L142">        new NamingThreadFactory(new DaemonThreadFactory(), &quot;Update center installer thread&quot;));</span>
+
+    /**
+     * An {@link ExecutorService} for updating UpdateSites.
+     */
+<span class="nc" id="L147">    protected final ExecutorService updateService = Executors.newCachedThreadPool(</span>
+<span class="nc" id="L148">        new NamingThreadFactory(new DaemonThreadFactory(), &quot;Update site data downloader&quot;));</span>
+        
+    /**
+     * List of created {@link UpdateCenterJob}s. Access needs to be synchronized.
+     */
+<span class="nc" id="L153">    private final Vector&lt;UpdateCenterJob&gt; jobs = new Vector&lt;UpdateCenterJob&gt;();</span>
+
+    /**
+     * {@link UpdateSite}s from which we've already installed a plugin at least once.
+     * This is used to skip network tests.
+     */
+<span class="nc" id="L159">    private final Set&lt;UpdateSite&gt; sourcesUsed = new HashSet&lt;UpdateSite&gt;();</span>
+
+    /**
+     * List of {@link UpdateSite}s to be used.
+     */
+<span class="nc" id="L164">    private final PersistedList&lt;UpdateSite&gt; sites = new PersistedList&lt;UpdateSite&gt;(this);</span>
+
+    /**
+     * Update center configuration data
+     */
+    private UpdateCenterConfiguration config;
+
+    private boolean requiresRestart;
+
+<span class="nc" id="L173">    public UpdateCenter() {</span>
+<span class="nc" id="L174">        configure(new UpdateCenterConfiguration());</span>
+<span class="nc" id="L175">    }</span>
+
+    public Api getApi() {
+<span class="nc" id="L178">        return new Api(this);</span>
+    }
+
+    /**
+     * Configures update center to get plugins/updates from alternate servers,
+     * and optionally using alternate strategies for downloading, installing
+     * and upgrading.
+     *
+     * @param config Configuration data
+     * @see UpdateCenterConfiguration
+     */
+    public void configure(UpdateCenterConfiguration config) {
+<span class="nc bnc" id="L190" title="All 2 branches missed.">        if (config!=null) {</span>
+<span class="nc" id="L191">            this.config = config;</span>
+        }
+<span class="nc" id="L193">    }</span>
+
+    /**
+     * Returns the list of {@link UpdateCenterJob} representing scheduled installation attempts.
+     *
+     * @return
+     *      can be empty but never null. Oldest entries first.
+     */
+    @Exported
+    public List&lt;UpdateCenterJob&gt; getJobs() {
+<span class="nc" id="L203">        synchronized (jobs) {</span>
+<span class="nc" id="L204">            return new ArrayList&lt;UpdateCenterJob&gt;(jobs);</span>
+        }
+    }
+
+    /**
+     * Gets a job by its ID.
+     *
+     * Primarily to make {@link UpdateCenterJob} bound to URL.
+     */
+    public UpdateCenterJob getJob(int id) {
+<span class="nc" id="L214">        synchronized (jobs) {</span>
+<span class="nc bnc" id="L215" title="All 2 branches missed.">            for (UpdateCenterJob job : jobs) {</span>
+<span class="nc bnc" id="L216" title="All 2 branches missed.">                if (job.id==id)</span>
+<span class="nc" id="L217">                    return job;</span>
+            }
+        }
+<span class="nc" id="L220">        return null;</span>
+    }
+
+    /**
+     * Returns latest install/upgrade job for the given plugin.
+     * @return InstallationJob or null if not found
+     */
+    public InstallationJob getJob(Plugin plugin) {
+<span class="nc" id="L228">        List&lt;UpdateCenterJob&gt; jobList = getJobs();</span>
+<span class="nc" id="L229">        Collections.reverse(jobList);</span>
+<span class="nc bnc" id="L230" title="All 2 branches missed.">        for (UpdateCenterJob job : jobList)</span>
+<span class="nc bnc" id="L231" title="All 2 branches missed.">            if (job instanceof InstallationJob) {</span>
+<span class="nc" id="L232">                InstallationJob ij = (InstallationJob)job;</span>
+<span class="nc bnc" id="L233" title="All 4 branches missed.">                if (ij.plugin.name.equals(plugin.name) &amp;&amp; ij.plugin.sourceId.equals(plugin.sourceId))</span>
+<span class="nc" id="L234">                    return ij;</span>
+            }
+<span class="nc" id="L236">        return null;</span>
+    }
+
+    /**
+     * Returns latest Jenkins upgrade job.
+     * @return HudsonUpgradeJob or null if not found
+     */
+    public HudsonUpgradeJob getHudsonJob() {
+<span class="nc" id="L244">        List&lt;UpdateCenterJob&gt; jobList = getJobs();</span>
+<span class="nc" id="L245">        Collections.reverse(jobList);</span>
+<span class="nc bnc" id="L246" title="All 2 branches missed.">        for (UpdateCenterJob job : jobList)</span>
+<span class="nc bnc" id="L247" title="All 2 branches missed.">            if (job instanceof HudsonUpgradeJob)</span>
+<span class="nc" id="L248">                return (HudsonUpgradeJob)job;</span>
+<span class="nc" id="L249">        return null;</span>
+    }
+
+    /**
+     * Returns the list of {@link UpdateSite}s to be used.
+     * This is a live list, whose change will be persisted automatically.
+     *
+     * @return
+     *      can be empty but never null.
+     */
+    public PersistedList&lt;UpdateSite&gt; getSites() {
+<span class="nc" id="L260">        return sites;</span>
+    }
+
+    /**
+     * The same as {@link #getSites()} but for REST API.
+     */
+    @Exported(name=&quot;sites&quot;)
+    public List&lt;UpdateSite&gt; getSiteList() {
+<span class="nc" id="L268">        return sites.toList();</span>
+    }
+
+    /**
+     * Alias for {@link #getById}.
+     */
+    public UpdateSite getSite(String id) {
+<span class="nc" id="L275">        return getById(id);</span>
+    }
+
+    /**
+     * Gets the string representing how long ago the data was obtained.
+     * Will be the newest of all {@link UpdateSite}s.
+     */
+    public String getLastUpdatedString() {
+<span class="nc" id="L283">        long newestTs = 0;</span>
+<span class="nc bnc" id="L284" title="All 2 branches missed.">        for (UpdateSite s : sites) {</span>
+<span class="nc bnc" id="L285" title="All 2 branches missed.">            if (s.getDataTimestamp()&gt;newestTs) {</span>
+<span class="nc" id="L286">                newestTs = s.getDataTimestamp();</span>
+            }
+        }
+<span class="nc bnc" id="L289" title="All 2 branches missed.">        if (newestTs == 0) {</span>
+<span class="nc" id="L290">            return Messages.UpdateCenter_n_a();</span>
+        }
+<span class="nc" id="L292">        return Util.getPastTimeString(System.currentTimeMillis()-newestTs);</span>
+    }
+
+    /**
+     * Gets {@link UpdateSite} by its ID.
+     * Used to bind them to URL.
+     */
+    public UpdateSite getById(String id) {
+<span class="nc bnc" id="L300" title="All 2 branches missed.">        for (UpdateSite s : sites) {</span>
+<span class="nc bnc" id="L301" title="All 2 branches missed.">            if (s.getId().equals(id)) {</span>
+<span class="nc" id="L302">                return s;</span>
+            }
+        }
+<span class="nc" id="L305">        return null;</span>
+    }
+
+    /**
+     * Gets the {@link UpdateSite} from which we receive updates for &lt;tt&gt;jenkins.war&lt;/tt&gt;.
+     *
+     * @return
+     *      null if no such update center is provided.
+     */
+    public UpdateSite getCoreSource() {
+<span class="nc bnc" id="L315" title="All 2 branches missed.">        for (UpdateSite s : sites) {</span>
+<span class="nc" id="L316">            Data data = s.getData();</span>
+<span class="nc bnc" id="L317" title="All 4 branches missed.">            if (data!=null &amp;&amp; data.core!=null)</span>
+<span class="nc" id="L318">                return s;</span>
+        }
+<span class="nc" id="L320">        return null;</span>
+    }
+
+    /**
+     * Gets the default base URL.
+     *
+     * @deprecated
+     *      TODO: revisit tool update mechanism, as that should be de-centralized, too. In the mean time,
+     *      please try not to use this method, and instead ping us to get this part completed.
+     */
+    @Deprecated
+    public String getDefaultBaseUrl() {
+<span class="nc" id="L332">        return config.getUpdateCenterUrl();</span>
+    }
+
+    /**
+     * Gets the plugin with the given name from the first {@link UpdateSite} to contain it.
+     */
+    public @CheckForNull Plugin getPlugin(String artifactId) {
+<span class="nc bnc" id="L339" title="All 2 branches missed.">        for (UpdateSite s : sites) {</span>
+<span class="nc" id="L340">            Plugin p = s.getPlugin(artifactId);</span>
+<span class="nc bnc" id="L341" title="All 2 branches missed.">            if (p!=null) return p;</span>
+        }
+<span class="nc" id="L343">        return null;</span>
+    }
+
+    /**
+     * Schedules a Jenkins upgrade.
+     */
+    @RequirePOST
+    public void doUpgrade(StaplerResponse rsp) throws IOException, ServletException {
+<span class="nc" id="L351">        Jenkins.getInstance().checkPermission(Jenkins.ADMINISTER);</span>
+<span class="nc" id="L352">        HudsonUpgradeJob job = new HudsonUpgradeJob(getCoreSource(), Jenkins.getAuthentication());</span>
+<span class="nc bnc" id="L353" title="All 2 branches missed.">        if(!Lifecycle.get().canRewriteHudsonWar()) {</span>
+<span class="nc" id="L354">            sendError(&quot;Jenkins upgrade not supported in this running mode&quot;);</span>
+<span class="nc" id="L355">            return;</span>
+        }
+
+<span class="nc" id="L358">        LOGGER.info(&quot;Scheduling the core upgrade&quot;);</span>
+<span class="nc" id="L359">        addJob(job);</span>
+<span class="nc" id="L360">        rsp.sendRedirect2(&quot;.&quot;);</span>
+<span class="nc" id="L361">    }</span>
+
+    /**
+     * Invalidates the update center JSON data for all the sites and force re-retrieval.
+     *
+     * @since 1.432
+     */
+    public HttpResponse doInvalidateData() {
+<span class="nc" id="L369">        Jenkins.getInstance().checkPermission(Jenkins.ADMINISTER);</span>
+<span class="nc bnc" id="L370" title="All 2 branches missed.">        for (UpdateSite site : sites) {</span>
+<span class="nc" id="L371">            site.doInvalidateData();</span>
+        }
+
+<span class="nc" id="L374">        return HttpResponses.ok();</span>
+    }
+
+
+    /**
+     * Schedules a Jenkins restart.
+     */
+    public void doSafeRestart(StaplerRequest request, StaplerResponse response) throws IOException, ServletException {
+<span class="nc" id="L382">        synchronized (jobs) {</span>
+<span class="nc bnc" id="L383" title="All 2 branches missed.">            if (!isRestartScheduled()) {</span>
+<span class="nc" id="L384">                Jenkins.getInstance().checkPermission(Jenkins.ADMINISTER);</span>
+<span class="nc" id="L385">                addJob(new RestartJenkinsJob(getCoreSource()));</span>
+<span class="nc" id="L386">                LOGGER.info(&quot;Scheduling Jenkins reboot&quot;);</span>
+            }
+        }
+<span class="nc" id="L389">        response.sendRedirect2(&quot;.&quot;);</span>
+<span class="nc" id="L390">    }</span>
+    
+    /**
+     * Cancel all scheduled jenkins restarts
+     */
+    public void doCancelRestart(StaplerResponse response) throws IOException, ServletException {
+<span class="nc" id="L396">        synchronized (jobs) {</span>
+<span class="nc bnc" id="L397" title="All 2 branches missed.">            for (UpdateCenterJob job : jobs) {</span>
+<span class="nc bnc" id="L398" title="All 2 branches missed.">                if (job instanceof RestartJenkinsJob) {</span>
+<span class="nc bnc" id="L399" title="All 2 branches missed.">                    if (((RestartJenkinsJob) job).cancel()) {</span>
+<span class="nc" id="L400">                        LOGGER.info(&quot;Scheduled Jenkins reboot unscheduled&quot;);</span>
+                    }
+                }
+            }
+        }
+<span class="nc" id="L405">        response.sendRedirect2(&quot;.&quot;);</span>
+<span class="nc" id="L406">    }</span>
+
+    /**
+     * If any of the executed {@link UpdateCenterJob}s requires a restart
+     * to take effect, this method returns true.
+     *
+     * &lt;p&gt;
+     * This doesn't necessarily mean the user has scheduled or initiated
+     * the restart operation.
+     *
+     * @see #isRestartScheduled()
+     */
+    @Exported
+    public boolean isRestartRequiredForCompletion() {
+<span class="nc" id="L420">        return requiresRestart;</span>
+    }
+
+    /**
+     * Checks if the restart operation is scheduled
+     * (which means in near future Jenkins will restart by itself)
+     *
+     * @see #isRestartRequiredForCompletion()
+     */
+    public boolean isRestartScheduled() {
+<span class="nc bnc" id="L430" title="All 2 branches missed.">        for (UpdateCenterJob job : getJobs()) {</span>
+<span class="nc bnc" id="L431" title="All 2 branches missed.">            if (job instanceof RestartJenkinsJob) {</span>
+<span class="nc" id="L432">                RestartJenkinsJob.RestartJenkinsJobStatus status = ((RestartJenkinsJob) job).status;</span>
+<span class="nc bnc" id="L433" title="All 2 branches missed.">                if (status instanceof RestartJenkinsJob.Pending</span>
+<span class="nc bnc" id="L434" title="All 2 branches missed.">                        || status instanceof RestartJenkinsJob.Running) {</span>
+<span class="nc" id="L435">                    return true;</span>
+                }
+            }
+        }
+<span class="nc" id="L439">        return false;</span>
+    }
+
+    /**
+     * Returns true if backup of jenkins.war exists on the hard drive
+     */
+    public boolean isDowngradable() {
+<span class="nc" id="L446">        return new File(Lifecycle.get().getHudsonWar() + &quot;.bak&quot;).exists();</span>
+    }
+
+    /**
+     * Performs hudson downgrade.
+     */
+    @RequirePOST
+    public void doDowngrade(StaplerResponse rsp) throws IOException, ServletException {
+<span class="nc" id="L454">        Jenkins.getInstance().checkPermission(Jenkins.ADMINISTER);</span>
+<span class="nc bnc" id="L455" title="All 2 branches missed.">        if(!isDowngradable()) {</span>
+<span class="nc" id="L456">            sendError(&quot;Jenkins downgrade is not possible, probably backup does not exist&quot;);</span>
+<span class="nc" id="L457">            return;</span>
+        }
+
+<span class="nc" id="L460">        HudsonDowngradeJob job = new HudsonDowngradeJob(getCoreSource(), Jenkins.getAuthentication());</span>
+<span class="nc" id="L461">        LOGGER.info(&quot;Scheduling the core downgrade&quot;);</span>
+<span class="nc" id="L462">        addJob(job);</span>
+<span class="nc" id="L463">        rsp.sendRedirect2(&quot;.&quot;);</span>
+<span class="nc" id="L464">    }</span>
+
+    /**
+     * Performs hudson downgrade.
+     */
+    public void doRestart(StaplerResponse rsp) throws IOException, ServletException {
+<span class="nc" id="L470">        Jenkins.getInstance().checkPermission(Jenkins.ADMINISTER);</span>
+<span class="nc" id="L471">        HudsonDowngradeJob job = new HudsonDowngradeJob(getCoreSource(), Jenkins.getAuthentication());</span>
+<span class="nc" id="L472">        LOGGER.info(&quot;Scheduling the core downgrade&quot;);</span>
+
+<span class="nc" id="L474">        addJob(job);</span>
+<span class="nc" id="L475">        rsp.sendRedirect2(&quot;.&quot;);</span>
+<span class="nc" id="L476">    }</span>
+
+    /**
+     * Returns String with version of backup .war file,
+     * if the file does not exists returns null
+     */
+    public String getBackupVersion() {
+        try {
+<span class="nc" id="L484">            JarFile backupWar = new JarFile(new File(Lifecycle.get().getHudsonWar() + &quot;.bak&quot;));</span>
+            try {
+<span class="nc" id="L486">                Attributes attrs = backupWar.getManifest().getMainAttributes();</span>
+<span class="nc" id="L487">                String v = attrs.getValue(&quot;Jenkins-Version&quot;);</span>
+<span class="nc bnc" id="L488" title="All 2 branches missed.">                if (v==null)    v = attrs.getValue(&quot;Hudson-Version&quot;);</span>
+<span class="nc" id="L489">                return v;</span>
+<span class="nc" id="L490">            } finally {</span>
+<span class="nc" id="L491">                backupWar.close();</span>
+<span class="nc" id="L492">            }</span>
+<span class="nc" id="L493">        } catch (IOException e) {</span>
+<span class="nc" id="L494">            LOGGER.log(Level.WARNING, &quot;Failed to read backup version &quot;, e);</span>
+<span class="nc" id="L495">            return null;}</span>
+
+    }
+
+    /*package*/ synchronized Future&lt;UpdateCenterJob&gt; addJob(UpdateCenterJob job) {
+        // the first job is always the connectivity check
+<span class="nc bnc" id="L501" title="All 2 branches missed.">        if (sourcesUsed.add(job.site))</span>
+<span class="nc" id="L502">            new ConnectionCheckJob(job.site).submit();</span>
+<span class="nc" id="L503">        return job.submit();</span>
+    }
+
+    public String getDisplayName() {
+<span class="nc" id="L507">        return &quot;Update center&quot;;</span>
+    }
+
+    public String getSearchUrl() {
+<span class="nc" id="L511">        return &quot;updateCenter&quot;;</span>
+    }
+
+    /**
+     * Saves the configuration info to the disk.
+     */
+    public synchronized void save() {
+<span class="nc bnc" id="L518" title="All 2 branches missed.">        if(BulkChange.contains(this))   return;</span>
+        try {
+<span class="nc" id="L520">            getConfigFile().write(sites);</span>
+<span class="nc" id="L521">            SaveableListener.fireOnChange(this, getConfigFile());</span>
+<span class="nc" id="L522">        } catch (IOException e) {</span>
+<span class="nc" id="L523">            LOGGER.log(Level.WARNING, &quot;Failed to save &quot;+getConfigFile(),e);</span>
+        }
+<span class="nc" id="L525">    }</span>
+
+    /**
+     * Loads the data from the disk into this object.
+     */
+    public synchronized void load() throws IOException {
+<span class="nc" id="L531">        UpdateSite defaultSite = new UpdateSite(ID_DEFAULT, config.getUpdateCenterUrl() + &quot;update-center.json&quot;);</span>
+<span class="nc" id="L532">        XmlFile file = getConfigFile();</span>
+<span class="nc bnc" id="L533" title="All 2 branches missed.">        if(file.exists()) {</span>
+            try {
+<span class="nc" id="L535">                sites.replaceBy(((PersistedList)file.unmarshal(sites)).toList());</span>
+<span class="nc" id="L536">            } catch (IOException e) {</span>
+<span class="nc" id="L537">                LOGGER.log(Level.WARNING, &quot;Failed to load &quot;+file, e);</span>
+            }
+<span class="nc bnc" id="L539" title="All 2 branches missed.">            for (UpdateSite site : sites) {</span>
+                // replace the legacy site with the new site
+<span class="nc bnc" id="L541" title="All 2 branches missed.">                if (site.isLegacyDefault()) {</span>
+<span class="nc" id="L542">                    sites.remove(site);</span>
+<span class="nc" id="L543">                    sites.add(defaultSite);</span>
+<span class="nc" id="L544">                    break;</span>
+                }
+            }
+<span class="nc" id="L547">        } else {</span>
+<span class="nc bnc" id="L548" title="All 2 branches missed.">            if (sites.isEmpty()) {</span>
+                // If there aren't already any UpdateSources, add the default one.
+                // to maintain compatibility with existing UpdateCenterConfiguration, create the default one as specified by UpdateCenterConfiguration
+<span class="nc" id="L551">                sites.add(defaultSite);</span>
+            }
+        }
+<span class="nc" id="L554">    }</span>
+
+    private XmlFile getConfigFile() {
+<span class="nc" id="L557">        return new XmlFile(XSTREAM,new File(Jenkins.getInstance().root,</span>
+<span class="nc" id="L558">                                    UpdateCenter.class.getName()+&quot;.xml&quot;));</span>
+    }
+
+    public List&lt;Plugin&gt; getAvailables() {
+<span class="nc" id="L562">        Map&lt;String,Plugin&gt; pluginMap = new LinkedHashMap&lt;String, Plugin&gt;();</span>
+<span class="nc bnc" id="L563" title="All 2 branches missed.">        for (UpdateSite site : sites) {</span>
+<span class="nc bnc" id="L564" title="All 2 branches missed.">            for (Plugin plugin: site.getAvailables()) {</span>
+<span class="nc" id="L565">                final Plugin existing = pluginMap.get(plugin.name);</span>
+<span class="nc bnc" id="L566" title="All 2 branches missed.">                if (existing == null) {</span>
+<span class="nc" id="L567">                    pluginMap.put(plugin.name, plugin);</span>
+<span class="nc bnc" id="L568" title="All 2 branches missed.">                } else if (!existing.version.equals(plugin.version)) {</span>
+                    // allow secondary update centers to publish different versions
+                    // TODO refactor to consolidate multiple versions of the same plugin within the one row
+<span class="nc" id="L571">                    final String altKey = plugin.name + &quot;:&quot; + plugin.version;</span>
+<span class="nc bnc" id="L572" title="All 2 branches missed.">                    if (!pluginMap.containsKey(altKey)) {</span>
+<span class="nc" id="L573">                        pluginMap.put(altKey, plugin);</span>
+                    }
+                }
+            }
+        }
+
+<span class="nc" id="L579">        return new ArrayList&lt;Plugin&gt;(pluginMap.values());</span>
+    }
+
+    /**
+     * Returns a list of plugins that should be shown in the &quot;available&quot; tab, grouped by category.
+     * A plugin with multiple categories will appear multiple times in the list.
+     */
+    public PluginEntry[] getCategorizedAvailables() {
+<span class="nc" id="L587">        TreeSet&lt;PluginEntry&gt; entries = new TreeSet&lt;PluginEntry&gt;();</span>
+<span class="nc bnc" id="L588" title="All 2 branches missed.">        for (Plugin p : getAvailables()) {</span>
+<span class="nc bnc" id="L589" title="All 4 branches missed.">            if (p.categories==null || p.categories.length==0)</span>
+<span class="nc" id="L590">                entries.add(new PluginEntry(p, getCategoryDisplayName(null)));</span>
+            else
+<span class="nc bnc" id="L592" title="All 2 branches missed.">                for (String c : p.categories)</span>
+<span class="nc" id="L593">                    entries.add(new PluginEntry(p, getCategoryDisplayName(c)));</span>
+        }
+<span class="nc" id="L595">        return entries.toArray(new PluginEntry[entries.size()]);</span>
+    }
+
+    private static String getCategoryDisplayName(String category) {
+<span class="nc bnc" id="L599" title="All 2 branches missed.">        if (category==null)</span>
+<span class="nc" id="L600">            return Messages.UpdateCenter_PluginCategory_misc();</span>
+        try {
+<span class="nc" id="L602">            return (String)Messages.class.getMethod(</span>
+<span class="nc" id="L603">                    &quot;UpdateCenter_PluginCategory_&quot; + category.replace('-', '_')).invoke(null);</span>
+<span class="nc" id="L604">        } catch (Exception ex) {</span>
+<span class="nc" id="L605">            return Messages.UpdateCenter_PluginCategory_unrecognized(category);</span>
+        }
+    }
+
+    public List&lt;Plugin&gt; getUpdates() {
+<span class="nc" id="L610">        Map&lt;String,Plugin&gt; pluginMap = new LinkedHashMap&lt;String, Plugin&gt;();</span>
+<span class="nc bnc" id="L611" title="All 2 branches missed.">        for (UpdateSite site : sites) {</span>
+<span class="nc bnc" id="L612" title="All 2 branches missed.">            for (Plugin plugin: site.getUpdates()) {</span>
+<span class="nc" id="L613">                final Plugin existing = pluginMap.get(plugin.name);</span>
+<span class="nc bnc" id="L614" title="All 2 branches missed.">                if (existing == null) {</span>
+<span class="nc" id="L615">                    pluginMap.put(plugin.name, plugin);</span>
+<span class="nc bnc" id="L616" title="All 2 branches missed.">                } else if (!existing.version.equals(plugin.version)) {</span>
+                    // allow secondary update centers to publish different versions
+                    // TODO refactor to consolidate multiple versions of the same plugin within the one row
+<span class="nc" id="L619">                    final String altKey = plugin.name + &quot;:&quot; + plugin.version;</span>
+<span class="nc bnc" id="L620" title="All 2 branches missed.">                    if (!pluginMap.containsKey(altKey)) {</span>
+<span class="nc" id="L621">                        pluginMap.put(altKey, plugin);</span>
+                    }
+                }
+            }
+        }
+
+<span class="nc" id="L627">        return new ArrayList&lt;Plugin&gt;(pluginMap.values());</span>
+    }
+    
+    /**
+     * Ensure that all UpdateSites are up to date, without requiring a user to
+     * browse to the instance.
+     * 
+     * @return a list of {@link FormValidation} for each updated Update Site
+     * @throws ExecutionException 
+     * @throws InterruptedException 
+     * @since 1.501
+     * 
+     */
+    public List&lt;FormValidation&gt; updateAllSites() throws InterruptedException, ExecutionException {
+<span class="nc" id="L641">        List &lt;Future&lt;FormValidation&gt;&gt; futures = new ArrayList&lt;Future&lt;FormValidation&gt;&gt;();</span>
+<span class="nc bnc" id="L642" title="All 2 branches missed.">        for (UpdateSite site : getSites()) {</span>
+<span class="nc" id="L643">            Future&lt;FormValidation&gt; future = site.updateDirectly(DownloadService.signatureCheck);</span>
+<span class="nc bnc" id="L644" title="All 2 branches missed.">            if (future != null) {</span>
+<span class="nc" id="L645">                futures.add(future);</span>
+            }
+        }
+        
+<span class="nc" id="L649">        List&lt;FormValidation&gt; results = new ArrayList&lt;FormValidation&gt;(); </span>
+<span class="nc bnc" id="L650" title="All 2 branches missed.">        for (Future&lt;FormValidation&gt; f : futures) {</span>
+<span class="nc" id="L651">            results.add(f.get());</span>
+        }
+<span class="nc" id="L653">        return results;</span>
+    }
+
+
+    /**
+     * {@link AdministrativeMonitor} that checks if there's Jenkins update.
+     */
+    @Extension
+<span class="nc" id="L661">    public static final class CoreUpdateMonitor extends AdministrativeMonitor {</span>
+        public boolean isActivated() {
+<span class="nc" id="L663">            Data data = getData();</span>
+<span class="nc bnc" id="L664" title="All 4 branches missed.">            return data!=null &amp;&amp; data.hasCoreUpdates();</span>
+        }
+
+        public Data getData() {
+<span class="nc" id="L668">            UpdateSite cs = Jenkins.getInstance().getUpdateCenter().getCoreSource();</span>
+<span class="nc bnc" id="L669" title="All 2 branches missed.">            if (cs!=null)   return cs.getData();</span>
+<span class="nc" id="L670">            return null;</span>
+        }
+    }
+
+
+    /**
+     * Strategy object for controlling the update center's behaviors.
+     *
+     * &lt;p&gt;
+     * Until 1.333, this extension point used to control the configuration of
+     * where to get updates (hence the name of this class), but with the introduction
+     * of multiple update center sites capability, that functionality is achieved by
+     * simply installing another {@link UpdateSite}.
+     *
+     * &lt;p&gt;
+     * See {@link UpdateSite} for how to manipulate them programmatically.
+     *
+     * @since 1.266
+     */
+    @SuppressWarnings({&quot;UnusedDeclaration&quot;})
+    public static class UpdateCenterConfiguration implements ExtensionPoint {
+        /**
+         * Creates default update center configuration - uses settings for global update center.
+         */
+<span class="nc" id="L694">        public UpdateCenterConfiguration() {</span>
+<span class="nc" id="L695">        }</span>
+
+        /**
+         * Check network connectivity by trying to establish a connection to
+         * the host in connectionCheckUrl.
+         *
+         * @param job The connection checker that is invoking this strategy.
+         * @param connectionCheckUrl A string containing the URL of a domain
+         *          that is assumed to be always available.
+         * @throws IOException if a connection can't be established
+         */
+        public void checkConnection(ConnectionCheckJob job, String connectionCheckUrl) throws IOException {
+<span class="nc" id="L707">            testConnection(new URL(connectionCheckUrl));</span>
+<span class="nc" id="L708">        }</span>
+
+        /**
+         * Check connection to update center server.
+         *
+         * @param job The connection checker that is invoking this strategy.
+         * @param updateCenterUrl A sting containing the URL of the update center host.
+         * @throws IOException if a connection to the update center server can't be established.
+         */
+        public void checkUpdateCenter(ConnectionCheckJob job, String updateCenterUrl) throws IOException {
+<span class="nc" id="L718">            testConnection(new URL(updateCenterUrl + &quot;?uctest&quot;));</span>
+<span class="nc" id="L719">        }</span>
+
+        /**
+         * Validate the URL of the resource before downloading it.
+         *
+         * @param job The download job that is invoking this strategy. This job is
+         *          responsible for managing the status of the download and installation.
+         * @param src The location of the resource on the network
+         * @throws IOException if the validation fails
+         */
+        public void preValidate(DownloadJob job, URL src) throws IOException {
+<span class="nc" id="L730">        }</span>
+
+        /**
+         * Validate the resource after it has been downloaded, before it is
+         * installed. The default implementation does nothing.
+         *
+         * @param job The download job that is invoking this strategy. This job is
+         *          responsible for managing the status of the download and installation.
+         * @param src The location of the downloaded resource.
+         * @throws IOException if the validation fails.
+         */
+        public void postValidate(DownloadJob job, File src) throws IOException {
+<span class="nc" id="L742">        }</span>
+
+        /**
+         * Download a plugin or core upgrade in preparation for installing it
+         * into its final location. Implementations will normally download the
+         * resource into a temporary location and hand off a reference to this
+         * location to the install or upgrade strategy to move into the final location.
+         *
+         * @param job The download job that is invoking this strategy. This job is
+         *          responsible for managing the status of the download and installation.
+         * @param src The URL to the resource to be downloaded.
+         * @return A File object that describes the downloaded resource.
+         * @throws IOException if there were problems downloading the resource.
+         * @see DownloadJob
+         */
+        public File download(DownloadJob job, URL src) throws IOException {
+<span class="nc" id="L758">            MessageDigest sha1 = null;</span>
+            try {
+<span class="nc" id="L760">                sha1 = MessageDigest.getInstance(&quot;SHA-1&quot;);</span>
+<span class="nc" id="L761">            } catch (NoSuchAlgorithmException ignored) {</span>
+                // Irrelevant as the Java spec says SHA-1 must exist. Still, if this fails
+                // the DownloadJob will just have computedSha1 = null and that is expected
+                // to be handled by caller
+            }
+
+<span class="nc" id="L767">            CountingInputStream in = null;</span>
+<span class="nc" id="L768">            OutputStream out = null;</span>
+<span class="nc" id="L769">            URLConnection con = null;</span>
+            try {
+<span class="nc" id="L771">                con = connect(job,src);</span>
+<span class="nc" id="L772">                int total = con.getContentLength();</span>
+<span class="nc" id="L773">                in = new CountingInputStream(con.getInputStream());</span>
+<span class="nc" id="L774">                byte[] buf = new byte[8192];</span>
+                int len;
+
+<span class="nc" id="L777">                File dst = job.getDestination();</span>
+<span class="nc" id="L778">                File tmp = new File(dst.getPath()+&quot;.tmp&quot;);</span>
+<span class="nc" id="L779">                out = new FileOutputStream(tmp);</span>
+<span class="nc bnc" id="L780" title="All 2 branches missed.">                if (sha1 != null) {</span>
+<span class="nc" id="L781">                    out = new DigestOutputStream(out, sha1);</span>
+                }
+
+<span class="nc" id="L784">                LOGGER.info(&quot;Downloading &quot;+job.getName());</span>
+<span class="nc" id="L785">                Thread t = Thread.currentThread();</span>
+<span class="nc" id="L786">                String oldName = t.getName();</span>
+<span class="nc" id="L787">                t.setName(oldName + &quot;: &quot; + src);</span>
+                try {
+<span class="nc bnc" id="L789" title="All 2 branches missed.">                    while((len=in.read(buf))&gt;=0) {</span>
+<span class="nc" id="L790">                        out.write(buf,0,len);</span>
+<span class="nc bnc" id="L791" title="All 2 branches missed.">                        job.status = job.new Installing(total==-1 ? -1 : in.getCount()*100/total);</span>
+                    }
+<span class="nc" id="L793">                } catch (IOException e) {</span>
+<span class="nc" id="L794">                    throw new IOException(&quot;Failed to load &quot;+src+&quot; to &quot;+tmp,e);</span>
+<span class="nc" id="L795">                } finally {</span>
+<span class="nc" id="L796">                    IOUtils.closeQuietly(out);</span>
+<span class="nc" id="L797">                    t.setName(oldName);</span>
+<span class="nc" id="L798">                }</span>
+
+<span class="nc bnc" id="L800" title="All 4 branches missed.">                if (total!=-1 &amp;&amp; total!=tmp.length()) {</span>
+                    // don't know exactly how this happens, but report like
+                    // http://www.ashlux.com/wordpress/2009/08/14/hudson-and-the-sonar-plugin-fail-maveninstallation-nosuchmethoderror/
+                    // indicates that this kind of inconsistency can happen. So let's be defensive
+<span class="nc" id="L804">                    throw new IOException(&quot;Inconsistent file length: expected &quot;+total+&quot; but only got &quot;+tmp.length());</span>
+                }
+
+<span class="nc bnc" id="L807" title="All 2 branches missed.">                if (sha1 != null) {</span>
+<span class="nc" id="L808">                    byte[] digest = sha1.digest();</span>
+<span class="nc" id="L809">                    job.computedSHA1 = Base64.encodeBase64String(digest);</span>
+                }
+<span class="nc" id="L811">                return tmp;</span>
+<span class="nc" id="L812">            } catch (IOException e) {</span>
+                // assist troubleshooting in case of e.g. &quot;too many redirects&quot; by printing actual URL
+<span class="nc" id="L814">                String extraMessage = &quot;&quot;;</span>
+<span class="nc bnc" id="L815" title="All 6 branches missed.">                if (con != null &amp;&amp; con.getURL() != null &amp;&amp; !src.toString().equals(con.getURL().toString())) {</span>
+                    // Two URLs are considered equal if different hosts resolve to same IP. Prefer to log in case of string inequality,
+                    // because who knows how the server responds to different host name in the request header?
+                    // Also, since it involved name resolution, it'd be an expensive operation.
+<span class="nc" id="L819">                    extraMessage = &quot; (redirected to: &quot; + con.getURL() + &quot;)&quot;;</span>
+                }
+<span class="nc" id="L821">                throw new IOException2(&quot;Failed to download from &quot;+src+extraMessage,e);</span>
+<span class="nc" id="L822">            } finally {</span>
+<span class="nc" id="L823">                IOUtils.closeQuietly(in);</span>
+<span class="nc" id="L824">                IOUtils.closeQuietly(out);</span>
+<span class="nc" id="L825">            }</span>
+        }
+
+        /**
+         * Connects to the given URL for downloading the binary. Useful for tweaking
+         * how the connection gets established.
+         */
+        protected URLConnection connect(DownloadJob job, URL src) throws IOException {
+<span class="nc" id="L833">            return ProxyConfiguration.open(src);</span>
+        }
+
+        /**
+         * Called after a plugin has been downloaded to move it into its final
+         * location. The default implementation is a file rename.
+         *
+         * @param job The install job that is invoking this strategy.
+         * @param src The temporary location of the plugin.
+         * @param dst The final destination to install the plugin to.
+         * @throws IOException if there are problems installing the resource.
+         */
+        public void install(DownloadJob job, File src, File dst) throws IOException {
+<span class="nc" id="L846">            job.replace(dst, src);</span>
+<span class="nc" id="L847">        }</span>
+
+        /**
+         * Called after an upgrade has been downloaded to move it into its final
+         * location. The default implementation is a file rename.
+         *
+         * @param job The upgrade job that is invoking this strategy.
+         * @param src The temporary location of the upgrade.
+         * @param dst The final destination to install the upgrade to.
+         * @throws IOException if there are problems installing the resource.
+         */
+        public void upgrade(DownloadJob job, File src, File dst) throws IOException {
+<span class="nc" id="L859">            job.replace(dst, src);</span>
+<span class="nc" id="L860">        }</span>
+
+        /**
+         * Returns an &quot;always up&quot; server for Internet connectivity testing.
+         *
+         * @deprecated as of 1.333
+         *      With the introduction of multiple update center capability, this information
+         *      is now a part of the &lt;tt&gt;update-center.json&lt;/tt&gt; file. See
+         *      &lt;tt&gt;http://jenkins-ci.org/update-center.json&lt;/tt&gt; as an example.
+         */
+        @Deprecated
+        public String getConnectionCheckUrl() {
+<span class="nc" id="L872">            return &quot;http://www.google.com&quot;;</span>
+        }
+
+        /**
+         * Returns the URL of the server that hosts the update-center.json
+         * file.
+         *
+         * @deprecated as of 1.333
+         *      With the introduction of multiple update center capability, this information
+         *      is now moved to {@link UpdateSite}.
+         * @return
+         *      Absolute URL that ends with '/'.
+         */
+        @Deprecated
+        public String getUpdateCenterUrl() {
+<span class="nc" id="L887">            return UPDATE_CENTER_URL;</span>
+        }
+
+        /**
+         * Returns the URL of the server that hosts plugins and core updates.
+         *
+         * @deprecated as of 1.333
+         *      &lt;tt&gt;update-center.json&lt;/tt&gt; is now signed, so we don't have to further make sure that
+         *      we aren't downloading from anywhere unsecure.
+         */
+        @Deprecated
+        public String getPluginRepositoryBaseUrl() {
+<span class="nc" id="L899">            return &quot;http://jenkins-ci.org/&quot;;</span>
+        }
+
+
+        private void testConnection(URL url) throws IOException {
+            try {
+<span class="nc" id="L905">                Util.copyStreamAndClose(ProxyConfiguration.open(url).getInputStream(),new NullOutputStream());</span>
+<span class="nc" id="L906">            } catch (SSLHandshakeException e) {</span>
+<span class="nc bnc" id="L907" title="All 2 branches missed.">                if (e.getMessage().contains(&quot;PKIX path building failed&quot;))</span>
+                   // fix up this crappy error message from JDK
+<span class="nc" id="L909">                    throw new IOException(&quot;Failed to validate the SSL certificate of &quot;+url,e);</span>
+            }
+<span class="nc" id="L911">        }</span>
+    }
+
+    /**
+     * Things that {@link UpdateCenter#installerService} executes.
+     *
+     * This object will have the &lt;tt&gt;row.jelly&lt;/tt&gt; which renders the job on UI.
+     */
+    @ExportedBean
+    public abstract class UpdateCenterJob implements Runnable {
+        /**
+         * Unique ID that identifies this job.
+         *
+         * @see UpdateCenter#getJob(int)
+         */
+        @Exported
+<span class="nc" id="L927">        public final int id = iota.incrementAndGet();</span>
+
+        /**
+         * Which {@link UpdateSite} does this belong to?
+         */
+        public final UpdateSite site;
+
+        /**
+         * If this job fails, set to the error.
+         */
+        protected Throwable error;
+
+<span class="nc" id="L939">        protected UpdateCenterJob(UpdateSite site) {</span>
+<span class="nc" id="L940">            this.site = site;</span>
+<span class="nc" id="L941">        }</span>
+
+        public Api getApi() {
+<span class="nc" id="L944">            return new Api(this);</span>
+        }
+
+        /**
+         * @deprecated as of 1.326
+         *      Use {@link #submit()} instead.
+         */
+        @Deprecated
+        public void schedule() {
+<span class="nc" id="L953">            submit();</span>
+<span class="nc" id="L954">        }</span>
+
+        @Exported
+        public String getType() {
+<span class="nc" id="L958">            return getClass().getSimpleName();</span>
+        }
+
+        /**
+         * Schedules this job for an execution
+         * @return
+         *      {@link Future} to keeps track of the status of the execution.
+         */
+        public Future&lt;UpdateCenterJob&gt; submit() {
+<span class="nc" id="L967">            LOGGER.fine(&quot;Scheduling &quot;+this+&quot; to installerService&quot;);</span>
+<span class="nc" id="L968">            jobs.add(this);</span>
+<span class="nc" id="L969">            return installerService.submit(this,this);</span>
+        }
+
+        @Exported
+        public String getErrorMessage() {
+<span class="nc bnc" id="L974" title="All 2 branches missed.">            return error != null ? error.getMessage() : null;</span>
+        }
+        
+        public Throwable getError() {
+<span class="nc" id="L978">            return error;</span>
+        }
+    }
+
+    /**
+     * Restarts jenkins.
+     */
+    public class RestartJenkinsJob extends UpdateCenterJob {
+         /**
+         * Immutable state of this job.
+         */
+         @Exported(inline=true)
+<span class="nc" id="L990">        public volatile RestartJenkinsJobStatus status = new Pending();</span>
+        
+        /**
+         * Cancel job
+         */     
+        public synchronized boolean cancel() {
+<span class="nc bnc" id="L996" title="All 2 branches missed.">            if (status instanceof Pending) {</span>
+<span class="nc" id="L997">                status = new Canceled();</span>
+<span class="nc" id="L998">                return true;</span>
+            }
+<span class="nc" id="L1000">            return false;</span>
+        }
+        
+<span class="nc" id="L1003">        public RestartJenkinsJob(UpdateSite site) {</span>
+<span class="nc" id="L1004">            super(site);</span>
+<span class="nc" id="L1005">        }</span>
+
+        public synchronized void run() {
+<span class="nc bnc" id="L1008" title="All 2 branches missed.">            if (!(status instanceof Pending)) {</span>
+<span class="nc" id="L1009">                return;</span>
+            }
+<span class="nc" id="L1011">            status = new Running();</span>
+            try {
+<span class="nc" id="L1013">                Jenkins.getInstance().safeRestart();</span>
+<span class="nc" id="L1014">            } catch (RestartNotSupportedException exception) {</span>
+                // ignore if restart is not allowed
+<span class="nc" id="L1016">                status = new Failure();</span>
+<span class="nc" id="L1017">                error = exception;</span>
+            }
+<span class="nc" id="L1019">        }</span>
+
+        @ExportedBean
+<span class="nc" id="L1022">        public abstract class RestartJenkinsJobStatus {</span>
+            @Exported
+<span class="nc" id="L1024">            public final int id = iota.incrementAndGet();</span>
+   
+        }
+        
+<span class="nc" id="L1028">        public class Pending extends RestartJenkinsJobStatus {</span>
+            @Exported
+            public String getType() {
+<span class="nc" id="L1031">                return getClass().getSimpleName();</span>
+            }
+        }
+        
+<span class="nc" id="L1035">        public class Running extends RestartJenkinsJobStatus {</span>
+            
+        }
+        
+<span class="nc" id="L1039">        public class Failure extends RestartJenkinsJobStatus {</span>
+            
+        }
+        
+<span class="nc" id="L1043">        public class Canceled extends RestartJenkinsJobStatus {</span>
+            
+        }
+    }
+
+    /**
+     * Tests the internet connectivity.
+     */
+    public final class ConnectionCheckJob extends UpdateCenterJob {
+<span class="nc" id="L1052">        private final Vector&lt;String&gt; statuses= new Vector&lt;String&gt;();</span>
+
+<span class="nc" id="L1054">        public ConnectionCheckJob(UpdateSite site) {</span>
+<span class="nc" id="L1055">            super(site);</span>
+<span class="nc" id="L1056">        }</span>
+
+        public void run() {
+<span class="nc bnc" id="L1059" title="All 2 branches missed.">            if (ID_UPLOAD.equals(site.getId())) {</span>
+<span class="nc" id="L1060">                return;</span>
+            }
+<span class="nc" id="L1062">            LOGGER.fine(&quot;Doing a connectivity check&quot;);</span>
+            try {
+<span class="nc" id="L1064">                String connectionCheckUrl = site.getConnectionCheckUrl();</span>
+<span class="nc bnc" id="L1065" title="All 2 branches missed.">                if (connectionCheckUrl!=null) {</span>
+<span class="nc" id="L1066">                    statuses.add(Messages.UpdateCenter_Status_CheckingInternet());</span>
+                    try {
+<span class="nc" id="L1068">                        config.checkConnection(this, connectionCheckUrl);</span>
+<span class="nc" id="L1069">                    } catch (IOException e) {</span>
+<span class="nc bnc" id="L1070" title="All 2 branches missed.">                        if(e.getMessage().contains(&quot;Connection timed out&quot;)) {</span>
+                            // Google can't be down, so this is probably a proxy issue
+<span class="nc" id="L1072">                            statuses.add(Messages.UpdateCenter_Status_ConnectionFailed(connectionCheckUrl));</span>
+<span class="nc" id="L1073">                            return;</span>
+                        }
+                    }
+                }
+
+<span class="nc" id="L1078">                statuses.add(Messages.UpdateCenter_Status_CheckingJavaNet());</span>
+<span class="nc" id="L1079">                config.checkUpdateCenter(this, site.getUrl());</span>
+
+<span class="nc" id="L1081">                statuses.add(Messages.UpdateCenter_Status_Success());</span>
+<span class="nc" id="L1082">            } catch (UnknownHostException e) {</span>
+<span class="nc" id="L1083">                statuses.add(Messages.UpdateCenter_Status_UnknownHostException(e.getMessage()));</span>
+<span class="nc" id="L1084">                addStatus(e);</span>
+<span class="nc" id="L1085">                error = e;</span>
+<span class="nc" id="L1086">            } catch (IOException e) {</span>
+<span class="nc" id="L1087">                statuses.add(Functions.printThrowable(e));</span>
+<span class="nc" id="L1088">                error = e;</span>
+            }
+<span class="nc" id="L1090">        }</span>
+
+        private void addStatus(UnknownHostException e) {
+<span class="nc" id="L1093">            statuses.add(&quot;&lt;pre&gt;&quot;+ Functions.xmlEscape(Functions.printThrowable(e))+&quot;&lt;/pre&gt;&quot;);</span>
+<span class="nc" id="L1094">        }</span>
+
+        public String[] getStatuses() {
+<span class="nc" id="L1097">            synchronized (statuses) {</span>
+<span class="nc" id="L1098">                return statuses.toArray(new String[statuses.size()]);</span>
+            }
+        }
+    }
+
+    /**
+     * Base class for a job that downloads a file from the Jenkins project.
+     */
+    public abstract class DownloadJob extends UpdateCenterJob {
+        /**
+         * Immutable object representing the current state of this job.
+         */
+        @Exported(inline=true)
+<span class="nc" id="L1111">        public volatile InstallationStatus status = new Pending();</span>
+
+        /**
+         * Where to download the file from.
+         */
+        protected abstract URL getURL() throws MalformedURLException;
+
+        /**
+         * Where to download the file to.
+         */
+        protected abstract File getDestination();
+
+        @Exported
+        public abstract String getName();
+
+        /**
+         * Called when the whole thing went successfully.
+         */
+        protected abstract void onSuccess();
+
+        /**
+         * During download, an attempt is made to compute the SHA-1 checksum of the file.
+         *
+         * @since TODO
+         */
+        @CheckForNull
+        protected String getComputedSHA1() {
+<span class="nc" id="L1138">            return computedSHA1;</span>
+        }
+
+        private String computedSHA1;
+
+        private Authentication authentication;
+
+        /**
+         * Get the user that initiated this job
+         */
+        public Authentication getUser() {
+<span class="nc" id="L1149">            return this.authentication;</span>
+        }
+
+<span class="nc" id="L1152">        protected DownloadJob(UpdateSite site, Authentication authentication) {</span>
+<span class="nc" id="L1153">            super(site);</span>
+<span class="nc" id="L1154">            this.authentication = authentication;</span>
+<span class="nc" id="L1155">        }</span>
+
+        public void run() {
+            try {
+<span class="nc" id="L1159">                LOGGER.info(&quot;Starting the installation of &quot;+getName()+&quot; on behalf of &quot;+getUser().getName());</span>
+
+<span class="nc" id="L1161">                _run();</span>
+
+<span class="nc" id="L1163">                LOGGER.info(&quot;Installation successful: &quot;+getName());</span>
+<span class="nc" id="L1164">                status = new Success();</span>
+<span class="nc" id="L1165">                onSuccess();</span>
+<span class="nc" id="L1166">            } catch (InstallationStatus e) {</span>
+<span class="nc" id="L1167">                status = e;</span>
+<span class="nc bnc" id="L1168" title="All 2 branches missed.">                if (status.isSuccess()) onSuccess();</span>
+<span class="nc" id="L1169">                requiresRestart |= status.requiresRestart();</span>
+<span class="nc" id="L1170">            } catch (Throwable e) {</span>
+<span class="nc" id="L1171">                LOGGER.log(Level.SEVERE, &quot;Failed to install &quot;+getName(),e);</span>
+<span class="nc" id="L1172">                status = new Failure(e);</span>
+<span class="nc" id="L1173">                error = e;</span>
+            }
+<span class="nc" id="L1175">        }</span>
+
+        protected void _run() throws IOException, InstallationStatus {
+<span class="nc" id="L1178">            URL src = getURL();</span>
+
+<span class="nc" id="L1180">            config.preValidate(this, src);</span>
+
+<span class="nc" id="L1182">            File dst = getDestination();</span>
+<span class="nc" id="L1183">            File tmp = config.download(this, src);</span>
+
+<span class="nc" id="L1185">            config.postValidate(this, tmp);</span>
+<span class="nc" id="L1186">            config.install(this, tmp, dst);</span>
+<span class="nc" id="L1187">        }</span>
+
+        /**
+         * Called when the download is completed to overwrite
+         * the old file with the new file.
+         */
+        protected void replace(File dst, File src) throws IOException {
+<span class="nc" id="L1194">            File bak = Util.changeExtension(dst,&quot;.bak&quot;);</span>
+<span class="nc" id="L1195">            bak.delete();</span>
+<span class="nc" id="L1196">            dst.renameTo(bak);</span>
+<span class="nc" id="L1197">            dst.delete(); // any failure up to here is no big deal</span>
+<span class="nc bnc" id="L1198" title="All 2 branches missed.">            if(!src.renameTo(dst)) {</span>
+<span class="nc" id="L1199">                throw new IOException(&quot;Failed to rename &quot;+src+&quot; to &quot;+dst);</span>
+            }
+<span class="nc" id="L1201">        }</span>
+
+        /**
+         * Indicates the status or the result of a plugin installation.
+         * &lt;p&gt;
+         * Instances of this class is immutable.
+         */
+        @ExportedBean
+<span class="nc" id="L1209">        public abstract class InstallationStatus extends Throwable {</span>
+<span class="nc" id="L1210">            public final int id = iota.incrementAndGet();</span>
+            @Exported
+            public boolean isSuccess() {
+<span class="nc" id="L1213">                return false;</span>
+            }
+            @Exported
+            public final String getType() {
+<span class="nc" id="L1217">                return getClass().getSimpleName();</span>
+            }
+
+            /**
+             * Indicates that a restart is needed to complete the tasks.
+             */
+            public boolean requiresRestart() {
+<span class="nc" id="L1224">                return false;</span>
+            }
+        }
+
+        /**
+         * Indicates that the installation of a plugin failed.
+         */
+        public class Failure extends InstallationStatus {
+            public final Throwable problem;
+
+<span class="nc" id="L1234">            public Failure(Throwable problem) {</span>
+<span class="nc" id="L1235">                this.problem = problem;</span>
+<span class="nc" id="L1236">            }</span>
+
+            public String getProblemStackTrace() {
+<span class="nc" id="L1239">                return Functions.printThrowable(problem);</span>
+            }
+        }
+
+        /**
+         * Indicates that the installation was successful but a restart is needed.
+         */
+        public class SuccessButRequiresRestart extends Success {
+            private final Localizable message;
+
+<span class="nc" id="L1249">            public SuccessButRequiresRestart(Localizable message) {</span>
+<span class="nc" id="L1250">                this.message = message;</span>
+<span class="nc" id="L1251">            }</span>
+
+            public String getMessage() {
+<span class="nc" id="L1254">                return message.toString();</span>
+            }
+
+            @Override
+            public boolean requiresRestart() {
+<span class="nc" id="L1259">                return true;</span>
+            }
+        }
+
+        /**
+         * Indicates that the plugin was successfully installed.
+         */
+<span class="nc" id="L1266">        public class Success extends InstallationStatus {</span>
+            @Override public boolean isSuccess() {
+<span class="nc" id="L1268">                return true;</span>
+            }
+        }
+
+        /**
+         * Indicates that the plugin is waiting for its turn for installation.
+         */
+<span class="nc" id="L1275">        public class Pending extends InstallationStatus {</span>
+        }
+
+        /**
+         * Installation of a plugin is in progress.
+         */
+        public class Installing extends InstallationStatus {
+            /**
+             * % completed download, or -1 if the percentage is not known.
+             */
+            public final int percentage;
+
+<span class="nc" id="L1287">            public Installing(int percentage) {</span>
+<span class="nc" id="L1288">                this.percentage = percentage;</span>
+<span class="nc" id="L1289">            }</span>
+        }
+    }
+
+    /**
+     * If expectedSHA1 is non-null, ensure that actualSha1 is the same value, otherwise throw.
+     *
+     * Utility method for InstallationJob and HudsonUpgradeJob.
+     *
+     * @throws IOException when checksums don't match, or actual checksum was null.
+     */
+    private void verifyChecksums(String expectedSHA1, String actualSha1, File downloadedFile) throws IOException {
+<span class="nc bnc" id="L1301" title="All 2 branches missed.">        if (expectedSHA1 != null) {</span>
+<span class="nc bnc" id="L1302" title="All 2 branches missed.">            if (actualSha1 == null) {</span>
+                // refuse to install if SHA-1 could not be computed
+<span class="nc" id="L1304">                throw new IOException(&quot;Failed to compute SHA-1 of downloaded file, refusing installation&quot;);</span>
+            }
+<span class="nc bnc" id="L1306" title="All 2 branches missed.">            if (!expectedSHA1.equals(actualSha1)) {</span>
+<span class="nc" id="L1307">                throw new IOException(&quot;Downloaded file &quot; + downloadedFile.getAbsolutePath() + &quot; does not match expected SHA-1, expected '&quot; + expectedSHA1 + &quot;', actual '&quot; + actualSha1 + &quot;'&quot;);</span>
+                // keep 'downloadedFile' around for investigating what's going on
+            }
+        }
+<span class="nc" id="L1311">    }</span>
+
+    /**
+     * Represents the state of the installation activity of one plugin.
+     */
+    public final class InstallationJob extends DownloadJob {
+        /**
+         * What plugin are we trying to install?
+         */
+        @Exported
+        public final Plugin plugin;
+
+<span class="nc" id="L1323">        private final PluginManager pm = Jenkins.getInstance().getPluginManager();</span>
+
+        /**
+         * True to load the plugin into this Jenkins, false to wait until restart.
+         */
+        private final boolean dynamicLoad;
+
+        /**
+         * @deprecated as of 1.442
+         */
+        @Deprecated
+        public InstallationJob(Plugin plugin, UpdateSite site, Authentication auth) {
+<span class="nc" id="L1335">            this(plugin,site,auth,false);</span>
+<span class="nc" id="L1336">        }</span>
+
+<span class="nc" id="L1338">        public InstallationJob(Plugin plugin, UpdateSite site, Authentication auth, boolean dynamicLoad) {</span>
+<span class="nc" id="L1339">            super(site, auth);</span>
+<span class="nc" id="L1340">            this.plugin = plugin;</span>
+<span class="nc" id="L1341">            this.dynamicLoad = dynamicLoad;</span>
+<span class="nc" id="L1342">        }</span>
+
+        protected URL getURL() throws MalformedURLException {
+<span class="nc" id="L1345">            return new URL(plugin.url);</span>
+        }
+
+        protected File getDestination() {
+<span class="nc" id="L1349">            File baseDir = pm.rootDir;</span>
+<span class="nc" id="L1350">            return new File(baseDir, plugin.name + &quot;.jpi&quot;);</span>
+        }
+        
+        private File getLegacyDestination() {
+<span class="nc" id="L1354">            File baseDir = pm.rootDir;</span>
+<span class="nc" id="L1355">            return new File(baseDir, plugin.name + &quot;.hpi&quot;);</span>
+        }
+
+        public String getName() {
+<span class="nc" id="L1359">            return plugin.getDisplayName();</span>
+        }
+
+        @Override
+        public void _run() throws IOException, InstallationStatus {
+<span class="nc" id="L1364">            super._run();</span>
+
+            // if this is a bundled plugin, make sure it won't get overwritten
+<span class="nc" id="L1367">            PluginWrapper pw = plugin.getInstalled();</span>
+<span class="nc bnc" id="L1368" title="All 4 branches missed.">            if (pw!=null &amp;&amp; pw.isBundled()) {</span>
+<span class="nc" id="L1369">                SecurityContext oldContext = ACL.impersonate(ACL.SYSTEM);</span>
+                try {
+<span class="nc" id="L1371">                    pw.doPin();</span>
+<span class="nc" id="L1372">                } finally {</span>
+<span class="nc" id="L1373">                    SecurityContextHolder.setContext(oldContext);</span>
+<span class="nc" id="L1374">                }</span>
+            }
+
+<span class="nc bnc" id="L1377" title="All 2 branches missed.">            if (dynamicLoad) {</span>
+                try {
+<span class="nc" id="L1379">                    pm.dynamicLoad(getDestination());</span>
+<span class="nc" id="L1380">                } catch (RestartRequiredException e) {</span>
+<span class="nc" id="L1381">                    throw new SuccessButRequiresRestart(e.message);</span>
+<span class="nc" id="L1382">                } catch (Exception e) {</span>
+<span class="nc" id="L1383">                    throw new IOException(&quot;Failed to dynamically deploy this plugin&quot;,e);</span>
+                }
+            } else {
+<span class="nc" id="L1386">                throw new SuccessButRequiresRestart(Messages._UpdateCenter_DownloadButNotActivated());</span>
+            }
+<span class="nc" id="L1388">        }</span>
+
+        protected void onSuccess() {
+<span class="nc" id="L1391">            pm.pluginUploaded = true;</span>
+<span class="nc" id="L1392">        }</span>
+
+        @Override
+        public String toString() {
+<span class="nc" id="L1396">            return super.toString()+&quot;[plugin=&quot;+plugin.title+&quot;]&quot;;</span>
+        }
+        
+        /**
+         * Called when the download is completed to overwrite
+         * the old file with the new file.
+         */
+        @Override
+        protected void replace(File dst, File src) throws IOException {
+
+<span class="nc" id="L1406">            verifyChecksums(plugin.getSha1(), getComputedSHA1(), src);</span>
+
+<span class="nc" id="L1408">            File bak = Util.changeExtension(dst, &quot;.bak&quot;);</span>
+<span class="nc" id="L1409">            bak.delete();</span>
+
+<span class="nc" id="L1411">            final File legacy = getLegacyDestination();</span>
+<span class="nc bnc" id="L1412" title="All 2 branches missed.">            if (legacy.exists()) {</span>
+<span class="nc bnc" id="L1413" title="All 2 branches missed.">                if (!legacy.renameTo(bak)) {</span>
+<span class="nc" id="L1414">                    legacy.delete();</span>
+                }
+            }
+<span class="nc bnc" id="L1417" title="All 2 branches missed.">            if (dst.exists()) {</span>
+<span class="nc bnc" id="L1418" title="All 2 branches missed.">                if (!dst.renameTo(bak)) {</span>
+<span class="nc" id="L1419">                    dst.delete();</span>
+                }
+            }
+
+<span class="nc bnc" id="L1423" title="All 2 branches missed.">            if(!src.renameTo(dst)) {</span>
+<span class="nc" id="L1424">                throw new IOException(&quot;Failed to rename &quot;+src+&quot; to &quot;+dst);</span>
+            }
+<span class="nc" id="L1426">        }</span>
+    }
+
+    /**
+     * Represents the state of the downgrading activity of plugin.
+     */
+    public final class PluginDowngradeJob extends DownloadJob {
+        /**
+         * What plugin are we trying to install?
+         */
+        public final Plugin plugin;
+
+<span class="nc" id="L1438">        private final PluginManager pm = Jenkins.getInstance().getPluginManager();</span>
+
+<span class="nc" id="L1440">        public PluginDowngradeJob(Plugin plugin, UpdateSite site, Authentication auth) {</span>
+<span class="nc" id="L1441">            super(site, auth);</span>
+<span class="nc" id="L1442">            this.plugin = plugin;</span>
+<span class="nc" id="L1443">        }</span>
+
+        protected URL getURL() throws MalformedURLException {
+<span class="nc" id="L1446">            return new URL(plugin.url);</span>
+        }
+
+        protected File getDestination() {
+<span class="nc" id="L1450">            File baseDir = pm.rootDir;</span>
+<span class="nc" id="L1451">            final File legacy = new File(baseDir, plugin.name + &quot;.hpi&quot;);</span>
+<span class="nc bnc" id="L1452" title="All 2 branches missed.">            if(legacy.exists()){</span>
+<span class="nc" id="L1453">            	return legacy;</span>
+            }
+<span class="nc" id="L1455">            return new File(baseDir, plugin.name + &quot;.jpi&quot;);</span>
+        }
+
+        protected File getBackup() {
+<span class="nc" id="L1459">            File baseDir = pm.rootDir;</span>
+<span class="nc" id="L1460">            return new File(baseDir, plugin.name + &quot;.bak&quot;);</span>
+        }
+
+        public String getName() {
+<span class="nc" id="L1464">            return plugin.getDisplayName();</span>
+        }
+
+        @Override
+        public void run() {
+            try {
+<span class="nc" id="L1470">                LOGGER.info(&quot;Starting the downgrade of &quot;+getName()+&quot; on behalf of &quot;+getUser().getName());</span>
+
+<span class="nc" id="L1472">                _run();</span>
+
+<span class="nc" id="L1474">                LOGGER.info(&quot;Downgrade successful: &quot;+getName());</span>
+<span class="nc" id="L1475">                status = new Success();</span>
+<span class="nc" id="L1476">                onSuccess();</span>
+<span class="nc" id="L1477">            } catch (Throwable e) {</span>
+<span class="nc" id="L1478">                LOGGER.log(Level.SEVERE, &quot;Failed to downgrade &quot;+getName(),e);</span>
+<span class="nc" id="L1479">                status = new Failure(e);</span>
+<span class="nc" id="L1480">                error = e;</span>
+            }
+<span class="nc" id="L1482">        }</span>
+
+        @Override
+        protected void _run() throws IOException {
+<span class="nc" id="L1486">            File dst = getDestination();</span>
+<span class="nc" id="L1487">            File backup = getBackup();</span>
+
+<span class="nc" id="L1489">            config.install(this, backup, dst);</span>
+<span class="nc" id="L1490">        }</span>
+
+        /**
+         * Called to overwrite
+         * current version with backup file
+         */
+        @Override
+        protected void replace(File dst, File backup) throws IOException {
+<span class="nc" id="L1498">            dst.delete(); // any failure up to here is no big deal</span>
+<span class="nc bnc" id="L1499" title="All 2 branches missed.">            if(!backup.renameTo(dst)) {</span>
+<span class="nc" id="L1500">                throw new IOException(&quot;Failed to rename &quot;+backup+&quot; to &quot;+dst);</span>
+            }
+<span class="nc" id="L1502">        }</span>
+
+        protected void onSuccess() {
+<span class="nc" id="L1505">            pm.pluginUploaded = true;</span>
+<span class="nc" id="L1506">        }</span>
+
+        @Override
+        public String toString() {
+<span class="nc" id="L1510">            return super.toString()+&quot;[plugin=&quot;+plugin.title+&quot;]&quot;;</span>
+        }
+    }
+
+    /**
+     * Represents the state of the upgrade activity of Jenkins core.
+     */
+    public final class HudsonUpgradeJob extends DownloadJob {
+<span class="nc" id="L1518">        public HudsonUpgradeJob(UpdateSite site, Authentication auth) {</span>
+<span class="nc" id="L1519">            super(site, auth);</span>
+<span class="nc" id="L1520">        }</span>
+
+        protected URL getURL() throws MalformedURLException {
+<span class="nc" id="L1523">            return new URL(site.getData().core.url);</span>
+        }
+
+        protected File getDestination() {
+<span class="nc" id="L1527">            return Lifecycle.get().getHudsonWar();</span>
+        }
+
+        public String getName() {
+<span class="nc" id="L1531">            return &quot;jenkins.war&quot;;</span>
+        }
+
+        protected void onSuccess() {
+<span class="nc" id="L1535">            status = new Success();</span>
+<span class="nc" id="L1536">        }</span>
+
+        @Override
+        protected void replace(File dst, File src) throws IOException {
+<span class="nc" id="L1540">            String expectedSHA1 = site.getData().core.getSha1();</span>
+<span class="nc" id="L1541">            verifyChecksums(expectedSHA1, getComputedSHA1(), src);</span>
+<span class="nc" id="L1542">            Lifecycle.get().rewriteHudsonWar(src);</span>
+<span class="nc" id="L1543">        }</span>
+    }
+
+    public final class HudsonDowngradeJob extends DownloadJob {
+<span class="nc" id="L1547">        public HudsonDowngradeJob(UpdateSite site, Authentication auth) {</span>
+<span class="nc" id="L1548">            super(site, auth);</span>
+<span class="nc" id="L1549">        }</span>
+
+        protected URL getURL() throws MalformedURLException {
+<span class="nc" id="L1552">            return new URL(site.getData().core.url);</span>
+        }
+
+        protected File getDestination() {
+<span class="nc" id="L1556">            return Lifecycle.get().getHudsonWar();</span>
+        }
+
+        public String getName() {
+<span class="nc" id="L1560">            return &quot;jenkins.war&quot;;</span>
+        }
+        protected void onSuccess() {
+<span class="nc" id="L1563">            status = new Success();</span>
+<span class="nc" id="L1564">        }</span>
+        @Override
+        public void run() {
+            try {
+<span class="nc" id="L1568">                LOGGER.info(&quot;Starting the downgrade of &quot;+getName()+&quot; on behalf of &quot;+getUser().getName());</span>
+
+<span class="nc" id="L1570">                _run();</span>
+
+<span class="nc" id="L1572">                LOGGER.info(&quot;Downgrading successful: &quot;+getName());</span>
+<span class="nc" id="L1573">                status = new Success();</span>
+<span class="nc" id="L1574">                onSuccess();</span>
+<span class="nc" id="L1575">            } catch (Throwable e) {</span>
+<span class="nc" id="L1576">                LOGGER.log(Level.SEVERE, &quot;Failed to downgrade &quot;+getName(),e);</span>
+<span class="nc" id="L1577">                status = new Failure(e);</span>
+<span class="nc" id="L1578">                error = e;</span>
+            }
+<span class="nc" id="L1580">        }</span>
+
+        @Override
+        protected void _run() throws IOException {
+
+<span class="nc" id="L1585">            File backup = new File(Lifecycle.get().getHudsonWar() + &quot;.bak&quot;);</span>
+<span class="nc" id="L1586">            File dst = getDestination();</span>
+
+<span class="nc" id="L1588">            config.install(this, backup, dst);</span>
+<span class="nc" id="L1589">        }</span>
+
+        @Override
+        protected void replace(File dst, File src) throws IOException {
+<span class="nc" id="L1593">            Lifecycle.get().rewriteHudsonWar(src);</span>
+<span class="nc" id="L1594">        }</span>
+    }
+
+    public static final class PluginEntry implements Comparable&lt;PluginEntry&gt; {
+        public Plugin plugin;
+        public String category;
+<span class="nc" id="L1600">        private PluginEntry(Plugin p, String c) { plugin = p; category = c; }</span>
+
+        public int compareTo(PluginEntry o) {
+<span class="nc" id="L1603">            int r = category.compareTo(o.category);</span>
+<span class="nc bnc" id="L1604" title="All 2 branches missed.">            if (r==0) r = plugin.name.compareToIgnoreCase(o.plugin.name);</span>
+<span class="nc" id="L1605">            return r;</span>
+        }
+    }
+
+    /**
+     * Adds the update center data retriever to HTML.
+     */
+    @Extension
+<span class="nc" id="L1613">    public static class PageDecoratorImpl extends PageDecorator {</span>
+    }
+
+    /**
+     * Initializes the update center.
+     *
+     * This has to wait until after all plugins load, to let custom UpdateCenterConfiguration take effect first.
+     */
+    @Initializer(after=PLUGINS_STARTED, fatal=false)
+    public static void init(Jenkins h) throws IOException {
+<span class="nc" id="L1623">        h.getUpdateCenter().load();</span>
+<span class="nc" id="L1624">    }</span>
+
+    /**
+     * Sequence number generator.
+     */
+<span class="nc" id="L1629">    private static final AtomicInteger iota = new AtomicInteger();</span>
+
+<span class="nc" id="L1631">    private static final Logger LOGGER = Logger.getLogger(UpdateCenter.class.getName());</span>
+
+    /**
+     * @deprecated as of 1.333
+     *      Use {@link UpdateSite#neverUpdate}
+     */
+    @Deprecated
+<span class="nc" id="L1638">    public static boolean neverUpdate = Boolean.getBoolean(UpdateCenter.class.getName()+&quot;.never&quot;);</span>
+
+<span class="nc" id="L1640">    public static final XStream2 XSTREAM = new XStream2();</span>
+
+    static {
+<span class="nc" id="L1643">        XSTREAM.alias(&quot;site&quot;,UpdateSite.class);</span>
+<span class="nc" id="L1644">        XSTREAM.alias(&quot;sites&quot;,PersistedList.class);</span>
+<span class="nc" id="L1645">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

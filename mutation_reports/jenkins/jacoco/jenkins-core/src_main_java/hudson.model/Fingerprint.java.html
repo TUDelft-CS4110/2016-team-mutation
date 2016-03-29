@@ -1,0 +1,1440 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>Fingerprint.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.model</a> &gt; <span class="el_source">Fingerprint.java</span></div><h1>Fingerprint.java</h1><pre class="source lang-java linenums"><span class="pc" id="L1">/*</span>
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc., Kohsuke Kawaguchi, Yahoo! Inc.
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.model;
+
+import com.google.common.collect.ImmutableList;
+import com.infradna.tool.bridge_method_injector.WithBridgeMethods;
+import com.thoughtworks.xstream.XStream;
+import com.thoughtworks.xstream.converters.Converter;
+import com.thoughtworks.xstream.converters.MarshallingContext;
+import com.thoughtworks.xstream.converters.UnmarshallingContext;
+import com.thoughtworks.xstream.converters.basic.DateConverter;
+import com.thoughtworks.xstream.converters.collections.CollectionConverter;
+import com.thoughtworks.xstream.io.HierarchicalStreamReader;
+import com.thoughtworks.xstream.io.HierarchicalStreamWriter;
+import hudson.Util;
+import hudson.XmlFile;
+import hudson.BulkChange;
+import hudson.Extension;
+import hudson.model.listeners.ItemListener;
+import hudson.model.listeners.SaveableListener;
+import hudson.security.ACL;
+import hudson.util.AtomicFileWriter;
+import hudson.util.HexBinaryConverter;
+import hudson.util.Iterators;
+import hudson.util.PersistedList;
+import hudson.util.RunList;
+import hudson.util.XStream2;
+import java.io.EOFException;
+import jenkins.model.FingerprintFacet;
+import jenkins.model.Jenkins;
+import jenkins.model.TransientFingerprintFacetFactory;
+import org.kohsuke.stapler.export.Exported;
+import org.kohsuke.stapler.export.ExportedBean;
+
+import java.io.File;
+import java.io.IOException;
+import java.io.PrintWriter;
+import java.util.AbstractCollection;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.Date;
+import java.util.Hashtable;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.TreeMap;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import javax.annotation.CheckForNull;
+import javax.annotation.Nonnull;
+import org.acegisecurity.AccessDeniedException;
+import org.acegisecurity.Authentication;
+import org.xmlpull.v1.XmlPullParserException;
+
+/**
+ * A file being tracked by Jenkins.
+ *
+ * &lt;p&gt;
+ * Lifecycle is managed by {@link FingerprintMap}.
+ *
+ * @author Kohsuke Kawaguchi
+ * @see FingerprintMap
+ */
+@ExportedBean
+<span class="pc bpc" id="L89" title="1 of 2 branches missed.">public class Fingerprint implements ModelObject, Saveable {</span>
+    /**
+     * Pointer to a {@link Build}.
+     */
+    @ExportedBean(defaultVisibility=2)
+    public static class BuildPtr {
+        String name;
+        final int number;
+
+<span class="fc" id="L98">        public BuildPtr(String name, int number) {</span>
+<span class="fc" id="L99">            this.name = name;</span>
+<span class="fc" id="L100">            this.number = number;</span>
+<span class="fc" id="L101">        }</span>
+
+        public BuildPtr(Run run) {
+<span class="nc" id="L104">            this( run.getParent().getFullName(), run.getNumber() );</span>
+<span class="nc" id="L105">        }</span>
+
+        /**
+         * Gets {@link Job#getFullName() the full name of the job}.
+         * Such job could be since then removed, so there might not be a corresponding {@link Job}.
+         * 
+         * @return A name of the job
+         */
+        @Exported
+        @Nonnull
+        public String getName() {
+<span class="nc" id="L116">            return name;</span>
+        }
+          
+        /**
+         * Checks if the current user has permission to see this pointer.
+         * @return {@code true} if the job exists and user has {@link Item#READ} permissions
+         *      or if the current user has {@link Jenkins#ADMINISTER} permissions. 
+         *      If the job exists, but the current user has no permission to discover it, 
+         *      {@code false}  will be returned.
+         *      If the job has been deleted and the user has no {@link Jenkins#ADMINISTER} permissions,
+         *      it also returns {@code false}   in order to avoid the job existence fact exposure.
+         */
+        private boolean hasPermissionToDiscoverBuild() {
+            // We expose the data to Jenkins administrators in order to
+            // let them manage the data for deleted jobs (also works for SYSTEM)
+<span class="nc" id="L131">            final Jenkins instance = Jenkins.getInstance();</span>
+<span class="nc bnc" id="L132" title="All 4 branches missed.">            if (instance != null &amp;&amp; instance.hasPermission(Jenkins.ADMINISTER)) {</span>
+<span class="nc" id="L133">                return true;</span>
+            }
+            
+<span class="nc" id="L136">            return canDiscoverItem(name);</span>
+        }
+        
+        
+
+        void setName(String newName) {
+<span class="nc" id="L142">            name = newName;</span>
+<span class="nc" id="L143">        }</span>
+        
+        /**
+         * Gets the {@link Job} that this pointer points to,
+         * or null if such a job no longer exists.
+         */
+        @WithBridgeMethods(value=AbstractProject.class, castRequired=true)
+        public Job&lt;?,?&gt; getJob() {
+<span class="nc" id="L151">            return Jenkins.getInstance().getItemByFullName(name, Job.class);</span>
+        }
+
+        /**
+         * Gets the project build number.
+         * &lt;p&gt;
+         * Such {@link Run} could be since then discarded.
+         * @return A build number
+         */
+        @Exported
+        @Nonnull
+        public int getNumber() {
+<span class="nc" id="L163">            return number;</span>
+        }
+
+        /**
+         * Gets the {@link Job} that this pointer points to,
+         * or null if such a job no longer exists.
+         */
+        public Run getRun() {
+<span class="nc" id="L171">            Job j = getJob();</span>
+<span class="nc bnc" id="L172" title="All 2 branches missed.">            if(j==null)     return null;</span>
+<span class="nc" id="L173">            return j.getBuildByNumber(number);</span>
+        }
+
+        private boolean isAlive() {
+<span class="nc bnc" id="L177" title="All 2 branches missed.">            return getRun()!=null;</span>
+        }
+
+        /**
+         * Returns true if {@link BuildPtr} points to the given run.
+         */
+        public boolean is(Run r) {
+<span class="nc bnc" id="L184" title="All 4 branches missed.">            return r.getNumber()==number &amp;&amp; r.getParent().getFullName().equals(name);</span>
+        }
+
+        /**
+         * Returns true if {@link BuildPtr} points to the given job.
+         */
+        public boolean is(Job job) {
+<span class="nc" id="L191">            return job.getFullName().equals(name);</span>
+        }
+
+        /**
+         * Returns true if {@link BuildPtr} points to the given job
+         * or one of its subordinates.
+         *
+         * &lt;p&gt;
+         * This is useful to check if an artifact in MavenModule
+         * belongs to MavenModuleSet. 
+         */
+        public boolean belongsTo(Job job) {
+<span class="nc" id="L203">            Item p = Jenkins.getInstance().getItemByFullName(name);</span>
+<span class="nc bnc" id="L204" title="All 2 branches missed.">            while(p!=null) {</span>
+<span class="nc bnc" id="L205" title="All 2 branches missed.">                if(p==job)</span>
+<span class="nc" id="L206">                    return true;</span>
+
+                // go up the chain while we
+<span class="nc" id="L209">                ItemGroup&lt;? extends Item&gt; parent = p.getParent();</span>
+<span class="nc bnc" id="L210" title="All 2 branches missed.">                if (!(parent instanceof Item)) {</span>
+<span class="nc" id="L211">                    return false;</span>
+                }
+
+<span class="nc" id="L214">                p = (Item) parent;</span>
+            }
+
+<span class="nc" id="L217">            return false;</span>
+        }
+
+        @Override public String toString() {
+<span class="fc" id="L221">            return name + &quot; #&quot; + number;</span>
+        }
+    }
+
+    /**
+     * Range of build numbers [start,end). Immutable.
+     */
+    @ExportedBean(defaultVisibility=4)
+<span class="pc bpc" id="L229" title="1 of 2 branches missed.">    public static final class Range {</span>
+        final int start;
+        final int end;
+
+<span class="fc" id="L233">        public Range(int start, int end) {</span>
+<span class="pc bpc" id="L234" title="3 of 4 branches missed.">            assert start&lt;end;</span>
+<span class="fc" id="L235">            this.start = start;</span>
+<span class="fc" id="L236">            this.end = end;</span>
+<span class="fc" id="L237">        }</span>
+
+        @Exported
+        public int getStart() {
+<span class="nc" id="L241">            return start;</span>
+        }
+
+        @Exported
+        public int getEnd() {
+<span class="nc" id="L246">            return end;</span>
+        }
+
+        public boolean isSmallerThan(int i) {
+<span class="nc bnc" id="L250" title="All 2 branches missed.">            return end&lt;=i;</span>
+        }
+
+        public boolean isBiggerThan(int i) {
+<span class="fc bfc" id="L254" title="All 2 branches covered.">            return i&lt;start;</span>
+        }
+
+        public boolean includes(int i) {
+<span class="fc bfc" id="L258" title="All 4 branches covered.">            return start&lt;=i &amp;&amp; i&lt;end;</span>
+        }
+
+        public Range expandRight() {
+<span class="fc" id="L262">            return new Range(start,end+1);</span>
+        }
+
+        public Range expandLeft() {
+<span class="fc" id="L266">            return new Range(start-1,end);</span>
+        }
+
+        public boolean isAdjacentTo(Range that) {
+<span class="fc bfc" id="L270" title="All 2 branches covered.">            return this.end==that.start;</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="fc" id="L275">            return &quot;[&quot;+start+&quot;,&quot;+end+&quot;)&quot;;</span>
+        }
+
+        /**
+         * Returns true if two {@link Range}s can't be combined into a single range.
+         */
+        public boolean isIndependent(Range that) {
+<span class="pc bpc" id="L282" title="2 of 4 branches missed.">            return this.end&lt;that.start ||that.end&lt;this.start;</span>
+        }
+
+        /**
+         * Returns true if two {@link Range}s do not share any common integer.
+         */
+        public boolean isDisjoint(Range that) {
+<span class="nc bnc" id="L289" title="All 4 branches missed.">            return this.end&lt;=that.start || that.end&lt;=this.start;</span>
+        }
+
+        /**
+         * Returns true if this range only represents a single number.
+         */
+        public boolean isSingle() {
+<span class="fc bfc" id="L296" title="All 2 branches covered.">            return end-1==start;</span>
+        }
+
+        /**
+         * If this range contains every int that's in the other range, return true
+         */
+        public boolean contains(Range that) {
+<span class="fc bfc" id="L303" title="All 4 branches covered.">            return this.start&lt;=that.start &amp;&amp; that.end&lt;=this.end;</span>
+        }
+
+        /**
+         * Returns the {@link Range} that combines two ranges.
+         */
+        public Range combine(Range that) {
+<span class="pc bpc" id="L310" title="3 of 4 branches missed.">            assert !isIndependent(that);</span>
+<span class="fc" id="L311">            return new Range(</span>
+<span class="fc" id="L312">                Math.min(this.start,that.start),</span>
+<span class="fc" id="L313">                Math.max(this.end  ,that.end  ));</span>
+        }
+
+        /**
+         * Returns the {@link Range} that represents the intersection of the two.
+         */
+        public Range intersect(Range that) {
+<span class="pc bpc" id="L320" title="3 of 4 branches missed.">            assert !isDisjoint(that);</span>
+<span class="fc" id="L321">            return new Range(</span>
+<span class="fc" id="L322">                Math.max(this.start, that.start),</span>
+<span class="fc" id="L323">                Math.min(this.end, that.end));</span>
+        }
+
+        @Override
+        public boolean equals(Object o) {
+<span class="pc bpc" id="L328" title="1 of 2 branches missed.">            if (this == o) return true;</span>
+<span class="pc bpc" id="L329" title="2 of 4 branches missed.">            if (o == null || getClass() != o.getClass()) return false;</span>
+
+<span class="fc" id="L331">            Range that = (Range) o;</span>
+<span class="pc bpc" id="L332" title="1 of 4 branches missed.">            return start == that.start &amp;&amp; end == that.end;</span>
+
+        }
+
+        @Override
+        public int hashCode() {
+<span class="nc" id="L338">            return 31 * start + end;</span>
+        }
+    }
+
+    /**
+     * Set of {@link Range}s. Mutable.
+     */
+    @ExportedBean(defaultVisibility=3)
+<span class="pc bpc" id="L346" title="1 of 2 branches missed.">    public static final class RangeSet {</span>
+        // sorted
+        private final List&lt;Range&gt; ranges;
+
+        public RangeSet() {
+<span class="fc" id="L351">            this(new ArrayList&lt;Range&gt;());</span>
+<span class="fc" id="L352">        }</span>
+
+<span class="fc" id="L354">        private RangeSet(List&lt;Range&gt; data) {</span>
+<span class="fc" id="L355">            this.ranges = data;</span>
+<span class="fc" id="L356">        }</span>
+
+        private RangeSet(Range initial) {
+<span class="nc" id="L359">            this();</span>
+<span class="nc" id="L360">            ranges.add(initial);</span>
+<span class="nc" id="L361">        }</span>
+
+        /**
+         * List all numbers in this range set, in the ascending order.
+         */
+        public Iterable&lt;Integer&gt; listNumbers() {
+<span class="nc" id="L367">            final List&lt;Range&gt; ranges = getRanges();</span>
+<span class="nc" id="L368">            return new Iterable&lt;Integer&gt;() {</span>
+                public Iterator&lt;Integer&gt; iterator() {
+<span class="nc" id="L370">                    return new Iterators.FlattenIterator&lt;Integer,Range&gt;(ranges) {</span>
+                        protected Iterator&lt;Integer&gt; expand(Range range) {
+<span class="nc" id="L372">                            return Iterators.sequence(range.start,range.end).iterator();</span>
+                        }
+                    };
+                }
+            };
+        }
+
+//        /**
+//         * List up builds.
+//         */
+//        public &lt;J extends Job&lt;J,R&gt;,R extends Run&lt;J,R&gt;&gt;  Iterable&lt;R&gt; listBuilds(final J job) {
+//            return new Iterable&lt;R&gt;() {
+//                public Iterator&lt;R&gt; iterator() {
+//                    return new Iterators.FilterIterator&lt;R&gt;(new AdaptedIterator&lt;Integer,R&gt;(listNumbers().iterator()) {
+//                        protected R adapt(Integer n) {
+//                            return job.getBuildByNumber(n);
+//                        }
+//                    }) {
+//                        protected boolean filter(R r) {
+//                            return r!=null;
+//                        }
+//                    };
+//                }
+//            };
+//        }
+
+        /**
+         * List all numbers in this range set in the descending order.
+         */
+        public Iterable&lt;Integer&gt; listNumbersReverse() {
+<span class="nc" id="L402">            final List&lt;Range&gt; ranges = getRanges();</span>
+<span class="nc" id="L403">            return new Iterable&lt;Integer&gt;() {</span>
+                public Iterator&lt;Integer&gt; iterator() {
+<span class="nc" id="L405">                    return new Iterators.FlattenIterator&lt;Integer,Range&gt;(Iterators.reverse(ranges)) {</span>
+                        protected Iterator&lt;Integer&gt; expand(Range range) {
+<span class="nc" id="L407">                            return Iterators.reverseSequence(range.start,range.end).iterator();</span>
+                        }
+                    };
+                }
+            };
+        }
+
+        /**
+         * Gets all the ranges.
+         */
+        @Exported
+        public synchronized List&lt;Range&gt; getRanges() {
+<span class="nc" id="L419">            return new ArrayList&lt;Range&gt;(ranges);</span>
+        }
+
+        /**
+         * Expands the range set to include the given value.
+         * If the set already includes this number, this will be a no-op.
+         */
+        public synchronized void add(int n) {
+<span class="fc bfc" id="L427" title="All 2 branches covered.">            for( int i=0; i&lt;ranges.size(); i++ ) {</span>
+<span class="fc" id="L428">                Range r = ranges.get(i);</span>
+<span class="pc bpc" id="L429" title="1 of 2 branches missed.">                if(r.includes(n))   return; // already included</span>
+<span class="fc bfc" id="L430" title="All 2 branches covered.">                if(r.end==n) {</span>
+<span class="fc" id="L431">                    ranges.set(i,r.expandRight());</span>
+<span class="fc" id="L432">                    checkCollapse(i);</span>
+<span class="fc" id="L433">                    return;</span>
+                }
+<span class="fc bfc" id="L435" title="All 2 branches covered.">                if(r.start==n+1) {</span>
+<span class="fc" id="L436">                    ranges.set(i,r.expandLeft());</span>
+<span class="fc" id="L437">                    checkCollapse(i-1);</span>
+<span class="fc" id="L438">                    return;</span>
+                }
+<span class="fc bfc" id="L440" title="All 2 branches covered.">                if(r.isBiggerThan(n)) {</span>
+                    // needs to insert a single-value Range
+<span class="fc" id="L442">                    ranges.add(i,new Range(n,n+1));</span>
+<span class="fc" id="L443">                    return;</span>
+                }
+            }
+
+<span class="fc" id="L447">            ranges.add(new Range(n,n+1));</span>
+<span class="fc" id="L448">        }</span>
+
+        public synchronized void addAll(int... n) {
+<span class="fc bfc" id="L451" title="All 2 branches covered.">            for (int i : n)</span>
+<span class="fc" id="L452">                add(i);</span>
+<span class="fc" id="L453">        }</span>
+
+
+        private void checkCollapse(int i) {
+<span class="pc bpc" id="L457" title="1 of 4 branches missed.">            if(i&lt;0 || i==ranges.size()-1)     return;</span>
+<span class="fc" id="L458">            Range lhs = ranges.get(i);</span>
+<span class="fc" id="L459">            Range rhs = ranges.get(i+1);</span>
+<span class="fc bfc" id="L460" title="All 2 branches covered.">            if(lhs.isAdjacentTo(rhs)) {</span>
+                // collapsed
+<span class="fc" id="L462">                Range r = new Range(lhs.start,rhs.end);</span>
+<span class="fc" id="L463">                ranges.set(i,r);</span>
+<span class="fc" id="L464">                ranges.remove(i+1);</span>
+            }
+<span class="fc" id="L466">        }</span>
+
+        public synchronized boolean includes(int i) {
+<span class="fc bfc" id="L469" title="All 2 branches covered.">            for (Range r : ranges) {</span>
+<span class="fc bfc" id="L470" title="All 2 branches covered.">                if(r.includes(i))</span>
+<span class="fc" id="L471">                    return true;</span>
+            }
+<span class="fc" id="L473">            return false;</span>
+        }
+
+        public synchronized void add(RangeSet that) {
+<span class="fc" id="L477">            int lhs=0,rhs=0;</span>
+<span class="fc bfc" id="L478" title="All 4 branches covered.">            while(lhs&lt;this.ranges.size() &amp;&amp; rhs&lt;that.ranges.size()) {</span>
+<span class="fc" id="L479">                Range lr = this.ranges.get(lhs);</span>
+<span class="fc" id="L480">                Range rr = that.ranges.get(rhs);</span>
+
+                // no overlap
+<span class="fc bfc" id="L483" title="All 2 branches covered.">                if(lr.end&lt;rr.start) {</span>
+<span class="fc" id="L484">                    lhs++;</span>
+<span class="fc" id="L485">                    continue;</span>
+                }
+<span class="fc bfc" id="L487" title="All 2 branches covered.">                if(rr.end&lt;lr.start) {</span>
+<span class="fc" id="L488">                    ranges.add(lhs,rr);</span>
+<span class="fc" id="L489">                    lhs++;</span>
+<span class="fc" id="L490">                    rhs++;</span>
+<span class="fc" id="L491">                    continue;</span>
+                }
+
+                // overlap. merge two
+<span class="fc" id="L495">                Range m = lr.combine(rr);</span>
+<span class="fc" id="L496">                rhs++;</span>
+
+                // since ranges[lhs] is expanded, it might overlap with others in this.ranges
+<span class="pc bpc" id="L499" title="1 of 4 branches missed.">                while(lhs+1&lt;this.ranges.size() &amp;&amp; !m.isIndependent(this.ranges.get(lhs+1))) {</span>
+<span class="fc" id="L500">                    m = m.combine(this.ranges.get(lhs+1));</span>
+<span class="fc" id="L501">                    this.ranges.remove(lhs+1);</span>
+                }
+
+<span class="fc" id="L504">                this.ranges.set(lhs,m);</span>
+            }
+
+            // if anything is left in that.ranges, add them all
+<span class="fc" id="L508">            this.ranges.addAll(that.ranges.subList(rhs,that.ranges.size()));</span>
+<span class="fc" id="L509">        }</span>
+
+        /**
+         * Updates this range set by the intersection of this range and the given range.
+         *
+         * @return true if this range set was modified as a result.
+         */
+        public synchronized boolean retainAll(RangeSet that) {
+<span class="fc" id="L517">            List&lt;Range&gt; intersection = new ArrayList&lt;Range&gt;();</span>
+
+<span class="fc" id="L519">            int lhs=0,rhs=0;</span>
+<span class="fc bfc" id="L520" title="All 4 branches covered.">            while(lhs&lt;this.ranges.size() &amp;&amp; rhs&lt;that.ranges.size()) {</span>
+<span class="fc" id="L521">                Range lr = this.ranges.get(lhs);</span>
+<span class="fc" id="L522">                Range rr = that.ranges.get(rhs);</span>
+
+<span class="fc bfc" id="L524" title="All 2 branches covered.">                if(lr.end&lt;=rr.start) {// lr has no overlap with that.ranges</span>
+<span class="fc" id="L525">                    lhs++;</span>
+<span class="fc" id="L526">                    continue;</span>
+                }
+<span class="fc bfc" id="L528" title="All 2 branches covered.">                if(rr.end&lt;=lr.start) {// rr has no overlap with this.ranges</span>
+<span class="fc" id="L529">                    rhs++;</span>
+<span class="fc" id="L530">                    continue;</span>
+                }
+
+                // overlap. figure out the intersection
+<span class="fc" id="L534">                Range v = lr.intersect(rr);</span>
+<span class="fc" id="L535">                intersection.add(v);</span>
+
+                // move on to the next pair
+<span class="fc bfc" id="L538" title="All 2 branches covered.">                if (lr.end&lt;rr.end) {</span>
+<span class="fc" id="L539">                    lhs++;</span>
+<span class="fc" id="L540">                } else {</span>
+<span class="fc" id="L541">                    rhs++;</span>
+                }
+            }
+
+<span class="fc" id="L545">            boolean same = this.ranges.equals(intersection);</span>
+
+<span class="pc bpc" id="L547" title="1 of 2 branches missed.">            if (!same) {</span>
+<span class="fc" id="L548">                this.ranges.clear();</span>
+<span class="fc" id="L549">                this.ranges.addAll(intersection);</span>
+<span class="fc" id="L550">                return true;</span>
+            } else {
+<span class="nc" id="L552">                return false;</span>
+            }
+        }
+
+        /**
+         * Updates this range set by removing all the values in the given range set.
+         *
+         * @return true if this range set was modified as a result.
+         */
+        public synchronized boolean removeAll(RangeSet that) {
+<span class="fc" id="L562">            boolean modified = false;</span>
+<span class="fc" id="L563">            List&lt;Range&gt; sub = new ArrayList&lt;Range&gt;();</span>
+
+<span class="fc" id="L565">            int lhs=0,rhs=0;</span>
+<span class="fc bfc" id="L566" title="All 4 branches covered.">            while(lhs&lt;this.ranges.size() &amp;&amp; rhs&lt;that.ranges.size()) {</span>
+<span class="fc" id="L567">                Range lr = this.ranges.get(lhs);</span>
+<span class="fc" id="L568">                Range rr = that.ranges.get(rhs);</span>
+
+<span class="fc bfc" id="L570" title="All 2 branches covered.">                if(lr.end&lt;=rr.start) {// lr has no overlap with that.ranges. lr stays</span>
+<span class="fc" id="L571">                    sub.add(lr);</span>
+<span class="fc" id="L572">                    lhs++;</span>
+<span class="fc" id="L573">                    continue;</span>
+                }
+<span class="fc bfc" id="L575" title="All 2 branches covered.">                if(rr.end&lt;=lr.start) {// rr has no overlap with this.ranges</span>
+<span class="fc" id="L576">                    rhs++;</span>
+<span class="fc" id="L577">                    continue;</span>
+                }
+
+                // some overlap between lr and rr
+<span class="pc bpc" id="L581" title="3 of 4 branches missed.">                assert !lr.isDisjoint(rr);</span>
+<span class="fc" id="L582">                modified = true;</span>
+
+<span class="fc bfc" id="L584" title="All 2 branches covered.">                if (rr.contains(lr)) {</span>
+                    // lr completely removed by rr
+<span class="fc" id="L586">                    lhs++;</span>
+<span class="fc" id="L587">                    continue;</span>
+                }
+
+                // we want to look at A and B below, if they are non-null.
+                // |------------| lr
+                //     |-----|    rr
+                //   A         B
+                //
+                // note that lr and rr could be something like or the other way around
+                // |------------| lr
+                //         |------------| rr
+                //     A             (no B)
+
+<span class="fc bfc" id="L600" title="All 2 branches covered.">                if (lr.start&lt;rr.start) {// if A is non-empty, that will stay</span>
+<span class="fc" id="L601">                    Range a = new Range(lr.start, rr.start);</span>
+<span class="fc" id="L602">                    sub.add(a);</span>
+                }
+
+<span class="fc bfc" id="L605" title="All 2 branches covered.">                if (rr.end&lt;lr.end) {// if B is non-empty</span>
+                    // we still need to check that with that.ranges, so keep it in the place of lr.
+                    // how much of them will eventually stay is up to the remainder of that.ranges
+<span class="fc" id="L608">                    this.ranges.set(lhs,new Range(rr.end,lr.end));</span>
+<span class="fc" id="L609">                    rhs++;</span>
+<span class="fc" id="L610">                } else {</span>
+                    // if B is empty, we are done considering lr
+<span class="fc" id="L612">                    lhs++;</span>
+                }
+            }
+
+<span class="fc bfc" id="L616" title="All 2 branches covered.">            if (!modified)  return false;   // no changes</span>
+
+            // whatever that remains in lhs will survive
+<span class="fc" id="L619">            sub.addAll(this.ranges.subList(lhs,this.ranges.size()));</span>
+
+<span class="fc" id="L621">            this.ranges.clear();</span>
+<span class="fc" id="L622">            this.ranges.addAll(sub);</span>
+<span class="fc" id="L623">            return true;</span>
+        }
+
+        @Override
+        public synchronized String toString() {
+<span class="fc" id="L628">            StringBuilder buf = new StringBuilder();</span>
+<span class="fc bfc" id="L629" title="All 2 branches covered.">            for (Range r : ranges) {</span>
+<span class="fc bfc" id="L630" title="All 2 branches covered.">                if(buf.length()&gt;0)  buf.append(',');</span>
+<span class="fc" id="L631">                buf.append(r);</span>
+            }
+<span class="fc" id="L633">            return buf.toString();</span>
+        }
+
+        @Override
+        public boolean equals(Object o) {
+<span class="pc bpc" id="L638" title="1 of 2 branches missed.">            if (this == o) return true;</span>
+<span class="pc bpc" id="L639" title="2 of 4 branches missed.">            if (o == null || getClass() != o.getClass()) return false;</span>
+
+<span class="fc" id="L641">            return ranges.equals(((RangeSet) o).ranges);</span>
+
+        }
+
+        @Override
+        public int hashCode() {
+<span class="nc" id="L647">            return ranges.hashCode();</span>
+        }
+
+        public synchronized boolean isEmpty() {
+<span class="fc" id="L651">            return ranges.isEmpty();</span>
+        }
+
+        /**
+         * Returns the smallest value in this range.
+         * &lt;p&gt;
+         * If this range is empty, this method throws an exception.
+         */
+        public synchronized int min() {
+<span class="nc" id="L660">            return ranges.get(0).start;</span>
+        }
+
+        /**
+         * Returns the largest value in this range.
+         * &lt;p&gt;
+         * If this range is empty, this method throws an exception.
+         */
+        public synchronized int max() {
+<span class="nc" id="L669">            return ranges.get(ranges.size()-1).end;</span>
+        }
+
+        /**
+         * Returns true if all the integers logically in this {@link RangeSet}
+         * is smaller than the given integer. For example, {[1,3)} is smaller than 3,
+         * but {[1,3),[100,105)} is not smaller than anything less than 105.
+         *
+         * Note that {} is smaller than any n.
+         */
+        public synchronized boolean isSmallerThan(int n) {
+<span class="nc bnc" id="L680" title="All 2 branches missed.">            if(ranges.isEmpty())    return true;</span>
+
+<span class="nc" id="L682">            return ranges.get(ranges.size() - 1).isSmallerThan(n);</span>
+        }
+
+        /**
+         * Parses a {@link RangeSet} from a string like &quot;1-3,5,7-9&quot;
+         */
+        public static RangeSet fromString(String list, boolean skipError) {
+<span class="fc" id="L689">            RangeSet rs = new RangeSet();</span>
+<span class="fc bfc" id="L690" title="All 2 branches covered.">            for (String s : Util.tokenize(list,&quot;,&quot;)) {</span>
+<span class="fc" id="L691">                s = s.trim();</span>
+                // s is either single number or range &quot;x-y&quot;.
+                // note that the end range is inclusive in this notation, but not in the Range class
+                try {
+<span class="fc bfc" id="L695" title="All 2 branches covered.">                    if(s.contains(&quot;-&quot;)) {</span>
+<span class="fc" id="L696">                        String[] tokens = Util.tokenize(s,&quot;-&quot;);</span>
+<span class="pc bpc" id="L697" title="1 of 2 branches missed.">                        if (tokens.length == 2) {</span>
+<span class="fc" id="L698">                            rs.ranges.add(new Range(Integer.parseInt(tokens[0]), Integer.parseInt(tokens[1]) + 1));</span>
+<span class="fc" id="L699">                        } else {</span>
+<span class="nc bnc" id="L700" title="All 2 branches missed.">                            if (!skipError) {</span>
+<span class="nc" id="L701">                                throw new IllegalArgumentException(</span>
+<span class="nc" id="L702">                                        String.format(&quot;Unable to parse %s, expected string with a range M-N&quot;, list));</span>
+                            }
+                            // ignore malformed text like &quot;1-10-50&quot;
+                        }
+                    } else {
+<span class="fc" id="L707">                        int n = Integer.parseInt(s);</span>
+<span class="fc" id="L708">                        rs.ranges.add(new Range(n,n+1));</span>
+                    }
+<span class="pc" id="L710">                } catch (NumberFormatException e) {</span>
+<span class="nc bnc" id="L711" title="All 2 branches missed.">                    if (!skipError)</span>
+<span class="nc" id="L712">                        throw new IllegalArgumentException(</span>
+<span class="nc" id="L713">                                String.format(&quot;Unable to parse %s, expected number&quot;, list));</span>
+                    // ignore malformed text
+                }
+            }
+<span class="fc" id="L717">            return rs;</span>
+        }
+
+        static final class ConverterImpl implements Converter {
+            private final Converter collectionConv; // used to convert ArrayList in it
+
+<span class="fc" id="L723">            public ConverterImpl(Converter collectionConv) {</span>
+<span class="fc" id="L724">                this.collectionConv = collectionConv;</span>
+<span class="fc" id="L725">            }</span>
+
+            public boolean canConvert(Class type) {
+<span class="fc bfc" id="L728" title="All 2 branches covered.">                return type==RangeSet.class;</span>
+            }
+
+            public void marshal(Object source, HierarchicalStreamWriter writer, MarshallingContext context) {
+<span class="fc" id="L732">                RangeSet src = (RangeSet) source;</span>
+<span class="fc" id="L733">                writer.setValue(serialize(src));</span>
+<span class="fc" id="L734">            }</span>
+
+            static String serialize(RangeSet src) {
+<span class="fc" id="L737">                StringBuilder buf = new StringBuilder(src.ranges.size()*10);</span>
+<span class="fc bfc" id="L738" title="All 2 branches covered.">                for (Range r : src.ranges) {</span>
+<span class="fc bfc" id="L739" title="All 2 branches covered.">                    if(buf.length()&gt;0)  buf.append(',');</span>
+<span class="fc bfc" id="L740" title="All 2 branches covered.">                    if(r.isSingle())</span>
+<span class="fc" id="L741">                        buf.append(r.start);</span>
+                    else
+<span class="fc" id="L743">                        buf.append(r.start).append('-').append(r.end-1);</span>
+                }
+<span class="fc" id="L745">                return buf.toString();</span>
+            }
+
+            public Object unmarshal(HierarchicalStreamReader reader, final UnmarshallingContext context) {
+<span class="pc bpc" id="L749" title="1 of 2 branches missed.">                if(reader.hasMoreChildren()) {</span>
+                    /* old format where &lt;range&gt; elements are nested like
+                            &lt;range&gt;
+                              &lt;start&gt;1337&lt;/start&gt;
+                              &lt;end&gt;1479&lt;/end&gt;
+                            &lt;/range&gt;
+                     */
+<span class="nc" id="L756">                    return new RangeSet((List&lt;Range&gt;)(collectionConv.unmarshal(reader,context)));</span>
+                } else {
+<span class="fc" id="L758">                    return RangeSet.fromString(reader.getValue(),true);</span>
+                }
+            }
+        }
+    }
+
+    @Extension
+<span class="nc" id="L765">    public static final class ProjectRenameListener extends ItemListener {</span>
+        @Override
+        public void onLocationChanged(final Item item, final String oldName, final String newName) {
+<span class="nc" id="L768">            ACL.impersonate(ACL.SYSTEM, new Runnable() {</span>
+                @Override public void run() {
+<span class="nc" id="L770">                    locationChanged(item, oldName, newName);</span>
+<span class="nc" id="L771">                }</span>
+            });
+<span class="nc" id="L773">        }</span>
+        private void locationChanged(Item item, String oldName, String newName) {
+<span class="nc bnc" id="L775" title="All 2 branches missed.">            if (item instanceof AbstractProject) {</span>
+<span class="nc" id="L776">                AbstractProject p = Jenkins.getInstance().getItemByFullName(newName, AbstractProject.class);</span>
+<span class="nc bnc" id="L777" title="All 2 branches missed.">                if (p != null) {</span>
+<span class="nc" id="L778">                    RunList builds = p.getBuilds();</span>
+<span class="nc bnc" id="L779" title="All 2 branches missed.">                    for (Object build : builds) {</span>
+<span class="nc bnc" id="L780" title="All 2 branches missed.">                        if (build instanceof AbstractBuild) {</span>
+<span class="nc" id="L781">                            Collection&lt;Fingerprint&gt; fingerprints = ((AbstractBuild)build).getBuildFingerprints();</span>
+<span class="nc bnc" id="L782" title="All 2 branches missed.">                            for (Fingerprint f : fingerprints) {</span>
+                                try {
+<span class="nc" id="L784">                                    f.rename(oldName, newName);</span>
+<span class="nc" id="L785">                                } catch (IOException e) {</span>
+<span class="nc" id="L786">                                    logger.log(Level.WARNING, &quot;Failed to update fingerprint record &quot; + f.getFileName() + &quot; when &quot; + oldName + &quot; was renamed to &quot; + newName, e);</span>
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+<span class="nc" id="L793">        }</span>
+    }
+
+<span class="fc" id="L796">    private static final DateConverter DATE_CONVERTER = new DateConverter();</span>
+    
+    /**
+     * Time when the fingerprint has been captured.
+     */
+    private final @Nonnull Date timestamp;
+
+    /**
+     * Null if this fingerprint is for a file that's
+     * apparently produced outside.
+     */
+    private final @CheckForNull BuildPtr original;
+
+    private final byte[] md5sum;
+
+    private final String fileName;
+
+    /**
+     * Range of builds that use this file keyed by a job full name.
+     */
+<span class="fc" id="L816">    private final Hashtable&lt;String,RangeSet&gt; usages = new Hashtable&lt;String,RangeSet&gt;();</span>
+
+<span class="fc" id="L818">    PersistedList&lt;FingerprintFacet&gt; facets = new PersistedList&lt;FingerprintFacet&gt;(this);</span>
+
+    /**
+     * Lazily computed immutable {@link FingerprintFacet}s created from {@link TransientFingerprintFacetFactory}.
+     */
+<span class="fc" id="L823">    private transient volatile List&lt;FingerprintFacet&gt; transientFacets = null;</span>
+
+    public Fingerprint(@CheckForNull Run build, @Nonnull String fileName, @Nonnull byte[] md5sum) throws IOException {
+<span class="nc bnc" id="L826" title="All 2 branches missed.">        this(build==null ? null : new BuildPtr(build), fileName, md5sum);</span>
+<span class="nc" id="L827">        save();</span>
+<span class="nc" id="L828">    }</span>
+
+<span class="fc" id="L830">    Fingerprint(@CheckForNull BuildPtr original, @Nonnull String fileName, @Nonnull byte[] md5sum) {</span>
+<span class="fc" id="L831">        this.original = original;</span>
+<span class="fc" id="L832">        this.md5sum = md5sum;</span>
+<span class="fc" id="L833">        this.fileName = fileName;</span>
+<span class="fc" id="L834">        this.timestamp = new Date();</span>
+<span class="fc" id="L835">    }</span>
+
+    /**
+     * The first build in which this file showed up,
+     * if the file looked like it's created there.
+     * &lt;p&gt;
+     * This is considered as the &quot;source&quot; of this file,
+     * or the owner, in the sense that this project &quot;owns&quot;
+     * this file.
+     *
+     * @return null
+     *      if the file is apparently created outside Hudson or if the current
+     *      user has no permission to discover the job.
+     */
+    @Exported
+    public @CheckForNull BuildPtr getOriginal() {
+<span class="nc bnc" id="L851" title="All 4 branches missed.">        if (original != null &amp;&amp; original.hasPermissionToDiscoverBuild()) {</span>
+<span class="nc" id="L852">            return original;</span>
+        }
+<span class="nc" id="L854">        return null;</span>
+    }
+
+    public @Nonnull String getDisplayName() {
+<span class="nc" id="L858">        return fileName;</span>
+    }
+
+    /**
+     * The file name (like &quot;foo.jar&quot; without path).
+     */
+    @Exported
+    public @Nonnull String getFileName() {
+<span class="nc" id="L866">        return fileName;</span>
+    }
+
+    /**
+     * Gets the MD5 hash string.
+     */
+    @Exported(name=&quot;hash&quot;)
+    public @Nonnull String getHashString() {
+<span class="fc" id="L874">        return Util.toHexString(md5sum);</span>
+    }
+
+    /**
+     * Gets the timestamp when this record is created.
+     */
+    @Exported
+    public @Nonnull Date getTimestamp() {
+<span class="nc" id="L882">        return timestamp;</span>
+    }
+
+    /**
+     * Gets the string that says how long since this build has scheduled.
+     *
+     * @return
+     *      string like &quot;3 minutes&quot; &quot;1 day&quot; etc.
+     */
+    public @Nonnull String getTimestampString() {
+<span class="nc" id="L892">        long duration = System.currentTimeMillis()-timestamp.getTime();</span>
+<span class="nc" id="L893">        return Util.getPastTimeString(duration);</span>
+    }
+
+    /**
+     * Gets the build range set for the given job name.
+     *
+     * &lt;p&gt;
+     * These builds of this job has used this file.
+     * @return may be empty but not null.
+     */
+    public @Nonnull RangeSet getRangeSet(String jobFullName) {
+<span class="nc" id="L904">        RangeSet r = usages.get(jobFullName);</span>
+<span class="nc bnc" id="L905" title="All 2 branches missed.">        if(r==null) r = new RangeSet();</span>
+<span class="nc" id="L906">        return r;</span>
+    }
+
+    public RangeSet getRangeSet(Job job) {
+<span class="nc" id="L910">        return getRangeSet(job.getFullName());</span>
+    }
+
+    /**
+     * Gets the sorted list of job names where this jar is used.
+     */
+    public @Nonnull List&lt;String&gt; getJobs() {
+<span class="nc" id="L917">        List&lt;String&gt; r = new ArrayList&lt;String&gt;();</span>
+<span class="nc" id="L918">        r.addAll(usages.keySet());</span>
+<span class="nc" id="L919">        Collections.sort(r);</span>
+<span class="nc" id="L920">        return r;</span>
+    }
+
+    public @Nonnull Hashtable&lt;String,RangeSet&gt; getUsages() {
+<span class="nc" id="L924">        return usages;</span>
+    }
+
+    @ExportedBean(defaultVisibility=2)
+    public static final class RangeItem {
+        @Exported
+        public final String name;
+        @Exported
+        public final RangeSet ranges;
+
+<span class="nc" id="L934">        public RangeItem(String name, RangeSet ranges) {</span>
+<span class="nc" id="L935">            this.name = name;</span>
+<span class="nc" id="L936">            this.ranges = ranges;</span>
+<span class="nc" id="L937">        }</span>
+    }
+
+    // this is for remote API
+    @Exported(name=&quot;usage&quot;)
+    public @Nonnull List&lt;RangeItem&gt; _getUsages() {
+<span class="nc" id="L943">        List&lt;RangeItem&gt; r = new ArrayList&lt;RangeItem&gt;();</span>
+<span class="nc" id="L944">        final Jenkins instance = Jenkins.getInstance();</span>
+<span class="nc bnc" id="L945" title="All 2 branches missed.">        if (instance == null) {</span>
+<span class="nc" id="L946">            return r;</span>
+        }
+        
+<span class="nc bnc" id="L949" title="All 2 branches missed.">        for (Entry&lt;String, RangeSet&gt; e : usages.entrySet()) {</span>
+<span class="nc" id="L950">            final String itemName = e.getKey();</span>
+<span class="nc bnc" id="L951" title="All 4 branches missed.">            if (instance.hasPermission(Jenkins.ADMINISTER) || canDiscoverItem(itemName)) {</span>
+<span class="nc" id="L952">                r.add(new RangeItem(itemName, e.getValue()));</span>
+            }
+        }
+<span class="nc" id="L955">        return r;</span>
+    }
+
+    /**
+     * @deprecated Use {@link #addFor(hudson.model.Run)}
+     */
+    @Deprecated
+    public synchronized void add(@Nonnull AbstractBuild b) throws IOException {
+<span class="nc" id="L963">        addFor((Run) b);</span>
+<span class="nc" id="L964">    }</span>
+
+    /**
+     * Adds a usage reference to the build.
+     * @param b {@link Run} to be referenced in {@link #usages}
+     * @since 1.577
+     */
+    public synchronized void addFor(@Nonnull Run b) throws IOException {
+<span class="nc" id="L972">        add(b.getParent().getFullName(), b.getNumber());</span>
+<span class="nc" id="L973">    }</span>
+
+    /**
+     * Records that a build of a job has used this file.
+     */
+    public synchronized void add(@Nonnull String jobFullName, int n) throws IOException {
+<span class="nc" id="L979">        addWithoutSaving(jobFullName, n);</span>
+<span class="nc" id="L980">        save();</span>
+<span class="nc" id="L981">    }</span>
+
+    void addWithoutSaving(@Nonnull String jobFullName, int n) {
+<span class="pc" id="L984">        synchronized(usages) { // TODO why not synchronized (this) like some, though not all, other accesses?</span>
+<span class="fc" id="L985">            RangeSet r = usages.get(jobFullName);</span>
+<span class="fc bfc" id="L986" title="All 2 branches covered.">            if(r==null) {</span>
+<span class="fc" id="L987">                r = new RangeSet();</span>
+<span class="fc" id="L988">                usages.put(jobFullName,r);</span>
+            }
+<span class="fc" id="L990">            r.add(n);</span>
+        }
+<span class="fc" id="L992">    }</span>
+
+    /**
+     * Returns true if any of the builds recorded in this fingerprint
+     * is still retained.
+     *
+     * &lt;p&gt;
+     * This is used to find out old fingerprint records that can be removed
+     * without losing too much information.
+     */
+    public synchronized boolean isAlive() {
+<span class="nc bnc" id="L1003" title="All 4 branches missed.">        if(original!=null &amp;&amp; original.isAlive())</span>
+<span class="nc" id="L1004">            return true;</span>
+
+<span class="nc bnc" id="L1006" title="All 2 branches missed.">        for (Entry&lt;String,RangeSet&gt; e : usages.entrySet()) {</span>
+<span class="nc" id="L1007">            Job j = Jenkins.getInstance().getItemByFullName(e.getKey(),Job.class);</span>
+<span class="nc bnc" id="L1008" title="All 2 branches missed.">            if(j==null)</span>
+<span class="nc" id="L1009">                continue;</span>
+
+<span class="nc" id="L1011">            Run firstBuild = j.getFirstBuild();</span>
+<span class="nc bnc" id="L1012" title="All 2 branches missed.">            if(firstBuild==null)</span>
+<span class="nc" id="L1013">                continue;</span>
+
+<span class="nc" id="L1015">            int oldest = firstBuild.getNumber();</span>
+<span class="nc bnc" id="L1016" title="All 2 branches missed.">            if(!e.getValue().isSmallerThan(oldest))</span>
+<span class="nc" id="L1017">                return true;</span>
+        }
+<span class="nc" id="L1019">        return false;</span>
+    }
+
+    /**
+     * Trim off references to non-existent builds and jobs, thereby making the fingerprint smaller.
+     *
+     * @return true
+     *      if this record was modified.
+     * 
+     * @throws IOException Save failure
+     */
+    public synchronized boolean trim() throws IOException {
+<span class="nc" id="L1031">        boolean modified = false;</span>
+
+<span class="nc bnc" id="L1033" title="All 2 branches missed.">        for (Entry&lt;String,RangeSet&gt; e : new Hashtable&lt;String,RangeSet&gt;(usages).entrySet()) {// copy because we mutate</span>
+<span class="nc" id="L1034">            Job j = Jenkins.getInstance().getItemByFullName(e.getKey(),Job.class);</span>
+<span class="nc bnc" id="L1035" title="All 2 branches missed.">            if(j==null) {// no such job any more. recycle the record</span>
+<span class="nc" id="L1036">                modified = true;</span>
+<span class="nc" id="L1037">                usages.remove(e.getKey());</span>
+<span class="nc" id="L1038">                continue;</span>
+            }
+
+<span class="nc" id="L1041">            Run firstBuild = j.getFirstBuild();</span>
+<span class="nc bnc" id="L1042" title="All 2 branches missed.">            if(firstBuild==null) {// no builds. recycle the whole record</span>
+<span class="nc" id="L1043">                modified = true;</span>
+<span class="nc" id="L1044">                usages.remove(e.getKey());</span>
+<span class="nc" id="L1045">                continue;</span>
+            }
+
+<span class="nc" id="L1048">            RangeSet cur = e.getValue();</span>
+
+            // builds that are around without the keepLog flag on are normally clustered together (in terms of build #)
+            // so our basic strategy is to discard everything up to the first ephemeral build, except those builds
+            // that are marked as kept
+<span class="nc" id="L1053">            RangeSet kept = new RangeSet();</span>
+<span class="nc" id="L1054">            Run r = firstBuild;</span>
+<span class="nc bnc" id="L1055" title="All 4 branches missed.">            while (r!=null &amp;&amp; r.isKeepLog()) {</span>
+<span class="nc" id="L1056">                kept.add(r.getNumber());</span>
+<span class="nc" id="L1057">                r = r.getNextBuild();</span>
+            }
+
+<span class="nc bnc" id="L1060" title="All 2 branches missed.">            if (r==null) {</span>
+                // all the build records are permanently kept ones, so we'll just have to keep 'kept' out of whatever currently in 'cur'
+<span class="nc" id="L1062">                modified |= cur.retainAll(kept);</span>
+<span class="nc" id="L1063">            } else {</span>
+                // otherwise we are ready to discard [0,r.number) except those marked as 'kept'
+<span class="nc" id="L1065">                RangeSet discarding =  new RangeSet(new Range(-1,r.getNumber()));</span>
+<span class="nc" id="L1066">                discarding.removeAll(kept);</span>
+<span class="nc" id="L1067">                modified |= cur.removeAll(discarding);</span>
+            }
+
+<span class="nc bnc" id="L1070" title="All 2 branches missed.">            if (cur.isEmpty()) {</span>
+<span class="nc" id="L1071">                usages.remove(e.getKey());</span>
+<span class="nc" id="L1072">                modified = true;</span>
+            }
+        }
+
+<span class="nc bnc" id="L1076" title="All 2 branches missed.">        if (modified) {</span>
+<span class="nc bnc" id="L1077" title="All 2 branches missed.">            if (logger.isLoggable(Level.FINE)) {</span>
+<span class="nc" id="L1078">                logger.log(Level.FINE, &quot;Saving trimmed {0}&quot;, getFingerprintFile(md5sum));</span>
+            }
+<span class="nc" id="L1080">            save();</span>
+        }
+
+<span class="nc" id="L1083">        return modified;</span>
+    }
+
+
+    /**
+     * Gets the associated {@link FingerprintFacet}s.
+     *
+     * &lt;p&gt;
+     * This method always return a non-empty collection, which is a synthetic collection.
+     * It contains persisted {@link FingerprintFacet}s (those that are added explicitly, like
+     * {@code fingerprint.getFacets().add(x)}), as well those {@linkplain TransientFingerprintFacetFactory that are transient}.
+     *
+     * &lt;p&gt;
+     * Mutation to this collection will manipulate persisted set of {@link FingerprintFacet}s, and therefore regardless
+     * of what you do, this collection will always contain a set of {@link FingerprintFacet}s that are added
+     * by {@link TransientFingerprintFacetFactory}s.
+     *
+     * @since 1.421
+     */
+    public @Nonnull Collection&lt;FingerprintFacet&gt; getFacets() {
+<span class="nc bnc" id="L1103" title="All 2 branches missed.">        if (transientFacets==null) {</span>
+<span class="nc" id="L1104">            List&lt;FingerprintFacet&gt; transientFacets = new ArrayList&lt;FingerprintFacet&gt;();</span>
+<span class="nc bnc" id="L1105" title="All 2 branches missed.">            for (TransientFingerprintFacetFactory fff : TransientFingerprintFacetFactory.all()) {</span>
+<span class="nc" id="L1106">                fff.createFor(this,transientFacets);</span>
+            }
+<span class="nc" id="L1108">            this.transientFacets = ImmutableList.copyOf(transientFacets);</span>
+        }
+
+<span class="nc" id="L1111">        return new AbstractCollection&lt;FingerprintFacet&gt;() {</span>
+            @Override
+            public Iterator&lt;FingerprintFacet&gt; iterator() {
+<span class="nc" id="L1114">                return Iterators.sequence(facets.iterator(), transientFacets.iterator());</span>
+            }
+
+            @Override
+            public boolean add(FingerprintFacet e) {
+<span class="nc" id="L1119">                facets.add(e);</span>
+<span class="nc" id="L1120">                return true;</span>
+            }
+
+            @Override
+            public boolean remove(Object o) {
+<span class="nc" id="L1125">                return facets.remove(o);</span>
+            }
+
+            @Override
+            public boolean contains(Object o) {
+<span class="nc bnc" id="L1130" title="All 4 branches missed.">                return facets.contains(o) || transientFacets.contains(o);</span>
+            }
+
+            @Override
+            public int size() {
+<span class="nc" id="L1135">                return facets.size()+transientFacets.size();</span>
+            }
+        };
+    }
+
+    /**
+     * Sorts {@link FingerprintFacet}s by their timestamps.
+     * @return Sorted list of {@link FingerprintFacet}s 
+     */
+    public @Nonnull Collection&lt;FingerprintFacet&gt; getSortedFacets() {
+<span class="nc" id="L1145">        List&lt;FingerprintFacet&gt; r = new ArrayList&lt;FingerprintFacet&gt;(getFacets());</span>
+<span class="nc" id="L1146">        Collections.sort(r,new Comparator&lt;FingerprintFacet&gt;() {</span>
+            public int compare(FingerprintFacet o1, FingerprintFacet o2) {
+<span class="nc" id="L1148">                long a = o1.getTimestamp();</span>
+<span class="nc" id="L1149">                long b = o2.getTimestamp();</span>
+<span class="nc bnc" id="L1150" title="All 2 branches missed.">                if (a&lt;b)    return -1;</span>
+<span class="nc bnc" id="L1151" title="All 2 branches missed.">                if (a==b)   return 0;</span>
+<span class="nc" id="L1152">                return 1;</span>
+            }
+        });
+<span class="nc" id="L1155">        return r;</span>
+    }
+
+    /**
+     * Finds a facet of the specific type (including subtypes.)
+     * @param &lt;T&gt; Class of the {@link FingerprintFacet}
+     * @return First matching facet of the specified class
+     * @since 1.556
+     */
+    public @CheckForNull &lt;T extends FingerprintFacet&gt; T getFacet(Class&lt;T&gt; type) {
+<span class="nc bnc" id="L1165" title="All 2 branches missed.">        for (FingerprintFacet f : getFacets()) {</span>
+<span class="nc bnc" id="L1166" title="All 2 branches missed.">            if (type.isInstance(f))</span>
+<span class="nc" id="L1167">                return type.cast(f);</span>
+        }
+<span class="nc" id="L1169">        return null;</span>
+    }
+
+    /**
+     * Returns the actions contributed from {@link #getFacets()}
+     */
+    public @Nonnull List&lt;Action&gt; getActions() {
+<span class="nc" id="L1176">        List&lt;Action&gt; r = new ArrayList&lt;Action&gt;();</span>
+<span class="nc bnc" id="L1177" title="All 2 branches missed.">        for (FingerprintFacet ff : getFacets())</span>
+<span class="nc" id="L1178">            ff.createActions(r);</span>
+<span class="nc" id="L1179">        return Collections.unmodifiableList(r);</span>
+    }
+
+    /**
+     * Save the settings to a file.
+     * @throws IOException Save error
+     */
+    public synchronized void save() throws IOException {
+<span class="nc bnc" id="L1187" title="All 2 branches missed.">        if(BulkChange.contains(this))   return;</span>
+
+<span class="nc" id="L1189">        long start=0;</span>
+<span class="nc bnc" id="L1190" title="All 2 branches missed.">        if(logger.isLoggable(Level.FINE))</span>
+<span class="nc" id="L1191">            start = System.currentTimeMillis();</span>
+
+<span class="nc" id="L1193">        File file = getFingerprintFile(md5sum);</span>
+<span class="nc" id="L1194">        save(file);</span>
+<span class="nc" id="L1195">        SaveableListener.fireOnChange(this, getConfigFile(file));</span>
+
+<span class="nc bnc" id="L1197" title="All 2 branches missed.">        if(logger.isLoggable(Level.FINE))</span>
+<span class="nc" id="L1198">            logger.fine(&quot;Saving fingerprint &quot;+file+&quot; took &quot;+(System.currentTimeMillis()-start)+&quot;ms&quot;);</span>
+<span class="nc" id="L1199">    }</span>
+
+    void save(File file) throws IOException {
+<span class="fc bfc" id="L1202" title="All 2 branches covered.">        if (facets.isEmpty()) {</span>
+<span class="fc" id="L1203">            file.getParentFile().mkdirs();</span>
+            // JENKINS-16301: fast path for the common case.
+<span class="fc" id="L1205">            AtomicFileWriter afw = new AtomicFileWriter(file);</span>
+            try {
+<span class="fc" id="L1207">                PrintWriter w = new PrintWriter(afw);</span>
+<span class="fc" id="L1208">                w.println(&quot;&lt;?xml version='1.0' encoding='UTF-8'?&gt;&quot;);</span>
+<span class="fc" id="L1209">                w.println(&quot;&lt;fingerprint&gt;&quot;);</span>
+<span class="fc" id="L1210">                w.print(&quot;  &lt;timestamp&gt;&quot;);</span>
+<span class="fc" id="L1211">                w.print(DATE_CONVERTER.toString(timestamp));</span>
+<span class="fc" id="L1212">                w.println(&quot;&lt;/timestamp&gt;&quot;);</span>
+<span class="pc bpc" id="L1213" title="1 of 2 branches missed.">                if (original != null) {</span>
+<span class="fc" id="L1214">                    w.println(&quot;  &lt;original&gt;&quot;);</span>
+<span class="fc" id="L1215">                    w.print(&quot;    &lt;name&gt;&quot;);</span>
+<span class="fc" id="L1216">                    w.print(Util.xmlEscape(original.name));</span>
+<span class="fc" id="L1217">                    w.println(&quot;&lt;/name&gt;&quot;);</span>
+<span class="fc" id="L1218">                    w.print(&quot;    &lt;number&gt;&quot;);</span>
+<span class="fc" id="L1219">                    w.print(original.number);</span>
+<span class="fc" id="L1220">                    w.println(&quot;&lt;/number&gt;&quot;);</span>
+<span class="fc" id="L1221">                    w.println(&quot;  &lt;/original&gt;&quot;);</span>
+                }
+<span class="fc" id="L1223">                w.print(&quot;  &lt;md5sum&gt;&quot;);</span>
+<span class="fc" id="L1224">                w.print(Util.toHexString(md5sum));</span>
+<span class="fc" id="L1225">                w.println(&quot;&lt;/md5sum&gt;&quot;);</span>
+<span class="fc" id="L1226">                w.print(&quot;  &lt;fileName&gt;&quot;);</span>
+<span class="fc" id="L1227">                w.print(Util.xmlEscape(fileName));</span>
+<span class="fc" id="L1228">                w.println(&quot;&lt;/fileName&gt;&quot;);</span>
+<span class="fc" id="L1229">                w.println(&quot;  &lt;usages&gt;&quot;);</span>
+<span class="fc bfc" id="L1230" title="All 2 branches covered.">                for (Map.Entry&lt;String,RangeSet&gt; e : usages.entrySet()) {</span>
+<span class="fc" id="L1231">                    w.println(&quot;    &lt;entry&gt;&quot;);</span>
+<span class="fc" id="L1232">                    w.print(&quot;      &lt;string&gt;&quot;);</span>
+<span class="fc" id="L1233">                    w.print(Util.xmlEscape(e.getKey()));</span>
+<span class="fc" id="L1234">                    w.println(&quot;&lt;/string&gt;&quot;);</span>
+<span class="fc" id="L1235">                    w.print(&quot;      &lt;ranges&gt;&quot;);</span>
+<span class="fc" id="L1236">                    w.print(RangeSet.ConverterImpl.serialize(e.getValue()));</span>
+<span class="fc" id="L1237">                    w.println(&quot;&lt;/ranges&gt;&quot;);</span>
+<span class="fc" id="L1238">                    w.println(&quot;    &lt;/entry&gt;&quot;);</span>
+                }
+<span class="fc" id="L1240">                w.println(&quot;  &lt;/usages&gt;&quot;);</span>
+<span class="fc" id="L1241">                w.println(&quot;  &lt;facets/&gt;&quot;);</span>
+<span class="fc" id="L1242">                w.print(&quot;&lt;/fingerprint&gt;&quot;);</span>
+<span class="fc" id="L1243">                w.flush();</span>
+<span class="fc" id="L1244">                afw.commit();</span>
+<span class="pc" id="L1245">            } finally {</span>
+<span class="pc" id="L1246">                afw.abort();</span>
+<span class="nc" id="L1247">            }</span>
+<span class="fc" id="L1248">        } else {</span>
+            // Slower fallback that can persist facets.
+<span class="fc" id="L1250">            getConfigFile(file).write(this);</span>
+        }
+<span class="fc" id="L1252">    }</span>
+
+    /**
+     * Update references to a renamed job in the fingerprint
+     */
+    public synchronized void rename(String oldName, String newName) throws IOException {
+<span class="nc" id="L1258">        boolean touched = false;</span>
+<span class="nc bnc" id="L1259" title="All 2 branches missed.">        if (original != null) {</span>
+<span class="nc bnc" id="L1260" title="All 2 branches missed.">            if (original.getName().equals(oldName)) {</span>
+<span class="nc" id="L1261">                original.setName(newName);</span>
+<span class="nc" id="L1262">                touched = true;</span>
+            }
+        }
+        
+<span class="nc bnc" id="L1266" title="All 2 branches missed.">        if (usages != null) {</span>
+<span class="nc" id="L1267">            RangeSet r = usages.get(oldName);</span>
+<span class="nc bnc" id="L1268" title="All 2 branches missed.">            if (r != null) {</span>
+<span class="nc" id="L1269">                usages.put(newName, r);</span>
+<span class="nc" id="L1270">                usages.remove(oldName);</span>
+<span class="nc" id="L1271">                touched = true;</span>
+            }
+        }
+        
+<span class="nc bnc" id="L1275" title="All 2 branches missed.">        if (touched) {</span>
+<span class="nc" id="L1276">            save();</span>
+        }
+<span class="nc" id="L1278">    }</span>
+    
+    public Api getApi() {
+<span class="nc" id="L1281">        return new Api(this);</span>
+    }
+
+    /**
+     * The file we save our configuration.
+     */
+    private static @Nonnull XmlFile getConfigFile(@Nonnull File file) {
+<span class="fc" id="L1288">        return new XmlFile(XSTREAM,file);</span>
+    }
+
+    /**
+     * Determines the file name from md5sum.
+     */
+    private static @Nonnull File getFingerprintFile(@Nonnull byte[] md5sum) {
+<span class="nc bnc" id="L1295" title="All 4 branches missed.">        assert md5sum.length==16;</span>
+<span class="nc" id="L1296">        return new File( Jenkins.getInstance().getRootDir(),</span>
+<span class="nc" id="L1297">            &quot;fingerprints/&quot;+ Util.toHexString(md5sum,0,1)+'/'+Util.toHexString(md5sum,1,1)+'/'+Util.toHexString(md5sum,2,md5sum.length-2)+&quot;.xml&quot;);</span>
+    }
+
+    /**
+     * Loads a {@link Fingerprint} from a file in the image.
+     * @return Loaded {@link Fingerprint}. Null if the config file does not exist or
+     * malformed.
+     */
+    /*package*/ static @CheckForNull Fingerprint load(@Nonnull byte[] md5sum) throws IOException {
+<span class="nc" id="L1306">        return load(getFingerprintFile(md5sum));</span>
+    }
+    /*package*/ static @CheckForNull Fingerprint load(@Nonnull File file) throws IOException {
+<span class="fc" id="L1309">        XmlFile configFile = getConfigFile(file);</span>
+<span class="pc bpc" id="L1310" title="1 of 2 branches missed.">        if(!configFile.exists())</span>
+<span class="nc" id="L1311">            return null;</span>
+
+<span class="fc" id="L1313">        long start=0;</span>
+<span class="pc bpc" id="L1314" title="1 of 2 branches missed.">        if(logger.isLoggable(Level.FINE))</span>
+<span class="nc" id="L1315">            start = System.currentTimeMillis();</span>
+
+        try {
+<span class="fc" id="L1318">            Fingerprint f = (Fingerprint) configFile.read();</span>
+<span class="pc bpc" id="L1319" title="1 of 2 branches missed.">            if(logger.isLoggable(Level.FINE))</span>
+<span class="nc" id="L1320">                logger.fine(&quot;Loading fingerprint &quot;+file+&quot; took &quot;+(System.currentTimeMillis()-start)+&quot;ms&quot;);</span>
+<span class="pc bpc" id="L1321" title="1 of 2 branches missed.">            if (f.facets==null)</span>
+<span class="nc" id="L1322">                f.facets = new PersistedList&lt;FingerprintFacet&gt;(f);</span>
+<span class="fc bfc" id="L1323" title="All 2 branches covered.">            for (FingerprintFacet facet : f.facets)</span>
+<span class="fc" id="L1324">                facet._setOwner(f);</span>
+<span class="fc" id="L1325">            return f;</span>
+<span class="nc" id="L1326">        } catch (IOException e) {</span>
+<span class="nc bnc" id="L1327" title="All 4 branches missed.">            if(file.exists() &amp;&amp; file.length()==0) {</span>
+                // Despite the use of AtomicFile, there are reports indicating that people often see
+                // empty XML file, presumably either due to file system corruption (perhaps by sudden
+                // power loss, etc.) or abnormal program termination.
+                // generally we don't want to wipe out user data just because we can't load it,
+                // but if the file size is 0, which is what's reported in HUDSON-2012, then it seems
+                // like recovering it silently by deleting the file is not a bad idea.
+<span class="nc" id="L1334">                logger.log(Level.WARNING, &quot;Size zero fingerprint. Disk corruption? {0}&quot;, configFile);</span>
+<span class="nc" id="L1335">                file.delete();</span>
+<span class="nc" id="L1336">                return null;</span>
+            }
+<span class="nc" id="L1338">            String parseError = messageOfParseException(e);</span>
+<span class="nc bnc" id="L1339" title="All 2 branches missed.">            if (parseError != null) {</span>
+<span class="nc" id="L1340">                logger.log(Level.WARNING, &quot;Malformed XML in {0}: {1}&quot;, new Object[] {configFile, parseError});</span>
+<span class="nc" id="L1341">                file.delete();</span>
+<span class="nc" id="L1342">                return null;</span>
+            }
+<span class="nc" id="L1344">            logger.log(Level.WARNING, &quot;Failed to load &quot;+configFile,e);</span>
+<span class="nc" id="L1345">            throw e;</span>
+        }
+    }
+    private static String messageOfParseException(Throwable t) {
+<span class="nc bnc" id="L1349" title="All 4 branches missed.">        if (t instanceof XmlPullParserException || t instanceof EOFException) {</span>
+<span class="nc" id="L1350">            return t.getMessage();</span>
+        }
+<span class="nc" id="L1352">        Throwable t2 = t.getCause();</span>
+<span class="nc bnc" id="L1353" title="All 2 branches missed.">        if (t2 != null) {</span>
+<span class="nc" id="L1354">            return messageOfParseException(t2);</span>
+        } else {
+<span class="nc" id="L1356">            return null;</span>
+        }
+    }
+
+    @Override public String toString() {
+<span class="fc" id="L1361">        return &quot;Fingerprint[original=&quot; + original + &quot;,hash=&quot; + getHashString() + &quot;,fileName=&quot; + fileName + &quot;,timestamp=&quot; + DATE_CONVERTER.toString(timestamp) + &quot;,usages=&quot; + new TreeMap&lt;String,RangeSet&gt;(usages) + &quot;,facets=&quot; + facets + &quot;]&quot;;</span>
+    }
+    
+    /**
+     * Checks if the current user can Discover the item.
+     * If yes, it may be displayed as a text in Fingerprint UIs.
+     * @param fullName Full name of the job
+     * @return {@code true} if the user can discover the item
+     */
+    private static boolean canDiscoverItem(@Nonnull final String fullName) {
+<span class="nc" id="L1371">        final Jenkins jenkins = Jenkins.getInstance();</span>
+<span class="nc bnc" id="L1372" title="All 2 branches missed.">        if (jenkins == null) {</span>
+<span class="nc" id="L1373">            return false;</span>
+        }
+        
+        // Fast check to avoid security context switches
+<span class="nc" id="L1377">        Item item = null;</span>
+        try {
+<span class="nc" id="L1379">            item = jenkins.getItemByFullName(fullName);</span>
+<span class="nc" id="L1380">        } catch (AccessDeniedException ex) {</span>
+            // ignore, we will fall-back later
+        }
+<span class="nc bnc" id="L1383" title="All 2 branches missed.">        if (item != null) {</span>
+<span class="nc" id="L1384">            return true;</span>
+        }
+          
+        // Probably it failed due to the missing Item.DISCOVER
+        // We try to retrieve the job using SYSTEM user and to check permissions manually.
+<span class="nc" id="L1389">        final Authentication userAuth = Jenkins.getAuthentication();</span>
+<span class="nc" id="L1390">        final boolean[] res = new boolean[] {false};</span>
+<span class="nc" id="L1391">        ACL.impersonate(ACL.SYSTEM, new Runnable() {</span>
+            @Override
+            public void run() {
+<span class="nc" id="L1394">                final Item itemBySystemUser = jenkins.getItemByFullName(fullName);</span>
+<span class="nc bnc" id="L1395" title="All 2 branches missed.">                if (itemBySystemUser == null) {</span>
+<span class="nc" id="L1396">                    return;</span>
+                }
+                
+                // To get the item existence fact, a user needs Item.DISCOVER for the item
+                // and Item.READ for all container folders.
+<span class="nc" id="L1401">                boolean canDiscoverTheItem = itemBySystemUser.getACL().hasPermission(userAuth, Item.DISCOVER);</span>
+<span class="nc bnc" id="L1402" title="All 2 branches missed.">                if (canDiscoverTheItem) {</span>
+<span class="nc" id="L1403">                    ItemGroup&lt;?&gt; current = itemBySystemUser.getParent();</span>
+                    do {
+<span class="nc bnc" id="L1405" title="All 2 branches missed.">                        if (current instanceof Item) {</span>
+<span class="nc" id="L1406">                            final Item item = (Item) current;</span>
+<span class="nc" id="L1407">                            current = item.getParent();</span>
+<span class="nc bnc" id="L1408" title="All 2 branches missed.">                            if (!item.getACL().hasPermission(userAuth, Item.READ)) {</span>
+<span class="nc" id="L1409">                                canDiscoverTheItem = false;</span>
+                            }
+<span class="nc" id="L1411">                        } else {</span>
+<span class="nc" id="L1412">                            current = null;</span>
+                        }
+<span class="nc bnc" id="L1414" title="All 4 branches missed.">                    } while (canDiscoverTheItem &amp;&amp; current != null);</span>
+                }
+<span class="nc" id="L1416">                res[0] = canDiscoverTheItem;</span>
+<span class="nc" id="L1417">            }</span>
+        });
+<span class="nc" id="L1419">        return res[0];</span>
+    }
+
+<span class="fc" id="L1422">    private static final XStream XSTREAM = new XStream2();</span>
+    static {
+<span class="fc" id="L1424">        XSTREAM.alias(&quot;fingerprint&quot;,Fingerprint.class);</span>
+<span class="fc" id="L1425">        XSTREAM.alias(&quot;range&quot;,Range.class);</span>
+<span class="fc" id="L1426">        XSTREAM.alias(&quot;ranges&quot;,RangeSet.class);</span>
+<span class="fc" id="L1427">        XSTREAM.registerConverter(new HexBinaryConverter(),10);</span>
+<span class="fc" id="L1428">        XSTREAM.registerConverter(new RangeSet.ConverterImpl(</span>
+<span class="fc" id="L1429">            new CollectionConverter(XSTREAM.getMapper()) {</span>
+                @Override
+                protected Object createCollection(Class type) {
+<span class="nc" id="L1432">                    return new ArrayList();</span>
+                }
+            }
+<span class="fc" id="L1435">        ),10);</span>
+    }
+
+<span class="fc" id="L1438">    private static final Logger logger = Logger.getLogger(Fingerprint.class.getName());</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

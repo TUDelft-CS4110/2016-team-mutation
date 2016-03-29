@@ -1,0 +1,1277 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>View.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.model</a> &gt; <span class="el_source">View.java</span></div><h1>View.java</h1><pre class="source lang-java linenums"><span class="pc" id="L1">/*</span>
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2011, Sun Microsystems, Inc., Kohsuke Kawaguchi, Tom Huybrechts,
+ * Yahoo!, Inc.
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.model;
+
+import com.thoughtworks.xstream.converters.ConversionException;
+import com.thoughtworks.xstream.io.StreamException;
+import com.thoughtworks.xstream.io.xml.XppDriver;
+import hudson.DescriptorExtensionList;
+import hudson.Extension;
+import hudson.ExtensionPoint;
+import hudson.Functions;
+import hudson.Indenter;
+import hudson.Util;
+import hudson.model.Descriptor.FormException;
+import hudson.model.labels.LabelAtomPropertyDescriptor;
+import hudson.scm.ChangeLogSet;
+import hudson.scm.ChangeLogSet.Entry;
+import hudson.search.CollectionSearchIndex;
+import hudson.search.SearchIndexBuilder;
+import hudson.security.ACL;
+import hudson.security.AccessControlled;
+import hudson.security.Permission;
+import hudson.security.PermissionGroup;
+import hudson.security.PermissionScope;
+import hudson.tasks.UserAvatarResolver;
+import hudson.util.AlternativeUiTextProvider;
+import hudson.util.AlternativeUiTextProvider.Message;
+import hudson.util.DescribableList;
+import hudson.util.DescriptorList;
+import hudson.util.FormApply;
+import hudson.util.RunList;
+import hudson.util.XStream2;
+import hudson.views.ListViewColumn;
+import hudson.widgets.Widget;
+import jenkins.model.Jenkins;
+import jenkins.model.ModelObjectWithChildren;
+import jenkins.util.ProgressiveRendering;
+import jenkins.util.xml.XMLUtils;
+
+import net.sf.json.JSON;
+import net.sf.json.JSONArray;
+import net.sf.json.JSONObject;
+import org.apache.tools.ant.filters.StringInputStream;
+import org.kohsuke.stapler.HttpResponse;
+import org.kohsuke.stapler.HttpResponses;
+import org.kohsuke.stapler.Stapler;
+import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.StaplerResponse;
+import org.kohsuke.stapler.WebMethod;
+import org.kohsuke.stapler.export.Exported;
+import org.kohsuke.stapler.export.ExportedBean;
+import org.kohsuke.stapler.interceptor.RequirePOST;
+
+import javax.servlet.ServletException;
+import javax.servlet.http.HttpServletResponse;
+import javax.xml.transform.Source;
+import javax.xml.transform.TransformerException;
+import javax.xml.transform.stream.StreamResult;
+import javax.xml.transform.stream.StreamSource;
+import java.io.BufferedInputStream;
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.io.StringWriter;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Calendar;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.GregorianCalendar;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+import static javax.servlet.http.HttpServletResponse.SC_BAD_REQUEST;
+import static jenkins.model.Jenkins.*;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
+import org.xml.sax.SAXException;
+
+/**
+ * Encapsulates the rendering of the list of {@link TopLevelItem}s
+ * that {@link Jenkins} owns.
+ *
+ * &lt;p&gt;
+ * This is an extension point in Hudson, allowing different kind of
+ * rendering to be added as plugins.
+ *
+ * &lt;h2&gt;Note for implementers&lt;/h2&gt;
+ * &lt;ul&gt;
+ * &lt;li&gt;
+ * {@link View} subtypes need the &lt;tt&gt;newViewDetail.jelly&lt;/tt&gt; page,
+ * which is included in the &quot;new view&quot; page. This page should have some
+ * description of what the view is about. 
+ * &lt;/ul&gt;
+ *
+ * @author Kohsuke Kawaguchi
+ * @see ViewDescriptor
+ * @see ViewGroup
+ */
+@ExportedBean
+public abstract class View extends AbstractModelObject implements AccessControlled, Describable&lt;View&gt;, ExtensionPoint, Saveable, ModelObjectWithChildren {
+
+    /**
+     * Container of this view. Set right after the construction
+     * and never change thereafter.
+     */
+    protected /*final*/ ViewGroup owner;
+
+    /**
+     * Name of this view.
+     */
+    protected String name;
+
+    /**
+     * Message displayed in the view page.
+     */
+    protected String description;
+    
+    /**
+     * If true, only show relevant executors
+     */
+    protected boolean filterExecutors;
+
+    /**
+     * If true, only show relevant queue items
+     */
+    protected boolean filterQueue;
+    
+    protected transient List&lt;Action&gt; transientActions;
+
+    /**
+     * List of {@link ViewProperty}s configured for this view.
+     * @since 1.406
+     */
+<span class="pc" id="L165">    private volatile DescribableList&lt;ViewProperty,ViewPropertyDescriptor&gt; properties = new PropertyList(this);</span>
+
+<span class="fc" id="L167">    protected View(String name) {</span>
+<span class="fc" id="L168">        this.name = name;</span>
+<span class="fc" id="L169">    }</span>
+
+<span class="nc" id="L171">    protected View(String name, ViewGroup owner) {</span>
+<span class="nc" id="L172">        this.name = name;</span>
+<span class="nc" id="L173">        this.owner = owner;</span>
+<span class="nc" id="L174">    }</span>
+
+    /**
+     * Gets all the items in this collection in a read-only view.
+     */
+    @Exported(name=&quot;jobs&quot;)
+    public abstract Collection&lt;TopLevelItem&gt; getItems();
+
+    /**
+     * Gets all the items recursively contained in this collection in a read-only view.
+     * &lt;p&gt;
+     * The default implementation recursively adds the items of all contained Views
+     * in case this view implements {@link ViewGroup}, which should be enough for most cases.
+     *
+     * @since 1.520
+     */
+    public Collection&lt;TopLevelItem&gt; getAllItems() {
+
+<span class="fc bfc" id="L192" title="All 2 branches covered.">        if (this instanceof ViewGroup) {</span>
+<span class="fc" id="L193">            final Collection&lt;TopLevelItem&gt; items = new LinkedHashSet&lt;TopLevelItem&gt;(getItems());</span>
+
+<span class="fc bfc" id="L195" title="All 2 branches covered.">            for(View view: ((ViewGroup) this).getViews()) {</span>
+<span class="fc" id="L196">                items.addAll(view.getAllItems());</span>
+            }
+<span class="fc" id="L198">            return Collections.unmodifiableCollection(items);</span>
+        } else {
+<span class="fc" id="L200">            return getItems();</span>
+        }
+    }
+
+    /**
+     * Gets the {@link TopLevelItem} of the given name.
+     */
+    public TopLevelItem getItem(String name) {
+<span class="nc" id="L208">        return getOwnerItemGroup().getItem(name);</span>
+    }
+
+    /**
+     * Alias for {@link #getItem(String)}. This is the one used in the URL binding.
+     */
+    public final TopLevelItem getJob(String name) {
+<span class="nc" id="L215">        return getItem(name);</span>
+    }
+
+    /**
+     * Checks if the job is in this collection.
+     */
+    public abstract boolean contains(TopLevelItem item);
+
+    /**
+     * Gets the name of all this collection.
+     *
+     * @see #rename(String)
+     */
+    @Exported(visibility=2,name=&quot;name&quot;)
+    public String getViewName() {
+<span class="nc" id="L230">        return name;</span>
+    }
+
+    /**
+     * Renames this view.
+     */
+    public void rename(String newName) throws Failure, FormException {
+<span class="nc bnc" id="L237" title="All 2 branches missed.">        if(name.equals(newName))    return; // noop</span>
+<span class="nc" id="L238">        checkGoodName(newName);</span>
+<span class="nc bnc" id="L239" title="All 2 branches missed.">        if(owner.getView(newName)!=null)</span>
+<span class="nc" id="L240">            throw new FormException(Messages.Hudson_ViewAlreadyExists(newName),&quot;name&quot;);</span>
+<span class="nc" id="L241">        String oldName = name;</span>
+<span class="nc" id="L242">        name = newName;</span>
+<span class="nc" id="L243">        owner.onViewRenamed(this,oldName,newName);</span>
+<span class="nc" id="L244">    }</span>
+
+    /**
+     * Gets the {@link ViewGroup} that this view belongs to.
+     */
+    public ViewGroup getOwner() {
+<span class="nc" id="L250">        return owner;</span>
+    }
+
+    /**
+     * Backward-compatible way of getting {@code getOwner().getItemGroup()}
+     */
+    public ItemGroup&lt;? extends TopLevelItem&gt; getOwnerItemGroup() {
+        try {
+<span class="nc" id="L258">            return owner.getItemGroup();</span>
+<span class="nc" id="L259">        } catch (AbstractMethodError e) {</span>
+<span class="nc" id="L260">            return Jenkins.getInstance();</span>
+        }
+    }
+
+    public View getOwnerPrimaryView() {
+        try {
+<span class="nc" id="L266">            return _getOwnerPrimaryView();</span>
+<span class="nc" id="L267">        } catch (AbstractMethodError e) {</span>
+<span class="nc" id="L268">            return null;</span>
+        }
+    }
+
+    private View _getOwnerPrimaryView() {
+<span class="nc" id="L273">        return owner.getPrimaryView();</span>
+    }
+
+    public List&lt;Action&gt; getOwnerViewActions() {
+        try {
+<span class="nc" id="L278">            return _getOwnerViewActions();</span>
+<span class="nc" id="L279">        } catch (AbstractMethodError e) {</span>
+<span class="nc" id="L280">            return Jenkins.getInstance().getActions();</span>
+        }
+    }
+
+    private List&lt;Action&gt; _getOwnerViewActions() {
+<span class="nc" id="L285">        return owner.getViewActions();</span>
+    }
+
+    /**
+     * Message displayed in the top page. Can be null. Includes HTML.
+     */
+    @Exported
+    public String getDescription() {
+<span class="nc" id="L293">        return description;</span>
+    }
+    
+    /**
+     * Gets the view properties configured for this view.
+     * @since 1.406
+     */
+    public DescribableList&lt;ViewProperty,ViewPropertyDescriptor&gt; getProperties() {
+        // readResolve was the best place to do this, but for compatibility reasons,
+        // this class can no longer have readResolve() (the mechanism itself isn't suitable for class hierarchy)
+        // see JENKINS-9431
+        //
+        // until we have that, putting this logic here.
+<span class="nc" id="L306">        synchronized (PropertyList.class) {</span>
+<span class="nc bnc" id="L307" title="All 2 branches missed.">            if (properties == null) {</span>
+<span class="nc" id="L308">                properties = new PropertyList(this);</span>
+<span class="nc" id="L309">            } else {</span>
+<span class="nc" id="L310">                properties.setOwner(this);</span>
+            }
+<span class="nc" id="L312">            return properties;</span>
+        }
+    }
+
+    /**
+     * Returns all the {@link LabelAtomPropertyDescriptor}s that can be potentially configured
+     * on this label.
+     */
+    public List&lt;ViewPropertyDescriptor&gt; getApplicablePropertyDescriptors() {
+<span class="nc" id="L321">        List&lt;ViewPropertyDescriptor&gt; r = new ArrayList&lt;ViewPropertyDescriptor&gt;();</span>
+<span class="nc bnc" id="L322" title="All 2 branches missed.">        for (ViewPropertyDescriptor pd : ViewProperty.all()) {</span>
+<span class="nc bnc" id="L323" title="All 2 branches missed.">            if (pd.isEnabledFor(this))</span>
+<span class="nc" id="L324">                r.add(pd);</span>
+        }
+<span class="nc" id="L326">        return r;</span>
+    }
+
+    public void save() throws IOException {
+        // persistence is a part of the owner
+        // due to initialization timing issue, it can be null when this method is called
+<span class="nc bnc" id="L332" title="All 2 branches missed.">        if (owner != null) {</span>
+<span class="nc" id="L333">            owner.save();</span>
+        }
+<span class="nc" id="L335">    }</span>
+
+    /**
+     * List of all {@link ViewProperty}s exposed primarily for the remoting API.
+     * @since 1.406
+     */
+    @Exported(name=&quot;property&quot;,inline=true)
+    public List&lt;ViewProperty&gt; getAllProperties() {
+<span class="nc" id="L343">        return getProperties().toList();</span>
+    }
+
+    public ViewDescriptor getDescriptor() {
+<span class="nc" id="L347">        return (ViewDescriptor) Jenkins.getInstance().getDescriptorOrDie(getClass());</span>
+    }
+
+    public String getDisplayName() {
+<span class="nc" id="L351">        return getViewName();</span>
+    }
+
+    public String getNewPronoun() {
+<span class="nc" id="L355">        return AlternativeUiTextProvider.get(NEW_PRONOUN, this, Messages.AbstractItem_Pronoun());</span>
+    }
+
+    /**
+     * By default, return true to render the &quot;Edit view&quot; link on the page.
+     * This method is really just for the default &quot;All&quot; view to hide the edit link
+     * so that the default Hudson top page remains the same as before 1.316.
+     *
+     * @since 1.316
+     */
+    public boolean isEditable() {
+<span class="nc" id="L366">        return true;</span>
+    }
+    
+    /**
+     * Enables or disables automatic refreshes of the view.
+     * By default, automatic refreshes are enabled.
+     * @since 1.557
+     */
+    public boolean isAutomaticRefreshEnabled() {
+<span class="nc" id="L375">        return true;</span>
+    }
+    
+    /**
+     * If true, only show relevant executors
+     */
+    public boolean isFilterExecutors() {
+<span class="nc" id="L382">        return filterExecutors;</span>
+    }
+    
+    /**
+     * If true, only show relevant queue items
+     */
+    public boolean isFilterQueue() {
+<span class="nc" id="L389">        return filterQueue;</span>
+    }
+
+    /**
+     * Gets the {@link Widget}s registered on this object.
+     *
+     * &lt;p&gt;
+     * For now, this just returns the widgets registered to Hudson.
+     */
+    public List&lt;Widget&gt; getWidgets() {
+<span class="nc" id="L399">        return Collections.unmodifiableList(Jenkins.getInstance().getWidgets());</span>
+    }
+
+    /**
+     * If this view uses &amp;lt;t:projectView&gt; for rendering, this method returns columns to be displayed.
+     */
+    public Iterable&lt;? extends ListViewColumn&gt; getColumns() {
+<span class="nc" id="L406">        return ListViewColumn.createDefaultInitialColumnList();</span>
+    }
+
+    /**
+     * If this view uses &amp;lt;t:projectView&gt; for rendering, this method returns the indenter used
+     * to indent each row.
+     */
+    public Indenter getIndenter() {
+<span class="nc" id="L414">        return null;</span>
+    }
+
+    /**
+     * If true, this is a view that renders the top page of Hudson.
+     */
+    public boolean isDefault() {
+<span class="nc bnc" id="L421" title="All 2 branches missed.">        return getOwnerPrimaryView()==this;</span>
+    }
+    
+    public List&lt;Computer&gt; getComputers() {
+<span class="nc" id="L425">        Computer[] computers = Jenkins.getInstance().getComputers();</span>
+
+<span class="nc bnc" id="L427" title="All 2 branches missed.">        if (!isFilterExecutors()) {</span>
+<span class="nc" id="L428">            return Arrays.asList(computers);</span>
+        }
+
+<span class="nc" id="L431">        List&lt;Computer&gt; result = new ArrayList&lt;Computer&gt;();</span>
+
+<span class="nc" id="L433">        HashSet&lt;Label&gt; labels = new HashSet&lt;Label&gt;();</span>
+<span class="nc bnc" id="L434" title="All 2 branches missed.">        for (Item item : getItems()) {</span>
+<span class="nc bnc" id="L435" title="All 2 branches missed.">            if (item instanceof AbstractProject&lt;?, ?&gt;) {</span>
+<span class="nc" id="L436">                labels.addAll(((AbstractProject&lt;?, ?&gt;) item).getRelevantLabels());</span>
+            }
+        }
+
+<span class="nc bnc" id="L440" title="All 2 branches missed.">        for (Computer c : computers) {</span>
+<span class="nc bnc" id="L441" title="All 2 branches missed.">            if (isRelevant(labels, c)) result.add(c);</span>
+        }
+
+<span class="nc" id="L444">        return result;</span>
+    }
+
+    private boolean isRelevant(Collection&lt;Label&gt; labels, Computer computer) {
+<span class="nc" id="L448">        Node node = computer.getNode();</span>
+<span class="nc bnc" id="L449" title="All 2 branches missed.">        if (node == null) return false;</span>
+<span class="nc bnc" id="L450" title="All 4 branches missed.">        if (labels.contains(null) &amp;&amp; node.getMode() == Mode.NORMAL) return true;</span>
+
+<span class="nc bnc" id="L452" title="All 2 branches missed.">        for (Label l : labels)</span>
+<span class="nc bnc" id="L453" title="All 4 branches missed.">            if (l != null &amp;&amp; l.contains(node))</span>
+<span class="nc" id="L454">                return true;</span>
+<span class="nc" id="L455">        return false;</span>
+    }
+
+    private List&lt;Queue.Item&gt; filterQueue(List&lt;Queue.Item&gt; base) {
+<span class="nc bnc" id="L459" title="All 2 branches missed.">        if (!isFilterQueue()) {</span>
+<span class="nc" id="L460">            return base;</span>
+        }
+
+<span class="nc" id="L463">        Collection&lt;TopLevelItem&gt; items = getItems();</span>
+<span class="nc" id="L464">        List&lt;Queue.Item&gt; result = new ArrayList&lt;Queue.Item&gt;();</span>
+<span class="nc bnc" id="L465" title="All 2 branches missed.">        for (Queue.Item qi : base) {</span>
+<span class="nc bnc" id="L466" title="All 2 branches missed.">            if (items.contains(qi.task)) {</span>
+<span class="nc" id="L467">                result.add(qi);</span>
+<span class="nc" id="L468">            } else</span>
+<span class="nc bnc" id="L469" title="All 2 branches missed.">            if (qi.task instanceof AbstractProject&lt;?, ?&gt;) {</span>
+<span class="nc" id="L470">                AbstractProject&lt;?,?&gt; project = (AbstractProject&lt;?, ?&gt;) qi.task;</span>
+<span class="nc bnc" id="L471" title="All 2 branches missed.">                if (items.contains(project.getRootProject())) {</span>
+<span class="nc" id="L472">                    result.add(qi);</span>
+                }
+            }
+        }
+<span class="nc" id="L476">        return result;</span>
+    }
+
+    public List&lt;Queue.Item&gt; getQueueItems() {
+<span class="nc" id="L480">        return filterQueue(Arrays.asList(Jenkins.getInstance().getQueue().getItems()));</span>
+    }
+
+    /**
+     * @deprecated Use {@link #getQueueItems()}. As of 1.607 the approximation is no longer needed.
+     * @return The items in the queue.
+     */
+    @Deprecated
+    public List&lt;Queue.Item&gt; getApproximateQueueItemsQuickly() {
+<span class="nc" id="L489">        return filterQueue(Jenkins.getInstance().getQueue().getApproximateItemsQuickly());</span>
+    }
+
+    /**
+     * Returns the path relative to the context root.
+     *
+     * Doesn't start with '/' but ends with '/' (except returns
+     * empty string when this is the default view).
+     */
+    public String getUrl() {
+<span class="nc bnc" id="L499" title="All 4 branches missed.">        return isDefault() ? (owner!=null ? owner.getUrl() : &quot;&quot;) : getViewUrl();</span>
+    }
+
+    /**
+     * Same as {@link #getUrl()} except this returns a view/{name} path
+     * even for the default view.
+     */
+    public String getViewUrl() {
+<span class="nc bnc" id="L507" title="All 2 branches missed.">        return (owner!=null ? owner.getUrl() : &quot;&quot;) + &quot;view/&quot; + Util.rawEncode(getViewName()) + '/';</span>
+    }
+
+    @Override public String toString() {
+<span class="nc" id="L511">        return super.toString() + &quot;[&quot; + getViewUrl() + &quot;]&quot;;</span>
+    }
+
+    public String getSearchUrl() {
+<span class="nc" id="L515">        return getUrl();</span>
+    }
+
+    /**
+     * Returns the transient {@link Action}s associated with the top page.
+     *
+     * &lt;p&gt;
+     * If views don't want to show top-level actions, this method
+     * can be overridden to return different objects.
+     *
+     * @see Jenkins#getActions()
+     */
+    public List&lt;Action&gt; getActions() {
+<span class="nc" id="L528">    	List&lt;Action&gt; result = new ArrayList&lt;Action&gt;();</span>
+<span class="nc" id="L529">    	result.addAll(getOwnerViewActions());</span>
+<span class="nc" id="L530">    	synchronized (this) {</span>
+<span class="nc bnc" id="L531" title="All 2 branches missed.">    		if (transientActions == null) {</span>
+<span class="nc" id="L532">                updateTransientActions();</span>
+    		}
+<span class="nc" id="L534">    		result.addAll(transientActions);</span>
+    	}
+<span class="nc" id="L536">    	return result;</span>
+    }
+    
+    public synchronized void updateTransientActions() {
+<span class="nc" id="L540">        transientActions = TransientViewActionFactory.createAllFor(this); </span>
+<span class="nc" id="L541">    }</span>
+    
+    public Object getDynamic(String token) {
+<span class="nc bnc" id="L544" title="All 2 branches missed.">        for (Action a : getActions()) {</span>
+<span class="nc" id="L545">            String url = a.getUrlName();</span>
+<span class="nc bnc" id="L546" title="All 2 branches missed.">            if (url==null)  continue;</span>
+<span class="nc bnc" id="L547" title="All 2 branches missed.">            if(a.getUrlName().equals(token))</span>
+<span class="nc" id="L548">                return a;</span>
+        }
+<span class="nc" id="L550">        return null;</span>
+    }
+
+    /**
+     * Gets the absolute URL of this view.
+     */
+    @Exported(visibility=2,name=&quot;url&quot;)
+    public String getAbsoluteUrl() {
+<span class="nc" id="L558">        return Jenkins.getInstance().getRootUrl()+getUrl();</span>
+    }
+
+    public Api getApi() {
+<span class="nc" id="L562">        return new Api(this);</span>
+    }
+
+    /**
+     * Returns the page to redirect the user to, after the view is created.
+     *
+     * The returned string is appended to &quot;/view/foobar/&quot;, so for example
+     * to direct the user to the top page of the view, return &quot;&quot;, etc.
+     */
+    public String getPostConstructLandingPage() {
+<span class="nc" id="L572">        return &quot;configure&quot;;</span>
+    }
+
+    /**
+     * Returns the {@link ACL} for this object.
+     */
+    public ACL getACL() {
+<span class="nc" id="L579">        return Jenkins.getInstance().getAuthorizationStrategy().getACL(this);</span>
+    }
+
+    public void checkPermission(Permission p) {
+<span class="nc" id="L583">        getACL().checkPermission(p);</span>
+<span class="nc" id="L584">    }</span>
+
+    public boolean hasPermission(Permission p) {
+<span class="nc" id="L587">        return getACL().hasPermission(p);</span>
+    }
+
+    /** @deprecated Does not work properly with moved jobs. Use {@link ItemListener#onLocationChanged} instead. */
+    @Deprecated
+<span class="nc" id="L592">    public void onJobRenamed(Item item, String oldName, String newName) {}</span>
+
+    @ExportedBean(defaultVisibility=2)
+    public static final class UserInfo implements Comparable&lt;UserInfo&gt; {
+        private final User user;
+        /**
+         * When did this user made a last commit on any of our projects? Can be null.
+         */
+        private Calendar lastChange;
+        /**
+         * Which project did this user commit? Can be null.
+         */
+        private AbstractProject project;
+
+        /** @see UserAvatarResolver */
+        String avatar;
+
+<span class="nc" id="L609">        UserInfo(User user, AbstractProject p, Calendar lastChange) {</span>
+<span class="nc" id="L610">            this.user = user;</span>
+<span class="nc" id="L611">            this.project = p;</span>
+<span class="nc" id="L612">            this.lastChange = lastChange;</span>
+<span class="nc" id="L613">        }</span>
+
+        @Exported
+        public User getUser() {
+<span class="nc" id="L617">            return user;</span>
+        }
+
+        @Exported
+        public Calendar getLastChange() {
+<span class="nc" id="L622">            return lastChange;</span>
+        }
+
+        @Exported
+        public AbstractProject getProject() {
+<span class="nc" id="L627">            return project;</span>
+        }
+
+        /**
+         * Returns a human-readable string representation of when this user was last active.
+         */
+        public String getLastChangeTimeString() {
+<span class="nc bnc" id="L634" title="All 2 branches missed.">            if(lastChange==null)    return &quot;N/A&quot;;</span>
+<span class="nc" id="L635">            long duration = new GregorianCalendar().getTimeInMillis()- ordinal();</span>
+<span class="nc" id="L636">            return Util.getTimeSpanString(duration);</span>
+        }
+
+        public String getTimeSortKey() {
+<span class="nc bnc" id="L640" title="All 2 branches missed.">            if(lastChange==null)    return &quot;-&quot;;</span>
+<span class="nc" id="L641">            return Util.XS_DATETIME_FORMATTER.format(lastChange.getTime());</span>
+        }
+
+        public int compareTo(UserInfo that) {
+<span class="nc" id="L645">            long rhs = that.ordinal();</span>
+<span class="nc" id="L646">            long lhs = this.ordinal();</span>
+<span class="nc bnc" id="L647" title="All 2 branches missed.">            if(rhs&gt;lhs) return 1;</span>
+<span class="nc bnc" id="L648" title="All 2 branches missed.">            if(rhs&lt;lhs) return -1;</span>
+<span class="nc" id="L649">            return 0;</span>
+        }
+
+        private long ordinal() {
+<span class="nc bnc" id="L653" title="All 2 branches missed.">            if(lastChange==null)    return 0;</span>
+<span class="nc" id="L654">            return lastChange.getTimeInMillis();</span>
+        }
+    }
+
+    /**
+     * Does this {@link View} has any associated user information recorded?
+     * @deprecated Potentially very expensive call; do not use from Jelly views.
+     */
+    @Deprecated
+    public boolean hasPeople() {
+<span class="nc" id="L664">        return People.isApplicable(getItems());</span>
+    }
+
+    /**
+     * Gets the users that show up in the changelog of this job collection.
+     */
+    public People getPeople() {
+<span class="nc" id="L671">        return new People(this);</span>
+    }
+
+    /**
+     * @since 1.484
+     */
+    public AsynchPeople getAsynchPeople() {
+<span class="nc" id="L678">        return new AsynchPeople(this);</span>
+    }
+
+    @ExportedBean
+    public static final class People  {
+        @Exported
+        public final List&lt;UserInfo&gt; users;
+
+        public final ModelObject parent;
+
+<span class="nc" id="L688">        public People(Jenkins parent) {</span>
+<span class="nc" id="L689">            this.parent = parent;</span>
+            // for Hudson, really load all users
+<span class="nc" id="L691">            Map&lt;User,UserInfo&gt; users = getUserInfo(parent.getItems());</span>
+<span class="nc" id="L692">            User unknown = User.getUnknown();</span>
+<span class="nc bnc" id="L693" title="All 2 branches missed.">            for (User u : User.getAll()) {</span>
+<span class="nc bnc" id="L694" title="All 2 branches missed.">                if(u==unknown)  continue;   // skip the special 'unknown' user</span>
+<span class="nc bnc" id="L695" title="All 2 branches missed.">                if(!users.containsKey(u))</span>
+<span class="nc" id="L696">                    users.put(u,new UserInfo(u,null,null));</span>
+            }
+<span class="nc" id="L698">            this.users = toList(users);</span>
+<span class="nc" id="L699">        }</span>
+
+<span class="nc" id="L701">        public People(View parent) {</span>
+<span class="nc" id="L702">            this.parent = parent;</span>
+<span class="nc" id="L703">            this.users = toList(getUserInfo(parent.getItems()));</span>
+<span class="nc" id="L704">        }</span>
+
+        private Map&lt;User,UserInfo&gt; getUserInfo(Collection&lt;? extends Item&gt; items) {
+<span class="nc" id="L707">            Map&lt;User,UserInfo&gt; users = new HashMap&lt;User,UserInfo&gt;();</span>
+<span class="nc bnc" id="L708" title="All 2 branches missed.">            for (Item item : items) {</span>
+<span class="nc bnc" id="L709" title="All 2 branches missed.">                for (Job job : item.getAllJobs()) {</span>
+<span class="nc bnc" id="L710" title="All 2 branches missed.">                    if (job instanceof AbstractProject) {</span>
+<span class="nc" id="L711">                        AbstractProject&lt;?,?&gt; p = (AbstractProject) job;</span>
+<span class="nc bnc" id="L712" title="All 2 branches missed.">                        for (AbstractBuild&lt;?,?&gt; build : p.getBuilds()) {</span>
+<span class="nc bnc" id="L713" title="All 2 branches missed.">                            for (Entry entry : build.getChangeSet()) {</span>
+<span class="nc" id="L714">                                User user = entry.getAuthor();</span>
+
+<span class="nc" id="L716">                                UserInfo info = users.get(user);</span>
+<span class="nc bnc" id="L717" title="All 2 branches missed.">                                if(info==null)</span>
+<span class="nc" id="L718">                                    users.put(user,new UserInfo(user,p,build.getTimestamp()));</span>
+                                else
+<span class="nc bnc" id="L720" title="All 2 branches missed.">                                if(info.getLastChange().before(build.getTimestamp())) {</span>
+<span class="nc" id="L721">                                    info.project = p;</span>
+<span class="nc" id="L722">                                    info.lastChange = build.getTimestamp();</span>
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+<span class="nc" id="L729">            return users;</span>
+        }
+
+        private List&lt;UserInfo&gt; toList(Map&lt;User,UserInfo&gt; users) {
+<span class="nc" id="L733">            ArrayList&lt;UserInfo&gt; list = new ArrayList&lt;UserInfo&gt;();</span>
+<span class="nc" id="L734">            list.addAll(users.values());</span>
+<span class="nc" id="L735">            Collections.sort(list);</span>
+<span class="nc" id="L736">            return Collections.unmodifiableList(list);</span>
+        }
+
+        public Api getApi() {
+<span class="nc" id="L740">            return new Api(this);</span>
+        }
+
+        /**
+         * @deprecated Potentially very expensive call; do not use from Jelly views.
+         */
+        @Deprecated
+        public static boolean isApplicable(Collection&lt;? extends Item&gt; items) {
+<span class="nc bnc" id="L748" title="All 2 branches missed.">            for (Item item : items) {</span>
+<span class="nc bnc" id="L749" title="All 2 branches missed.">                for (Job job : item.getAllJobs()) {</span>
+<span class="nc bnc" id="L750" title="All 2 branches missed.">                    if (job instanceof AbstractProject) {</span>
+<span class="nc" id="L751">                        AbstractProject&lt;?,?&gt; p = (AbstractProject) job;</span>
+<span class="nc bnc" id="L752" title="All 2 branches missed.">                        for (AbstractBuild&lt;?,?&gt; build : p.getBuilds()) {</span>
+<span class="nc bnc" id="L753" title="All 2 branches missed.">                            for (Entry entry : build.getChangeSet()) {</span>
+<span class="nc" id="L754">                                User user = entry.getAuthor();</span>
+<span class="nc bnc" id="L755" title="All 2 branches missed.">                                if(user!=null)</span>
+<span class="nc" id="L756">                                    return true;</span>
+                            }
+                        }
+                    }
+                }
+            }
+<span class="nc" id="L762">            return false;</span>
+        }
+    }
+
+    /**
+     * Variant of {@link People} which can be displayed progressively, since it may be slow.
+     * @since 1.484
+     */
+    public static final class AsynchPeople extends ProgressiveRendering { // JENKINS-15206
+
+        private final Collection&lt;TopLevelItem&gt; items;
+        private final User unknown;
+<span class="nc" id="L774">        private final Map&lt;User,UserInfo&gt; users = new HashMap&lt;User,UserInfo&gt;();</span>
+<span class="nc" id="L775">        private final Set&lt;User&gt; modified = new HashSet&lt;User&gt;();</span>
+        private final String iconSize;
+        public final ModelObject parent;
+
+        /** @see Jenkins#getAsynchPeople */
+<span class="nc" id="L780">        public AsynchPeople(Jenkins parent) {</span>
+<span class="nc" id="L781">            this.parent = parent;</span>
+<span class="nc" id="L782">            items = parent.getItems();</span>
+<span class="nc" id="L783">            unknown = User.getUnknown();</span>
+<span class="nc" id="L784">        }</span>
+
+        /** @see View#getAsynchPeople */
+<span class="nc" id="L787">        public AsynchPeople(View parent) {</span>
+<span class="nc" id="L788">            this.parent = parent;</span>
+<span class="nc" id="L789">            items = parent.getItems();</span>
+<span class="nc" id="L790">            unknown = null;</span>
+<span class="nc" id="L791">        }</span>
+
+        {
+<span class="nc" id="L794">            StaplerRequest req = Stapler.getCurrentRequest();</span>
+<span class="nc bnc" id="L795" title="All 4 branches missed.">            iconSize = req != null ? Functions.validateIconSize(Functions.getCookie(req, &quot;iconSize&quot;, &quot;32x32&quot;)) : &quot;32x32&quot;;</span>
+        }
+
+        @Override protected void compute() throws Exception {
+<span class="nc" id="L799">            int itemCount = 0;</span>
+<span class="nc bnc" id="L800" title="All 2 branches missed.">            for (Item item : items) {</span>
+<span class="nc bnc" id="L801" title="All 2 branches missed.">                for (Job&lt;?,?&gt; job : item.getAllJobs()) {</span>
+<span class="nc bnc" id="L802" title="All 2 branches missed.">                    if (job instanceof AbstractProject) {</span>
+<span class="nc" id="L803">                        AbstractProject&lt;?,?&gt; p = (AbstractProject) job;</span>
+<span class="nc" id="L804">                        RunList&lt;? extends AbstractBuild&lt;?,?&gt;&gt; builds = p.getBuilds();</span>
+<span class="nc" id="L805">                        int buildCount = 0;</span>
+<span class="nc bnc" id="L806" title="All 2 branches missed.">                        for (AbstractBuild&lt;?,?&gt; build : builds) {</span>
+<span class="nc bnc" id="L807" title="All 2 branches missed.">                            if (canceled()) {</span>
+<span class="nc" id="L808">                                return;</span>
+                            }
+<span class="nc bnc" id="L810" title="All 2 branches missed.">                            for (ChangeLogSet.Entry entry : build.getChangeSet()) {</span>
+<span class="nc" id="L811">                                User user = entry.getAuthor();</span>
+<span class="nc" id="L812">                                UserInfo info = users.get(user);</span>
+<span class="nc bnc" id="L813" title="All 2 branches missed.">                                if (info == null) {</span>
+<span class="nc" id="L814">                                    UserInfo userInfo = new UserInfo(user, p, build.getTimestamp());</span>
+<span class="nc" id="L815">                                    userInfo.avatar = UserAvatarResolver.resolveOrNull(user, iconSize);</span>
+<span class="nc" id="L816">                                    synchronized (this) {</span>
+<span class="nc" id="L817">                                        users.put(user, userInfo);</span>
+<span class="nc" id="L818">                                        modified.add(user);</span>
+                                    }
+<span class="nc bnc" id="L820" title="All 2 branches missed.">                                } else if (info.getLastChange().before(build.getTimestamp())) {</span>
+<span class="nc" id="L821">                                    synchronized (this) {</span>
+<span class="nc" id="L822">                                        info.project = p;</span>
+<span class="nc" id="L823">                                        info.lastChange = build.getTimestamp();</span>
+<span class="nc" id="L824">                                        modified.add(user);</span>
+                                    }
+                                }
+                            }
+                            // TODO consider also adding the user of the UserCause when applicable
+<span class="nc" id="L829">                            buildCount++;</span>
+                            // TODO this defeats lazy-loading. Should rather do a breadth-first search, as in hudson.plugins.view.dashboard.builds.LatestBuilds
+                            // (though currently there is no quick implementation of RunMap.size() ~ idOnDisk.size(), which would be needed for proper progress)
+<span class="nc" id="L832">                            progress((itemCount + 1.0 * buildCount / builds.size()) / (items.size() + 1));</span>
+                        }
+                    }
+                }
+<span class="nc" id="L836">                itemCount++;</span>
+<span class="nc" id="L837">                progress(1.0 * itemCount / (items.size() + /* handling User.getAll */1));</span>
+            }
+<span class="nc bnc" id="L839" title="All 2 branches missed.">            if (unknown != null) {</span>
+<span class="nc bnc" id="L840" title="All 2 branches missed.">                if (canceled()) {</span>
+<span class="nc" id="L841">                    return;</span>
+                }
+<span class="nc bnc" id="L843" title="All 2 branches missed.">                for (User u : User.getAll()) { // TODO nice to have a method to iterate these lazily</span>
+<span class="nc bnc" id="L844" title="All 2 branches missed.">                    if (canceled()) {</span>
+<span class="nc" id="L845">                        return;</span>
+                    }
+<span class="nc bnc" id="L847" title="All 2 branches missed.">                    if (u == unknown) {</span>
+<span class="nc" id="L848">                        continue;</span>
+                    }
+<span class="nc bnc" id="L850" title="All 2 branches missed.">                    if (!users.containsKey(u)) {</span>
+<span class="nc" id="L851">                        UserInfo userInfo = new UserInfo(u, null, null);</span>
+<span class="nc" id="L852">                        userInfo.avatar = UserAvatarResolver.resolveOrNull(u, iconSize);</span>
+<span class="nc" id="L853">                        synchronized (this) {</span>
+<span class="nc" id="L854">                            users.put(u, userInfo);</span>
+<span class="nc" id="L855">                            modified.add(u);</span>
+                        }
+                    }
+                }
+            }
+<span class="nc" id="L860">        }</span>
+
+        @Override protected synchronized JSON data() {
+<span class="nc" id="L863">            JSONArray r = new JSONArray();</span>
+<span class="nc bnc" id="L864" title="All 2 branches missed.">            for (User u : modified) {</span>
+<span class="nc" id="L865">                UserInfo i = users.get(u);</span>
+<span class="nc" id="L866">                JSONObject entry = new JSONObject().</span>
+<span class="nc" id="L867">                        accumulate(&quot;id&quot;, u.getId()).</span>
+<span class="nc" id="L868">                        accumulate(&quot;fullName&quot;, u.getFullName()).</span>
+<span class="nc" id="L869">                        accumulate(&quot;url&quot;, u.getUrl()).</span>
+<span class="nc bnc" id="L870" title="All 2 branches missed.">                        accumulate(&quot;avatar&quot;, i.avatar != null ? i.avatar : Stapler.getCurrentRequest().getContextPath() + Functions.getResourcePath() + &quot;/images/&quot; + iconSize + &quot;/user.png&quot;).</span>
+<span class="nc" id="L871">                        accumulate(&quot;timeSortKey&quot;, i.getTimeSortKey()).</span>
+<span class="nc" id="L872">                        accumulate(&quot;lastChangeTimeString&quot;, i.getLastChangeTimeString());</span>
+<span class="nc" id="L873">                AbstractProject&lt;?,?&gt; p = i.getProject();</span>
+<span class="nc bnc" id="L874" title="All 2 branches missed.">                if (p != null) {</span>
+<span class="nc" id="L875">                    entry.accumulate(&quot;projectUrl&quot;, p.getUrl()).accumulate(&quot;projectFullDisplayName&quot;, p.getFullDisplayName());</span>
+                }
+<span class="nc" id="L877">                r.add(entry);</span>
+            }
+<span class="nc" id="L879">            modified.clear();</span>
+<span class="nc" id="L880">            return r;</span>
+        }
+
+        public Api getApi() {
+<span class="nc" id="L884">            return new Api(new People());</span>
+        }
+
+        /** JENKINS-16397 workaround */
+        @Restricted(NoExternalUse.class)
+        @ExportedBean
+<span class="nc" id="L890">        public final class People {</span>
+
+            private View.People people;
+
+            @Exported public synchronized List&lt;UserInfo&gt; getUsers() {
+<span class="nc bnc" id="L895" title="All 2 branches missed.">                if (people == null) {</span>
+<span class="nc bnc" id="L896" title="All 2 branches missed.">                    people = parent instanceof Jenkins ? new View.People((Jenkins) parent) : new View.People((View) parent);</span>
+                }
+<span class="nc" id="L898">                return people.users;</span>
+            }
+        }
+
+    }
+
+    void addDisplayNamesToSearchIndex(SearchIndexBuilder sib, Collection&lt;TopLevelItem&gt; items) {
+<span class="fc bfc" id="L905" title="All 2 branches covered.">        for(TopLevelItem item : items) {</span>
+            
+<span class="pc bpc" id="L907" title="1 of 2 branches missed.">            if(LOGGER.isLoggable(Level.FINE)) {</span>
+<span class="nc" id="L908">                LOGGER.fine((String.format(&quot;Adding url=%s,displayName=%s&quot;,</span>
+<span class="nc" id="L909">                            item.getSearchUrl(), item.getDisplayName())));</span>
+            }
+<span class="fc" id="L911">            sib.add(item.getSearchUrl(), item.getDisplayName());</span>
+        }        
+<span class="fc" id="L913">    }</span>
+    
+    @Override
+    public SearchIndexBuilder makeSearchIndex() {
+<span class="nc" id="L917">        SearchIndexBuilder sib = super.makeSearchIndex();</span>
+<span class="nc" id="L918">        sib.add(new CollectionSearchIndex&lt;TopLevelItem&gt;() {// for jobs in the view</span>
+<span class="nc" id="L919">                protected TopLevelItem get(String key) { return getItem(key); }</span>
+<span class="nc" id="L920">                protected Collection&lt;TopLevelItem&gt; all() { return getItems(); }                </span>
+                @Override
+                protected String getName(TopLevelItem o) {
+                    // return the name instead of the display for suggestion searching
+<span class="nc" id="L924">                    return o.getName();</span>
+                }
+            });
+        
+        // add the display name for each item in the search index
+<span class="nc" id="L929">        addDisplayNamesToSearchIndex(sib, getItems());</span>
+
+<span class="nc" id="L931">        return sib;</span>
+    }
+
+    /**
+     * Accepts the new description.
+     */
+    @RequirePOST
+    public synchronized void doSubmitDescription( StaplerRequest req, StaplerResponse rsp ) throws IOException, ServletException {
+<span class="nc" id="L939">        checkPermission(CONFIGURE);</span>
+
+<span class="nc" id="L941">        description = req.getParameter(&quot;description&quot;);</span>
+<span class="nc" id="L942">        save();</span>
+<span class="nc" id="L943">        rsp.sendRedirect(&quot;.&quot;);  // go to the top page</span>
+<span class="nc" id="L944">    }</span>
+
+    /**
+     * Accepts submission from the configuration page.
+     *
+     * Subtypes should override the {@link #submit(StaplerRequest)} method.
+     */
+    @RequirePOST
+    public final synchronized void doConfigSubmit( StaplerRequest req, StaplerResponse rsp ) throws IOException, ServletException, FormException {
+<span class="nc" id="L953">        checkPermission(CONFIGURE);</span>
+
+<span class="nc" id="L955">        submit(req);</span>
+
+<span class="nc" id="L957">        description = Util.nullify(req.getParameter(&quot;description&quot;));</span>
+<span class="nc bnc" id="L958" title="All 2 branches missed.">        filterExecutors = req.getParameter(&quot;filterExecutors&quot;) != null;</span>
+<span class="nc bnc" id="L959" title="All 2 branches missed.">        filterQueue = req.getParameter(&quot;filterQueue&quot;) != null;</span>
+
+<span class="nc" id="L961">        rename(req.getParameter(&quot;name&quot;));</span>
+
+<span class="nc" id="L963">        getProperties().rebuild(req, req.getSubmittedForm(), getApplicablePropertyDescriptors());</span>
+<span class="nc" id="L964">        updateTransientActions();  </span>
+
+<span class="nc" id="L966">        save();</span>
+
+<span class="nc" id="L968">        FormApply.success(&quot;../&quot; + Util.rawEncode(name)).generateResponse(req,rsp,this);</span>
+<span class="nc" id="L969">    }</span>
+
+    /**
+     * Handles the configuration submission.
+     *
+     * Load view-specific properties here.
+     */
+    protected abstract void submit(StaplerRequest req) throws IOException, ServletException, FormException;
+
+    /**
+     * Deletes this view.
+     */
+    @RequirePOST
+    public synchronized void doDoDelete(StaplerRequest req, StaplerResponse rsp) throws IOException, ServletException {
+<span class="nc" id="L983">        checkPermission(DELETE);</span>
+
+<span class="nc" id="L985">        owner.deleteView(this);</span>
+
+<span class="nc" id="L987">        rsp.sendRedirect2(req.getContextPath()+&quot;/&quot; + owner.getUrl());</span>
+<span class="nc" id="L988">    }</span>
+
+
+    /**
+     * Creates a new {@link Item} in this collection.
+     *
+     * &lt;p&gt;
+     * This method should call {@link ModifiableItemGroup#doCreateItem(StaplerRequest, StaplerResponse)}
+     * and then add the newly created item to this view.
+     * 
+     * @return
+     *      null if fails.
+     */
+    public abstract Item doCreateItem( StaplerRequest req, StaplerResponse rsp ) throws IOException, ServletException;
+
+    public void doRssAll( StaplerRequest req, StaplerResponse rsp ) throws IOException, ServletException {
+<span class="nc" id="L1004">        rss(req, rsp, &quot; all builds&quot;, getBuilds());</span>
+<span class="nc" id="L1005">    }</span>
+
+    public void doRssFailed( StaplerRequest req, StaplerResponse rsp ) throws IOException, ServletException {
+<span class="nc" id="L1008">        rss(req, rsp, &quot; failed builds&quot;, getBuilds().failureOnly());</span>
+<span class="nc" id="L1009">    }</span>
+    
+    public RunList getBuilds() {
+<span class="nc" id="L1012">        return new RunList(this);</span>
+    }
+    
+    public BuildTimelineWidget getTimeline() {
+<span class="nc" id="L1016">        return new BuildTimelineWidget(getBuilds());</span>
+    }
+
+    private void rss(StaplerRequest req, StaplerResponse rsp, String suffix, RunList runs) throws IOException, ServletException {
+<span class="nc" id="L1020">        RSS.forwardToRss(getDisplayName()+ suffix, getUrl(),</span>
+<span class="nc" id="L1021">            runs.newBuilds(), Run.FEED_ADAPTER, req, rsp );</span>
+<span class="nc" id="L1022">    }</span>
+
+    public void doRssLatest( StaplerRequest req, StaplerResponse rsp ) throws IOException, ServletException {
+<span class="nc" id="L1025">        List&lt;Run&gt; lastBuilds = new ArrayList&lt;Run&gt;();</span>
+<span class="nc bnc" id="L1026" title="All 2 branches missed.">        for (TopLevelItem item : getItems()) {</span>
+<span class="nc bnc" id="L1027" title="All 2 branches missed.">            if (item instanceof Job) {</span>
+<span class="nc" id="L1028">                Job job = (Job) item;</span>
+<span class="nc" id="L1029">                Run lb = job.getLastBuild();</span>
+<span class="nc bnc" id="L1030" title="All 2 branches missed.">                if(lb!=null)    lastBuilds.add(lb);</span>
+            }
+        }
+<span class="nc" id="L1033">        RSS.forwardToRss(getDisplayName()+&quot; last builds only&quot;, getUrl(),</span>
+<span class="nc" id="L1034">            lastBuilds, Run.FEED_ADAPTER_LATEST, req, rsp );</span>
+<span class="nc" id="L1035">    }</span>
+
+    /**
+     * Accepts &lt;tt&gt;config.xml&lt;/tt&gt; submission, as well as serve it.
+     */
+    @WebMethod(name = &quot;config.xml&quot;)
+    public HttpResponse doConfigDotXml(StaplerRequest req) throws IOException {
+<span class="nc bnc" id="L1042" title="All 2 branches missed.">        if (req.getMethod().equals(&quot;GET&quot;)) {</span>
+            // read
+<span class="nc" id="L1044">            checkPermission(READ);</span>
+<span class="nc" id="L1045">            return new HttpResponse() {</span>
+                public void generateResponse(StaplerRequest req, StaplerResponse rsp, Object node) throws IOException, ServletException {
+<span class="nc" id="L1047">                    rsp.setContentType(&quot;application/xml&quot;);</span>
+<span class="nc" id="L1048">                    View.this.writeXml(rsp.getOutputStream());</span>
+<span class="nc" id="L1049">                }</span>
+            };
+        }
+<span class="nc bnc" id="L1052" title="All 2 branches missed.">        if (req.getMethod().equals(&quot;POST&quot;)) {</span>
+            // submission
+<span class="nc" id="L1054">            updateByXml(new StreamSource(req.getReader()));</span>
+<span class="nc" id="L1055">            return HttpResponses.ok();</span>
+        }
+
+        // huh?
+<span class="nc" id="L1059">        return HttpResponses.error(SC_BAD_REQUEST, &quot;Unexpected request method &quot; + req.getMethod());</span>
+    }
+
+    /**
+     * @since 1.538
+     */
+    public void writeXml(OutputStream out) throws IOException {
+        // pity we don't have a handy way to clone Jenkins.XSTREAM to temp add the omit Field
+<span class="nc" id="L1067">        XStream2 xStream2 = new XStream2();</span>
+<span class="nc" id="L1068">        xStream2.omitField(View.class, &quot;owner&quot;);</span>
+<span class="nc" id="L1069">        xStream2.toXMLUTF8(View.this,  out);</span>
+<span class="nc" id="L1070">    }</span>
+
+    /**
+     * Updates the View with the new XML definition.
+     * @param source source of the Item's new definition.
+     *               The source should be either a &lt;code&gt;StreamSource&lt;/code&gt; or &lt;code&gt;SAXSource&lt;/code&gt;, other sources
+     *               may not be handled.
+     */
+    public void updateByXml(Source source) throws IOException {
+<span class="nc" id="L1079">        checkPermission(CONFIGURE);</span>
+<span class="nc" id="L1080">        StringWriter out = new StringWriter();</span>
+        try {
+            // this allows us to use UTF-8 for storing data,
+            // plus it checks any well-formedness issue in the submitted
+            // data
+<span class="nc" id="L1085">            XMLUtils.safeTransform(source, new StreamResult(out));</span>
+<span class="nc" id="L1086">            out.close();</span>
+<span class="nc" id="L1087">        } catch (TransformerException e) {</span>
+<span class="nc" id="L1088">            throw new IOException(&quot;Failed to persist configuration.xml&quot;, e);</span>
+<span class="nc" id="L1089">        } catch (SAXException e) {</span>
+<span class="nc" id="L1090">            throw new IOException(&quot;Failed to persist configuration.xml&quot;, e);</span>
+        }
+
+        // try to reflect the changes by reloading
+<span class="nc" id="L1094">        InputStream in = new BufferedInputStream(new ByteArrayInputStream(out.toString().getBytes(&quot;UTF-8&quot;)));</span>
+        try {
+            // Do not allow overwriting view name as it might collide with another
+            // view in same ViewGroup and might not satisfy Jenkins.checkGoodName.
+<span class="nc" id="L1098">            String oldname = name;</span>
+<span class="nc" id="L1099">            Jenkins.XSTREAM.unmarshal(new XppDriver().createReader(in), this);</span>
+<span class="nc" id="L1100">            name = oldname;</span>
+<span class="nc" id="L1101">        } catch (StreamException e) {</span>
+<span class="nc" id="L1102">            throw new IOException(&quot;Unable to read&quot;,e);</span>
+<span class="nc" id="L1103">        } catch(ConversionException e) {</span>
+<span class="nc" id="L1104">            throw new IOException(&quot;Unable to read&quot;,e);</span>
+<span class="nc" id="L1105">        } catch(Error e) {// mostly reflection errors</span>
+<span class="nc" id="L1106">            throw new IOException(&quot;Unable to read&quot;,e);</span>
+<span class="nc" id="L1107">        } finally {</span>
+<span class="nc" id="L1108">            in.close();</span>
+<span class="nc" id="L1109">        }</span>
+<span class="nc" id="L1110">        save();</span>
+<span class="nc" id="L1111">    }</span>
+
+    public ContextMenu doChildrenContextMenu(StaplerRequest request, StaplerResponse response) throws Exception {
+<span class="nc" id="L1114">        ContextMenu m = new ContextMenu();</span>
+<span class="nc bnc" id="L1115" title="All 2 branches missed.">        for (TopLevelItem i : getItems())</span>
+<span class="nc" id="L1116">            m.add(i.getShortUrl(),i.getDisplayName());</span>
+<span class="nc" id="L1117">        return m;</span>
+    }
+
+    /**
+     * A list of available view types.
+     * @deprecated as of 1.286
+     *      Use {@link #all()} for read access, and use {@link Extension} for registration.
+     */
+    @Deprecated
+<span class="fc" id="L1126">    public static final DescriptorList&lt;View&gt; LIST = new DescriptorList&lt;View&gt;(View.class);</span>
+
+    /**
+     * Returns all the registered {@link ViewDescriptor}s.
+     */
+    public static DescriptorExtensionList&lt;View,ViewDescriptor&gt; all() {
+<span class="nc" id="L1132">        return Jenkins.getInstance().&lt;View,ViewDescriptor&gt;getDescriptorList(View.class);</span>
+    }
+
+    public static List&lt;ViewDescriptor&gt; allInstantiable() {
+<span class="nc" id="L1136">        List&lt;ViewDescriptor&gt; r = new ArrayList&lt;ViewDescriptor&gt;();</span>
+<span class="nc bnc" id="L1137" title="All 2 branches missed.">        for (ViewDescriptor d : all())</span>
+<span class="nc bnc" id="L1138" title="All 2 branches missed.">            if(d.isInstantiable())</span>
+<span class="nc" id="L1139">                r.add(d);</span>
+<span class="nc" id="L1140">        return r;</span>
+    }
+
+<span class="fc" id="L1143">    public static final Comparator&lt;View&gt; SORTER = new Comparator&lt;View&gt;() {</span>
+        public int compare(View lhs, View rhs) {
+<span class="nc" id="L1145">            return lhs.getViewName().compareTo(rhs.getViewName());</span>
+        }
+    };
+
+<span class="fc" id="L1149">    public static final PermissionGroup PERMISSIONS = new PermissionGroup(View.class,Messages._View_Permissions_Title());</span>
+    /**
+     * Permission to create new views.
+     */
+<span class="fc" id="L1153">    public static final Permission CREATE = new Permission(PERMISSIONS,&quot;Create&quot;, Messages._View_CreatePermission_Description(), Permission.CREATE, PermissionScope.ITEM_GROUP);</span>
+<span class="fc" id="L1154">    public static final Permission DELETE = new Permission(PERMISSIONS,&quot;Delete&quot;, Messages._View_DeletePermission_Description(), Permission.DELETE, PermissionScope.ITEM_GROUP);</span>
+<span class="fc" id="L1155">    public static final Permission CONFIGURE = new Permission(PERMISSIONS,&quot;Configure&quot;, Messages._View_ConfigurePermission_Description(), Permission.CONFIGURE, PermissionScope.ITEM_GROUP);</span>
+<span class="fc" id="L1156">    public static final Permission READ = new Permission(PERMISSIONS,&quot;Read&quot;, Messages._View_ReadPermission_Description(), Permission.READ, PermissionScope.ITEM_GROUP);</span>
+
+    // to simplify access from Jelly
+    public static Permission getItemCreatePermission() {
+<span class="nc" id="L1160">        return Item.CREATE;</span>
+    }
+    
+    public static View create(StaplerRequest req, StaplerResponse rsp, ViewGroup owner)
+            throws FormException, IOException, ServletException {
+<span class="nc" id="L1165">        String mode = req.getParameter(&quot;mode&quot;);</span>
+
+<span class="nc" id="L1167">        String requestContentType = req.getContentType();</span>
+<span class="nc bnc" id="L1168" title="All 2 branches missed.">        if (requestContentType == null</span>
+<span class="nc bnc" id="L1169" title="All 4 branches missed.">                &amp;&amp; !(mode != null &amp;&amp; mode.equals(&quot;copy&quot;)))</span>
+<span class="nc" id="L1170">            throw new Failure(&quot;No Content-Type header set&quot;);</span>
+
+<span class="nc bnc" id="L1172" title="All 2 branches missed.">        boolean isXmlSubmission = requestContentType != null</span>
+<span class="nc bnc" id="L1173" title="All 2 branches missed.">                &amp;&amp; (requestContentType.startsWith(&quot;application/xml&quot;)</span>
+<span class="nc bnc" id="L1174" title="All 2 branches missed.">                        || requestContentType.startsWith(&quot;text/xml&quot;));</span>
+
+<span class="nc" id="L1176">        String name = req.getParameter(&quot;name&quot;);</span>
+<span class="nc" id="L1177">        checkGoodName(name);</span>
+<span class="nc bnc" id="L1178" title="All 2 branches missed.">        if(owner.getView(name)!=null)</span>
+<span class="nc" id="L1179">            throw new Failure(Messages.Hudson_ViewAlreadyExists(name));</span>
+
+<span class="nc bnc" id="L1181" title="All 4 branches missed.">        if (mode==null || mode.length()==0) {</span>
+<span class="nc bnc" id="L1182" title="All 2 branches missed.">            if(isXmlSubmission) {</span>
+<span class="nc" id="L1183">                View v = createViewFromXML(name, req.getInputStream());</span>
+<span class="nc" id="L1184">                v.owner = owner;</span>
+<span class="nc" id="L1185">                rsp.setStatus(HttpServletResponse.SC_OK);</span>
+<span class="nc" id="L1186">                return v;</span>
+            } else
+<span class="nc" id="L1188">                throw new Failure(Messages.View_MissingMode());</span>
+        }
+
+        View v;
+<span class="nc bnc" id="L1192" title="All 4 branches missed.">        if (mode!=null &amp;&amp; mode.equals(&quot;copy&quot;)) {</span>
+<span class="nc" id="L1193">            v = copy(req, owner, name);</span>
+<span class="nc" id="L1194">        } else {</span>
+<span class="nc" id="L1195">            ViewDescriptor descriptor = all().findByName(mode);</span>
+<span class="nc bnc" id="L1196" title="All 2 branches missed.">            if (descriptor == null) {</span>
+<span class="nc" id="L1197">                throw new Failure(&quot;No view type ‘&quot; + mode + &quot;’ is known&quot;);</span>
+            }
+
+            // create a view
+<span class="nc" id="L1201">            v = descriptor.newInstance(req,req.getSubmittedForm());</span>
+        }
+<span class="nc" id="L1203">        v.owner = owner;</span>
+
+        // redirect to the config screen
+<span class="nc" id="L1206">        rsp.sendRedirect2(req.getContextPath()+'/'+v.getUrl()+v.getPostConstructLandingPage());</span>
+
+<span class="nc" id="L1208">        return v;</span>
+    }
+
+    private static View copy(StaplerRequest req, ViewGroup owner, String name) throws IOException {
+        View v;
+<span class="nc" id="L1213">        String from = req.getParameter(&quot;from&quot;);</span>
+<span class="nc" id="L1214">        View src = src = owner.getView(from);</span>
+
+<span class="nc bnc" id="L1216" title="All 2 branches missed.">        if(src==null) {</span>
+<span class="nc bnc" id="L1217" title="All 2 branches missed.">            if(Util.fixEmpty(from)==null)</span>
+<span class="nc" id="L1218">                throw new Failure(&quot;Specify which view to copy&quot;);</span>
+            else
+<span class="nc" id="L1220">                throw new Failure(&quot;No such view: &quot;+from);</span>
+        }
+<span class="nc" id="L1222">        String xml = Jenkins.XSTREAM.toXML(src);</span>
+<span class="nc" id="L1223">        v = createViewFromXML(name, new StringInputStream(xml));</span>
+<span class="nc" id="L1224">        return v;</span>
+    }
+
+    /**
+     * Instantiate View subtype from XML stream.
+     *
+     * @param name Alternative name to use or &lt;tt&gt;null&lt;/tt&gt; to keep the one in xml.
+     */
+    public static View createViewFromXML(String name, InputStream xml) throws IOException {
+<span class="nc" id="L1233">        InputStream in = new BufferedInputStream(xml);</span>
+        try {
+<span class="nc" id="L1235">            View v = (View) Jenkins.XSTREAM.fromXML(in);</span>
+<span class="nc bnc" id="L1236" title="All 2 branches missed.">            if (name != null) v.name = name;</span>
+<span class="nc" id="L1237">            checkGoodName(v.name);</span>
+<span class="nc" id="L1238">            return v;</span>
+<span class="nc" id="L1239">        } catch(StreamException e) {</span>
+<span class="nc" id="L1240">            throw new IOException(&quot;Unable to read&quot;,e);</span>
+<span class="nc" id="L1241">        } catch(ConversionException e) {</span>
+<span class="nc" id="L1242">            throw new IOException(&quot;Unable to read&quot;,e);</span>
+<span class="nc" id="L1243">        } catch(Error e) {// mostly reflection errors</span>
+<span class="nc" id="L1244">            throw new IOException(&quot;Unable to read&quot;,e);</span>
+<span class="nc" id="L1245">        } finally {</span>
+<span class="nc" id="L1246">            in.close();</span>
+<span class="nc" id="L1247">        }</span>
+    }
+
+    public static class PropertyList extends DescribableList&lt;ViewProperty,ViewPropertyDescriptor&gt; {
+        private PropertyList(View owner) {
+<span class="fc" id="L1252">            super(owner);</span>
+<span class="fc" id="L1253">        }</span>
+
+<span class="nc" id="L1255">        public PropertyList() {// needed for XStream deserialization</span>
+<span class="nc" id="L1256">        }</span>
+
+        public View getOwner() {
+<span class="nc" id="L1259">            return (View)owner;</span>
+        }
+
+        @Override
+        protected void onModified() throws IOException {
+<span class="nc bnc" id="L1264" title="All 2 branches missed.">            for (ViewProperty p : this)</span>
+<span class="nc" id="L1265">                p.setView(getOwner());</span>
+<span class="nc" id="L1266">        }</span>
+    }
+
+    /**
+     * &quot;Job&quot; in &quot;New Job&quot;. When a view is used in a context that restricts the child type,
+     * It might be useful to override this.
+     */
+<span class="fc" id="L1273">    public static final Message&lt;View&gt; NEW_PRONOUN = new Message&lt;View&gt;();</span>
+
+<span class="fc" id="L1275">    private final static Logger LOGGER = Logger.getLogger(View.class.getName());</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

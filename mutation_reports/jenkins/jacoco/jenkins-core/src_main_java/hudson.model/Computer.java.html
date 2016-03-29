@@ -1,0 +1,1711 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>Computer.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.model</a> &gt; <span class="el_source">Computer.java</span></div><h1>Computer.java</h1><pre class="source lang-java linenums"><span class="pc" id="L1">/*</span>
+ * The MIT License
+ *
+ * Copyright (c) 2004-2010, Sun Microsystems, Inc., Kohsuke Kawaguchi,
+ * Red Hat, Inc., Seiji Sogabe, Stephen Connolly, Thomas J. Black, Tom Huybrechts,
+ * CloudBees, Inc., Christopher Simons
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.model;
+
+import edu.umd.cs.findbugs.annotations.OverrideMustInvoke;
+import edu.umd.cs.findbugs.annotations.When;
+import hudson.EnvVars;
+import hudson.Extension;
+import hudson.Launcher.ProcStarter;
+import hudson.Util;
+import hudson.cli.declarative.CLIMethod;
+import hudson.cli.declarative.CLIResolver;
+import hudson.console.AnnotatedLargeText;
+import hudson.init.Initializer;
+import hudson.model.Descriptor.FormException;
+import hudson.model.Queue.FlyweightTask;
+import hudson.model.labels.LabelAtom;
+import hudson.model.queue.WorkUnit;
+import hudson.node_monitors.NodeMonitor;
+import hudson.remoting.Channel;
+import hudson.remoting.VirtualChannel;
+import hudson.security.ACL;
+import hudson.security.AccessControlled;
+import hudson.security.Permission;
+import hudson.security.PermissionGroup;
+import hudson.security.PermissionScope;
+import hudson.slaves.AbstractCloudSlave;
+import hudson.slaves.ComputerLauncher;
+import hudson.slaves.ComputerListener;
+import hudson.slaves.NodeProperty;
+import hudson.slaves.RetentionStrategy;
+import hudson.slaves.WorkspaceList;
+import hudson.slaves.OfflineCause;
+import hudson.slaves.OfflineCause.ByCLI;
+import hudson.util.DaemonThreadFactory;
+import hudson.util.EditDistance;
+import hudson.util.ExceptionCatchingThreadFactory;
+import hudson.util.RemotingDiagnostics;
+import hudson.util.RemotingDiagnostics.HeapDump;
+import hudson.util.RunList;
+import hudson.util.Futures;
+import hudson.util.NamingThreadFactory;
+import jenkins.model.Jenkins;
+import jenkins.util.ContextResettingExecutorService;
+import jenkins.security.MasterToSlaveCallable;
+import jenkins.security.NotReallyRoleSensitiveCallable;
+
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.DoNotUse;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
+import org.kohsuke.args4j.Argument;
+import org.kohsuke.args4j.CmdLineException;
+import org.kohsuke.stapler.Stapler;
+import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.StaplerResponse;
+import org.kohsuke.stapler.QueryParameter;
+import org.kohsuke.stapler.HttpResponses;
+import org.kohsuke.stapler.HttpResponse;
+import org.kohsuke.stapler.HttpRedirect;
+import org.kohsuke.stapler.WebMethod;
+import org.kohsuke.stapler.export.Exported;
+import org.kohsuke.stapler.export.ExportedBean;
+import org.kohsuke.args4j.Option;
+import org.kohsuke.stapler.interceptor.RequirePOST;
+
+import javax.annotation.concurrent.GuardedBy;
+import javax.servlet.ServletException;
+
+import java.io.File;
+import java.io.FilenameFilter;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.PrintWriter;
+import java.io.StringWriter;
+import java.util.*;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ExecutionException;
+import java.util.logging.LogRecord;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import java.nio.charset.Charset;
+import java.net.InetAddress;
+import java.net.NetworkInterface;
+import java.net.Inet4Address;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import javax.annotation.CheckForNull;
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+
+import static javax.servlet.http.HttpServletResponse.*;
+
+/**
+ * Represents the running state of a remote computer that holds {@link Executor}s.
+ *
+ * &lt;p&gt;
+ * {@link Executor}s on one {@link Computer} are transparently interchangeable
+ * (that is the definition of {@link Computer}).
+ *
+ * &lt;p&gt;
+ * This object is related to {@link Node} but they have some significant differences.
+ * {@link Computer} primarily works as a holder of {@link Executor}s, so
+ * if a {@link Node} is configured (probably temporarily) with 0 executors,
+ * you won't have a {@link Computer} object for it (except for the master node,
+ * which always gets its {@link Computer} in case we have no static executors and
+ * we need to run a {@link FlyweightTask} - see JENKINS-7291 for more discussion.)
+ *
+ * Also, even if you remove a {@link Node}, it takes time for the corresponding
+ * {@link Computer} to be removed, if some builds are already in progress on that
+ * node. Or when the node configuration is changed, unaffected {@link Computer} object
+ * remains intact, while all the {@link Node} objects will go away.
+ *
+ * &lt;p&gt;
+ * This object also serves UI (unlike {@link Node}), and can be used along with
+ * {@link TransientComputerActionFactory} to add {@link Action}s to {@link Computer}s.
+ *
+ * @author Kohsuke Kawaguchi
+ */
+@ExportedBean
+<span class="pc bpc" id="L147" title="1 of 2 branches missed.">public /*transient*/ abstract class Computer extends Actionable implements AccessControlled, ExecutorListener {</span>
+
+<span class="nc" id="L149">    private final CopyOnWriteArrayList&lt;Executor&gt; executors = new CopyOnWriteArrayList&lt;Executor&gt;();</span>
+    // TODO:
+<span class="nc" id="L151">    private final CopyOnWriteArrayList&lt;OneOffExecutor&gt; oneOffExecutors = new CopyOnWriteArrayList&lt;OneOffExecutor&gt;();</span>
+
+    private int numExecutors;
+
+    /**
+     * Contains info about reason behind computer being offline.
+     */
+    protected volatile OfflineCause offlineCause;
+
+<span class="nc" id="L160">    private long connectTime = 0;</span>
+
+    /**
+     * True if Jenkins shouldn't start new builds on this node.
+     */
+    private boolean temporarilyOffline;
+
+    /**
+     * {@link Node} object may be created and deleted independently
+     * from this object.
+     */
+    protected String nodeName;
+
+    /**
+     * @see #getHostName()
+     */
+    private volatile String cachedHostName;
+    private volatile boolean hostNameCached;
+
+    /**
+     * @see #getEnvironment()
+     */
+    private volatile EnvVars cachedEnvironment;
+
+
+<span class="nc" id="L185">    private final WorkspaceList workspaceList = new WorkspaceList();</span>
+
+    protected transient List&lt;Action&gt; transientActions;
+
+<span class="nc" id="L189">    protected final Object statusChangeLock = new Object();</span>
+
+    /**
+     * Keeps track of stack traces to track the tremination requests for this computer.
+     *
+     * @since 1.607
+     * @see Executor#resetWorkUnit(String)
+     */
+<span class="nc" id="L197">    private transient final List&lt;TerminationRequest&gt; terminatedBy = Collections.synchronizedList(new ArrayList</span>
+            &lt;TerminationRequest&gt;());
+
+    /**
+     * This method captures the information of a request to terminate a computer instance. Method is public as
+     * it needs to be called from {@link AbstractCloudSlave} and {@link jenkins.model.Nodes}. In general you should
+     * not need to call this method directly, however if implementing a custom node type or a different path
+     * for removing nodes, it may make sense to call this method in order to capture the originating request.
+     *
+     * @since 1.607
+     */
+    public void recordTermination() {
+<span class="nc" id="L209">        StaplerRequest request = Stapler.getCurrentRequest();</span>
+<span class="nc bnc" id="L210" title="All 2 branches missed.">        if (request != null) {</span>
+<span class="nc" id="L211">            terminatedBy.add(new TerminationRequest(</span>
+<span class="nc" id="L212">                    String.format(&quot;Termination requested at %s by %s [id=%d] from HTTP request for %s&quot;,</span>
+<span class="nc" id="L213">                            new Date(),</span>
+<span class="nc" id="L214">                            Thread.currentThread(),</span>
+<span class="nc" id="L215">                            Thread.currentThread().getId(),</span>
+<span class="nc" id="L216">                            request.getRequestURL()</span>
+                    )
+            ));
+<span class="nc" id="L219">        } else {</span>
+<span class="nc" id="L220">            terminatedBy.add(new TerminationRequest(</span>
+<span class="nc" id="L221">                    String.format(&quot;Termination requested at %s by %s [id=%d]&quot;,</span>
+<span class="nc" id="L222">                            new Date(),</span>
+<span class="nc" id="L223">                            Thread.currentThread(),</span>
+<span class="nc" id="L224">                            Thread.currentThread().getId()</span>
+                    )
+            ));
+        }
+<span class="nc" id="L228">    }</span>
+
+    /**
+     * Returns the list of captured termination requests for this Computer. This method is used by {@link Executor}
+     * to provide details on why a Computer was removed in-between work being scheduled against the {@link Executor}
+     * and the {@link Executor} starting to execute the task.
+     *
+     * @return the (possibly empty) list of termination requests.
+     * @see Executor#resetWorkUnit(String)
+     * @since 1.607
+     */
+    public List&lt;TerminationRequest&gt; getTerminatedBy() {
+<span class="nc" id="L240">        return new ArrayList&lt;TerminationRequest&gt;(terminatedBy);</span>
+    }
+
+<span class="nc" id="L243">    public Computer(Node node) {</span>
+<span class="nc" id="L244">        setNode(node);</span>
+<span class="nc" id="L245">    }</span>
+
+     /**
+     * Returns list of all boxes {@link ComputerPanelBox}s.
+     */
+    public List&lt;ComputerPanelBox&gt; getComputerPanelBoxs(){
+<span class="nc" id="L251">        return ComputerPanelBox.all(this);</span>
+    }
+
+    /**
+     * Returns the transient {@link Action}s associated with the computer.
+     */
+    @SuppressWarnings(&quot;deprecation&quot;)
+    public List&lt;Action&gt; getActions() {
+<span class="nc" id="L259">    	List&lt;Action&gt; result = new ArrayList&lt;Action&gt;();</span>
+<span class="nc" id="L260">    	result.addAll(super.getActions());</span>
+<span class="nc" id="L261">    	synchronized (this) {</span>
+<span class="nc bnc" id="L262" title="All 2 branches missed.">    		if (transientActions == null) {</span>
+<span class="nc" id="L263">    			transientActions = TransientComputerActionFactory.createAllFor(this);</span>
+    		}
+<span class="nc" id="L265">    		result.addAll(transientActions);</span>
+    	}
+<span class="nc" id="L267">    	return Collections.unmodifiableList(result);</span>
+    }
+
+    @SuppressWarnings(&quot;deprecation&quot;)
+    @Override
+    public void addAction(Action a) {
+<span class="nc bnc" id="L273" title="All 2 branches missed.">        if(a==null) throw new IllegalArgumentException();</span>
+<span class="nc" id="L274">        super.getActions().add(a);</span>
+<span class="nc" id="L275">    }</span>
+
+    /**
+     * This is where the log from the remote agent goes.
+     * The method also creates a log directory if required.
+     * @see #getLogDir(), #relocateOldLogs()
+     */
+    public @Nonnull File getLogFile() {
+<span class="nc" id="L283">        return new File(getLogDir(),&quot;slave.log&quot;);</span>
+    }
+
+    /**
+     * Directory where rotated slave logs are stored.
+     *
+     * The method also creates a log directory if required.
+     *
+     * @since 1.613
+     */
+    protected @Nonnull File getLogDir() {
+<span class="nc" id="L294">        File dir = new File(Jenkins.getInstance().getRootDir(),&quot;logs/slaves/&quot;+nodeName);</span>
+<span class="nc bnc" id="L295" title="All 4 branches missed.">        if (!dir.exists() &amp;&amp; !dir.mkdirs()) {</span>
+<span class="nc" id="L296">            LOGGER.severe(&quot;Failed to create slave log directory &quot; + dir.getAbsolutePath());</span>
+        }
+<span class="nc" id="L298">        return dir;</span>
+    }
+
+    /**
+     * Gets the object that coordinates the workspace allocation on this computer.
+     */
+    public WorkspaceList getWorkspaceList() {
+<span class="nc" id="L305">        return workspaceList;</span>
+    }
+
+    /**
+     * Gets the string representation of the slave log.
+     */
+    public String getLog() throws IOException {
+<span class="nc" id="L312">        return Util.loadFile(getLogFile());</span>
+    }
+
+    /**
+     * Used to URL-bind {@link AnnotatedLargeText}.
+     */
+    public AnnotatedLargeText&lt;Computer&gt; getLogText() {
+<span class="nc" id="L319">        return new AnnotatedLargeText&lt;Computer&gt;(getLogFile(), Charset.defaultCharset(), false, this);</span>
+    }
+
+    public ACL getACL() {
+<span class="nc" id="L323">        return Jenkins.getInstance().getAuthorizationStrategy().getACL(this);</span>
+    }
+
+    public void checkPermission(Permission permission) {
+<span class="nc" id="L327">        getACL().checkPermission(permission);</span>
+<span class="nc" id="L328">    }</span>
+
+    public boolean hasPermission(Permission permission) {
+<span class="nc" id="L331">        return getACL().hasPermission(permission);</span>
+    }
+
+    /**
+     * If the computer was offline (either temporarily or not),
+     * this method will return the cause.
+     *
+     * @return
+     *      null if the system was put offline without given a cause.
+     */
+    @Exported
+    public OfflineCause getOfflineCause() {
+<span class="nc" id="L343">        return offlineCause;</span>
+    }
+
+    /**
+     * If the computer was offline (either temporarily or not),
+     * this method will return the cause as a string (without user info).
+     *
+     * @return
+     *      empty string if the system was put offline without given a cause.
+     */
+    @Exported
+    public String getOfflineCauseReason() {
+<span class="nc bnc" id="L355" title="All 2 branches missed.">        if (offlineCause == null) {</span>
+<span class="nc" id="L356">            return &quot;&quot;;</span>
+        }
+        // fetch the localized string for &quot;Disconnected By&quot;
+<span class="nc" id="L359">        String gsub_base = hudson.slaves.Messages.SlaveComputer_DisconnectedBy(&quot;&quot;,&quot;&quot;);</span>
+        // regex to remove commented reason base string
+<span class="nc" id="L361">        String gsub1 = &quot;^&quot; + gsub_base + &quot;[\\w\\W]* \\: &quot;;</span>
+        // regex to remove non-commented reason base string
+<span class="nc" id="L363">        String gsub2 = &quot;^&quot; + gsub_base + &quot;[\\w\\W]*&quot;;</span>
+
+<span class="nc" id="L365">        String newString = offlineCause.toString().replaceAll(gsub1, &quot;&quot;);</span>
+<span class="nc" id="L366">        return newString.replaceAll(gsub2, &quot;&quot;);</span>
+    }
+
+    /**
+     * Gets the channel that can be used to run a program on this computer.
+     *
+     * @return
+     *      never null when {@link #isOffline()}==false.
+     */
+    public abstract @Nullable VirtualChannel getChannel();
+
+    /**
+     * Gets the default charset of this computer.
+     *
+     * @return
+     *      never null when {@link #isOffline()}==false.
+     */
+    public abstract Charset getDefaultCharset();
+
+    /**
+     * Gets the logs recorded by this slave.
+     */
+    public abstract List&lt;LogRecord&gt; getLogRecords() throws IOException, InterruptedException;
+
+    /**
+     * If {@link #getChannel()}==null, attempts to relaunch the slave agent.
+     */
+    public abstract void doLaunchSlaveAgent( StaplerRequest req, StaplerResponse rsp ) throws IOException, ServletException;
+
+    /**
+     * @deprecated since 2009-01-06.  Use {@link #connect(boolean)}
+     */
+    @Deprecated
+    public final void launch() {
+<span class="nc" id="L400">        connect(true);</span>
+<span class="nc" id="L401">    }</span>
+
+    /**
+     * Do the same as {@link #doLaunchSlaveAgent(StaplerRequest, StaplerResponse)}
+     * but outside the context of serving a request.
+     *
+     * &lt;p&gt;
+     * If already connected or if this computer doesn't support proactive launching, no-op.
+     * This method may return immediately
+     * while the launch operation happens asynchronously.
+     *
+     * @see #disconnect()
+     *
+     * @param forceReconnect
+     *      If true and a connect activity is already in progress, it will be cancelled and
+     *      the new one will be started. If false, and a connect activity is already in progress, this method
+     *      will do nothing and just return the pending connection operation.
+     * @return
+     *      A {@link Future} representing pending completion of the task. The 'completion' includes
+     *      both a successful completion and a non-successful completion (such distinction typically doesn't
+     *      make much sense because as soon as {@link Computer} is connected it can be disconnected by some other threads.)
+     */
+    public final Future&lt;?&gt; connect(boolean forceReconnect) {
+<span class="nc" id="L424">    	connectTime = System.currentTimeMillis();</span>
+<span class="nc" id="L425">    	return _connect(forceReconnect);</span>
+    }
+
+    /**
+     * Allows implementing-classes to provide an implementation for the connect method.
+     *
+     * &lt;p&gt;
+     * If already connected or if this computer doesn't support proactive launching, no-op.
+     * This method may return immediately
+     * while the launch operation happens asynchronously.
+     *
+     * @see #disconnect()
+     *
+     * @param forceReconnect
+     *      If true and a connect activity is already in progress, it will be cancelled and
+     *      the new one will be started. If false, and a connect activity is already in progress, this method
+     *      will do nothing and just return the pending connection operation.
+     * @return
+     *      A {@link Future} representing pending completion of the task. The 'completion' includes
+     *      both a successful completion and a non-successful completion (such distinction typically doesn't
+     *      make much sense because as soon as {@link Computer} is connected it can be disconnected by some other threads.)
+     */
+    protected abstract Future&lt;?&gt; _connect(boolean forceReconnect);
+
+    /**
+     * CLI command to reconnect this node.
+     */
+    @CLIMethod(name=&quot;connect-node&quot;)
+    public void cliConnect(@Option(name=&quot;-f&quot;,usage=&quot;Cancel any currently pending connect operation and retry from scratch&quot;) boolean force) throws ExecutionException, InterruptedException {
+<span class="nc" id="L454">        checkPermission(CONNECT);</span>
+<span class="nc" id="L455">        connect(force).get();</span>
+<span class="nc" id="L456">    }</span>
+
+    /**
+     * Gets the time (since epoch) when this computer connected.
+     *
+     * @return The time in ms since epoch when this computer last connected.
+     */
+    public final long getConnectTime() {
+<span class="nc" id="L464">    	return connectTime;</span>
+    }
+
+    /**
+     * Disconnect this computer.
+     *
+     * If this is the master, no-op. This method may return immediately
+     * while the launch operation happens asynchronously.
+     *
+     * @param cause
+     *      Object that identifies the reason the node was disconnected.
+     *
+     * @return
+     *      {@link Future} to track the asynchronous disconnect operation.
+     * @see #connect(boolean)
+     * @since 1.320
+     */
+    public Future&lt;?&gt; disconnect(OfflineCause cause) {
+<span class="nc" id="L482">        recordTermination();</span>
+<span class="nc" id="L483">        offlineCause = cause;</span>
+<span class="nc bnc" id="L484" title="All 2 branches missed.">        if (Util.isOverridden(Computer.class,getClass(),&quot;disconnect&quot;))</span>
+<span class="nc" id="L485">            return disconnect();    // legacy subtypes that extend disconnect().</span>
+
+<span class="nc" id="L487">        connectTime=0;</span>
+<span class="nc" id="L488">        return Futures.precomputed(null);</span>
+    }
+
+    /**
+     * Equivalent to {@code disconnect(null)}
+     *
+     * @deprecated as of 1.320.
+     *      Use {@link #disconnect(OfflineCause)} and specify the cause.
+     */
+    @Deprecated
+    public Future&lt;?&gt; disconnect() {
+<span class="nc" id="L499">        recordTermination();</span>
+<span class="nc bnc" id="L500" title="All 2 branches missed.">        if (Util.isOverridden(Computer.class,getClass(),&quot;disconnect&quot;,OfflineCause.class))</span>
+            // if the subtype already derives disconnect(OfflineCause), delegate to it
+<span class="nc" id="L502">            return disconnect(null);</span>
+
+<span class="nc" id="L504">        connectTime=0;</span>
+<span class="nc" id="L505">        return Futures.precomputed(null);</span>
+    }
+
+    /**
+     * CLI command to disconnects this node.
+     */
+    @CLIMethod(name=&quot;disconnect-node&quot;)
+    public void cliDisconnect(@Option(name=&quot;-m&quot;,usage=&quot;Record the note about why you are disconnecting this node&quot;) String cause) throws ExecutionException, InterruptedException {
+<span class="nc" id="L513">        checkPermission(DISCONNECT);</span>
+<span class="nc" id="L514">        disconnect(new ByCLI(cause)).get();</span>
+<span class="nc" id="L515">    }</span>
+
+    /**
+     * CLI command to mark the node offline.
+     */
+    @CLIMethod(name=&quot;offline-node&quot;)
+    public void cliOffline(@Option(name=&quot;-m&quot;,usage=&quot;Record the note about why you are disconnecting this node&quot;) String cause) throws ExecutionException, InterruptedException {
+<span class="nc" id="L522">        checkPermission(DISCONNECT);</span>
+<span class="nc" id="L523">        setTemporarilyOffline(true, new ByCLI(cause));</span>
+<span class="nc" id="L524">    }</span>
+
+    public void cliOnline() throws ExecutionException, InterruptedException {
+<span class="nc" id="L527">        checkPermission(CONNECT);</span>
+<span class="nc" id="L528">        setTemporarilyOffline(false, null);</span>
+<span class="nc" id="L529">    }</span>
+
+    /**
+     * Number of {@link Executor}s that are configured for this computer.
+     *
+     * &lt;p&gt;
+     * When this value is decreased, it is temporarily possible
+     * for {@link #executors} to have a larger number than this.
+     */
+    // ugly name to let EL access this
+    @Exported
+    public int getNumExecutors() {
+<span class="nc" id="L541">        return numExecutors;</span>
+    }
+
+    /**
+     * Returns {@link Node#getNodeName() the name of the node}.
+     */
+    public @Nonnull String getName() {
+<span class="nc bnc" id="L548" title="All 2 branches missed.">        return nodeName != null ? nodeName : &quot;&quot;;</span>
+    }
+
+    /**
+     * True if this computer is a Unix machine (as opposed to Windows machine).
+     *
+     * @since 1.624
+     * @return
+     *      null if the computer is disconnected and therefore we don't know whether it is Unix or not.
+     */
+    public abstract @CheckForNull Boolean isUnix();
+
+    /**
+     * Returns the {@link Node} that this computer represents.
+     *
+     * @return
+     *      null if the configuration has changed and the node is removed, yet the corresponding {@link Computer}
+     *      is not yet gone.
+     */
+    public @CheckForNull Node getNode() {
+<span class="nc" id="L568">        Jenkins j = Jenkins.getInstance();</span>
+<span class="nc bnc" id="L569" title="All 2 branches missed.">        if (j == null) {</span>
+<span class="nc" id="L570">            return null;</span>
+        }
+<span class="nc bnc" id="L572" title="All 2 branches missed.">        if (nodeName == null) {</span>
+<span class="nc" id="L573">            return j;</span>
+        }
+<span class="nc" id="L575">        return j.getNode(nodeName);</span>
+    }
+
+    @Exported
+    public LoadStatistics getLoadStatistics() {
+<span class="nc bnc" id="L580" title="All 2 branches missed.">        return LabelAtom.get(nodeName != null ? nodeName : Jenkins.getInstance().getSelfLabel().toString()).loadStatistics;</span>
+    }
+
+    public BuildTimelineWidget getTimeline() {
+<span class="nc" id="L584">        return new BuildTimelineWidget(getBuilds());</span>
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public void taskAccepted(Executor executor, Queue.Task task) {
+        // dummy implementation
+<span class="nc" id="L593">    }</span>
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public void taskCompleted(Executor executor, Queue.Task task, long durationMS) {
+        // dummy implementation
+<span class="nc" id="L601">    }</span>
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public void taskCompletedWithProblems(Executor executor, Queue.Task task, long durationMS, Throwable problems) {
+        // dummy implementation
+<span class="nc" id="L609">    }</span>
+
+    @Exported
+    public boolean isOffline() {
+<span class="nc bnc" id="L613" title="All 4 branches missed.">        return temporarilyOffline || getChannel()==null;</span>
+    }
+
+    public final boolean isOnline() {
+<span class="nc bnc" id="L617" title="All 2 branches missed.">        return !isOffline();</span>
+    }
+
+    /**
+     * This method is called to determine whether manual launching of the slave is allowed at this point in time.
+     * @return {@code true} if manual launching of the slave is allowed at this point in time.
+     */
+    @Exported
+    public boolean isManualLaunchAllowed() {
+<span class="nc" id="L626">        return getRetentionStrategy().isManualLaunchAllowed(this);</span>
+    }
+
+
+    /**
+     * Is a {@link #connect(boolean)} operation in progress?
+     */
+    public abstract boolean isConnecting();
+
+    /**
+     * Returns true if this computer is supposed to be launched via JNLP.
+     * @deprecated since 2008-05-18.
+     *     See {@linkplain #isLaunchSupported()} and {@linkplain ComputerLauncher}
+     */
+    @Exported
+    @Deprecated
+    public boolean isJnlpAgent() {
+<span class="nc" id="L643">        return false;</span>
+    }
+
+    /**
+     * Returns true if this computer can be launched by Hudson proactively and automatically.
+     *
+     * &lt;p&gt;
+     * For example, JNLP slaves return {@code false} from this, because the launch process
+     * needs to be initiated from the slave side.
+     */
+    @Exported
+    public boolean isLaunchSupported() {
+<span class="nc" id="L655">        return true;</span>
+    }
+
+    /**
+     * Returns true if this node is marked temporarily offline by the user.
+     *
+     * &lt;p&gt;
+     * In contrast, {@link #isOffline()} represents the actual online/offline
+     * state. For example, this method may return false while {@link #isOffline()}
+     * returns true if the slave agent failed to launch.
+     *
+     * @deprecated
+     *      You should almost always want {@link #isOffline()}.
+     *      This method is marked as deprecated to warn people when they
+     *      accidentally call this method.
+     */
+    @Exported
+    @Deprecated
+    public boolean isTemporarilyOffline() {
+<span class="nc" id="L674">        return temporarilyOffline;</span>
+    }
+
+    /**
+     * @deprecated as of 1.320.
+     *      Use {@link #setTemporarilyOffline(boolean, OfflineCause)}
+     */
+    @Deprecated
+    public void setTemporarilyOffline(boolean temporarilyOffline) {
+<span class="nc" id="L683">        setTemporarilyOffline(temporarilyOffline,null);</span>
+<span class="nc" id="L684">    }</span>
+
+    /**
+     * Marks the computer as temporarily offline. This retains the underlying
+     * {@link Channel} connection, but prevent builds from executing.
+     *
+     * @param cause
+     *      If the first argument is true, specify the reason why the node is being put
+     *      offline.
+     */
+    public void setTemporarilyOffline(boolean temporarilyOffline, OfflineCause cause) {
+<span class="nc bnc" id="L695" title="All 2 branches missed.">        offlineCause = temporarilyOffline ? cause : null;</span>
+<span class="nc" id="L696">        this.temporarilyOffline = temporarilyOffline;</span>
+<span class="nc" id="L697">        Node node = getNode();</span>
+<span class="nc bnc" id="L698" title="All 2 branches missed.">        if (node != null) {</span>
+<span class="nc" id="L699">            node.setTemporaryOfflineCause(offlineCause);</span>
+        }
+<span class="nc" id="L701">        synchronized (statusChangeLock) {</span>
+<span class="nc" id="L702">            statusChangeLock.notifyAll();</span>
+        }
+<span class="nc bnc" id="L704" title="All 2 branches missed.">        for (ComputerListener cl : ComputerListener.all()) {</span>
+<span class="nc bnc" id="L705" title="All 2 branches missed.">            if (temporarilyOffline)     cl.onTemporarilyOffline(this,cause);</span>
+<span class="nc" id="L706">            else                        cl.onTemporarilyOnline(this);</span>
+        }
+<span class="nc" id="L708">    }</span>
+
+    @Exported
+    public String getIcon() {
+<span class="nc bnc" id="L712" title="All 2 branches missed.">        if(isOffline())</span>
+<span class="nc" id="L713">            return &quot;computer-x.png&quot;;</span>
+        else
+<span class="nc" id="L715">            return &quot;computer.png&quot;;</span>
+    }
+
+    @Exported
+    public String getIconClassName() {
+<span class="nc bnc" id="L720" title="All 2 branches missed.">        if(isOffline())</span>
+<span class="nc" id="L721">            return &quot;icon-computer-x&quot;;</span>
+        else
+<span class="nc" id="L723">            return &quot;icon-computer&quot;;</span>
+    }
+
+    public String getIconAltText() {
+<span class="nc bnc" id="L727" title="All 2 branches missed.">        if(isOffline())</span>
+<span class="nc" id="L728">            return &quot;[offline]&quot;;</span>
+        else
+<span class="nc" id="L730">            return &quot;[online]&quot;;</span>
+    }
+
+    @Exported
+    @Override public @Nonnull String getDisplayName() {
+<span class="nc" id="L735">        return nodeName;</span>
+    }
+
+    public String getCaption() {
+<span class="nc" id="L739">        return Messages.Computer_Caption(nodeName);</span>
+    }
+
+    public String getUrl() {
+<span class="nc" id="L743">        return &quot;computer/&quot; + Util.rawEncode(getName()) + &quot;/&quot;;</span>
+    }
+
+    /**
+     * Returns projects that are tied on this node.
+     */
+    public List&lt;AbstractProject&gt; getTiedJobs() {
+<span class="nc" id="L750">        Node node = getNode();</span>
+<span class="nc bnc" id="L751" title="All 2 branches missed.">        return (node != null) ? node.getSelfLabel().getTiedJobs() : Collections.EMPTY_LIST;</span>
+    }
+
+    public RunList getBuilds() {
+<span class="nc" id="L755">    	return new RunList(Jenkins.getInstance().getAllItems(Job.class)).node(getNode());</span>
+    }
+
+    /**
+     * Called to notify {@link Computer} that its corresponding {@link Node}
+     * configuration is updated.
+     */
+    protected void setNode(Node node) {
+<span class="nc bnc" id="L763" title="All 4 branches missed.">        assert node!=null;</span>
+<span class="nc bnc" id="L764" title="All 2 branches missed.">        if(node instanceof Slave)</span>
+<span class="nc" id="L765">            this.nodeName = node.getNodeName();</span>
+        else
+<span class="nc" id="L767">            this.nodeName = null;</span>
+
+<span class="nc" id="L769">        setNumExecutors(node.getNumExecutors());</span>
+<span class="nc bnc" id="L770" title="All 2 branches missed.">        if (this.temporarilyOffline) {</span>
+            // When we get a new node, push our current temp offline
+            // status to it (as the status is not carried across
+            // configuration changes that recreate the node).
+            // Since this is also called the very first time this
+            // Computer is created, avoid pushing an empty status
+            // as that could overwrite any status that the Node
+            // brought along from its persisted config data.
+<span class="nc" id="L778">            node.setTemporaryOfflineCause(this.offlineCause);</span>
+        }
+<span class="nc" id="L780">    }</span>
+
+    /**
+     * Called by {@link Jenkins#updateComputerList()} to notify {@link Computer} that it will be discarded.
+     *
+     * &lt;p&gt;
+     * Note that at this point {@link #getNode()} returns null.
+     *
+     * @see #onRemoved()
+     */
+    protected void kill() {
+        // On most code paths, this should already be zero, and thus this next call becomes a no-op... and more
+        // importantly it will not acquire a lock on the Queue... not that the lock is bad, more that the lock
+        // may delay unnecessarily
+<span class="nc" id="L794">        setNumExecutors(0);</span>
+<span class="nc" id="L795">    }</span>
+
+    /**
+     * Called by {@link Jenkins#updateComputerList()} to notify {@link Computer} that it will be discarded.
+     *
+     * &lt;p&gt;
+     * Note that at this point {@link #getNode()} returns null.
+     *
+     * &lt;p&gt;
+     * Note that the Queue lock is already held when this method is called.
+     *
+     * @see #onRemoved()
+     */
+    @Restricted(NoExternalUse.class)
+    @GuardedBy(&quot;hudson.model.Queue.lock&quot;)
+    /*package*/ void inflictMortalWound() {
+<span class="nc" id="L811">        setNumExecutors(0);</span>
+<span class="nc" id="L812">    }</span>
+
+    /**
+     * Called by {@link Jenkins} when this computer is removed.
+     *
+     * &lt;p&gt;
+     * This happens when list of nodes are updated (for example by {@link Jenkins#setNodes(List)} and
+     * the computer becomes redundant. Such {@link Computer}s get {@linkplain #kill() killed}, then
+     * after all its executors are finished, this method is called.
+     *
+     * &lt;p&gt;
+     * Note that at this point {@link #getNode()} returns null.
+     *
+     * @see #kill()
+     * @since 1.510
+     */
+    protected void onRemoved(){
+<span class="nc" id="L829">    }</span>
+
+    private synchronized void setNumExecutors(int n) {
+<span class="nc" id="L832">        this.numExecutors = n;</span>
+<span class="nc" id="L833">        final int diff = executors.size()-n;</span>
+
+<span class="nc bnc" id="L835" title="All 2 branches missed.">        if (diff&gt;0) {</span>
+            // we have too many executors
+            // send signal to all idle executors to potentially kill them off
+            // need the Queue maintenance lock held to prevent concurrent job assignment on the idle executors
+<span class="nc" id="L839">            Queue.withLock(new Runnable() {</span>
+                @Override
+                public void run() {
+<span class="nc bnc" id="L842" title="All 2 branches missed.">                    for( Executor e : executors )</span>
+<span class="nc bnc" id="L843" title="All 2 branches missed.">                        if(e.isIdle())</span>
+<span class="nc" id="L844">                            e.interrupt();</span>
+<span class="nc" id="L845">                }</span>
+            });
+        }
+
+<span class="nc bnc" id="L849" title="All 2 branches missed.">        if (diff&lt;0) {</span>
+            // if the number is increased, add new ones
+<span class="nc" id="L851">            addNewExecutorIfNecessary();</span>
+        }
+<span class="nc" id="L853">    }</span>
+
+    private void addNewExecutorIfNecessary() {
+<span class="nc" id="L856">        Set&lt;Integer&gt; availableNumbers  = new HashSet&lt;Integer&gt;();</span>
+<span class="nc bnc" id="L857" title="All 2 branches missed.">        for (int i = 0; i &lt; numExecutors; i++)</span>
+<span class="nc" id="L858">            availableNumbers.add(i);</span>
+
+<span class="nc bnc" id="L860" title="All 2 branches missed.">        for (Executor executor : executors)</span>
+<span class="nc" id="L861">            availableNumbers.remove(executor.getNumber());</span>
+
+<span class="nc bnc" id="L863" title="All 2 branches missed.">        for (Integer number : availableNumbers) {</span>
+            /* There may be busy executors with higher index, so only
+               fill up until numExecutors is reached.
+               Extra executors will call removeExecutor(...) and that
+               will create any necessary executors from #0 again. */
+<span class="nc bnc" id="L868" title="All 2 branches missed.">            if (executors.size() &lt; numExecutors) {</span>
+<span class="nc" id="L869">                Executor e = new Executor(this, number);</span>
+<span class="nc" id="L870">                executors.add(e);</span>
+            }
+        }
+
+<span class="nc" id="L874">    }</span>
+
+    /**
+     * Returns the number of idle {@link Executor}s that can start working immediately.
+     */
+    public int countIdle() {
+<span class="nc" id="L880">        int n = 0;</span>
+<span class="nc bnc" id="L881" title="All 2 branches missed.">        for (Executor e : executors) {</span>
+<span class="nc bnc" id="L882" title="All 2 branches missed.">            if(e.isIdle())</span>
+<span class="nc" id="L883">                n++;</span>
+        }
+<span class="nc" id="L885">        return n;</span>
+    }
+
+    /**
+     * Returns the number of {@link Executor}s that are doing some work right now.
+     */
+    public final int countBusy() {
+<span class="nc" id="L892">        return countExecutors()-countIdle();</span>
+    }
+
+    /**
+     * Returns the current size of the executor pool for this computer.
+     * This number may temporarily differ from {@link #getNumExecutors()} if there
+     * are busy tasks when the configured size is decreased.  OneOffExecutors are
+     * not included in this count.
+     */
+    public final int countExecutors() {
+<span class="nc" id="L902">        return executors.size();</span>
+    }
+
+    /**
+     * Gets the read-only snapshot view of all {@link Executor}s.
+     */
+    @Exported
+    public List&lt;Executor&gt; getExecutors() {
+<span class="nc" id="L910">        return new ArrayList&lt;Executor&gt;(executors);</span>
+    }
+
+    /**
+     * Gets the read-only snapshot view of all {@link OneOffExecutor}s.
+     */
+    @Exported
+    public List&lt;OneOffExecutor&gt; getOneOffExecutors() {
+<span class="nc" id="L918">        return new ArrayList&lt;OneOffExecutor&gt;(oneOffExecutors);</span>
+    }
+
+    /**
+     * Used to render the list of executors.
+     * @return a snapshot of the executor display information
+     * @since 1.607
+     */
+    @Restricted(NoExternalUse.class)
+    public List&lt;DisplayExecutor&gt; getDisplayExecutors() {
+        // The size may change while we are populating, but let's start with a reasonable guess to minimize resizing
+<span class="nc" id="L929">        List&lt;DisplayExecutor&gt; result = new ArrayList&lt;DisplayExecutor&gt;(executors.size()+oneOffExecutors.size());</span>
+<span class="nc" id="L930">        int index = 0;</span>
+<span class="nc bnc" id="L931" title="All 2 branches missed.">        for (Executor e: executors) {</span>
+<span class="nc bnc" id="L932" title="All 2 branches missed.">            if (e.isDisplayCell()) {</span>
+<span class="nc" id="L933">                result.add(new DisplayExecutor(Integer.toString(index + 1), String.format(&quot;executors/%d&quot;, index), e));</span>
+            }
+<span class="nc" id="L935">            index++;</span>
+        }
+<span class="nc" id="L937">        index = 0;</span>
+<span class="nc bnc" id="L938" title="All 2 branches missed.">        for (OneOffExecutor e: oneOffExecutors) {</span>
+<span class="nc bnc" id="L939" title="All 2 branches missed.">            if (e.isDisplayCell()) {</span>
+<span class="nc" id="L940">                result.add(new DisplayExecutor(&quot;&quot;, String.format(&quot;oneOffExecutors/%d&quot;, index), e));</span>
+            }
+<span class="nc" id="L942">            index++;</span>
+        }
+<span class="nc" id="L944">        return result;</span>
+    }
+
+    /**
+     * Returns true if all the executors of this computer are idle.
+     */
+    @Exported
+    public final boolean isIdle() {
+<span class="nc bnc" id="L952" title="All 2 branches missed.">        if (!oneOffExecutors.isEmpty())</span>
+<span class="nc" id="L953">            return false;</span>
+<span class="nc bnc" id="L954" title="All 2 branches missed.">        for (Executor e : executors)</span>
+<span class="nc bnc" id="L955" title="All 2 branches missed.">            if(!e.isIdle())</span>
+<span class="nc" id="L956">                return false;</span>
+<span class="nc" id="L957">        return true;</span>
+    }
+
+    /**
+     * Returns true if this computer has some idle executors that can take more workload.
+     */
+    public final boolean isPartiallyIdle() {
+<span class="nc bnc" id="L964" title="All 2 branches missed.">        for (Executor e : executors)</span>
+<span class="nc bnc" id="L965" title="All 2 branches missed.">            if(e.isIdle())</span>
+<span class="nc" id="L966">                return true;</span>
+<span class="nc" id="L967">        return false;</span>
+    }
+
+    /**
+     * Returns the time when this computer last became idle.
+     *
+     * &lt;p&gt;
+     * If this computer is already idle, the return value will point to the
+     * time in the past since when this computer has been idle.
+     *
+     * &lt;p&gt;
+     * If this computer is busy, the return value will point to the
+     * time in the future where this computer will be expected to become free.
+     */
+    public final long getIdleStartMilliseconds() {
+<span class="nc" id="L982">        long firstIdle = Long.MIN_VALUE;</span>
+<span class="nc bnc" id="L983" title="All 2 branches missed.">        for (Executor e : oneOffExecutors) {</span>
+<span class="nc" id="L984">            firstIdle = Math.max(firstIdle, e.getIdleStartMilliseconds());</span>
+        }
+<span class="nc bnc" id="L986" title="All 2 branches missed.">        for (Executor e : executors) {</span>
+<span class="nc" id="L987">            firstIdle = Math.max(firstIdle, e.getIdleStartMilliseconds());</span>
+        }
+<span class="nc" id="L989">        return firstIdle;</span>
+    }
+
+    /**
+     * Returns the time when this computer first became in demand.
+     */
+    public final long getDemandStartMilliseconds() {
+<span class="nc" id="L996">        long firstDemand = Long.MAX_VALUE;</span>
+<span class="nc bnc" id="L997" title="All 2 branches missed.">        for (Queue.BuildableItem item : Jenkins.getInstance().getQueue().getBuildableItems(this)) {</span>
+<span class="nc" id="L998">            firstDemand = Math.min(item.buildableStartMilliseconds, firstDemand);</span>
+        }
+<span class="nc" id="L1000">        return firstDemand;</span>
+    }
+
+    /**
+     * Called by {@link Executor} to kill excessive executors from this computer.
+     */
+    /*package*/ void removeExecutor(final Executor e) {
+<span class="nc" id="L1007">        final Runnable task = new Runnable() {</span>
+            @Override
+            public void run() {
+<span class="nc" id="L1010">                synchronized (Computer.this) {</span>
+<span class="nc" id="L1011">                    executors.remove(e);</span>
+<span class="nc" id="L1012">                    addNewExecutorIfNecessary();</span>
+<span class="nc bnc" id="L1013" title="All 2 branches missed.">                    if (!isAlive()) {</span>
+<span class="nc" id="L1014">                        AbstractCIBase ciBase = Jenkins.getInstance();</span>
+<span class="nc bnc" id="L1015" title="All 2 branches missed.">                        if (ciBase != null) {</span>
+<span class="nc" id="L1016">                            ciBase.removeComputer(Computer.this);</span>
+                        }
+                    }
+                }
+<span class="nc" id="L1020">            }</span>
+        };
+<span class="nc bnc" id="L1022" title="All 2 branches missed.">        if (!Queue.tryWithLock(task)) {</span>
+            // JENKINS-28840 if we couldn't get the lock push the operation to a separate thread to avoid deadlocks
+<span class="nc" id="L1024">            threadPoolForRemoting.submit(Queue.wrapWithLock(task));</span>
+        }
+<span class="nc" id="L1026">    }</span>
+
+    /**
+     * Returns true if any of the executors are {@linkplain Executor#isActive active}.
+     *
+     * Note that if an executor dies, we'll leave it in {@link #executors} until
+     * the administrator yanks it out, so that we can see why it died.
+     *
+     * @since 1.509
+     */
+    protected boolean isAlive() {
+<span class="nc bnc" id="L1037" title="All 2 branches missed.">        for (Executor e : executors)</span>
+<span class="nc bnc" id="L1038" title="All 2 branches missed.">            if (e.isActive())</span>
+<span class="nc" id="L1039">                return true;</span>
+<span class="nc" id="L1040">        return false;</span>
+    }
+
+    /**
+     * Interrupt all {@link Executor}s.
+     * Called from {@link Jenkins#cleanUp}.
+     */
+    public void interrupt() {
+<span class="nc" id="L1048">        Queue.withLock(new Runnable() {</span>
+            @Override
+            public void run() {
+<span class="nc bnc" id="L1051" title="All 2 branches missed.">                for (Executor e : executors) {</span>
+<span class="nc" id="L1052">                    e.interruptForShutdown();</span>
+                }
+<span class="nc" id="L1054">            }</span>
+        });
+<span class="nc" id="L1056">    }</span>
+
+    public String getSearchUrl() {
+<span class="nc" id="L1059">        return getUrl();</span>
+    }
+
+    /**
+     * {@link RetentionStrategy} associated with this computer.
+     *
+     * @return
+     *      never null. This method return {@code RetentionStrategy&lt;? super T&gt;} where
+     *      {@code T=this.getClass()}.
+     */
+    public abstract RetentionStrategy getRetentionStrategy();
+
+    /**
+     * Expose monitoring data for the remote API.
+     */
+    @Exported(inline=true)
+    public Map&lt;String/*monitor name*/,Object&gt; getMonitorData() {
+<span class="nc" id="L1076">        Map&lt;String,Object&gt; r = new HashMap&lt;String, Object&gt;();</span>
+<span class="nc bnc" id="L1077" title="All 2 branches missed.">        for (NodeMonitor monitor : NodeMonitor.getAll())</span>
+<span class="nc" id="L1078">            r.put(monitor.getClass().getName(),monitor.data(this));</span>
+<span class="nc" id="L1079">        return r;</span>
+    }
+
+    /**
+     * Gets the system properties of the JVM on this computer.
+     * If this is the master, it returns the system property of the master computer.
+     */
+    public Map&lt;Object,Object&gt; getSystemProperties() throws IOException, InterruptedException {
+<span class="nc" id="L1087">        return RemotingDiagnostics.getSystemProperties(getChannel());</span>
+    }
+
+    /**
+     * @deprecated as of 1.292
+     *      Use {@link #getEnvironment()} instead.
+     */
+    @Deprecated
+    public Map&lt;String,String&gt; getEnvVars() throws IOException, InterruptedException {
+<span class="nc" id="L1096">        return getEnvironment();</span>
+    }
+
+    /**
+     * Returns cached environment variables (copy to prevent modification) for the JVM on this computer.
+     * If this is the master, it returns the system property of the master computer.
+     */
+    public EnvVars getEnvironment() throws IOException, InterruptedException {
+<span class="nc" id="L1104">        EnvVars cachedEnvironment = this.cachedEnvironment;</span>
+<span class="nc bnc" id="L1105" title="All 2 branches missed.">        if (cachedEnvironment != null) {</span>
+<span class="nc" id="L1106">            return new EnvVars(cachedEnvironment);</span>
+        }
+
+<span class="nc" id="L1109">        cachedEnvironment = EnvVars.getRemote(getChannel());</span>
+<span class="nc" id="L1110">        this.cachedEnvironment = cachedEnvironment;</span>
+<span class="nc" id="L1111">        return new EnvVars(cachedEnvironment);</span>
+    }
+
+    /**
+     * Creates an environment variable override to be used for launching processes on this node.
+     *
+     * @see ProcStarter#envs(Map)
+     * @since 1.489
+     */
+    public @Nonnull EnvVars buildEnvironment(@Nonnull TaskListener listener) throws IOException, InterruptedException {
+<span class="nc" id="L1121">        EnvVars env = new EnvVars();</span>
+
+<span class="nc" id="L1123">        Node node = getNode();</span>
+<span class="nc bnc" id="L1124" title="All 2 branches missed.">        if (node==null)     return env; // bail out</span>
+
+<span class="nc bnc" id="L1126" title="All 2 branches missed.">        for (NodeProperty nodeProperty: Jenkins.getInstance().getGlobalNodeProperties()) {</span>
+<span class="nc" id="L1127">            nodeProperty.buildEnvVars(env,listener);</span>
+        }
+
+<span class="nc bnc" id="L1130" title="All 2 branches missed.">        for (NodeProperty nodeProperty: node.getNodeProperties()) {</span>
+<span class="nc" id="L1131">            nodeProperty.buildEnvVars(env,listener);</span>
+        }
+
+        // TODO: hmm, they don't really belong
+<span class="nc" id="L1135">        String rootUrl = Jenkins.getInstance().getRootUrl();</span>
+<span class="nc bnc" id="L1136" title="All 2 branches missed.">        if(rootUrl!=null) {</span>
+<span class="nc" id="L1137">            env.put(&quot;HUDSON_URL&quot;, rootUrl); // Legacy.</span>
+<span class="nc" id="L1138">            env.put(&quot;JENKINS_URL&quot;, rootUrl);</span>
+        }
+
+<span class="nc" id="L1141">        return env;</span>
+    }
+
+    /**
+     * Gets the thread dump of the slave JVM.
+     * @return
+     *      key is the thread name, and the value is the pre-formatted dump.
+     */
+    public Map&lt;String,String&gt; getThreadDump() throws IOException, InterruptedException {
+<span class="nc" id="L1150">        return RemotingDiagnostics.getThreadDump(getChannel());</span>
+    }
+
+    /**
+     * Obtains the heap dump.
+     */
+    public HeapDump getHeapDump() throws IOException {
+<span class="nc" id="L1157">        return new HeapDump(this,getChannel());</span>
+    }
+
+    /**
+     * This method tries to compute the name of the host that's reachable by all the other nodes.
+     *
+     * &lt;p&gt;
+     * Since it's possible that the slave is not reachable from the master (it may be behind a firewall,
+     * connecting to master via JNLP), this method may return null.
+     *
+     * It's surprisingly tricky for a machine to know a name that other systems can get to,
+     * especially between things like DNS search suffix, the hosts file, and YP.
+     *
+     * &lt;p&gt;
+     * So the technique here is to compute possible interfaces and names on the slave,
+     * then try to ping them from the master, and pick the one that worked.
+     *
+     * &lt;p&gt;
+     * The computation may take some time, so it employs caching to make the successive lookups faster.
+     *
+     * @since 1.300
+     * @return
+     *      null if the host name cannot be computed (for example because this computer is offline,
+     *      because the slave is behind the firewall, etc.)
+     */
+    public String getHostName() throws IOException, InterruptedException {
+<span class="nc bnc" id="L1183" title="All 2 branches missed.">        if(hostNameCached)</span>
+            // in the worst case we end up having multiple threads computing the host name simultaneously, but that's not harmful, just wasteful.
+<span class="nc" id="L1185">            return cachedHostName;</span>
+
+<span class="nc" id="L1187">        VirtualChannel channel = getChannel();</span>
+<span class="nc bnc" id="L1188" title="All 2 branches missed.">        if(channel==null)   return null; // can't compute right now</span>
+
+<span class="nc bnc" id="L1190" title="All 2 branches missed.">        for( String address : channel.call(new ListPossibleNames())) {</span>
+            try {
+<span class="nc" id="L1192">                InetAddress ia = InetAddress.getByName(address);</span>
+<span class="nc bnc" id="L1193" title="All 2 branches missed.">                if(!(ia instanceof Inet4Address)) {</span>
+<span class="nc" id="L1194">                    LOGGER.log(Level.FINE, &quot;{0} is not an IPv4 address&quot;, address);</span>
+<span class="nc" id="L1195">                    continue;</span>
+                }
+<span class="nc bnc" id="L1197" title="All 2 branches missed.">                if(!ComputerPinger.checkIsReachable(ia, 3)) {</span>
+<span class="nc" id="L1198">                    LOGGER.log(Level.FINE, &quot;{0} didn't respond to ping&quot;, address);</span>
+<span class="nc" id="L1199">                    continue;</span>
+                }
+<span class="nc" id="L1201">                cachedHostName = ia.getCanonicalHostName();</span>
+<span class="nc" id="L1202">                hostNameCached = true;</span>
+<span class="nc" id="L1203">                return cachedHostName;</span>
+<span class="nc" id="L1204">            } catch (IOException e) {</span>
+                // if a given name fails to parse on this host, we get this error
+<span class="nc" id="L1206">                LogRecord lr = new LogRecord(Level.FINE, &quot;Failed to parse {0}&quot;);</span>
+<span class="nc" id="L1207">                lr.setThrown(e);</span>
+<span class="nc" id="L1208">                lr.setParameters(new Object[]{address});</span>
+<span class="nc" id="L1209">                LOGGER.log(lr);</span>
+            }
+        }
+
+        // allow the administrator to manually specify the host name as a fallback. HUDSON-5373
+<span class="nc" id="L1214">        cachedHostName = channel.call(new GetFallbackName());</span>
+<span class="nc" id="L1215">        hostNameCached = true;</span>
+<span class="nc" id="L1216">        return cachedHostName;</span>
+    }
+
+    /**
+     * Starts executing a fly-weight task.
+     */
+    /*package*/ final void startFlyWeightTask(WorkUnit p) {
+<span class="nc" id="L1223">        OneOffExecutor e = new OneOffExecutor(this);</span>
+<span class="nc" id="L1224">        e.start(p);</span>
+<span class="nc" id="L1225">        oneOffExecutors.add(e);</span>
+<span class="nc" id="L1226">    }</span>
+
+    /*package*/ final void remove(OneOffExecutor e) {
+<span class="nc" id="L1229">        oneOffExecutors.remove(e);</span>
+<span class="nc" id="L1230">    }</span>
+
+<span class="nc" id="L1232">    private static class ListPossibleNames extends MasterToSlaveCallable&lt;List&lt;String&gt;,IOException&gt; {</span>
+        /**
+         * In the normal case we would use {@link Computer} as the logger's name, however to
+         * do that we would have to send the {@link Computer} class over to the remote classloader
+         * and then it would need to be loaded, which pulls in {@link Jenkins} and loads that
+         * and then that fails to load as you are not supposed to do that. Another option
+         * would be to export the logger over remoting, with increased complexity as a result.
+         * Instead we just use a loger based on this class name and prevent any references to
+         * other classes from being transferred over remoting.
+         */
+<span class="nc" id="L1242">        private static final Logger LOGGER = Logger.getLogger(ListPossibleNames.class.getName());</span>
+        
+        public List&lt;String&gt; call() throws IOException {
+<span class="nc" id="L1245">            List&lt;String&gt; names = new ArrayList&lt;String&gt;();</span>
+
+<span class="nc" id="L1247">            Enumeration&lt;NetworkInterface&gt; nis = NetworkInterface.getNetworkInterfaces();</span>
+<span class="nc bnc" id="L1248" title="All 2 branches missed.">            while (nis.hasMoreElements()) {</span>
+<span class="nc" id="L1249">                NetworkInterface ni =  nis.nextElement();</span>
+<span class="nc" id="L1250">                LOGGER.log(Level.FINE, &quot;Listing up IP addresses for {0}&quot;, ni.getDisplayName());</span>
+<span class="nc" id="L1251">                Enumeration&lt;InetAddress&gt; e = ni.getInetAddresses();</span>
+<span class="nc bnc" id="L1252" title="All 2 branches missed.">                while (e.hasMoreElements()) {</span>
+<span class="nc" id="L1253">                    InetAddress ia =  e.nextElement();</span>
+<span class="nc bnc" id="L1254" title="All 2 branches missed.">                    if(ia.isLoopbackAddress()) {</span>
+<span class="nc" id="L1255">                        LOGGER.log(Level.FINE, &quot;{0} is a loopback address&quot;, ia);</span>
+<span class="nc" id="L1256">                        continue;</span>
+                    }
+
+<span class="nc bnc" id="L1259" title="All 2 branches missed.">                    if(!(ia instanceof Inet4Address)) {</span>
+<span class="nc" id="L1260">                        LOGGER.log(Level.FINE, &quot;{0} is not an IPv4 address&quot;, ia);</span>
+<span class="nc" id="L1261">                        continue;</span>
+                    }
+
+<span class="nc" id="L1264">                    LOGGER.log(Level.FINE, &quot;{0} is a viable candidate&quot;, ia);</span>
+<span class="nc" id="L1265">                    names.add(ia.getHostAddress());</span>
+                }
+            }
+<span class="nc" id="L1268">            return names;</span>
+        }
+<span class="nc" id="L1270">        private static final long serialVersionUID = 1L;</span>
+    }
+
+<span class="nc" id="L1273">    private static class GetFallbackName extends MasterToSlaveCallable&lt;String,IOException&gt; {</span>
+        public String call() throws IOException {
+<span class="nc" id="L1275">            return System.getProperty(&quot;host.name&quot;);</span>
+        }
+        private static final long serialVersionUID = 1L;
+    }
+
+<span class="fc" id="L1280">    public static final ExecutorService threadPoolForRemoting = new ContextResettingExecutorService(</span>
+<span class="fc" id="L1281">            Executors.newCachedThreadPool(</span>
+<span class="fc" id="L1282">                    new ExceptionCatchingThreadFactory(</span>
+<span class="fc" id="L1283">                            new NamingThreadFactory(new DaemonThreadFactory(), &quot;Computer.threadPoolForRemoting&quot;))));</span>
+
+//
+//
+// UI
+//
+//
+    public void doRssAll( StaplerRequest req, StaplerResponse rsp ) throws IOException, ServletException {
+<span class="nc" id="L1291">        rss(req, rsp, &quot; all builds&quot;, getBuilds());</span>
+<span class="nc" id="L1292">    }</span>
+
+    public void doRssFailed(StaplerRequest req, StaplerResponse rsp ) throws IOException, ServletException {
+<span class="nc" id="L1295">        rss(req, rsp, &quot; failed builds&quot;, getBuilds().failureOnly());</span>
+<span class="nc" id="L1296">    }</span>
+    private void rss(StaplerRequest req, StaplerResponse rsp, String suffix, RunList runs) throws IOException, ServletException {
+<span class="nc" id="L1298">        RSS.forwardToRss(getDisplayName() + suffix, getUrl(),</span>
+<span class="nc" id="L1299">                runs.newBuilds(), Run.FEED_ADAPTER, req, rsp);</span>
+<span class="nc" id="L1300">    }</span>
+
+    @RequirePOST
+    public HttpResponse doToggleOffline(@QueryParameter String offlineMessage) throws IOException, ServletException {
+<span class="nc bnc" id="L1304" title="All 2 branches missed.">        if(!temporarilyOffline) {</span>
+<span class="nc" id="L1305">            checkPermission(DISCONNECT);</span>
+<span class="nc" id="L1306">            offlineMessage = Util.fixEmptyAndTrim(offlineMessage);</span>
+<span class="nc bnc" id="L1307" title="All 2 branches missed.">            setTemporarilyOffline(!temporarilyOffline,</span>
+<span class="nc" id="L1308">                    new OfflineCause.UserCause(User.current(), offlineMessage));</span>
+<span class="nc" id="L1309">        } else {</span>
+<span class="nc" id="L1310">            checkPermission(CONNECT);</span>
+<span class="nc bnc" id="L1311" title="All 2 branches missed.">            setTemporarilyOffline(!temporarilyOffline,null);</span>
+        }
+<span class="nc" id="L1313">        return HttpResponses.redirectToDot();</span>
+    }
+
+    @RequirePOST
+    public HttpResponse doChangeOfflineCause(@QueryParameter String offlineMessage) throws IOException, ServletException {
+<span class="nc" id="L1318">        checkPermission(DISCONNECT);</span>
+<span class="nc" id="L1319">        offlineMessage = Util.fixEmptyAndTrim(offlineMessage);</span>
+<span class="nc" id="L1320">        setTemporarilyOffline(true,</span>
+<span class="nc" id="L1321">                new OfflineCause.UserCause(User.current(), offlineMessage));</span>
+<span class="nc" id="L1322">        return HttpResponses.redirectToDot();</span>
+    }
+
+    public Api getApi() {
+<span class="nc" id="L1326">        return new Api(this);</span>
+    }
+
+    /**
+     * Dumps the contents of the export table.
+     */
+    public void doDumpExportTable( StaplerRequest req, StaplerResponse rsp ) throws IOException, ServletException, InterruptedException {
+        // this is a debug probe and may expose sensitive information
+<span class="nc" id="L1334">        checkPermission(Jenkins.ADMINISTER);</span>
+
+<span class="nc" id="L1336">        rsp.setContentType(&quot;text/plain&quot;);</span>
+<span class="nc" id="L1337">        PrintWriter w = new PrintWriter(rsp.getCompressedWriter(req));</span>
+<span class="nc" id="L1338">        VirtualChannel vc = getChannel();</span>
+<span class="nc bnc" id="L1339" title="All 2 branches missed.">        if (vc instanceof Channel) {</span>
+<span class="nc" id="L1340">            w.println(&quot;Master to slave&quot;);</span>
+<span class="nc" id="L1341">            ((Channel)vc).dumpExportTable(w);</span>
+<span class="nc" id="L1342">            w.flush(); // flush here once so that even if the dump from the slave fails, the client gets some useful info</span>
+
+<span class="nc" id="L1344">            w.println(&quot;\n\n\nSlave to master&quot;);</span>
+<span class="nc" id="L1345">            w.print(vc.call(new DumpExportTableTask()));</span>
+<span class="nc" id="L1346">        } else {</span>
+<span class="nc" id="L1347">            w.println(Messages.Computer_BadChannel());</span>
+        }
+<span class="nc" id="L1349">        w.close();</span>
+<span class="nc" id="L1350">    }</span>
+
+<span class="nc" id="L1352">    private static final class DumpExportTableTask extends MasterToSlaveCallable&lt;String,IOException&gt; {</span>
+        public String call() throws IOException {
+<span class="nc" id="L1354">            StringWriter sw = new StringWriter();</span>
+<span class="nc" id="L1355">            PrintWriter pw = new PrintWriter(sw);</span>
+<span class="nc" id="L1356">            Channel.current().dumpExportTable(pw);</span>
+<span class="nc" id="L1357">            pw.close();</span>
+<span class="nc" id="L1358">            return sw.toString();</span>
+        }
+    }
+
+    /**
+     * For system diagnostics.
+     * Run arbitrary Groovy script.
+     */
+    public void doScript(StaplerRequest req, StaplerResponse rsp) throws IOException, ServletException {
+<span class="nc" id="L1367">        _doScript(req, rsp, &quot;_script.jelly&quot;);</span>
+<span class="nc" id="L1368">    }</span>
+
+    /**
+     * Run arbitrary Groovy script and return result as plain text.
+     */
+    public void doScriptText(StaplerRequest req, StaplerResponse rsp) throws IOException, ServletException {
+<span class="nc" id="L1374">        _doScript(req, rsp, &quot;_scriptText.jelly&quot;);</span>
+<span class="nc" id="L1375">    }</span>
+
+    protected void _doScript(StaplerRequest req, StaplerResponse rsp, String view) throws IOException, ServletException {
+<span class="nc" id="L1378">        Jenkins._doScript(req, rsp, req.getView(this, view), getChannel(), getACL());</span>
+<span class="nc" id="L1379">    }</span>
+
+    /**
+     * Accepts the update to the node configuration.
+     */
+    @RequirePOST
+    public void doConfigSubmit( StaplerRequest req, StaplerResponse rsp ) throws IOException, ServletException, FormException {
+<span class="nc" id="L1386">        checkPermission(CONFIGURE);</span>
+
+<span class="nc" id="L1388">        String proposedName = Util.fixEmptyAndTrim(req.getSubmittedForm().getString(&quot;name&quot;));</span>
+<span class="nc" id="L1389">        Jenkins.checkGoodName(proposedName);</span>
+
+<span class="nc" id="L1391">        Node node = getNode();</span>
+<span class="nc bnc" id="L1392" title="All 2 branches missed.">        if (node == null) {</span>
+<span class="nc" id="L1393">            throw new ServletException(&quot;No such node &quot; + nodeName);</span>
+        }
+
+<span class="nc bnc" id="L1396" title="All 2 branches missed.">        if ((!proposedName.equals(nodeName))</span>
+<span class="nc bnc" id="L1397" title="All 2 branches missed.">                &amp;&amp; Jenkins.getActiveInstance().getNode(proposedName) != null) {</span>
+<span class="nc" id="L1398">            throw new FormException(Messages.ComputerSet_SlaveAlreadyExists(proposedName), &quot;name&quot;);</span>
+        }
+
+<span class="nc" id="L1401">        Node result = node.reconfigure(req, req.getSubmittedForm());</span>
+<span class="nc" id="L1402">        replaceBy(result);</span>
+
+        // take the user back to the slave top page.
+<span class="nc" id="L1405">        rsp.sendRedirect2(&quot;../&quot; + result.getNodeName() + '/');</span>
+<span class="nc" id="L1406">    }</span>
+
+    /**
+     * Accepts &lt;tt&gt;config.xml&lt;/tt&gt; submission, as well as serve it.
+     */
+    @WebMethod(name = &quot;config.xml&quot;)
+    public void doConfigDotXml(StaplerRequest req, StaplerResponse rsp)
+            throws IOException, ServletException {
+
+<span class="nc bnc" id="L1415" title="All 2 branches missed.">        if (req.getMethod().equals(&quot;GET&quot;)) {</span>
+            // read
+<span class="nc" id="L1417">            checkPermission(EXTENDED_READ);</span>
+<span class="nc" id="L1418">            rsp.setContentType(&quot;application/xml&quot;);</span>
+<span class="nc" id="L1419">            Node node = getNode();</span>
+<span class="nc bnc" id="L1420" title="All 2 branches missed.">            if (node == null) {</span>
+<span class="nc" id="L1421">                throw HttpResponses.notFound();</span>
+            }
+<span class="nc" id="L1423">            Jenkins.XSTREAM2.toXMLUTF8(node, rsp.getOutputStream());</span>
+<span class="nc" id="L1424">            return;</span>
+        }
+<span class="nc bnc" id="L1426" title="All 2 branches missed.">        if (req.getMethod().equals(&quot;POST&quot;)) {</span>
+            // submission
+<span class="nc" id="L1428">            updateByXml(req.getInputStream());</span>
+<span class="nc" id="L1429">            return;</span>
+        }
+
+        // huh?
+<span class="nc" id="L1433">        rsp.sendError(SC_BAD_REQUEST);</span>
+<span class="nc" id="L1434">    }</span>
+
+    /**
+     * Replaces the current {@link Node} by another one.
+     */
+    private void replaceBy(final Node newNode) throws ServletException, IOException {
+<span class="nc" id="L1440">        final Jenkins app = Jenkins.getInstance();</span>
+
+        // use the queue lock until Nodes has a way of directly modifying a single node.
+<span class="nc" id="L1443">        Queue.withLock(new NotReallyRoleSensitiveCallable&lt;Void, IOException&gt;() {</span>
+            public Void call() throws IOException {
+<span class="nc" id="L1445">                List&lt;Node&gt; nodes = new ArrayList&lt;Node&gt;(app.getNodes());</span>
+<span class="nc" id="L1446">                Node node = getNode();</span>
+<span class="nc bnc" id="L1447" title="All 2 branches missed.">                int i  = (node != null) ? nodes.indexOf(node) : -1;</span>
+<span class="nc bnc" id="L1448" title="All 2 branches missed.">                if(i&lt;0) {</span>
+<span class="nc" id="L1449">                    throw new IOException(&quot;This slave appears to be removed while you were editing the configuration&quot;);</span>
+                }
+<span class="nc" id="L1451">                nodes.set(i, newNode);</span>
+<span class="nc" id="L1452">                app.setNodes(nodes);</span>
+<span class="nc" id="L1453">                return null;</span>
+            }
+        });
+<span class="nc" id="L1456">    }</span>
+
+    /**
+     * Updates Job by its XML definition.
+     *
+     * @since 1.526
+     */
+    public void updateByXml(final InputStream source) throws IOException, ServletException {
+<span class="nc" id="L1464">        checkPermission(CONFIGURE);</span>
+<span class="nc" id="L1465">        Node result = (Node)Jenkins.XSTREAM2.fromXML(source);</span>
+<span class="nc" id="L1466">        replaceBy(result);</span>
+<span class="nc" id="L1467">    }</span>
+
+    /**
+     * Really deletes the slave.
+     */
+    @RequirePOST
+    public HttpResponse doDoDelete() throws IOException {
+<span class="nc" id="L1474">        checkPermission(DELETE);</span>
+<span class="nc" id="L1475">        Node node = getNode();</span>
+<span class="nc bnc" id="L1476" title="All 2 branches missed.">        if (node != null) {</span>
+<span class="nc" id="L1477">            Jenkins.getInstance().removeNode(node);</span>
+<span class="nc" id="L1478">        } else {</span>
+<span class="nc" id="L1479">            AbstractCIBase app = Jenkins.getInstance();</span>
+<span class="nc" id="L1480">            app.removeComputer(this);</span>
+        }
+<span class="nc" id="L1482">        return new HttpRedirect(&quot;..&quot;);</span>
+    }
+
+    /**
+     * Blocks until the node becomes online/offline.
+     */
+    @CLIMethod(name=&quot;wait-node-online&quot;)
+    public void waitUntilOnline() throws InterruptedException {
+<span class="nc" id="L1490">        synchronized (statusChangeLock) {</span>
+<span class="nc bnc" id="L1491" title="All 2 branches missed.">            while (!isOnline())</span>
+<span class="nc" id="L1492">                statusChangeLock.wait(1000);</span>
+        }
+<span class="nc" id="L1494">    }</span>
+
+    @CLIMethod(name=&quot;wait-node-offline&quot;)
+    public void waitUntilOffline() throws InterruptedException {
+<span class="nc" id="L1498">        synchronized (statusChangeLock) {</span>
+<span class="nc bnc" id="L1499" title="All 2 branches missed.">            while (!isOffline())</span>
+<span class="nc" id="L1500">                statusChangeLock.wait(1000);</span>
+        }
+<span class="nc" id="L1502">    }</span>
+
+    /**
+     * Handles incremental log.
+     */
+    public void doProgressiveLog( StaplerRequest req, StaplerResponse rsp) throws IOException {
+<span class="nc" id="L1508">        getLogText().doProgressText(req, rsp);</span>
+<span class="nc" id="L1509">    }</span>
+
+    /**
+     * Gets the current {@link Computer} that the build is running.
+     * This method only works when called during a build, such as by
+     * {@link hudson.tasks.Publisher}, {@link hudson.tasks.BuildWrapper}, etc.
+     * @return the {@link Computer} associated with {@link Executor#currentExecutor}, or (consistently as of 1.591) null if not on an executor thread
+     */
+    public static @Nullable Computer currentComputer() {
+<span class="nc" id="L1518">        Executor e = Executor.currentExecutor();</span>
+<span class="nc bnc" id="L1519" title="All 2 branches missed.">        return e != null ? e.getOwner() : null;</span>
+    }
+
+    /**
+     * Returns {@code true} if the computer is accepting tasks. Needed to allow slaves programmatic suspension of task
+     * scheduling that does not overlap with being offline.
+     *
+     * @return {@code true} if the computer is accepting tasks
+     * @see hudson.slaves.RetentionStrategy#isAcceptingTasks(Computer)
+     * @see hudson.model.Node#isAcceptingTasks()
+     */
+    @OverrideMustInvoke(When.ANYTIME)
+    public boolean isAcceptingTasks() {
+<span class="nc" id="L1532">        final Node node = getNode();</span>
+<span class="nc bnc" id="L1533" title="All 6 branches missed.">        return getRetentionStrategy().isAcceptingTasks(this) &amp;&amp; (node == null || node.isAcceptingTasks());</span>
+    }
+
+    /**
+     * Used for CLI binding.
+     */
+    @CLIResolver
+    public static Computer resolveForCLI(
+            @Argument(required=true,metaVar=&quot;NAME&quot;,usage=&quot;Slave name, or empty string for master&quot;) String name) throws CmdLineException {
+<span class="nc" id="L1542">        Jenkins h = Jenkins.getInstance();</span>
+<span class="nc" id="L1543">        Computer item = h.getComputer(name);</span>
+<span class="nc bnc" id="L1544" title="All 2 branches missed.">        if (item==null) {</span>
+<span class="nc" id="L1545">            List&lt;String&gt; names = new ArrayList&lt;String&gt;();</span>
+<span class="nc bnc" id="L1546" title="All 2 branches missed.">            for (Computer c : h.getComputers())</span>
+<span class="nc bnc" id="L1547" title="All 2 branches missed.">                if (c.getName().length()&gt;0)</span>
+<span class="nc" id="L1548">                    names.add(c.getName());</span>
+<span class="nc" id="L1549">            throw new CmdLineException(null,Messages.Computer_NoSuchSlaveExists(name,EditDistance.findNearest(name,names)));</span>
+        }
+<span class="nc" id="L1551">        return item;</span>
+    }
+
+    /**
+     * Relocate log files in the old location to the new location.
+     *
+     * Files were used to be $JENKINS_ROOT/slave-NAME.log (and .1, .2, ...)
+     * but now they are at $JENKINS_ROOT/logs/slaves/NAME/slave.log (and .1, .2, ...)
+     *
+     * @see #getLogFile()
+     */
+    @Initializer
+    public static void relocateOldLogs() {
+<span class="nc" id="L1564">        relocateOldLogs(Jenkins.getInstance().getRootDir());</span>
+<span class="nc" id="L1565">    }</span>
+
+    /*package*/ static void relocateOldLogs(File dir) {
+<span class="fc" id="L1568">        final Pattern logfile = Pattern.compile(&quot;slave-(.*)\\.log(\\.[0-9]+)?&quot;);</span>
+<span class="fc" id="L1569">        File[] logfiles = dir.listFiles(new FilenameFilter() {</span>
+            public boolean accept(File dir, String name) {
+<span class="fc" id="L1571">                return logfile.matcher(name).matches();</span>
+            }
+        });
+<span class="pc bpc" id="L1574" title="1 of 2 branches missed.">        if (logfiles==null)     return;</span>
+
+<span class="fc bfc" id="L1576" title="All 2 branches covered.">        for (File f : logfiles) {</span>
+<span class="fc" id="L1577">            Matcher m = logfile.matcher(f.getName());</span>
+<span class="pc bpc" id="L1578" title="1 of 2 branches missed.">            if (m.matches()) {</span>
+<span class="fc" id="L1579">                File newLocation = new File(dir, &quot;logs/slaves/&quot; + m.group(1) + &quot;/slave.log&quot; + Util.fixNull(m.group(2)));</span>
+<span class="fc" id="L1580">                newLocation.getParentFile().mkdirs();</span>
+<span class="fc" id="L1581">                boolean relocationSuccessful=f.renameTo(newLocation);</span>
+<span class="pc bpc" id="L1582" title="1 of 2 branches missed.">                if (relocationSuccessful) { // The operation will fail if mkdir fails</span>
+<span class="fc" id="L1583">                    LOGGER.log(Level.INFO, &quot;Relocated log file {0} to {1}&quot;,new Object[] {f.getPath(),newLocation.getPath()});</span>
+<span class="fc" id="L1584">                } else {</span>
+<span class="nc" id="L1585">                    LOGGER.log(Level.WARNING, &quot;Cannot relocate log file {0} to {1}&quot;,new Object[] {f.getPath(),newLocation.getPath()});</span>
+                }
+<span class="nc" id="L1587">            } else {</span>
+<span class="nc bnc" id="L1588" title="All 2 branches missed.">                assert false;</span>
+            }
+        }
+<span class="fc" id="L1591">    }</span>
+
+    /**
+     * A value class to provide a consistent snapshot view of the state of an executor to avoid race conditions
+     * during rendering of the executors list.
+     *
+     * @since 1.607
+     */
+    @Restricted(NoExternalUse.class)
+    public static class DisplayExecutor implements ModelObject {
+
+        @Nonnull
+        private final String displayName;
+        @Nonnull
+        private final String url;
+        @Nonnull
+        private final Executor executor;
+
+<span class="nc" id="L1609">        public DisplayExecutor(@Nonnull String displayName, @Nonnull String url, @Nonnull Executor executor) {</span>
+<span class="nc" id="L1610">            this.displayName = displayName;</span>
+<span class="nc" id="L1611">            this.url = url;</span>
+<span class="nc" id="L1612">            this.executor = executor;</span>
+<span class="nc" id="L1613">        }</span>
+
+        @Override
+        @Nonnull
+        public String getDisplayName() {
+<span class="nc" id="L1618">            return displayName;</span>
+        }
+
+        @Nonnull
+        public String getUrl() {
+<span class="nc" id="L1623">            return url;</span>
+        }
+
+        @Nonnull
+        public Executor getExecutor() {
+<span class="nc" id="L1628">            return executor;</span>
+        }
+
+        @Override
+        public String toString() {
+<span class="nc" id="L1633">            final StringBuilder sb = new StringBuilder(&quot;DisplayExecutor{&quot;);</span>
+<span class="nc" id="L1634">            sb.append(&quot;displayName='&quot;).append(displayName).append('\'');</span>
+<span class="nc" id="L1635">            sb.append(&quot;, url='&quot;).append(url).append('\'');</span>
+<span class="nc" id="L1636">            sb.append(&quot;, executor=&quot;).append(executor);</span>
+<span class="nc" id="L1637">            sb.append('}');</span>
+<span class="nc" id="L1638">            return sb.toString();</span>
+        }
+
+        @Override
+        public boolean equals(Object o) {
+<span class="nc bnc" id="L1643" title="All 2 branches missed.">            if (this == o) {</span>
+<span class="nc" id="L1644">                return true;</span>
+            }
+<span class="nc bnc" id="L1646" title="All 4 branches missed.">            if (o == null || getClass() != o.getClass()) {</span>
+<span class="nc" id="L1647">                return false;</span>
+            }
+
+<span class="nc" id="L1650">            DisplayExecutor that = (DisplayExecutor) o;</span>
+
+<span class="nc bnc" id="L1652" title="All 2 branches missed.">            if (!executor.equals(that.executor)) {</span>
+<span class="nc" id="L1653">                return false;</span>
+            }
+
+<span class="nc" id="L1656">            return true;</span>
+        }
+
+        @Extension(ordinal = Double.MAX_VALUE)
+        @Restricted(DoNotUse.class)
+<span class="nc" id="L1661">        public static class InternalComputerListener extends ComputerListener {</span>
+            @Override
+            public void onOnline(Computer c, TaskListener listener) throws IOException, InterruptedException {
+<span class="nc" id="L1664">                c.cachedEnvironment = null;</span>
+<span class="nc" id="L1665">            }</span>
+        }
+
+        @Override
+        public int hashCode() {
+<span class="nc" id="L1670">            return executor.hashCode();</span>
+        }
+    }
+
+    /**
+     * Used to trace requests to terminate a computer.
+     *
+     * @since 1.607
+     */
+    public static class TerminationRequest extends RuntimeException {
+        private final long when;
+        public TerminationRequest(String message) {
+<span class="nc" id="L1682">            super(message);</span>
+<span class="nc" id="L1683">            this.when = System.currentTimeMillis();</span>
+<span class="nc" id="L1684">        }</span>
+
+        /**
+         * Returns the when the termination request was created.
+         *
+         * @return the difference, measured in milliseconds, between
+         * the time of the termination request and midnight, January 1, 1970 UTC.
+         */
+        public long getWhen() {
+<span class="nc" id="L1693">            return when;</span>
+        }
+    }
+
+<span class="fc" id="L1697">    public static final PermissionGroup PERMISSIONS = new PermissionGroup(Computer.class,Messages._Computer_Permissions_Title());</span>
+<span class="fc" id="L1698">    public static final Permission CONFIGURE = new Permission(PERMISSIONS,&quot;Configure&quot;, Messages._Computer_ConfigurePermission_Description(), Permission.CONFIGURE, PermissionScope.COMPUTER);</span>
+    /**
+     * @since 1.532
+     */
+<span class="fc" id="L1702">    public static final Permission EXTENDED_READ = new Permission(PERMISSIONS,&quot;ExtendedRead&quot;, Messages._Computer_ExtendedReadPermission_Description(), CONFIGURE, Boolean.getBoolean(&quot;hudson.security.ExtendedReadPermission&quot;), new PermissionScope[]{PermissionScope.COMPUTER});</span>
+<span class="fc" id="L1703">    public static final Permission DELETE = new Permission(PERMISSIONS,&quot;Delete&quot;, Messages._Computer_DeletePermission_Description(), Permission.DELETE, PermissionScope.COMPUTER);</span>
+<span class="fc" id="L1704">    public static final Permission CREATE = new Permission(PERMISSIONS,&quot;Create&quot;, Messages._Computer_CreatePermission_Description(), Permission.CREATE, PermissionScope.COMPUTER);</span>
+<span class="fc" id="L1705">    public static final Permission DISCONNECT = new Permission(PERMISSIONS,&quot;Disconnect&quot;, Messages._Computer_DisconnectPermission_Description(), Jenkins.ADMINISTER, PermissionScope.COMPUTER);</span>
+<span class="fc" id="L1706">    public static final Permission CONNECT = new Permission(PERMISSIONS,&quot;Connect&quot;, Messages._Computer_ConnectPermission_Description(), DISCONNECT, PermissionScope.COMPUTER);</span>
+<span class="fc" id="L1707">    public static final Permission BUILD = new Permission(PERMISSIONS, &quot;Build&quot;, Messages._Computer_BuildPermission_Description(),  Permission.WRITE, PermissionScope.COMPUTER);</span>
+
+<span class="fc" id="L1709">    private static final Logger LOGGER = Logger.getLogger(Computer.class.getName());</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

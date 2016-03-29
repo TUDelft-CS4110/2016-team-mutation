@@ -1,0 +1,333 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>Nodes.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">jenkins.model</a> &gt; <span class="el_source">Nodes.java</span></div><h1>Nodes.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">/*</span>
+ * The MIT License
+ *
+ * Copyright (c) 2015, CloudBees, Inc., Stephen Connolly
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package jenkins.model;
+
+import hudson.BulkChange;
+import hudson.Util;
+import hudson.XmlFile;
+import hudson.model.Computer;
+import hudson.model.Node;
+import hudson.model.Queue;
+import hudson.model.Saveable;
+import hudson.model.listeners.SaveableListener;
+import hudson.slaves.EphemeralNode;
+import hudson.slaves.OfflineCause;
+import java.util.concurrent.Callable;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
+
+import javax.annotation.CheckForNull;
+import javax.annotation.Nonnull;
+import java.io.File;
+import java.io.FileFilter;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+/**
+ * Manages all the nodes for Jenkins.
+ *
+ * @since 1.607
+ */
+@Restricted(NoExternalUse.class) // for now, we may make it public later
+public class Nodes implements Saveable {
+
+    /**
+     * The {@link Jenkins} instance that we are tracking nodes for.
+     */
+    @Nonnull
+    private final Jenkins jenkins;
+
+    /**
+     * The map of nodes.
+     */
+<span class="nc" id="L75">    private final ConcurrentMap&lt;String, Node&gt; nodes = new ConcurrentSkipListMap&lt;String, Node&gt;();</span>
+
+    /**
+     * Constructor, intended to be called only from {@link Jenkins}.
+     *
+     * @param jenkins A reference to the {@link Jenkins} that this instance is tracking nodes for, beware not to
+     *                let this reference escape from a partially constructed {@link Nodes} as when we are passed the
+     *                reference the {@link Jenkins} instance has not completed instantiation.
+     */
+<span class="nc" id="L84">    /*package*/ Nodes(@Nonnull Jenkins jenkins) {</span>
+<span class="nc" id="L85">        this.jenkins = jenkins;</span>
+<span class="nc" id="L86">    }</span>
+
+    /**
+     * Returns the list of nodes.
+     *
+     * @return the list of nodes.
+     */
+    @Nonnull
+    public List&lt;Node&gt; getNodes() {
+<span class="nc" id="L95">        return new ArrayList&lt;Node&gt;(nodes.values());</span>
+    }
+
+    /**
+     * Sets the list of nodes.
+     *
+     * @param nodes the new list of nodes.
+     * @throws IOException if the new list of nodes could not be persisted.
+     */
+    public void setNodes(final @Nonnull Collection&lt;? extends Node&gt; nodes) throws IOException {
+<span class="nc" id="L105">        Queue.withLock(new Runnable() {</span>
+            @Override
+            public void run() {
+<span class="nc" id="L108">                Set&lt;String&gt; toRemove = new HashSet&lt;String&gt;(Nodes.this.nodes.keySet());</span>
+<span class="nc bnc" id="L109" title="All 2 branches missed.">                for (Node n : nodes) {</span>
+<span class="nc" id="L110">                    final String name = n.getNodeName();</span>
+<span class="nc" id="L111">                    toRemove.remove(name);</span>
+<span class="nc" id="L112">                    Nodes.this.nodes.put(name, n);</span>
+                }
+<span class="nc" id="L114">                Nodes.this.nodes.keySet().removeAll(toRemove); // directory clean up will be handled by save</span>
+<span class="nc" id="L115">                jenkins.updateComputerList();</span>
+<span class="nc" id="L116">                jenkins.trimLabels();</span>
+<span class="nc" id="L117">            }</span>
+        });
+<span class="nc" id="L119">        save();</span>
+<span class="nc" id="L120">    }</span>
+
+    /**
+     * Adds a node. If a node of the same name already exists then that node will be replaced.
+     *
+     * @param node the new node.
+     * @throws IOException if the list of nodes could not be persisted.
+     */
+    public void addNode(final @Nonnull Node node) throws IOException {
+<span class="nc bnc" id="L129" title="All 2 branches missed.">        if (node != nodes.get(node.getNodeName())) {</span>
+            // TODO we should not need to lock the queue for adding nodes but until we have a way to update the
+            // computer list for just the new node
+<span class="nc" id="L132">            Queue.withLock(new Runnable() {</span>
+                @Override
+                public void run() {
+<span class="nc" id="L135">                    nodes.put(node.getNodeName(), node);</span>
+<span class="nc" id="L136">                    jenkins.updateComputerList();</span>
+<span class="nc" id="L137">                    jenkins.trimLabels();</span>
+<span class="nc" id="L138">                }</span>
+            });
+            // TODO there is a theoretical race whereby the node instance is updated/removed after lock release
+<span class="nc" id="L141">            persistNode(node);</span>
+        }
+<span class="nc" id="L143">    }</span>
+
+    /**
+     * Actually persists a node on disk.
+     *
+     * @param node the node to be persisted.
+     * @throws IOException if the node could not be persisted.
+     */
+    private void persistNode(final @Nonnull Node node)  throws IOException {
+        // no need for a full save() so we just do the minimum
+<span class="nc bnc" id="L153" title="All 2 branches missed.">        if (node instanceof EphemeralNode) {</span>
+<span class="nc" id="L154">            Util.deleteRecursive(new File(getNodesDir(), node.getNodeName()));</span>
+<span class="nc" id="L155">        } else {</span>
+<span class="nc" id="L156">            XmlFile xmlFile = new XmlFile(Jenkins.XSTREAM,</span>
+<span class="nc" id="L157">                    new File(new File(getNodesDir(), node.getNodeName()), &quot;config.xml&quot;));</span>
+<span class="nc" id="L158">            xmlFile.write(node);</span>
+<span class="nc" id="L159">            SaveableListener.fireOnChange(this, xmlFile);</span>
+        }
+<span class="nc" id="L161">        jenkins.getQueue().scheduleMaintenance();</span>
+<span class="nc" id="L162">    }</span>
+
+    /**
+     * Updates an existing node on disk. If the node instance is not in the list of nodes, then this
+     * will be a no-op, even if there is another instance with the same {@link Node#getNodeName()}.
+     *
+     * @param node the node to be updated.
+     * @return {@code true}, if the node was updated. {@code false}, if the node was not in the list of nodes.
+     * @throws IOException if the node could not be persisted.
+     * @since 1.634
+     */
+    public boolean updateNode(final @Nonnull Node node) throws IOException {
+        boolean exists;
+        try {
+<span class="nc" id="L176">            exists = Queue.withLock(new Callable&lt;Boolean&gt;() {</span>
+                @Override
+                public Boolean call() throws Exception {
+<span class="nc bnc" id="L179" title="All 2 branches missed.">                    if (node == nodes.get(node.getNodeName())) {</span>
+<span class="nc" id="L180">                        jenkins.trimLabels();</span>
+<span class="nc" id="L181">                        return true;</span>
+                    }
+<span class="nc" id="L183">                    return false;</span>
+                }
+            });
+<span class="nc" id="L186">        } catch (RuntimeException e) {</span>
+            // should never happen, but if it does let's do the right thing
+<span class="nc" id="L188">            throw e;</span>
+<span class="nc" id="L189">        } catch (Exception e) {</span>
+            // can never happen
+<span class="nc" id="L191">            exists = false;</span>
+        }
+<span class="nc bnc" id="L193" title="All 2 branches missed.">        if (exists) {</span>
+            // TODO there is a theoretical race whereby the node instance is updated/removed after lock release
+<span class="nc" id="L195">            persistNode(node);</span>
+<span class="nc" id="L196">            return true;</span>
+        }
+<span class="nc" id="L198">        return false;</span>
+    }
+
+    /**
+     * Removes a node. If the node instance is not in the list of nodes, then this will be a no-op, even if
+     * there is another instance with the same {@link Node#getNodeName()}.
+     *
+     * @param node the node instance to remove.
+     * @throws IOException if the list of nodes could not be persisted.
+     */
+    public void removeNode(final @Nonnull Node node) throws IOException {
+<span class="nc bnc" id="L209" title="All 2 branches missed.">        if (node == nodes.get(node.getNodeName())) {</span>
+<span class="nc" id="L210">            Queue.withLock(new Runnable() {</span>
+                @Override
+                public void run() {
+<span class="nc" id="L213">                    Computer c = node.toComputer();</span>
+<span class="nc bnc" id="L214" title="All 2 branches missed.">                    if (c != null) {</span>
+<span class="nc" id="L215">                        c.recordTermination();</span>
+<span class="nc" id="L216">                        c.disconnect(OfflineCause.create(hudson.model.Messages._Hudson_NodeBeingRemoved()));</span>
+                    }
+<span class="nc bnc" id="L218" title="All 2 branches missed.">                    if (node == nodes.remove(node.getNodeName())) {</span>
+<span class="nc" id="L219">                        jenkins.updateComputerList();</span>
+<span class="nc" id="L220">                        jenkins.trimLabels();</span>
+                    }
+<span class="nc" id="L222">                }</span>
+            });
+            // no need for a full save() so we just do the minimum
+<span class="nc" id="L225">            Util.deleteRecursive(new File(getNodesDir(), node.getNodeName()));</span>
+        }
+<span class="nc" id="L227">    }</span>
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public void save() throws IOException {
+<span class="nc bnc" id="L234" title="All 2 branches missed.">        if (BulkChange.contains(this)) {</span>
+<span class="nc" id="L235">            return;</span>
+        }
+<span class="nc" id="L237">        final File nodesDir = getNodesDir();</span>
+<span class="nc" id="L238">        final Set&lt;String&gt; existing = new HashSet&lt;String&gt;();</span>
+<span class="nc bnc" id="L239" title="All 2 branches missed.">        for (Node n : nodes.values()) {</span>
+<span class="nc bnc" id="L240" title="All 2 branches missed.">            if (n instanceof EphemeralNode) {</span>
+<span class="nc" id="L241">                continue;</span>
+            }
+<span class="nc" id="L243">            existing.add(n.getNodeName());</span>
+<span class="nc" id="L244">            XmlFile xmlFile = new XmlFile(Jenkins.XSTREAM, new File(new File(nodesDir, n.getNodeName()), &quot;config.xml&quot;));</span>
+<span class="nc" id="L245">            xmlFile.write(n);</span>
+<span class="nc" id="L246">            SaveableListener.fireOnChange(this, xmlFile);</span>
+        }
+<span class="nc bnc" id="L248" title="All 2 branches missed.">        for (File forDeletion : nodesDir.listFiles(new FileFilter() {</span>
+            @Override
+            public boolean accept(File pathname) {
+<span class="nc bnc" id="L251" title="All 4 branches missed.">                return pathname.isDirectory() &amp;&amp; !existing.contains(pathname.getName());</span>
+            }
+        })) {
+<span class="nc" id="L254">            Util.deleteRecursive(forDeletion);</span>
+        }
+<span class="nc" id="L256">    }</span>
+
+    /**
+     * Returns the named node.
+     *
+     * @param name the {@link Node#getNodeName()} of the node to retrieve.
+     * @return the {@link Node} or {@code null} if the node could not be found.
+     */
+    @CheckForNull
+    public Node getNode(String name) {
+<span class="nc bnc" id="L266" title="All 2 branches missed.">        return name == null ? null : nodes.get(name);</span>
+    }
+
+    /**
+     * Loads the nodes from disk.
+     *
+     * @throws IOException if the nodes could not be deserialized.
+     */
+    public void load() throws IOException {
+<span class="nc" id="L275">        final File nodesDir = getNodesDir();</span>
+<span class="nc" id="L276">        final File[] subdirs = nodesDir.listFiles(new FileFilter() {</span>
+            public boolean accept(File child) {
+<span class="nc" id="L278">                return child.isDirectory();</span>
+            }
+        });
+<span class="nc" id="L281">        final Map&lt;String, Node&gt; newNodes = new TreeMap&lt;String, Node&gt;();</span>
+<span class="nc bnc" id="L282" title="All 2 branches missed.">        if (subdirs != null) {</span>
+<span class="nc bnc" id="L283" title="All 2 branches missed.">            for (File subdir : subdirs) {</span>
+                try {
+<span class="nc" id="L285">                    XmlFile xmlFile = new XmlFile(Jenkins.XSTREAM, new File(subdir, &quot;config.xml&quot;));</span>
+<span class="nc bnc" id="L286" title="All 2 branches missed.">                    if (xmlFile.exists()) {</span>
+<span class="nc" id="L287">                        Node node = (Node) xmlFile.read();</span>
+<span class="nc" id="L288">                        newNodes.put(node.getNodeName(), node);</span>
+                    }
+<span class="nc" id="L290">                } catch (IOException e) {</span>
+<span class="nc" id="L291">                    Logger.getLogger(Nodes.class.getName()).log(Level.WARNING, &quot;could not load &quot; + subdir, e);</span>
+                }
+            }
+        }
+<span class="nc" id="L295">        Queue.withLock(new Runnable() {</span>
+            @Override
+            public void run() {
+<span class="nc bnc" id="L298" title="All 2 branches missed.">                for (Iterator&lt;Map.Entry&lt;String, Node&gt;&gt; i = nodes.entrySet().iterator(); i.hasNext(); ) {</span>
+<span class="nc bnc" id="L299" title="All 2 branches missed.">                    if (!(i.next().getValue() instanceof EphemeralNode)) {</span>
+<span class="nc" id="L300">                        i.remove();</span>
+                    }
+                }
+<span class="nc" id="L303">                nodes.putAll(newNodes);</span>
+<span class="nc" id="L304">                jenkins.updateComputerList();</span>
+<span class="nc" id="L305">                jenkins.trimLabels();</span>
+<span class="nc" id="L306">            }</span>
+        });
+<span class="nc" id="L308">    }</span>
+
+    /**
+     * Returns the directory that the nodes are stored in.
+     *
+     * @return the directory that the nodes are stored in.
+     * @throws IOException
+     */
+    private File getNodesDir() throws IOException {
+<span class="nc" id="L317">        final File nodesDir = new File(jenkins.getRootDir(), &quot;nodes&quot;);</span>
+<span class="nc bnc" id="L318" title="All 4 branches missed.">        if (!nodesDir.isDirectory() &amp;&amp; !nodesDir.mkdirs()) {</span>
+<span class="nc" id="L319">            throw new IOException(String.format(&quot;Could not mkdirs %s&quot;, nodesDir));</span>
+        }
+<span class="nc" id="L321">        return nodesDir;</span>
+    }
+
+    /**
+     * Returns {@code true} if and only if the list of nodes is stored in the legacy location.
+     *
+     * @return {@code true} if and only if the list of nodes is stored in the legacy location.
+     */
+    public boolean isLegacy() {
+<span class="nc bnc" id="L330" title="All 2 branches missed.">        return !new File(jenkins.getRootDir(), &quot;nodes&quot;).isDirectory();</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

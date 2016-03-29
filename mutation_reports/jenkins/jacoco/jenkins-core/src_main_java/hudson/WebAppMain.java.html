@@ -1,0 +1,414 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>WebAppMain.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson</a> &gt; <span class="el_source">WebAppMain.java</span></div><h1>WebAppMain.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">/*</span>
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc., Kohsuke Kawaguchi, Jean-Baptiste Quenot, Tom Huybrechts
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson;
+
+import com.thoughtworks.xstream.converters.reflection.PureJavaReflectionProvider;
+import com.thoughtworks.xstream.core.JVM;
+import com.trilead.ssh2.util.IOUtils;
+import hudson.model.Hudson;
+import hudson.util.BootFailure;
+import jenkins.model.Jenkins;
+import hudson.util.HudsonIsLoading;
+import hudson.util.IncompatibleServletVersionDetected;
+import hudson.util.IncompatibleVMDetected;
+import hudson.util.InsufficientPermissionDetected;
+import hudson.util.NoHomeDir;
+import hudson.util.RingBufferLogHandler;
+import hudson.util.NoTempDir;
+import hudson.util.IncompatibleAntVersionDetected;
+import hudson.util.HudsonFailedToLoad;
+import hudson.util.ChartUtil;
+import hudson.util.AWTProblem;
+import org.jvnet.localizer.LocaleProvider;
+import org.kohsuke.stapler.jelly.JellyFacet;
+import org.apache.tools.ant.types.FileSet;
+
+import javax.naming.Context;
+import javax.naming.InitialContext;
+import javax.naming.NamingException;
+import javax.servlet.ServletContext;
+import javax.servlet.ServletContextEvent;
+import javax.servlet.ServletContextListener;
+import javax.servlet.ServletResponse;
+import javax.xml.transform.TransformerFactory;
+import javax.xml.transform.TransformerFactoryConfigurationError;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.lang.reflect.Method;
+import java.net.URL;
+import java.net.URLClassLoader;
+import java.util.Date;
+import java.util.Locale;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import java.security.Security;
+import java.util.logging.LogRecord;
+
+import static java.util.logging.Level.*;
+
+/**
+ * Entry point when Hudson is used as a webapp.
+ *
+ * @author Kohsuke Kawaguchi
+ */
+<span class="nc" id="L76">public class WebAppMain implements ServletContextListener {</span>
+<span class="nc" id="L77">    private final RingBufferLogHandler handler = new RingBufferLogHandler() {</span>
+        @Override public synchronized void publish(LogRecord record) {
+<span class="nc bnc" id="L79" title="All 2 branches missed.">            if (record.getLevel().intValue() &gt;= Level.INFO.intValue()) {</span>
+<span class="nc" id="L80">                super.publish(record);</span>
+            }
+<span class="nc" id="L82">        }</span>
+    };
+    private static final String APP = &quot;app&quot;;
+    private boolean terminated;
+    private Thread initThread;
+
+    /**
+     * Creates the sole instance of {@link jenkins.model.Jenkins} and register it to the {@link ServletContext}.
+     */
+    public void contextInitialized(ServletContextEvent event) {
+<span class="nc" id="L92">        final ServletContext context = event.getServletContext();</span>
+<span class="nc" id="L93">        File home=null;</span>
+        try {
+
+            // use the current request to determine the language
+<span class="nc" id="L97">            LocaleProvider.setProvider(new LocaleProvider() {</span>
+                public Locale get() {
+<span class="nc" id="L99">                    return Functions.getCurrentLocale();</span>
+                }
+            });
+
+            // quick check to see if we (seem to) have enough permissions to run. (see #719)
+            JVM jvm;
+            try {
+<span class="nc" id="L106">                jvm = new JVM();</span>
+<span class="nc" id="L107">                new URLClassLoader(new URL[0],getClass().getClassLoader());</span>
+<span class="nc" id="L108">            } catch(SecurityException e) {</span>
+<span class="nc" id="L109">                throw new InsufficientPermissionDetected(e);</span>
+            }
+
+            try {// remove Sun PKCS11 provider if present. See http://wiki.jenkins-ci.org/display/JENKINS/Solaris+Issue+6276483
+<span class="nc" id="L113">                Security.removeProvider(&quot;SunPKCS11-Solaris&quot;);</span>
+<span class="nc" id="L114">            } catch (SecurityException e) {</span>
+                // ignore this error.
+            }
+
+<span class="nc" id="L118">            installLogger();</span>
+
+<span class="nc" id="L120">            markCookieAsHttpOnly(context);</span>
+
+<span class="nc" id="L122">            final FileAndDescription describedHomeDir = getHomeDir(event);</span>
+<span class="nc" id="L123">            home = describedHomeDir.file.getAbsoluteFile();</span>
+<span class="nc" id="L124">            home.mkdirs();</span>
+<span class="nc" id="L125">            System.out.println(&quot;Jenkins home directory: &quot;+home+&quot; found at: &quot;+describedHomeDir.description);</span>
+
+            // check that home exists (as mkdirs could have failed silently), otherwise throw a meaningful error
+<span class="nc bnc" id="L128" title="All 2 branches missed.">            if (!home.exists())</span>
+<span class="nc" id="L129">                throw new NoHomeDir(home);</span>
+
+<span class="nc" id="L131">            recordBootAttempt(home);</span>
+
+            // make sure that we are using XStream in the &quot;enhanced&quot; (JVM-specific) mode
+<span class="nc bnc" id="L134" title="All 2 branches missed.">            if(jvm.bestReflectionProvider().getClass()==PureJavaReflectionProvider.class) {</span>
+<span class="nc" id="L135">                throw new IncompatibleVMDetected(); // nope</span>
+            }
+
+//  JNA is no longer a hard requirement. It's just nice to have. See HUDSON-4820 for more context.
+//            // make sure JNA works. this can fail if
+//            //    - platform is unsupported
+//            //    - JNA is already loaded in another classloader
+//            // see http://wiki.jenkins-ci.org/display/JENKINS/JNA+is+already+loaded
+//            // TODO: or shall we instead modify Hudson to work gracefully without JNA?
+//            try {
+//                /*
+//                    java.lang.UnsatisfiedLinkError: Native Library /builds/apps/glassfish/domains/hudson-domain/generated/jsp/j2ee-modules/hudson-1.309/loader/com/sun/jna/sunos-sparc/libjnidispatch.so already loaded in another classloader
+//                        at java.lang.ClassLoader.loadLibrary0(ClassLoader.java:1743)
+//                        at java.lang.ClassLoader.loadLibrary(ClassLoader.java:1674)
+//                        at java.lang.Runtime.load0(Runtime.java:770)
+//                        at java.lang.System.load(System.java:1005)
+//                        at com.sun.jna.Native.loadNativeLibraryFromJar(Native.java:746)
+//                        at com.sun.jna.Native.loadNativeLibrary(Native.java:680)
+//                        at com.sun.jna.Native.&lt;clinit&gt;(Native.java:108)
+//                        at hudson.util.jna.GNUCLibrary.&lt;clinit&gt;(GNUCLibrary.java:86)
+//                        at hudson.Util.createSymlink(Util.java:970)
+//                        at hudson.model.Run.run(Run.java:1174)
+//                        at hudson.matrix.MatrixBuild.run(MatrixBuild.java:149)
+//                        at hudson.model.ResourceController.execute(ResourceController.java:88)
+//                        at hudson.model.Executor.run(Executor.java:123)
+//                 */
+//                String.valueOf(Native.POINTER_SIZE); // this meaningless operation forces the classloading and initialization
+//            } catch (LinkageError e) {
+//                if (e.getMessage().contains(&quot;another classloader&quot;))
+//                    context.setAttribute(APP,new JNADoublyLoaded(e));
+//                else
+//                    context.setAttribute(APP,new HudsonFailedToLoad(e));
+//            }
+
+            // make sure this is servlet 2.4 container or above
+            try {
+<span class="nc" id="L171">                ServletResponse.class.getMethod(&quot;setCharacterEncoding&quot;,String.class);</span>
+<span class="nc" id="L172">            } catch (NoSuchMethodException e) {</span>
+<span class="nc" id="L173">                throw new IncompatibleServletVersionDetected(ServletResponse.class);</span>
+            }
+
+            // make sure that we see Ant 1.7
+            try {
+<span class="nc" id="L178">                FileSet.class.getMethod(&quot;getDirectoryScanner&quot;);</span>
+<span class="nc" id="L179">            } catch (NoSuchMethodException e) {</span>
+<span class="nc" id="L180">                throw new IncompatibleAntVersionDetected(FileSet.class);</span>
+            }
+
+            // make sure AWT is functioning, or else JFreeChart won't even load.
+<span class="nc bnc" id="L184" title="All 2 branches missed.">            if(ChartUtil.awtProblemCause!=null) {</span>
+<span class="nc" id="L185">                throw new AWTProblem(ChartUtil.awtProblemCause);</span>
+            }
+
+            // some containers (in particular Tomcat) doesn't abort a launch
+            // even if the temp directory doesn't exist.
+            // check that and report an error
+            try {
+<span class="nc" id="L192">                File f = File.createTempFile(&quot;test&quot;, &quot;test&quot;);</span>
+<span class="nc" id="L193">                f.delete();</span>
+<span class="nc" id="L194">            } catch (IOException e) {</span>
+<span class="nc" id="L195">                throw new NoTempDir(e);</span>
+            }
+
+            // Tomcat breaks XSLT with JDK 5.0 and onward. Check if that's the case, and if so,
+            // try to correct it
+            try {
+<span class="nc" id="L201">                TransformerFactory.newInstance();</span>
+                // if this works we are all happy
+<span class="nc" id="L203">            } catch (TransformerFactoryConfigurationError x) {</span>
+                // no it didn't.
+<span class="nc" id="L205">                LOGGER.log(WARNING, &quot;XSLT not configured correctly. Hudson will try to fix this. See http://issues.apache.org/bugzilla/show_bug.cgi?id=40895 for more details&quot;,x);</span>
+<span class="nc" id="L206">                System.setProperty(TransformerFactory.class.getName(),&quot;com.sun.org.apache.xalan.internal.xsltc.trax.TransformerFactoryImpl&quot;);</span>
+                try {
+<span class="nc" id="L208">                    TransformerFactory.newInstance();</span>
+<span class="nc" id="L209">                    LOGGER.info(&quot;XSLT is set to the JAXP RI in JRE&quot;);</span>
+<span class="nc" id="L210">                } catch(TransformerFactoryConfigurationError y) {</span>
+<span class="nc" id="L211">                    LOGGER.log(SEVERE, &quot;Failed to correct the problem.&quot;);</span>
+                }
+            }
+
+<span class="nc" id="L215">            installExpressionFactory(event);</span>
+
+<span class="nc" id="L217">            context.setAttribute(APP,new HudsonIsLoading());</span>
+
+<span class="nc" id="L219">            final File _home = home;</span>
+<span class="nc" id="L220">            initThread = new Thread(&quot;Jenkins initialization thread&quot;) {</span>
+                @Override
+                public void run() {
+<span class="nc" id="L223">                    boolean success = false;</span>
+                    try {
+<span class="nc" id="L225">                        Jenkins instance = new Hudson(_home, context);</span>
+<span class="nc" id="L226">                        context.setAttribute(APP, instance);</span>
+
+<span class="nc" id="L228">                        BootFailure.getBootFailureFile(_home).delete();</span>
+
+                        // at this point we are open for business and serving requests normally
+<span class="nc" id="L231">                        LOGGER.info(&quot;Jenkins is fully up and running&quot;);</span>
+<span class="nc" id="L232">                        success = true;</span>
+<span class="nc" id="L233">                    } catch (Error e) {</span>
+<span class="nc" id="L234">                        new HudsonFailedToLoad(e).publish(context,_home);</span>
+<span class="nc" id="L235">                        throw e;</span>
+<span class="nc" id="L236">                    } catch (Exception e) {</span>
+<span class="nc" id="L237">                        new HudsonFailedToLoad(e).publish(context,_home);</span>
+<span class="nc" id="L238">                    } finally {</span>
+<span class="nc" id="L239">                        Jenkins instance = Jenkins.getInstance();</span>
+<span class="nc bnc" id="L240" title="All 12 branches missed.">                        if(!success &amp;&amp; instance!=null)</span>
+<span class="nc" id="L241">                            instance.cleanUp();</span>
+<span class="nc" id="L242">                    }</span>
+<span class="nc" id="L243">                }</span>
+            };
+<span class="nc" id="L245">            initThread.start();</span>
+<span class="nc" id="L246">        } catch (BootFailure e) {</span>
+<span class="nc" id="L247">            e.publish(context,home);</span>
+<span class="nc" id="L248">        } catch (Error e) {</span>
+<span class="nc" id="L249">            LOGGER.log(SEVERE, &quot;Failed to initialize Jenkins&quot;,e);</span>
+<span class="nc" id="L250">            throw e;</span>
+<span class="nc" id="L251">        } catch (RuntimeException e) {</span>
+<span class="nc" id="L252">            LOGGER.log(SEVERE, &quot;Failed to initialize Jenkins&quot;,e);</span>
+<span class="nc" id="L253">            throw e;</span>
+        }
+<span class="nc" id="L255">    }</span>
+
+    /**
+     * Set the session cookie as HTTP only.
+     *
+     * @see &lt;a href=&quot;https://www.owasp.org/index.php/HttpOnly&quot;&gt;discussion of this topic in OWASP&lt;/a&gt;
+     */
+    private void markCookieAsHttpOnly(ServletContext context) {
+        try {
+            Method m;
+            try {
+<span class="nc" id="L266">                m = context.getClass().getMethod(&quot;getSessionCookieConfig&quot;);</span>
+<span class="nc" id="L267">            } catch (NoSuchMethodException x) { // 3.0+</span>
+<span class="nc" id="L268">                LOGGER.log(Level.FINE, &quot;Failed to set secure cookie flag&quot;, x);</span>
+<span class="nc" id="L269">                return;</span>
+            }
+<span class="nc" id="L271">            Object sessionCookieConfig = m.invoke(context);</span>
+
+            // not exposing session cookie to JavaScript to mitigate damage caused by XSS
+<span class="nc" id="L274">            Class scc = Class.forName(&quot;javax.servlet.SessionCookieConfig&quot;);</span>
+<span class="nc" id="L275">            Method setHttpOnly = scc.getMethod(&quot;setHttpOnly&quot;,boolean.class);</span>
+<span class="nc" id="L276">            setHttpOnly.invoke(sessionCookieConfig,true);</span>
+<span class="nc" id="L277">        } catch (Exception e) {</span>
+<span class="nc" id="L278">            LOGGER.log(Level.WARNING, &quot;Failed to set HTTP-only cookie flag&quot;, e);</span>
+        }
+<span class="nc" id="L280">    }</span>
+
+    public void joinInit() throws InterruptedException {
+<span class="nc" id="L283">        initThread.join();</span>
+<span class="nc" id="L284">    }</span>
+
+    /**
+     * To assist boot failure script, record the number of boot attempts.
+     * This file gets deleted in case of successful boot.
+     *
+     * @see BootFailure
+     */
+    private void recordBootAttempt(File home) {
+<span class="nc" id="L293">        FileOutputStream o=null;</span>
+        try {
+<span class="nc" id="L295">            o = new FileOutputStream(BootFailure.getBootFailureFile(home), true);</span>
+<span class="nc" id="L296">            o.write((new Date().toString() + System.getProperty(&quot;line.separator&quot;, &quot;\n&quot;)).toString().getBytes());</span>
+<span class="nc" id="L297">        } catch (IOException e) {</span>
+<span class="nc" id="L298">            LOGGER.log(WARNING, &quot;Failed to record boot attempts&quot;,e);</span>
+<span class="nc" id="L299">        } finally {</span>
+<span class="nc" id="L300">            IOUtils.closeQuietly(o);</span>
+<span class="nc" id="L301">        }</span>
+<span class="nc" id="L302">    }</span>
+
+    public static void installExpressionFactory(ServletContextEvent event) {
+<span class="nc" id="L305">        JellyFacet.setExpressionFactory(event, new ExpressionFactory2());</span>
+<span class="nc" id="L306">    }</span>
+
+	/**
+     * Installs log handler to monitor all Hudson logs.
+     */
+    @edu.umd.cs.findbugs.annotations.SuppressWarnings(&quot;LG_LOST_LOGGER_DUE_TO_WEAK_REFERENCE&quot;)
+    private void installLogger() {
+<span class="nc" id="L313">        Jenkins.logRecords = handler.getView();</span>
+<span class="nc" id="L314">        Logger.getLogger(&quot;&quot;).addHandler(handler);</span>
+<span class="nc" id="L315">    }</span>
+
+    /** Add some metadata to a File, allowing to trace setup issues */
+    public static class FileAndDescription {
+        public final File file;
+        public final String description;
+<span class="nc" id="L321">        public FileAndDescription(File file,String description) {</span>
+<span class="nc" id="L322">            this.file = file;</span>
+<span class="nc" id="L323">            this.description = description;</span>
+<span class="nc" id="L324">        }</span>
+    }
+
+    /**
+     * Determines the home directory for Jenkins.
+     *
+     * &lt;p&gt;
+     * We look for a setting that affects the smallest scope first, then bigger ones later.
+     *
+     * &lt;p&gt;
+     * People makes configuration mistakes, so we are trying to be nice
+     * with those by doing {@link String#trim()}.
+     * 
+     * &lt;p&gt;
+     * @return the File alongside with some description to help the user troubleshoot issues
+     */
+    public FileAndDescription getHomeDir(ServletContextEvent event) {
+        // check JNDI for the home directory first
+<span class="nc bnc" id="L342" title="All 2 branches missed.">        for (String name : HOME_NAMES) {</span>
+            try {
+<span class="nc" id="L344">                InitialContext iniCtxt = new InitialContext();</span>
+<span class="nc" id="L345">                Context env = (Context) iniCtxt.lookup(&quot;java:comp/env&quot;);</span>
+<span class="nc" id="L346">                String value = (String) env.lookup(name);</span>
+<span class="nc bnc" id="L347" title="All 4 branches missed.">                if(value!=null &amp;&amp; value.trim().length()&gt;0)</span>
+<span class="nc" id="L348">                    return new FileAndDescription(new File(value.trim()),&quot;JNDI/java:comp/env/&quot;+name);</span>
+                // look at one more place. See issue #1314
+<span class="nc" id="L350">                value = (String) iniCtxt.lookup(name);</span>
+<span class="nc bnc" id="L351" title="All 4 branches missed.">                if(value!=null &amp;&amp; value.trim().length()&gt;0)</span>
+<span class="nc" id="L352">                    return new FileAndDescription(new File(value.trim()),&quot;JNDI/&quot;+name);</span>
+<span class="nc" id="L353">            } catch (NamingException e) {</span>
+                // ignore
+            }
+        }
+
+        // next the system property
+<span class="nc bnc" id="L359" title="All 2 branches missed.">        for (String name : HOME_NAMES) {</span>
+<span class="nc" id="L360">            String sysProp = System.getProperty(name);</span>
+<span class="nc bnc" id="L361" title="All 2 branches missed.">            if(sysProp!=null)</span>
+<span class="nc" id="L362">                return new FileAndDescription(new File(sysProp.trim()),&quot;System.getProperty(\&quot;&quot;+name+&quot;\&quot;)&quot;);</span>
+        }
+
+        // look at the env var next
+<span class="nc bnc" id="L366" title="All 2 branches missed.">        for (String name : HOME_NAMES) {</span>
+<span class="nc" id="L367">            String env = EnvVars.masterEnvVars.get(name);</span>
+<span class="nc bnc" id="L368" title="All 2 branches missed.">            if(env!=null)</span>
+<span class="nc" id="L369">                return new FileAndDescription(new File(env.trim()).getAbsoluteFile(),&quot;EnvVars.masterEnvVars.get(\&quot;&quot;+name+&quot;\&quot;)&quot;);</span>
+        }
+
+        // otherwise pick a place by ourselves
+
+<span class="nc" id="L374">        String root = event.getServletContext().getRealPath(&quot;/WEB-INF/workspace&quot;);</span>
+<span class="nc bnc" id="L375" title="All 2 branches missed.">        if(root!=null) {</span>
+<span class="nc" id="L376">            File ws = new File(root.trim());</span>
+<span class="nc bnc" id="L377" title="All 2 branches missed.">            if(ws.exists())</span>
+                // Hudson &lt;1.42 used to prefer this before ~/.hudson, so
+                // check the existence and if it's there, use it.
+                // otherwise if this is a new installation, prefer ~/.hudson
+<span class="nc" id="L381">                return new FileAndDescription(ws,&quot;getServletContext().getRealPath(\&quot;/WEB-INF/workspace\&quot;)&quot;);</span>
+        }
+
+<span class="nc" id="L384">        File legacyHome = new File(new File(System.getProperty(&quot;user.home&quot;)),&quot;.hudson&quot;);</span>
+<span class="nc bnc" id="L385" title="All 2 branches missed.">        if (legacyHome.exists()) {</span>
+<span class="nc" id="L386">            return new FileAndDescription(legacyHome,&quot;$user.home/.hudson&quot;); // before rename, this is where it was stored</span>
+        }
+
+<span class="nc" id="L389">        File newHome = new File(new File(System.getProperty(&quot;user.home&quot;)),&quot;.jenkins&quot;);</span>
+<span class="nc" id="L390">        return new FileAndDescription(newHome,&quot;$user.home/.jenkins&quot;);</span>
+    }
+
+    public void contextDestroyed(ServletContextEvent event) {
+<span class="nc" id="L394">        terminated = true;</span>
+<span class="nc" id="L395">        Jenkins instance = Jenkins.getInstance();</span>
+<span class="nc bnc" id="L396" title="All 2 branches missed.">        if(instance!=null)</span>
+<span class="nc" id="L397">            instance.cleanUp();</span>
+<span class="nc" id="L398">        Thread t = initThread;</span>
+<span class="nc bnc" id="L399" title="All 4 branches missed.">        if (t != null &amp;&amp; t.isAlive()) {</span>
+<span class="nc" id="L400">            LOGGER.log(Level.INFO, &quot;Shutting down a Jenkins instance that was still starting up&quot;, new Throwable(&quot;reason&quot;));</span>
+<span class="nc" id="L401">            t.interrupt();</span>
+        }
+
+        // Logger is in the system classloader, so if we don't do this
+        // the whole web app will never be undepoyed.
+<span class="nc" id="L406">        Logger.getLogger(&quot;&quot;).removeHandler(handler);</span>
+<span class="nc" id="L407">    }</span>
+
+<span class="nc" id="L409">    private static final Logger LOGGER = Logger.getLogger(WebAppMain.class.getName());</span>
+
+
+<span class="nc" id="L412">    private static final String[] HOME_NAMES = {&quot;JENKINS_HOME&quot;,&quot;HUDSON_HOME&quot;};</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

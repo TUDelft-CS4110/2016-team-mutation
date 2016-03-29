@@ -1,0 +1,1012 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>User.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.model</a> &gt; <span class="el_source">User.java</span></div><h1>User.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">/*</span>
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2012, Sun Microsystems, Inc., Kohsuke Kawaguchi, Erik Ramfelt,
+ * Tom Huybrechts, Vincent Latombe
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.model;
+
+import com.google.common.base.Predicate;
+import com.infradna.tool.bridge_method_injector.WithBridgeMethods;
+import hudson.*;
+import hudson.model.Descriptor.FormException;
+import hudson.model.listeners.SaveableListener;
+import hudson.security.ACL;
+import hudson.security.AccessControlled;
+import hudson.security.Permission;
+import hudson.security.SecurityRealm;
+import hudson.security.UserMayOrMayNotExistException;
+import hudson.util.FormApply;
+import hudson.util.FormValidation;
+import hudson.util.RunList;
+import hudson.util.XStream2;
+import jenkins.model.IdStrategy;
+import jenkins.model.Jenkins;
+import jenkins.model.ModelObjectWithContextMenu;
+import jenkins.security.ImpersonatingUserDetailsService;
+import jenkins.security.LastGrantedAuthoritiesProperty;
+import net.sf.json.JSONObject;
+
+import org.acegisecurity.Authentication;
+import org.acegisecurity.GrantedAuthority;
+import org.acegisecurity.providers.UsernamePasswordAuthenticationToken;
+import org.acegisecurity.providers.anonymous.AnonymousAuthenticationToken;
+import org.acegisecurity.userdetails.UserDetails;
+import org.acegisecurity.userdetails.UsernameNotFoundException;
+import org.springframework.dao.DataAccessException;
+import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.StaplerResponse;
+import org.kohsuke.stapler.export.Exported;
+import org.kohsuke.stapler.export.ExportedBean;
+import org.apache.commons.io.filefilter.DirectoryFileFilter;
+import org.kohsuke.stapler.interceptor.RequirePOST;
+
+import javax.annotation.concurrent.GuardedBy;
+import javax.servlet.ServletException;
+import javax.servlet.http.HttpServletResponse;
+import java.io.File;
+import java.io.IOException;
+import java.io.FileFilter;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import javax.annotation.CheckForNull;
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+
+/**
+ * Represents a user.
+ *
+ * &lt;p&gt;
+ * In Hudson, {@link User} objects are created in on-demand basis;
+ * for example, when a build is performed, its change log is computed
+ * and as a result commits from users who Hudson has never seen may be discovered.
+ * When this happens, new {@link User} object is created.
+ *
+ * &lt;p&gt;
+ * If the persisted record for an user exists, the information is loaded at
+ * that point, but if there's no such record, a fresh instance is created from
+ * thin air (this is where {@link UserPropertyDescriptor#newInstance(User)} is
+ * called to provide initial {@link UserProperty} objects.
+ *
+ * &lt;p&gt;
+ * Such newly created {@link User} objects will be simply GC-ed without
+ * ever leaving the persisted record, unless {@link User#save()} method
+ * is explicitly invoked (perhaps as a result of a browser submitting a
+ * configuration.)
+ *
+ *
+ * @author Kohsuke Kawaguchi
+ */
+@ExportedBean
+public class User extends AbstractModelObject implements AccessControlled, DescriptorByNameOwner, Saveable, Comparable&lt;User&gt;, ModelObjectWithContextMenu {
+
+    /**
+     * The username of the 'unknown' user used to avoid null user references.
+     */
+    private static final String UKNOWN_USERNAME = &quot;unknown&quot;;
+
+    /**
+     * These usernames should not be used by real users logging into Jenkins. Therefore, we prevent
+     * users with these names from being saved.
+     */
+<span class="fc" id="L123">    private static final String[] ILLEGAL_PERSISTED_USERNAMES = new String[]{ACL.ANONYMOUS_USERNAME,</span>
+<span class="fc" id="L124">            ACL.SYSTEM_USERNAME, UKNOWN_USERNAME};</span>
+    private transient final String id;
+
+    private volatile String fullName;
+
+    private volatile String description;
+
+    /**
+     * List of {@link UserProperty}s configured for this project.
+     */
+    @CopyOnWrite
+<span class="nc" id="L135">    private volatile List&lt;UserProperty&gt; properties = new ArrayList&lt;UserProperty&gt;();</span>
+
+
+<span class="nc" id="L138">    private User(String id, String fullName) {</span>
+<span class="nc" id="L139">        this.id = id;</span>
+<span class="nc" id="L140">        this.fullName = fullName;</span>
+<span class="nc" id="L141">        load();</span>
+<span class="nc" id="L142">    }</span>
+
+    /**
+     * Returns the {@link jenkins.model.IdStrategy} for use with {@link User} instances. See
+     * {@link hudson.security.SecurityRealm#getUserIdStrategy()}
+     *
+     * @return the {@link jenkins.model.IdStrategy} for use with {@link User} instances.
+     * @since 1.566
+     */
+    @Nonnull
+    public static IdStrategy idStrategy() {
+<span class="nc" id="L153">        Jenkins j = Jenkins.getInstance();</span>
+<span class="nc bnc" id="L154" title="All 2 branches missed.">        if (j == null) {</span>
+<span class="nc" id="L155">            return IdStrategy.CASE_INSENSITIVE;</span>
+        }
+<span class="nc" id="L157">        SecurityRealm realm = j.getSecurityRealm();</span>
+<span class="nc bnc" id="L158" title="All 2 branches missed.">        if (realm == null) {</span>
+<span class="nc" id="L159">            return IdStrategy.CASE_INSENSITIVE;</span>
+        }
+<span class="nc" id="L161">        return realm.getUserIdStrategy();</span>
+    }
+
+    public int compareTo(User that) {
+<span class="nc" id="L165">        return idStrategy().compare(this.id, that.id);</span>
+    }
+
+    /**
+     * Loads the other data from disk if it's available.
+     */
+    private synchronized void load() {
+<span class="nc" id="L172">        properties.clear();</span>
+
+<span class="nc" id="L174">        XmlFile config = getConfigFile();</span>
+        try {
+<span class="nc bnc" id="L176" title="All 2 branches missed.">            if(config.exists())</span>
+<span class="nc" id="L177">                config.unmarshal(this);</span>
+<span class="nc" id="L178">        } catch (IOException e) {</span>
+<span class="nc" id="L179">            LOGGER.log(Level.SEVERE, &quot;Failed to load &quot;+config,e);</span>
+        }
+
+        // remove nulls that have failed to load
+<span class="nc bnc" id="L183" title="All 2 branches missed.">        for (Iterator&lt;UserProperty&gt; itr = properties.iterator(); itr.hasNext();) {</span>
+<span class="nc bnc" id="L184" title="All 2 branches missed.">            if(itr.next()==null)</span>
+<span class="nc" id="L185">                itr.remove();            </span>
+        }
+
+        // allocate default instances if needed.
+        // doing so after load makes sure that newly added user properties do get reflected
+<span class="nc bnc" id="L190" title="All 2 branches missed.">        for (UserPropertyDescriptor d : UserProperty.all()) {</span>
+<span class="nc bnc" id="L191" title="All 2 branches missed.">            if(getProperty(d.clazz)==null) {</span>
+<span class="nc" id="L192">                UserProperty up = d.newInstance(this);</span>
+<span class="nc bnc" id="L193" title="All 2 branches missed.">                if(up!=null)</span>
+<span class="nc" id="L194">                    properties.add(up);</span>
+            }
+        }
+
+<span class="nc bnc" id="L198" title="All 2 branches missed.">        for (UserProperty p : properties)</span>
+<span class="nc" id="L199">            p.setUser(this);</span>
+<span class="nc" id="L200">    }</span>
+
+    @Exported
+    public String getId() {
+<span class="nc" id="L204">        return id;</span>
+    }
+
+    public @Nonnull String getUrl() {
+<span class="nc" id="L208">        return &quot;user/&quot;+Util.rawEncode(idStrategy().keyFor(id));</span>
+    }
+
+    public @Nonnull String getSearchUrl() {
+<span class="nc" id="L212">        return &quot;/user/&quot;+Util.rawEncode(idStrategy().keyFor(id));</span>
+    }
+
+    /**
+     * The URL of the user page.
+     */
+    @Exported(visibility=999)
+    public @Nonnull String getAbsoluteUrl() {
+<span class="nc" id="L220">        return Jenkins.getInstance().getRootUrl()+getUrl();</span>
+    }
+
+    /**
+     * Gets the human readable name of this user.
+     * This is configurable by the user.
+     */
+    @Exported(visibility=999)
+    public @Nonnull String getFullName() {
+<span class="nc" id="L229">        return fullName;</span>
+    }
+
+    /**
+     * Sets the human readable name of the user.
+     * If the input parameter is empty, the user's ID will be set.
+     */
+    public void setFullName(String name) {
+<span class="nc bnc" id="L237" title="All 2 branches missed.">        if(Util.fixEmptyAndTrim(name)==null)    name=id;</span>
+<span class="nc" id="L238">        this.fullName = name;</span>
+<span class="nc" id="L239">    }</span>
+
+    @Exported
+    public @CheckForNull String getDescription() {
+<span class="nc" id="L243">        return description;</span>
+    }
+
+
+    /**
+     * Sets the description of the user.
+     * @since 1.609
+     */
+    public void setDescription(String description) {
+<span class="nc" id="L252">        this.description = description;</span>
+<span class="nc" id="L253">    }</span>
+
+    /**
+     * Gets the user properties configured for this user.
+     */
+    public Map&lt;Descriptor&lt;UserProperty&gt;,UserProperty&gt; getProperties() {
+<span class="nc" id="L259">        return Descriptor.toMap(properties);</span>
+    }
+
+    /**
+     * Updates the user object by adding a property.
+     */
+    public synchronized void addProperty(@Nonnull UserProperty p) throws IOException {
+<span class="nc" id="L266">        UserProperty old = getProperty(p.getClass());</span>
+<span class="nc" id="L267">        List&lt;UserProperty&gt; ps = new ArrayList&lt;UserProperty&gt;(properties);</span>
+<span class="nc bnc" id="L268" title="All 2 branches missed.">        if(old!=null)</span>
+<span class="nc" id="L269">            ps.remove(old);</span>
+<span class="nc" id="L270">        ps.add(p);</span>
+<span class="nc" id="L271">        p.setUser(this);</span>
+<span class="nc" id="L272">        properties = ps;</span>
+<span class="nc" id="L273">        save();</span>
+<span class="nc" id="L274">    }</span>
+
+    /**
+     * List of all {@link UserProperty}s exposed primarily for the remoting API.
+     */
+    @Exported(name=&quot;property&quot;,inline=true)
+    public List&lt;UserProperty&gt; getAllProperties() {
+<span class="nc" id="L281">        return Collections.unmodifiableList(properties);</span>
+    }
+    
+    /**
+     * Gets the specific property, or null.
+     */
+    public &lt;T extends UserProperty&gt; T getProperty(Class&lt;T&gt; clazz) {
+<span class="nc bnc" id="L288" title="All 2 branches missed.">        for (UserProperty p : properties) {</span>
+<span class="nc bnc" id="L289" title="All 2 branches missed.">            if(clazz.isInstance(p))</span>
+<span class="nc" id="L290">                return clazz.cast(p);</span>
+        }
+<span class="nc" id="L292">        return null;</span>
+    }
+
+    /**
+     * Creates an {@link Authentication} object that represents this user.
+     *
+     * This method checks with {@link SecurityRealm} if the user is a valid user that can login to the security realm.
+     * If {@link SecurityRealm} is a kind that does not support querying information about other users, this will
+     * use {@link LastGrantedAuthoritiesProperty} to pick up the granted authorities as of the last time the user has
+     * logged in.
+     *
+     * @throws UsernameNotFoundException
+     *      If this user is not a valid user in the backend {@link SecurityRealm}.
+     * @since 1.419
+     */
+    public @Nonnull Authentication impersonate() throws UsernameNotFoundException {
+        try {
+<span class="nc" id="L309">            UserDetails u = new ImpersonatingUserDetailsService(</span>
+<span class="nc" id="L310">                    Jenkins.getInstance().getSecurityRealm().getSecurityComponents().userDetails).loadUserByUsername(id);</span>
+<span class="nc" id="L311">            return new UsernamePasswordAuthenticationToken(u.getUsername(), &quot;&quot;, u.getAuthorities());</span>
+<span class="nc" id="L312">        } catch (UserMayOrMayNotExistException e) {</span>
+            // backend can't load information about other users. so use the stored information if available
+<span class="nc" id="L314">        } catch (UsernameNotFoundException e) {</span>
+            // if the user no longer exists in the backend, we need to refuse impersonating this user
+<span class="nc bnc" id="L316" title="All 2 branches missed.">            if (!ALLOW_NON_EXISTENT_USER_TO_LOGIN)</span>
+<span class="nc" id="L317">                throw e;</span>
+<span class="nc" id="L318">        } catch (DataAccessException e) {</span>
+            // seems like it's in the same boat as UserMayOrMayNotExistException
+        }
+
+        // seems like a legitimate user we have no idea about. proceed with minimum access
+<span class="nc" id="L323">        return new UsernamePasswordAuthenticationToken(id, &quot;&quot;,</span>
+<span class="nc" id="L324">            new GrantedAuthority[]{SecurityRealm.AUTHENTICATED_AUTHORITY});</span>
+    }
+
+    /**
+     * Accepts the new description.
+     */
+    public synchronized void doSubmitDescription( StaplerRequest req, StaplerResponse rsp ) throws IOException, ServletException {
+<span class="nc" id="L331">        checkPermission(Jenkins.ADMINISTER);</span>
+
+<span class="nc" id="L333">        description = req.getParameter(&quot;description&quot;);</span>
+<span class="nc" id="L334">        save();</span>
+        
+<span class="nc" id="L336">        rsp.sendRedirect(&quot;.&quot;);  // go to the top page</span>
+<span class="nc" id="L337">    }</span>
+
+    /**
+     * Gets the fallback &quot;unknown&quot; user instance.
+     * &lt;p&gt;
+     * This is used to avoid null {@link User} instance.
+     */
+    public static @Nonnull User getUnknown() {
+<span class="nc" id="L345">        return get(UKNOWN_USERNAME);</span>
+    }
+
+    /**
+     * Gets the {@link User} object by its id or full name.
+     *
+     * @param create
+     *      If true, this method will never return null for valid input
+     *      (by creating a new {@link User} object if none exists.)
+     *      If false, this method will return null if {@link User} object
+     *      with the given name doesn't exist.
+     * @return Requested user. May be {@code null} if a user does not exist and
+     *      {@code create} is false.
+     * @deprecated use {@link User#get(String, boolean, java.util.Map)}
+     */
+    @Deprecated
+    public static @Nullable User get(String idOrFullName, boolean create) {
+<span class="nc" id="L362">        return get(idOrFullName, create, Collections.emptyMap());</span>
+    }
+
+    /**
+     * Gets the {@link User} object by its id or full name.
+     *
+     * @param create
+     *      If true, this method will never return null for valid input
+     *      (by creating a new {@link User} object if none exists.)
+     *      If false, this method will return null if {@link User} object
+     *      with the given name doesn't exist.
+     *
+     * @param context
+     *      contextual environment this user idOfFullName was retrieved from,
+     *      that can help resolve the user ID
+     * 
+     * @return
+     *      An existing or created user. May be {@code null} if a user does not exist and
+     *      {@code create} is false.
+     */
+    public static @Nullable User get(String idOrFullName, boolean create, Map context) {
+
+<span class="nc bnc" id="L384" title="All 2 branches missed.">        if(idOrFullName==null)</span>
+<span class="nc" id="L385">            return null;</span>
+
+        // sort resolvers by priority
+<span class="nc" id="L388">        List&lt;CanonicalIdResolver&gt; resolvers = new ArrayList&lt;CanonicalIdResolver&gt;(ExtensionList.lookup(CanonicalIdResolver.class));</span>
+<span class="nc" id="L389">        Collections.sort(resolvers);</span>
+
+<span class="nc" id="L391">        String id = null;</span>
+<span class="nc bnc" id="L392" title="All 2 branches missed.">        for (CanonicalIdResolver resolver : resolvers) {</span>
+<span class="nc" id="L393">            id = resolver.resolveCanonicalId(idOrFullName, context);</span>
+<span class="nc bnc" id="L394" title="All 2 branches missed.">            if (id != null) {</span>
+<span class="nc" id="L395">                LOGGER.log(Level.FINE, &quot;{0} mapped {1} to {2}&quot;, new Object[] {resolver, idOrFullName, id});</span>
+<span class="nc" id="L396">                break;</span>
+            }
+        }
+        // DefaultUserCanonicalIdResolver will always return a non-null id if all other CanonicalIdResolver failed
+<span class="nc bnc" id="L400" title="All 2 branches missed.">        if (id == null) {</span>
+<span class="nc" id="L401">            throw new IllegalStateException(&quot;The user id should be always non-null thanks to DefaultUserCanonicalIdResolver&quot;);</span>
+        }
+<span class="nc" id="L403">        return getOrCreate(id, idOrFullName, create);</span>
+    }
+
+    /**
+     * Retrieve a user by its ID, and create a new one if requested.
+     * @return
+     *      An existing or created user. May be {@code null} if a user does not exist and
+     *      {@code create} is false.
+     */
+    private static @Nullable User getOrCreate(@Nonnull String id, @Nonnull String fullName, boolean create) {
+<span class="nc" id="L413">        String idkey = idStrategy().keyFor(id);</span>
+
+<span class="nc" id="L415">        byNameLock.readLock().lock();</span>
+        User u;
+        try {
+<span class="nc" id="L418">            u = byName.get(idkey);</span>
+<span class="nc" id="L419">        } finally {</span>
+<span class="nc" id="L420">            byNameLock.readLock().unlock();</span>
+<span class="nc" id="L421">        }</span>
+<span class="nc" id="L422">        final File configFile = getConfigFileFor(id);</span>
+<span class="nc bnc" id="L423" title="All 4 branches missed.">        if (!configFile.isFile() &amp;&amp; !configFile.getParentFile().isDirectory()) {</span>
+            // check for legacy users and migrate if safe to do so.
+<span class="nc" id="L425">            File[] legacy = getLegacyConfigFilesFor(id);</span>
+<span class="nc bnc" id="L426" title="All 4 branches missed.">            if (legacy != null &amp;&amp; legacy.length &gt; 0) {</span>
+<span class="nc bnc" id="L427" title="All 2 branches missed.">                for (File legacyUserDir : legacy) {</span>
+<span class="nc" id="L428">                    final XmlFile legacyXml = new XmlFile(XSTREAM, new File(legacyUserDir, &quot;config.xml&quot;));</span>
+                    try {
+<span class="nc" id="L430">                        Object o = legacyXml.read();</span>
+<span class="nc bnc" id="L431" title="All 2 branches missed.">                        if (o instanceof User) {</span>
+<span class="nc bnc" id="L432" title="All 2 branches missed.">                            if (idStrategy().equals(id, legacyUserDir.getName()) &amp;&amp; !idStrategy().filenameOf(legacyUserDir.getName())</span>
+<span class="nc bnc" id="L433" title="All 2 branches missed.">                                    .equals(legacyUserDir.getName())) {</span>
+<span class="nc bnc" id="L434" title="All 2 branches missed.">                                if (!legacyUserDir.renameTo(configFile.getParentFile())) {</span>
+<span class="nc" id="L435">                                    LOGGER.log(Level.WARNING, &quot;Failed to migrate user record from {0} to {1}&quot;,</span>
+<span class="nc" id="L436">                                            new Object[]{legacyUserDir, configFile.getParentFile()});</span>
+                                }
+<span class="nc" id="L438">                                break;</span>
+                            }
+                        } else {
+<span class="nc" id="L441">                            LOGGER.log(Level.FINE, &quot;Unexpected object loaded from {0}: {1}&quot;,</span>
+<span class="nc" id="L442">                                    new Object[]{ legacyUserDir, o });</span>
+                        }
+<span class="nc" id="L444">                    } catch (IOException e) {</span>
+<span class="nc" id="L445">                        LOGGER.log(Level.FINE, String.format(&quot;Exception trying to load user from {0}: {1}&quot;,</span>
+<span class="nc" id="L446">                                new Object[]{ legacyUserDir, e.getMessage() }), e);</span>
+                    }
+                }
+            }
+        }
+<span class="nc bnc" id="L451" title="All 6 branches missed.">        if (u==null &amp;&amp; (create || configFile.exists())) {</span>
+<span class="nc" id="L452">            User tmp = new User(id, fullName);</span>
+            User prev;
+<span class="nc" id="L454">            byNameLock.readLock().lock();</span>
+            try {
+<span class="nc" id="L456">                prev = byName.putIfAbsent(idkey, u = tmp);</span>
+<span class="nc" id="L457">            } finally {</span>
+<span class="nc" id="L458">                byNameLock.readLock().unlock();</span>
+<span class="nc" id="L459">            }</span>
+<span class="nc bnc" id="L460" title="All 2 branches missed.">            if (prev != null) {</span>
+<span class="nc" id="L461">                u = prev; // if some has already put a value in the map, use it</span>
+<span class="nc bnc" id="L462" title="All 4 branches missed.">                if (LOGGER.isLoggable(Level.FINE) &amp;&amp; !fullName.equals(prev.getFullName())) {</span>
+<span class="nc" id="L463">                    LOGGER.log(Level.FINE, &quot;mismatch on fullName (‘&quot; + fullName + &quot;’ vs. ‘&quot; + prev.getFullName() + &quot;’) for ‘&quot; + id + &quot;’&quot;, new Throwable());</span>
+                }
+<span class="nc bnc" id="L465" title="All 4 branches missed.">            } else if (!id.equals(fullName) &amp;&amp; !configFile.exists()) {</span>
+                // JENKINS-16332: since the fullName may not be recoverable from the id, and various code may store the id only, we must save the fullName
+                try {
+<span class="nc" id="L468">                    u.save();</span>
+<span class="nc" id="L469">                } catch (IOException x) {</span>
+<span class="nc" id="L470">                    LOGGER.log(Level.WARNING, null, x);</span>
+                }
+            }
+        }
+<span class="nc" id="L474">        return u;</span>
+    }
+
+    /**
+     * Gets the {@link User} object by its id or full name.
+     */
+    public static @Nonnull User get(String idOrFullName) {
+<span class="nc" id="L481">        return get(idOrFullName,true);</span>
+    }
+
+    /**
+     * Gets the {@link User} object representing the currently logged-in user, or null
+     * if the current user is anonymous.
+     * @since 1.172
+     */
+    public static @CheckForNull User current() {
+<span class="fc" id="L490">        return get(Jenkins.getAuthentication());</span>
+    }
+
+    /**
+     * Gets the {@link User} object representing the supplied {@link Authentication} or
+     * {@code null} if the supplied {@link Authentication} is either anonymous or {@code null}
+     * @param a the supplied {@link Authentication} .
+     * @return a {@link User} object for the supplied {@link Authentication} or {@code null}
+     * @since 1.609
+     */
+    public static @CheckForNull User get(@CheckForNull Authentication a) {
+<span class="pc bpc" id="L501" title="2 of 4 branches missed.">        if(a == null || a instanceof AnonymousAuthenticationToken)</span>
+<span class="fc" id="L502">            return null;</span>
+
+        // Since we already know this is a name, we can just call getOrCreate with the name directly.
+<span class="nc" id="L505">        String id = a.getName();</span>
+<span class="nc" id="L506">        return getOrCreate(id, id, true);</span>
+    }
+
+    private static volatile long lastScanned;
+
+    /**
+     * Gets all the users.
+     */
+    public static @Nonnull Collection&lt;User&gt; getAll() {
+<span class="nc" id="L515">        final IdStrategy strategy = idStrategy();</span>
+<span class="nc bnc" id="L516" title="All 2 branches missed.">        if(System.currentTimeMillis() -lastScanned&gt;10000) {</span>
+            // occasionally scan the file system to check new users
+            // whether we should do this only once at start up or not is debatable.
+            // set this right away to avoid another thread from doing the same thing while we do this.
+            // having two threads doing the work won't cause race condition, but it's waste of time.
+<span class="nc" id="L521">            lastScanned = System.currentTimeMillis();</span>
+
+<span class="nc" id="L523">            File[] subdirs = getRootDir().listFiles((FileFilter)DirectoryFileFilter.INSTANCE);</span>
+<span class="nc bnc" id="L524" title="All 2 branches missed.">            if(subdirs==null)       return Collections.emptyList(); // shall never happen</span>
+
+<span class="nc bnc" id="L526" title="All 2 branches missed.">            for (File subdir : subdirs)</span>
+<span class="nc bnc" id="L527" title="All 2 branches missed.">                if(new File(subdir,&quot;config.xml&quot;).exists()) {</span>
+<span class="nc" id="L528">                    String name = strategy.idFromFilename(subdir.getName());</span>
+<span class="nc" id="L529">                    User.getOrCreate(name, name, true);</span>
+                }
+
+<span class="nc" id="L532">            lastScanned = System.currentTimeMillis();</span>
+        }
+
+<span class="nc" id="L535">        byNameLock.readLock().lock();</span>
+        ArrayList&lt;User&gt; r;
+        try {
+<span class="nc" id="L538">            r = new ArrayList&lt;User&gt;(byName.values());</span>
+<span class="nc" id="L539">        } finally {</span>
+<span class="nc" id="L540">            byNameLock.readLock().unlock();</span>
+<span class="nc" id="L541">        }</span>
+<span class="nc" id="L542">        Collections.sort(r,new Comparator&lt;User&gt;() {</span>
+
+            public int compare(User o1, User o2) {
+<span class="nc" id="L545">                return strategy.compare(o1.getId(), o2.getId());</span>
+            }
+        });
+<span class="nc" id="L548">        return r;</span>
+    }
+
+    /**
+     * Reloads the configuration from disk.
+     */
+    public static void reload() {
+<span class="nc" id="L555">        byNameLock.readLock().lock();</span>
+        try {
+<span class="nc bnc" id="L557" title="All 2 branches missed.">            for (User u : byName.values()) {</span>
+<span class="nc" id="L558">                u.load();</span>
+            }
+<span class="nc" id="L560">        } finally {</span>
+<span class="nc" id="L561">            byNameLock.readLock().unlock();</span>
+<span class="nc" id="L562">        }</span>
+<span class="nc" id="L563">    }</span>
+
+    /**
+     * Stop gap hack. Don't use it. To be removed in the trunk.
+     */
+    public static void clear() {
+<span class="nc" id="L569">        byNameLock.writeLock().lock();</span>
+        try {
+<span class="nc" id="L571">            byName.clear();</span>
+<span class="nc" id="L572">        } finally {</span>
+<span class="nc" id="L573">            byNameLock.writeLock().unlock();</span>
+<span class="nc" id="L574">        }</span>
+<span class="nc" id="L575">    }</span>
+
+    /**
+     * Called when changing the {@link IdStrategy}.
+     * @since 1.566
+     */
+    public static void rekey() {
+<span class="nc" id="L582">        final IdStrategy strategy = idStrategy();</span>
+<span class="nc" id="L583">        byNameLock.writeLock().lock();</span>
+        try {
+<span class="nc bnc" id="L585" title="All 2 branches missed.">            for (Map.Entry&lt;String, User&gt; e : byName.entrySet()) {</span>
+<span class="nc" id="L586">                String idkey = strategy.keyFor(e.getValue().id);</span>
+<span class="nc bnc" id="L587" title="All 2 branches missed.">                if (!idkey.equals(e.getKey())) {</span>
+                    // need to remap
+<span class="nc" id="L589">                    byName.remove(e.getKey());</span>
+<span class="nc" id="L590">                    byName.putIfAbsent(idkey, e.getValue());</span>
+                }
+            }
+<span class="nc" id="L593">        } finally {</span>
+<span class="nc" id="L594">            byNameLock.writeLock().unlock();</span>
+<span class="nc" id="L595">        }</span>
+<span class="nc" id="L596">    }</span>
+
+    /**
+     * Returns the user name.
+     */
+    public @Nonnull String getDisplayName() {
+<span class="nc" id="L602">        return getFullName();</span>
+    }
+
+    /** true if {@link AbstractBuild#hasParticipant} or {@link hudson.model.Cause.UserIdCause} */
+    private boolean relatedTo(@Nonnull AbstractBuild&lt;?,?&gt; b) {
+<span class="nc bnc" id="L607" title="All 2 branches missed.">        if (b.hasParticipant(this)) {</span>
+<span class="nc" id="L608">            return true;</span>
+        }
+<span class="nc bnc" id="L610" title="All 2 branches missed.">        for (Cause cause : b.getCauses()) {</span>
+<span class="nc bnc" id="L611" title="All 2 branches missed.">            if (cause instanceof Cause.UserIdCause) {</span>
+<span class="nc" id="L612">                String userId = ((Cause.UserIdCause) cause).getUserId();</span>
+<span class="nc bnc" id="L613" title="All 4 branches missed.">                if (userId != null &amp;&amp; idStrategy().equals(userId, getId())) {</span>
+<span class="nc" id="L614">                    return true;</span>
+                }
+            }
+        }
+<span class="nc" id="L618">        return false;</span>
+    }
+
+    /**
+     * Gets the list of {@link Build}s that include changes by this user,
+     * by the timestamp order.
+     */
+    @WithBridgeMethods(List.class)
+    public @Nonnull RunList getBuilds() {
+<span class="nc" id="L627">    	return new RunList&lt;Run&lt;?,?&gt;&gt;(Jenkins.getInstance().getAllItems(Job.class)).filter(new Predicate&lt;Run&lt;?,?&gt;&gt;() {</span>
+            @Override public boolean apply(Run&lt;?,?&gt; r) {
+<span class="nc bnc" id="L629" title="All 4 branches missed.">                return r instanceof AbstractBuild &amp;&amp; relatedTo((AbstractBuild&lt;?,?&gt;) r);</span>
+            }
+        });
+    }
+
+    /**
+     * Gets all the {@link AbstractProject}s that this user has committed to.
+     * @since 1.191
+     */
+    public @Nonnull Set&lt;AbstractProject&lt;?,?&gt;&gt; getProjects() {
+<span class="nc" id="L639">        Set&lt;AbstractProject&lt;?,?&gt;&gt; r = new HashSet&lt;AbstractProject&lt;?,?&gt;&gt;();</span>
+<span class="nc bnc" id="L640" title="All 2 branches missed.">        for (AbstractProject&lt;?,?&gt; p : Jenkins.getInstance().getAllItems(AbstractProject.class))</span>
+<span class="nc bnc" id="L641" title="All 2 branches missed.">            if(p.hasParticipant(this))</span>
+<span class="nc" id="L642">                r.add(p);</span>
+<span class="nc" id="L643">        return r;</span>
+    }
+
+    public @Override String toString() {
+<span class="nc" id="L647">        return fullName;</span>
+    }
+
+    /**
+     * The file we save our configuration.
+     */
+    protected final XmlFile getConfigFile() {
+<span class="nc" id="L654">        return new XmlFile(XSTREAM,getConfigFileFor(id));</span>
+    }
+
+    private static final File getConfigFileFor(String id) {
+<span class="nc" id="L658">        return new File(getRootDir(), idStrategy().filenameOf(id) +&quot;/config.xml&quot;);</span>
+    }
+
+    private static final File[] getLegacyConfigFilesFor(final String id) {
+<span class="nc" id="L662">        return getRootDir().listFiles(new FileFilter() {</span>
+            @Override
+            public boolean accept(File pathname) {
+<span class="nc bnc" id="L665" title="All 4 branches missed.">                return pathname.isDirectory() &amp;&amp; new File(pathname, &quot;config.xml&quot;).isFile() &amp;&amp; idStrategy().equals(</span>
+<span class="nc bnc" id="L666" title="All 2 branches missed.">                        pathname.getName(), id);</span>
+            }
+        });
+    }
+
+    /**
+     * Gets the directory where Hudson stores user information.
+     */
+    private static File getRootDir() {
+<span class="nc" id="L675">        return new File(Jenkins.getInstance().getRootDir(), &quot;users&quot;);</span>
+    }
+
+    /**
+     * Is the ID allowed? Some are prohibited for security reasons. See SECURITY-166.
+     * &lt;p/&gt;
+     * Note that this is only enforced when saving. These users are often created
+     * via the constructor (and even listed on /asynchPeople), but our goal is to
+     * prevent anyone from logging in as these users. Therefore, we prevent
+     * saving a User with one of these ids.
+     *
+     * @return true if the username or fullname is valid
+     * @since 1.600
+     */
+    public static boolean isIdOrFullnameAllowed(String id) {
+<span class="nc bnc" id="L690" title="All 2 branches missed.">        for (String invalidId : ILLEGAL_PERSISTED_USERNAMES) {</span>
+<span class="nc bnc" id="L691" title="All 2 branches missed.">            if (id.equalsIgnoreCase(invalidId))</span>
+<span class="nc" id="L692">                return false;</span>
+        }
+<span class="nc" id="L694">        return true;</span>
+    }
+
+    /**
+     * Save the settings to a file.
+     */
+    public synchronized void save() throws IOException, FormValidation {
+<span class="nc bnc" id="L701" title="All 2 branches missed.">        if (! isIdOrFullnameAllowed(id)) {</span>
+<span class="nc" id="L702">            throw FormValidation.error(Messages.User_IllegalUsername(id));</span>
+        }
+<span class="nc bnc" id="L704" title="All 2 branches missed.">        if (! isIdOrFullnameAllowed(fullName)) {</span>
+<span class="nc" id="L705">            throw FormValidation.error(Messages.User_IllegalFullname(fullName));</span>
+        }
+<span class="nc bnc" id="L707" title="All 2 branches missed.">        if(BulkChange.contains(this))   return;</span>
+<span class="nc" id="L708">        getConfigFile().write(this);</span>
+<span class="nc" id="L709">        SaveableListener.fireOnChange(this, getConfigFile());</span>
+<span class="nc" id="L710">    }</span>
+
+    /**
+     * Deletes the data directory and removes this user from Hudson.
+     *
+     * @throws IOException
+     *      if we fail to delete.
+     */
+    public synchronized void delete() throws IOException {
+<span class="nc" id="L719">        final IdStrategy strategy = idStrategy();</span>
+<span class="nc" id="L720">        byNameLock.readLock().lock();</span>
+        try {
+<span class="nc" id="L722">            byName.remove(strategy.keyFor(id));</span>
+<span class="nc" id="L723">        } finally {</span>
+<span class="nc" id="L724">            byNameLock.readLock().unlock();</span>
+<span class="nc" id="L725">        }</span>
+<span class="nc" id="L726">        Util.deleteRecursive(new File(getRootDir(), strategy.filenameOf(id)));</span>
+<span class="nc" id="L727">    }</span>
+
+    /**
+     * Exposed remote API.
+     */
+    public Api getApi() {
+<span class="nc" id="L733">        return new Api(this);</span>
+    }
+
+    /**
+     * Accepts submission from the configuration page.
+     */
+    @RequirePOST
+    public void doConfigSubmit( StaplerRequest req, StaplerResponse rsp ) throws IOException, ServletException, FormException {
+<span class="nc" id="L741">        checkPermission(Jenkins.ADMINISTER);</span>
+
+<span class="nc" id="L743">        JSONObject json = req.getSubmittedForm();</span>
+
+<span class="nc" id="L745">        fullName = json.getString(&quot;fullName&quot;);</span>
+<span class="nc" id="L746">        description = json.getString(&quot;description&quot;);</span>
+
+<span class="nc" id="L748">        List&lt;UserProperty&gt; props = new ArrayList&lt;UserProperty&gt;();</span>
+<span class="nc" id="L749">        int i = 0;</span>
+<span class="nc bnc" id="L750" title="All 2 branches missed.">        for (UserPropertyDescriptor d : UserProperty.all()) {</span>
+<span class="nc" id="L751">            UserProperty p = getProperty(d.clazz);</span>
+
+<span class="nc" id="L753">            JSONObject o = json.optJSONObject(&quot;userProperty&quot; + (i++));</span>
+<span class="nc bnc" id="L754" title="All 2 branches missed.">            if (o!=null) {</span>
+<span class="nc bnc" id="L755" title="All 2 branches missed.">                if (p != null) {</span>
+<span class="nc" id="L756">                    p = p.reconfigure(req, o);</span>
+<span class="nc" id="L757">                } else {</span>
+<span class="nc" id="L758">                    p = d.newInstance(req, o);</span>
+                }
+<span class="nc" id="L760">                p.setUser(this);</span>
+            }
+
+<span class="nc bnc" id="L763" title="All 2 branches missed.">            if (p!=null)</span>
+<span class="nc" id="L764">                props.add(p);</span>
+        }
+<span class="nc" id="L766">        this.properties = props;</span>
+
+<span class="nc" id="L768">        save();</span>
+
+<span class="nc" id="L770">        FormApply.success(&quot;.&quot;).generateResponse(req,rsp,this);</span>
+<span class="nc" id="L771">    }</span>
+
+    /**
+     * Deletes this user from Hudson.
+     */
+    @RequirePOST
+    public void doDoDelete(StaplerRequest req, StaplerResponse rsp) throws IOException, ServletException {
+<span class="nc" id="L778">        checkPermission(Jenkins.ADMINISTER);</span>
+<span class="nc bnc" id="L779" title="All 2 branches missed.">        if (idStrategy().equals(id, Jenkins.getAuthentication().getName())) {</span>
+<span class="nc" id="L780">            rsp.sendError(HttpServletResponse.SC_BAD_REQUEST, &quot;Cannot delete self&quot;);</span>
+<span class="nc" id="L781">            return;</span>
+        }
+
+<span class="nc" id="L784">        delete();</span>
+
+<span class="nc" id="L786">        rsp.sendRedirect2(&quot;../..&quot;);</span>
+<span class="nc" id="L787">    }</span>
+
+    public void doRssAll(StaplerRequest req, StaplerResponse rsp) throws IOException, ServletException {
+<span class="nc" id="L790">        rss(req, rsp, &quot; all builds&quot;, getBuilds(), Run.FEED_ADAPTER);</span>
+<span class="nc" id="L791">    }</span>
+
+    public void doRssFailed(StaplerRequest req, StaplerResponse rsp) throws IOException, ServletException {
+<span class="nc" id="L794">        rss(req, rsp, &quot; regression builds&quot;, getBuilds().regressionOnly(), Run.FEED_ADAPTER);</span>
+<span class="nc" id="L795">    }</span>
+
+    public void doRssLatest(StaplerRequest req, StaplerResponse rsp) throws IOException, ServletException {
+<span class="nc" id="L798">        final List&lt;Run&gt; lastBuilds = new ArrayList&lt;Run&gt;();</span>
+<span class="nc bnc" id="L799" title="All 2 branches missed.">        for (AbstractProject&lt;?,?&gt; p : Jenkins.getInstance().getAllItems(AbstractProject.class)) {</span>
+<span class="nc bnc" id="L800" title="All 2 branches missed.">            for (AbstractBuild&lt;?,?&gt; b = p.getLastBuild(); b != null; b = b.getPreviousBuild()) {</span>
+<span class="nc bnc" id="L801" title="All 2 branches missed.">                if (relatedTo(b)) {</span>
+<span class="nc" id="L802">                    lastBuilds.add(b);</span>
+<span class="nc" id="L803">                    break;</span>
+                }
+            }
+        }
+<span class="nc" id="L807">        rss(req, rsp, &quot; latest build&quot;, RunList.fromRuns(lastBuilds), Run.FEED_ADAPTER_LATEST);</span>
+<span class="nc" id="L808">    }</span>
+
+    private void rss(StaplerRequest req, StaplerResponse rsp, String suffix, RunList runs, FeedAdapter adapter)
+            throws IOException, ServletException {
+<span class="nc" id="L812">        RSS.forwardToRss(getDisplayName()+ suffix, getUrl(), runs.newBuilds(), adapter, req, rsp);</span>
+<span class="nc" id="L813">    }</span>
+
+    /**
+     * Keyed by {@link User#id}. This map is used to ensure
+     * singleton-per-id semantics of {@link User} objects.
+     *
+     * The key needs to be generated by {@link IdStrategy#keyFor(String)}.
+     */
+    @GuardedBy(&quot;byNameLock&quot;)
+<span class="fc" id="L822">    private static final ConcurrentMap&lt;String,User&gt; byName = new ConcurrentHashMap&lt;String, User&gt;();</span>
+
+    /**
+     * This lock is used to guard access to the {@link #byName} map. Use
+     * {@link java.util.concurrent.locks.ReadWriteLock#readLock()} for normal access and
+     * {@link java.util.concurrent.locks.ReadWriteLock#writeLock()} for {@link #rekey()} or any other operation
+     * that requires operating on the map as a whole.
+     */
+<span class="fc" id="L830">    private static final ReadWriteLock byNameLock = new ReentrantReadWriteLock();</span>
+
+    /**
+     * Used to load/save user configuration.
+     */
+<span class="fc" id="L835">    public static final XStream2 XSTREAM = new XStream2();</span>
+
+<span class="fc" id="L837">    private static final Logger LOGGER = Logger.getLogger(User.class.getName());</span>
+
+    static {
+<span class="fc" id="L840">        XSTREAM.alias(&quot;user&quot;,User.class);</span>
+    }
+
+    public ACL getACL() {
+<span class="nc" id="L844">        final ACL base = Jenkins.getInstance().getAuthorizationStrategy().getACL(this);</span>
+        // always allow a non-anonymous user full control of himself.
+<span class="nc" id="L846">        return new ACL() {</span>
+            public boolean hasPermission(Authentication a, Permission permission) {
+<span class="nc bnc" id="L848" title="All 4 branches missed.">                return (idStrategy().equals(a.getName(), id) &amp;&amp; !(a instanceof AnonymousAuthenticationToken))</span>
+<span class="nc bnc" id="L849" title="All 2 branches missed.">                        || base.hasPermission(a, permission);</span>
+            }
+        };
+    }
+
+    public void checkPermission(Permission permission) {
+<span class="nc" id="L855">        getACL().checkPermission(permission);</span>
+<span class="nc" id="L856">    }</span>
+
+    public boolean hasPermission(Permission permission) {
+<span class="nc" id="L859">        return getACL().hasPermission(permission);</span>
+    }
+
+    /**
+     * With ADMINISTER permission, can delete users with persisted data but can't delete self.
+     */
+    public boolean canDelete() {
+<span class="nc" id="L866">        final IdStrategy strategy = idStrategy();</span>
+<span class="nc bnc" id="L867" title="All 4 branches missed.">        return hasPermission(Jenkins.ADMINISTER) &amp;&amp; !strategy.equals(id, Jenkins.getAuthentication().getName())</span>
+<span class="nc bnc" id="L868" title="All 2 branches missed.">                &amp;&amp; new File(getRootDir(), strategy.filenameOf(id)).exists();</span>
+    }
+
+    /**
+     * Checks for authorities (groups) associated with this user.
+     * If the caller lacks {@link Jenkins#ADMINISTER}, or any problems arise, returns an empty list.
+     * {@link SecurityRealm#AUTHENTICATED_AUTHORITY} and the username, if present, are omitted.
+     * @since 1.498
+     * @return a possibly empty list
+     */
+    public @Nonnull List&lt;String&gt; getAuthorities() {
+<span class="nc bnc" id="L879" title="All 2 branches missed.">        if (!Jenkins.getInstance().hasPermission(Jenkins.ADMINISTER)) {</span>
+<span class="nc" id="L880">            return Collections.emptyList();</span>
+        }
+<span class="nc" id="L882">        List&lt;String&gt; r = new ArrayList&lt;String&gt;();</span>
+        Authentication authentication;
+        try {
+<span class="nc" id="L885">            authentication = impersonate();</span>
+<span class="nc" id="L886">        } catch (UsernameNotFoundException x) {</span>
+<span class="nc" id="L887">            LOGGER.log(Level.FINE, &quot;cannot look up authorities for &quot; + id, x);</span>
+<span class="nc" id="L888">            return Collections.emptyList();</span>
+        }
+<span class="nc bnc" id="L890" title="All 2 branches missed.">        for (GrantedAuthority a : authentication.getAuthorities()) {</span>
+<span class="nc bnc" id="L891" title="All 2 branches missed.">            if (a.equals(SecurityRealm.AUTHENTICATED_AUTHORITY)) {</span>
+<span class="nc" id="L892">                continue;</span>
+            }
+<span class="nc" id="L894">            String n = a.getAuthority();</span>
+<span class="nc bnc" id="L895" title="All 4 branches missed.">            if (n != null &amp;&amp; !idStrategy().equals(n, id)) {</span>
+<span class="nc" id="L896">                r.add(n);</span>
+            }
+        }
+<span class="nc" id="L899">        Collections.sort(r, String.CASE_INSENSITIVE_ORDER);</span>
+<span class="nc" id="L900">        return r;</span>
+    }
+
+    public Descriptor getDescriptorByName(String className) {
+<span class="nc" id="L904">        return Jenkins.getInstance().getDescriptorByName(className);</span>
+    }
+    
+    public Object getDynamic(String token) {
+<span class="nc bnc" id="L908" title="All 2 branches missed.">        for(Action action: getTransientActions()){</span>
+<span class="nc bnc" id="L909" title="All 2 branches missed.">            if(action.getUrlName().equals(token))</span>
+<span class="nc" id="L910">                return action;</span>
+        }
+<span class="nc bnc" id="L912" title="All 2 branches missed.">        for(Action action: getPropertyActions()){</span>
+<span class="nc bnc" id="L913" title="All 2 branches missed.">            if(action.getUrlName().equals(token))</span>
+<span class="nc" id="L914">                return action;</span>
+        }
+<span class="nc" id="L916">        return null;</span>
+    }
+    
+    /**
+     * Return all properties that are also actions.
+     * 
+     * @return the list can be empty but never null. read only.
+     */
+    public List&lt;Action&gt; getPropertyActions() {
+<span class="nc" id="L925">        List&lt;Action&gt; actions = new ArrayList&lt;Action&gt;();</span>
+<span class="nc bnc" id="L926" title="All 2 branches missed.">        for (UserProperty userProp : getProperties().values()) {</span>
+<span class="nc bnc" id="L927" title="All 2 branches missed.">            if (userProp instanceof Action) {</span>
+<span class="nc" id="L928">                actions.add((Action) userProp);</span>
+            }
+        }
+<span class="nc" id="L931">        return Collections.unmodifiableList(actions);</span>
+    }
+    
+    /**
+     * Return all transient actions associated with this user.
+     * 
+     * @return the list can be empty but never null. read only.
+     */
+    public List&lt;Action&gt; getTransientActions() {
+<span class="nc" id="L940">        List&lt;Action&gt; actions = new ArrayList&lt;Action&gt;();</span>
+<span class="nc bnc" id="L941" title="All 2 branches missed.">        for (TransientUserActionFactory factory: TransientUserActionFactory.all()) {</span>
+<span class="nc" id="L942">            actions.addAll(factory.createFor(this));</span>
+        }
+<span class="nc" id="L944">        return Collections.unmodifiableList(actions);</span>
+    }
+
+    public ContextMenu doContextMenu(StaplerRequest request, StaplerResponse response) throws Exception {
+<span class="nc" id="L948">        return new ContextMenu().from(this,request,response);</span>
+    }
+
+<span class="nc" id="L951">    public static abstract class CanonicalIdResolver extends AbstractDescribableImpl&lt;CanonicalIdResolver&gt; implements ExtensionPoint, Comparable&lt;CanonicalIdResolver&gt; {</span>
+
+        /**
+         * context key for realm (domain) where idOrFullName has been retreived from.
+         * Can be used (for example) to distinguish ambiguous committer ID using the SCM URL.
+         * Associated Value is a {@link String}
+         */
+        public static final String REALM = &quot;realm&quot;;
+
+        public int compareTo(CanonicalIdResolver o) {
+            // reverse priority order
+<span class="nc" id="L962">            int i = getPriority();</span>
+<span class="nc" id="L963">            int j = o.getPriority();</span>
+<span class="nc bnc" id="L964" title="All 4 branches missed.">            return i&gt;j ? -1 : (i==j ? 0:1);</span>
+        }
+
+        /**
+         * extract user ID from idOrFullName with help from contextual infos.
+         * can return &lt;code&gt;null&lt;/code&gt; if no user ID matched the input
+         */
+        public abstract @CheckForNull String resolveCanonicalId(String idOrFullName, Map&lt;String, ?&gt; context);
+
+        public int getPriority() {
+<span class="nc" id="L974">            return 1;</span>
+        }
+
+    }
+
+
+    /**
+     * Resolve user ID from full name
+     */
+    @Extension
+<span class="nc" id="L984">    public static class FullNameIdResolver extends CanonicalIdResolver {</span>
+
+        @Override
+        public String resolveCanonicalId(String idOrFullName, Map&lt;String, ?&gt; context) {
+<span class="nc bnc" id="L988" title="All 2 branches missed.">            for (User user : getAll()) {</span>
+<span class="nc bnc" id="L989" title="All 2 branches missed.">                if (idOrFullName.equals(user.getFullName())) return user.getId();</span>
+            }
+<span class="nc" id="L991">            return null;</span>
+        }
+
+        @Override
+        public int getPriority() {
+<span class="nc" id="L996">            return -1; // lower than default</span>
+        }
+    }
+
+    /**
+     * Jenkins now refuses to let the user login if he/she doesn't exist in {@link SecurityRealm},
+     * which was necessary to make sure users removed from the backend will get removed from the frontend.
+     * &lt;p&gt;
+     * Unfortunately this infringed some legitimate use cases of creating Jenkins-local users for
+     * automation purposes. This escape hatch switch can be enabled to resurrect that behaviour.
+     *
+     * JENKINS-22346.
+     */
+<span class="fc" id="L1009">    public static boolean ALLOW_NON_EXISTENT_USER_TO_LOGIN = Boolean.getBoolean(User.class.getName()+&quot;.allowNonExistentUserToLogin&quot;);</span>
+}
+
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

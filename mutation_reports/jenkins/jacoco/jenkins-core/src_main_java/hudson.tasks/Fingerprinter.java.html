@@ -1,0 +1,440 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>Fingerprinter.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.tasks</a> &gt; <span class="el_source">Fingerprinter.java</span></div><h1>Fingerprinter.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">/*</span>
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2010, Sun Microsystems, Inc., Kohsuke Kawaguchi
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.tasks;
+
+import com.google.common.collect.ImmutableMap;
+import hudson.EnvVars;
+import hudson.Extension;
+import hudson.FilePath;
+import jenkins.MasterToSlaveFileCallable;
+import hudson.Launcher;
+import hudson.Util;
+import hudson.model.AbstractBuild;
+import hudson.model.AbstractProject;
+import hudson.model.Action;
+import jenkins.model.DependencyDeclarer;
+import hudson.model.DependencyGraph;
+import hudson.model.DependencyGraph.Dependency;
+import hudson.model.Fingerprint;
+import hudson.model.Fingerprint.BuildPtr;
+import hudson.model.FingerprintMap;
+import hudson.model.Job;
+import jenkins.model.Jenkins;
+import hudson.model.Result;
+import hudson.model.Run;
+import hudson.model.TaskListener;
+import hudson.remoting.VirtualChannel;
+import hudson.util.FormValidation;
+import hudson.util.PackedMap;
+import hudson.util.RunList;
+import net.sf.json.JSONObject;
+import org.acegisecurity.AccessDeniedException;
+import org.apache.tools.ant.DirectoryScanner;
+import org.apache.tools.ant.types.FileSet;
+import org.kohsuke.stapler.AncestorInPath;
+import org.kohsuke.stapler.DataBoundConstructor;
+import org.kohsuke.stapler.QueryParameter;
+import org.kohsuke.stapler.StaplerRequest;
+
+import java.io.File;
+import java.io.IOException;
+import java.io.Serializable;
+import java.lang.ref.WeakReference;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.ListIterator;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Random;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import jenkins.model.RunAction2;
+import jenkins.tasks.SimpleBuildStep;
+
+/**
+ * Records fingerprints of the specified files.
+ *
+ * @author Kohsuke Kawaguchi
+ */
+public class Fingerprinter extends Recorder implements Serializable, DependencyDeclarer, SimpleBuildStep {
+<span class="nc" id="L85">    public static boolean enableFingerprintsInDependencyGraph = Boolean.getBoolean(Fingerprinter.class.getName() + &quot;.enableFingerprintsInDependencyGraph&quot;);</span>
+    
+    /**
+     * Comma-separated list of files/directories to be fingerprinted.
+     */
+    private final String targets;
+
+    @Deprecated
+    Boolean recordBuildArtifacts;
+
+<span class="nc" id="L95">    @DataBoundConstructor public Fingerprinter(String targets) {</span>
+<span class="nc" id="L96">        this.targets = targets;</span>
+<span class="nc" id="L97">    }</span>
+
+    @Deprecated
+    public Fingerprinter(String targets, boolean recordBuildArtifacts) {
+<span class="nc" id="L101">        this(targets);</span>
+<span class="nc" id="L102">        this.recordBuildArtifacts = recordBuildArtifacts;</span>
+<span class="nc" id="L103">    }</span>
+
+    public String getTargets() {
+<span class="nc" id="L106">        return targets;</span>
+    }
+
+    @Deprecated
+    public boolean getRecordBuildArtifacts() {
+<span class="nc bnc" id="L111" title="All 4 branches missed.">        return recordBuildArtifacts != null &amp;&amp; recordBuildArtifacts;</span>
+    }
+
+    @Override
+    public void perform(Run&lt;?,?&gt; build, FilePath workspace, Launcher launcher, TaskListener listener) throws InterruptedException {
+        try {
+<span class="nc" id="L117">            listener.getLogger().println(Messages.Fingerprinter_Recording());</span>
+
+<span class="nc" id="L119">            Map&lt;String,String&gt; record = new HashMap&lt;String,String&gt;();</span>
+            
+<span class="nc" id="L121">            EnvVars environment = build.getEnvironment(listener);</span>
+<span class="nc bnc" id="L122" title="All 2 branches missed.">            if(targets.length()!=0) {</span>
+<span class="nc" id="L123">                String expandedTargets = environment.expand(targets);</span>
+<span class="nc" id="L124">                record(build, workspace, listener, record, expandedTargets);</span>
+            }
+
+<span class="nc" id="L127">            FingerprintAction fingerprintAction = build.getAction(FingerprintAction.class);</span>
+<span class="nc bnc" id="L128" title="All 2 branches missed.">            if (fingerprintAction != null) {</span>
+<span class="nc" id="L129">                fingerprintAction.add(record);</span>
+<span class="nc" id="L130">            } else {</span>
+<span class="nc" id="L131">                build.addAction(new FingerprintAction(build,record));</span>
+            }
+
+<span class="nc bnc" id="L134" title="All 2 branches missed.">            if (enableFingerprintsInDependencyGraph) {</span>
+<span class="nc" id="L135">                Jenkins.getInstance().rebuildDependencyGraphAsync();</span>
+            }
+<span class="nc" id="L137">        } catch (IOException e) {</span>
+<span class="nc" id="L138">            e.printStackTrace(listener.error(Messages.Fingerprinter_Failed()));</span>
+<span class="nc" id="L139">            build.setResult(Result.FAILURE);</span>
+        }
+
+        // failing to record fingerprints is an error but not fatal
+<span class="nc" id="L143">    }</span>
+
+    public BuildStepMonitor getRequiredMonitorService() {
+<span class="nc" id="L146">        return BuildStepMonitor.NONE;</span>
+    }
+
+    public void buildDependencyGraph(AbstractProject owner, DependencyGraph graph) {
+<span class="nc bnc" id="L150" title="All 2 branches missed.">        if (enableFingerprintsInDependencyGraph) {</span>
+<span class="nc" id="L151">            RunList builds = owner.getBuilds();</span>
+<span class="nc" id="L152">            Set&lt;String&gt; seenUpstreamProjects = new HashSet&lt;String&gt;();</span>
+
+<span class="nc bnc" id="L154" title="All 2 branches missed.">            for ( ListIterator iter = builds.listIterator(); iter.hasNext(); ) {</span>
+<span class="nc" id="L155">                Run build = (Run) iter.next();</span>
+<span class="nc bnc" id="L156" title="All 2 branches missed.">                for (FingerprintAction action : build.getActions(FingerprintAction.class)) {</span>
+<span class="nc bnc" id="L157" title="All 2 branches missed.">                    for (AbstractProject key : action.getDependencies().keySet()) {</span>
+<span class="nc bnc" id="L158" title="All 2 branches missed.">                        if (key == owner) {</span>
+<span class="nc" id="L159">                            continue;   // Avoid self references</span>
+                        }
+
+<span class="nc" id="L162">                        AbstractProject p = key;</span>
+                        // TODO is this harmful to call unconditionally, so it would apply also to MavenModule for example?
+<span class="nc bnc" id="L164" title="All 2 branches missed.">                        if (key.getClass().getName().equals(&quot;hudson.matrix.MatrixConfiguration&quot;)) {</span>
+<span class="nc" id="L165">                            p = key.getRootProject();</span>
+                        }
+
+<span class="nc bnc" id="L168" title="All 2 branches missed.">                        if (seenUpstreamProjects.contains(p.getName())) {</span>
+<span class="nc" id="L169">                            continue;</span>
+                        }
+
+<span class="nc" id="L172">                        seenUpstreamProjects.add(p.getName());</span>
+<span class="nc" id="L173">                        graph.addDependency(new Dependency(p, owner) {</span>
+                            @Override
+                            public boolean shouldTriggerBuild(AbstractBuild build,
+                                                              TaskListener listener,
+                                                              List&lt;Action&gt; actions) {
+                                // Fingerprints should not trigger builds.
+<span class="nc" id="L179">                                return false;</span>
+                            }
+                        });
+                    }
+                }
+            }
+        }
+<span class="nc" id="L186">    }</span>
+
+    private void record(Run&lt;?,?&gt; build, FilePath ws, TaskListener listener, Map&lt;String,String&gt; record, final String targets) throws IOException, InterruptedException {
+        final class Record implements Serializable {
+            final boolean produced;
+            final String relativePath;
+            final String fileName;
+            final String md5sum;
+
+<span class="nc" id="L195">            public Record(boolean produced, String relativePath, String fileName, String md5sum) {</span>
+<span class="nc" id="L196">                this.produced = produced;</span>
+<span class="nc" id="L197">                this.relativePath = relativePath;</span>
+<span class="nc" id="L198">                this.fileName = fileName;</span>
+<span class="nc" id="L199">                this.md5sum = md5sum;</span>
+<span class="nc" id="L200">            }</span>
+
+            Fingerprint addRecord(Run build) throws IOException {
+<span class="nc" id="L203">                FingerprintMap map = Jenkins.getInstance().getFingerprintMap();</span>
+<span class="nc bnc" id="L204" title="All 2 branches missed.">                return map.getOrCreate(produced?build:null, fileName, md5sum);</span>
+            }
+
+            private static final long serialVersionUID = 1L;
+        }
+
+<span class="nc" id="L210">        final long buildTimestamp = build.getTimeInMillis();</span>
+
+<span class="nc" id="L212">        List&lt;Record&gt; records = ws.act(new MasterToSlaveFileCallable&lt;List&lt;Record&gt;&gt;() {</span>
+            public List&lt;Record&gt; invoke(File baseDir, VirtualChannel channel) throws IOException {
+<span class="nc" id="L214">                List&lt;Record&gt; results = new ArrayList&lt;Record&gt;();</span>
+
+<span class="nc" id="L216">                FileSet src = Util.createFileSet(baseDir,targets);</span>
+
+<span class="nc" id="L218">                DirectoryScanner ds = src.getDirectoryScanner();</span>
+<span class="nc bnc" id="L219" title="All 2 branches missed.">                for( String f : ds.getIncludedFiles() ) {</span>
+<span class="nc" id="L220">                    File file = new File(baseDir,f);</span>
+
+                    // consider the file to be produced by this build only if the timestamp
+                    // is newer than when the build has started.
+                    // 2000ms is an error margin since since VFAT only retains timestamp at 2sec precision
+<span class="nc bnc" id="L225" title="All 2 branches missed.">                    boolean produced = buildTimestamp &lt;= file.lastModified()+2000;</span>
+
+                    try {
+<span class="nc" id="L228">                        results.add(new Record(produced,f,file.getName(),new FilePath(file).digest()));</span>
+<span class="nc" id="L229">                    } catch (IOException e) {</span>
+<span class="nc" id="L230">                        throw new IOException(Messages.Fingerprinter_DigestFailed(file),e);</span>
+<span class="nc" id="L231">                    } catch (InterruptedException e) {</span>
+<span class="nc" id="L232">                        throw new IOException(Messages.Fingerprinter_Aborted(),e);</span>
+                    }
+                }
+
+<span class="nc" id="L236">                return results;</span>
+            }
+        });
+
+<span class="nc bnc" id="L240" title="All 2 branches missed.">        for (Record r : records) {</span>
+<span class="nc" id="L241">            Fingerprint fp = r.addRecord(build);</span>
+<span class="nc bnc" id="L242" title="All 2 branches missed.">            if(fp==null) {</span>
+<span class="nc" id="L243">                listener.error(Messages.Fingerprinter_FailedFor(r.relativePath));</span>
+<span class="nc" id="L244">                continue;</span>
+            }
+<span class="nc" id="L246">            fp.addFor(build);</span>
+<span class="nc" id="L247">            record.put(r.relativePath,fp.getHashString());</span>
+        }
+<span class="nc" id="L249">    }</span>
+
+    @Extension
+<span class="nc" id="L252">    public static class DescriptorImpl extends BuildStepDescriptor&lt;Publisher&gt; {</span>
+        public String getDisplayName() {
+<span class="nc" id="L254">            return Messages.Fingerprinter_DisplayName();</span>
+        }
+
+        @Deprecated
+        public FormValidation doCheck(@AncestorInPath AbstractProject project, @QueryParameter String value) throws IOException {
+<span class="nc" id="L259">            return doCheckTargets(project, value);</span>
+        }
+
+        public FormValidation doCheckTargets(@AncestorInPath AbstractProject&lt;?,?&gt; project, @QueryParameter String value) throws IOException {
+<span class="nc bnc" id="L263" title="All 2 branches missed.">            if (project == null) {</span>
+<span class="nc" id="L264">                return FormValidation.ok();</span>
+            }
+<span class="nc" id="L266">            return FilePath.validateFileMask(project.getSomeWorkspace(),value);</span>
+        }
+
+        @Override
+        public Publisher newInstance(StaplerRequest req, JSONObject formData) {
+<span class="nc" id="L271">            return req.bindJSON(Fingerprinter.class, formData);</span>
+        }
+
+        public boolean isApplicable(Class&lt;? extends AbstractProject&gt; jobType) {
+<span class="nc" id="L275">            return true;</span>
+        }
+    }
+
+    /**
+     * Action for displaying fingerprints.
+     */
+    public static final class FingerprintAction implements RunAction2 {
+
+        private transient Run build;
+        
+<span class="nc" id="L286">        private static final Random rand = new Random();</span>
+
+        /**
+         * From file name to the digest.
+         */
+        private /*almost final*/ PackedMap&lt;String,String&gt; record;
+
+        private transient WeakReference&lt;Map&lt;String,Fingerprint&gt;&gt; ref;
+
+<span class="nc" id="L295">        public FingerprintAction(Run build, Map&lt;String, String&gt; record) {</span>
+<span class="nc" id="L296">            this.build = build;</span>
+<span class="nc" id="L297">            this.record = compact(record);</span>
+<span class="nc" id="L298">        }</span>
+
+        @Deprecated
+        public FingerprintAction(AbstractBuild build, Map&lt;String, String&gt; record) {
+<span class="nc" id="L302">            this((Run) build, record);</span>
+<span class="nc" id="L303">        }</span>
+
+        public void add(Map&lt;String,String&gt; moreRecords) {
+<span class="nc" id="L306">            Map&lt;String,String&gt; r = new HashMap&lt;String, String&gt;(record);</span>
+<span class="nc" id="L307">            r.putAll(moreRecords);</span>
+<span class="nc" id="L308">            record = compact(r);</span>
+<span class="nc" id="L309">            ref = null;</span>
+<span class="nc" id="L310">        }</span>
+
+        public String getIconFileName() {
+<span class="nc" id="L313">            return &quot;fingerprint.png&quot;;</span>
+        }
+
+        public String getDisplayName() {
+<span class="nc" id="L317">            return Messages.Fingerprinter_Action_DisplayName();</span>
+        }
+
+        public String getUrlName() {
+<span class="nc" id="L321">            return &quot;fingerprints&quot;;</span>
+        }
+
+        public Run getRun() {
+<span class="nc" id="L325">            return build;</span>
+        }
+
+        @Deprecated
+        public AbstractBuild getBuild() {
+<span class="nc bnc" id="L330" title="All 2 branches missed.">            return build instanceof AbstractBuild ? (AbstractBuild) build : null;</span>
+        }
+
+        /**
+         * Obtains the raw data.
+         */
+        public Map&lt;String,String&gt; getRecords() {
+<span class="nc" id="L337">            return record;</span>
+        }
+
+        @Override public void onLoad(Run&lt;?,?&gt; r) {
+<span class="nc" id="L341">            build = r;</span>
+<span class="nc" id="L342">            record = compact(record);</span>
+<span class="nc" id="L343">        }</span>
+
+        @Override public void onAttached(Run&lt;?,?&gt; r) {
+            // for historical reasons this setup is done in the constructor instead
+<span class="nc" id="L347">        }</span>
+
+        /** Share data structure with other builds, mainly those of the same job. */
+        private PackedMap&lt;String,String&gt; compact(Map&lt;String,String&gt; record) {
+<span class="nc" id="L351">            Map&lt;String,String&gt; b = new HashMap&lt;String,String&gt;();</span>
+<span class="nc bnc" id="L352" title="All 2 branches missed.">            for (Entry&lt;String,String&gt; e : record.entrySet()) {</span>
+<span class="nc" id="L353">                b.put(e.getKey().intern(), e.getValue().intern());</span>
+            }
+<span class="nc" id="L355">            return PackedMap.of(b);</span>
+        }
+
+        /**
+         * Map from file names of the fingerprinted file to its fingerprint record.
+         */
+        public synchronized Map&lt;String,Fingerprint&gt; getFingerprints() {
+<span class="nc bnc" id="L362" title="All 2 branches missed.">            if(ref!=null) {</span>
+<span class="nc" id="L363">                Map&lt;String,Fingerprint&gt; m = ref.get();</span>
+<span class="nc bnc" id="L364" title="All 2 branches missed.">                if(m!=null)</span>
+<span class="nc" id="L365">                    return m;</span>
+            }
+
+<span class="nc" id="L368">            Jenkins h = Jenkins.getInstance();</span>
+
+<span class="nc" id="L370">            Map&lt;String,Fingerprint&gt; m = new TreeMap&lt;String,Fingerprint&gt;();</span>
+<span class="nc bnc" id="L371" title="All 2 branches missed.">            for (Entry&lt;String, String&gt; r : record.entrySet()) {</span>
+                try {
+<span class="nc" id="L373">                    Fingerprint fp = h._getFingerprint(r.getValue());</span>
+<span class="nc bnc" id="L374" title="All 2 branches missed.">                    if(fp!=null)</span>
+<span class="nc" id="L375">                        m.put(r.getKey(), fp);</span>
+<span class="nc" id="L376">                } catch (IOException e) {</span>
+<span class="nc" id="L377">                    logger.log(Level.WARNING,e.getMessage(),e);</span>
+                }
+            }
+
+<span class="nc" id="L381">            m = ImmutableMap.copyOf(m);</span>
+<span class="nc" id="L382">            ref = new WeakReference&lt;Map&lt;String,Fingerprint&gt;&gt;(m);</span>
+<span class="nc" id="L383">            return m;</span>
+        }
+
+        /**
+         * Gets the dependency to other existing builds in a map.
+         */
+        public Map&lt;AbstractProject,Integer&gt; getDependencies() {
+<span class="nc" id="L390">            return getDependencies(false);</span>
+        }
+        
+        /**
+         * Gets the dependency to other builds in a map.
+         *
+         * @param includeMissing true if the original build should be included in
+         *  the result, even if it doesn't exist
+         * @since 1.430
+         */
+        public Map&lt;AbstractProject,Integer&gt; getDependencies(boolean includeMissing) {
+<span class="nc" id="L401">            Map&lt;AbstractProject,Integer&gt; r = new HashMap&lt;AbstractProject,Integer&gt;();</span>
+
+<span class="nc bnc" id="L403" title="All 2 branches missed.">            for (Fingerprint fp : getFingerprints().values()) {</span>
+<span class="nc" id="L404">                BuildPtr bp = fp.getOriginal();</span>
+<span class="nc bnc" id="L405" title="All 2 branches missed.">                if(bp==null)    continue;       // outside Hudson</span>
+<span class="nc bnc" id="L406" title="All 2 branches missed.">                if(bp.is(build))    continue;   // we are the owner</span>
+
+                try {
+<span class="nc" id="L409">                    Job job = bp.getJob();</span>
+<span class="nc bnc" id="L410" title="All 2 branches missed.">                    if (job==null)  continue;   // project no longer exists</span>
+<span class="nc bnc" id="L411" title="All 2 branches missed.">                    if (!(job instanceof AbstractProject)) {</span>
+                        // Ignoring this for now. In the future we may want a dependency map function not limited to AbstractProject.
+                        // (Could be used by getDependencyChanges if pulled up from AbstractBuild into Run, for example.)
+<span class="nc" id="L414">                        continue;</span>
+                    }
+<span class="nc bnc" id="L416" title="All 2 branches missed.">                    if (job.getParent()==build.getParent())</span>
+<span class="nc" id="L417">                        continue;   // we are the parent of the build owner, that is almost like we are the owner</span>
+<span class="nc bnc" id="L418" title="All 4 branches missed.">                    if(!includeMissing &amp;&amp; job.getBuildByNumber(bp.getNumber())==null)</span>
+<span class="nc" id="L419">                        continue;               // build no longer exists</span>
+
+<span class="nc" id="L421">                    Integer existing = r.get(job);</span>
+<span class="nc bnc" id="L422" title="All 4 branches missed.">                    if(existing!=null &amp;&amp; existing&gt;bp.getNumber())</span>
+<span class="nc" id="L423">                        continue;   // the record in the map is already up to date</span>
+<span class="nc" id="L424">                    r.put((AbstractProject) job, bp.getNumber());</span>
+<span class="nc" id="L425">                } catch (AccessDeniedException e) {</span>
+                    // Need to log in to access this job, so ignore
+                    continue;
+                }
+
+            }
+            
+<span class="nc" id="L432">            return r;</span>
+        }
+    }
+
+<span class="nc" id="L436">    private static final Logger logger = Logger.getLogger(Fingerprinter.class.getName());</span>
+
+<span class="nc" id="L438">    private static final long serialVersionUID = 1L;</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

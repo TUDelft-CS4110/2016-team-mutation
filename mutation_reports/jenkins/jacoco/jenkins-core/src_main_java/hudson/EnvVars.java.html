@@ -1,0 +1,440 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>EnvVars.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson</a> &gt; <span class="el_source">EnvVars.java</span></div><h1>EnvVars.java</h1><pre class="source lang-java linenums">/*
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc., Kohsuke Kawaguchi, Red Hat, Inc.
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson;
+
+import hudson.remoting.VirtualChannel;
+import hudson.util.CaseInsensitiveComparator;
+import hudson.util.CyclicGraphDetector;
+import hudson.util.CyclicGraphDetector.CycleDetectedException;
+import hudson.util.VariableResolver;
+import jenkins.security.MasterToSlaveCallable;
+
+import java.io.File;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.Arrays;
+import java.util.TreeSet;
+import java.util.UUID;
+import java.util.logging.Logger;
+
+/**
+ * Environment variables.
+ *
+ * &lt;p&gt;
+ * While all the platforms I tested (Linux 2.6, Solaris, and Windows XP) have the case sensitive
+ * environment variable table, Windows batch script handles environment variable in the case preserving
+ * but case &lt;b&gt;insensitive&lt;/b&gt; way (that is, cmd.exe can get both FOO and foo as environment variables
+ * when it's launched, and the &quot;set&quot; command will display it accordingly, but &quot;echo %foo%&quot; results in
+ * echoing the value of &quot;FOO&quot;, not &quot;foo&quot; &amp;mdash; this is presumably caused by the behavior of the underlying
+ * Win32 API &lt;tt&gt;GetEnvironmentVariable&lt;/tt&gt; acting in case insensitive way.) Windows users are also
+ * used to write environment variable case-insensitively (like %Path% vs %PATH%), and you can see many
+ * documents on the web that claims Windows environment variables are case insensitive.
+ *
+ * &lt;p&gt;
+ * So for a consistent cross platform behavior, it creates the least confusion to make the table
+ * case insensitive but case preserving.
+ *
+ * &lt;p&gt;
+ * In Jenkins, often we need to build up &quot;environment variable overrides&quot;
+ * on master, then to execute the process on slaves. This causes a problem
+ * when working with variables like &lt;tt&gt;PATH&lt;/tt&gt;. So to make this work,
+ * we introduce a special convention &lt;tt&gt;PATH+FOO&lt;/tt&gt; &amp;mdash; all entries
+ * that starts with &lt;tt&gt;PATH+&lt;/tt&gt; are merged and prepended to the inherited
+ * &lt;tt&gt;PATH&lt;/tt&gt; variable, on the process where a new process is executed. 
+ *
+ * @author Kohsuke Kawaguchi
+ */
+public class EnvVars extends TreeMap&lt;String,String&gt; {
+<span class="fc" id="L75">    private static Logger LOGGER = Logger.getLogger(EnvVars.class.getName());</span>
+    /**
+     * If this {@link EnvVars} object represents the whole environment variable set,
+     * not just a partial list used for overriding later, then we need to know
+     * the platform for which this env vars are targeted for, or else we won't know
+     * how to merge variables properly.
+     *
+     * &lt;p&gt;
+     * So this property remembers that information.
+     */
+    private Platform platform;
+
+    public EnvVars() {
+<span class="fc" id="L88">        super(CaseInsensitiveComparator.INSTANCE);</span>
+<span class="fc" id="L89">    }</span>
+
+    public EnvVars(Map&lt;String,String&gt; m) {
+<span class="fc" id="L92">        this();</span>
+<span class="fc" id="L93">        putAll(m);</span>
+
+        // because of the backward compatibility, some parts of Jenkins passes
+        // EnvVars as Map&lt;String,String&gt; so downcasting is safer.
+<span class="fc bfc" id="L97" title="All 2 branches covered.">        if (m instanceof EnvVars) {</span>
+<span class="fc" id="L98">            EnvVars lhs = (EnvVars) m;</span>
+<span class="fc" id="L99">            this.platform = lhs.platform;</span>
+        }
+<span class="fc" id="L101">    }</span>
+
+    public EnvVars(EnvVars m) {
+        // this constructor is so that in future we can get rid of the downcasting.
+<span class="fc" id="L105">        this((Map)m);</span>
+<span class="fc" id="L106">    }</span>
+
+    /**
+     * Builds an environment variables from an array of the form &lt;tt&gt;&quot;key&quot;,&quot;value&quot;,&quot;key&quot;,&quot;value&quot;...&lt;/tt&gt;
+     */
+    public EnvVars(String... keyValuePairs) {
+<span class="fc" id="L112">        this();</span>
+<span class="pc bpc" id="L113" title="1 of 2 branches missed.">        if(keyValuePairs.length%2!=0)</span>
+<span class="nc" id="L114">            throw new IllegalArgumentException(Arrays.asList(keyValuePairs).toString());</span>
+<span class="fc bfc" id="L115" title="All 2 branches covered.">        for( int i=0; i&lt;keyValuePairs.length; i+=2 )</span>
+<span class="fc" id="L116">            put(keyValuePairs[i],keyValuePairs[i+1]);</span>
+<span class="fc" id="L117">    }</span>
+
+    /**
+     * Overrides the current entry by the given entry.
+     *
+     * &lt;p&gt;
+     * Handles &lt;tt&gt;PATH+XYZ&lt;/tt&gt; notation.
+     */
+    public void override(String key, String value) {
+<span class="pc bpc" id="L126" title="2 of 4 branches missed.">        if(value==null || value.length()==0) {</span>
+<span class="nc" id="L127">            remove(key);</span>
+<span class="nc" id="L128">            return;</span>
+        }
+
+<span class="fc" id="L131">        int idx = key.indexOf('+');</span>
+<span class="fc bfc" id="L132" title="All 2 branches covered.">        if(idx&gt;0) {</span>
+<span class="fc" id="L133">            String realKey = key.substring(0,idx);</span>
+<span class="fc" id="L134">            String v = get(realKey);</span>
+<span class="pc bpc" id="L135" title="1 of 2 branches missed.">            if(v==null) v=value;</span>
+            else {
+                // we might be handling environment variables for a slave that can have different path separator
+                // than the master, so the following is an attempt to get it right.
+                // it's still more error prone that I'd like.
+<span class="pc bpc" id="L140" title="1 of 2 branches missed.">                char ch = platform==null ? File.pathSeparatorChar : platform.pathSeparator;</span>
+<span class="fc" id="L141">                v=value+ch+v;</span>
+            }
+<span class="fc" id="L143">            put(realKey,v);</span>
+<span class="fc" id="L144">            return;</span>
+        }
+
+<span class="fc" id="L147">        put(key,value);</span>
+<span class="fc" id="L148">    }</span>
+
+    /**
+     * Overrides all values in the map by the given map.
+     * See {@link #override(String, String)}.
+     * @return this
+     */
+    public EnvVars overrideAll(Map&lt;String,String&gt; all) {
+<span class="nc bnc" id="L156" title="All 2 branches missed.">        for (Map.Entry&lt;String, String&gt; e : all.entrySet()) {</span>
+<span class="nc" id="L157">            override(e.getKey(),e.getValue());</span>
+        }
+<span class="nc" id="L159">        return this;</span>
+    }
+
+    /**
+     * Calculates the order to override variables.
+     * 
+     * Sort variables with topological sort with their reference graph.
+     * 
+     * This is package accessible for testing purpose.
+     */
+<span class="pc bpc" id="L169" title="1 of 2 branches missed.">    static class OverrideOrderCalculator {</span>
+        /**
+         * Extract variables referred directly from a variable.
+         */
+        private static class TraceResolver implements VariableResolver&lt;String&gt; {
+            private final Comparator&lt;? super String&gt; comparator;
+            public Set&lt;String&gt; referredVariables;
+            
+<span class="fc" id="L177">            public TraceResolver(Comparator&lt;? super String&gt; comparator) {</span>
+<span class="fc" id="L178">                this.comparator = comparator;</span>
+<span class="fc" id="L179">                clear();</span>
+<span class="fc" id="L180">            }</span>
+            
+            public void clear() {
+<span class="fc" id="L183">                referredVariables = new TreeSet&lt;String&gt;(comparator);</span>
+<span class="fc" id="L184">            }</span>
+            
+            public String resolve(String name) {
+<span class="fc" id="L187">                referredVariables.add(name);</span>
+<span class="fc" id="L188">                return &quot;&quot;;</span>
+            }
+        }
+        
+        private static class VariableReferenceSorter extends CyclicGraphDetector&lt;String&gt; {
+            // map from a variable to a set of variables that variable refers.
+            private final Map&lt;String, Set&lt;String&gt;&gt; refereeSetMap;
+            
+<span class="fc" id="L196">            public VariableReferenceSorter(Map&lt;String, Set&lt;String&gt;&gt; refereeSetMap) {</span>
+<span class="fc" id="L197">                this.refereeSetMap = refereeSetMap;</span>
+<span class="fc" id="L198">            }</span>
+            
+            @Override
+            protected Iterable&lt;? extends String&gt; getEdges(String n) {
+                // return variables referred from the variable.
+<span class="fc bfc" id="L203" title="All 2 branches covered.">                if (!refereeSetMap.containsKey(n)) {</span>
+                    // there is a case a non-existing variable is referred...
+<span class="fc" id="L205">                    return Collections.emptySet();</span>
+                }
+<span class="fc" id="L207">                return refereeSetMap.get(n);</span>
+            }
+        };
+        
+        private final Comparator&lt;? super String&gt; comparator;
+        
+        private final EnvVars target;
+        private final Map&lt;String,String&gt; overrides;
+        
+        private Map&lt;String, Set&lt;String&gt;&gt; refereeSetMap;
+        private List&lt;String&gt; orderedVariableNames;
+        
+<span class="fc" id="L219">        public OverrideOrderCalculator(EnvVars target, Map&lt;String,String&gt; overrides) {</span>
+<span class="fc" id="L220">            comparator = target.comparator();</span>
+<span class="fc" id="L221">            this.target = target;</span>
+<span class="fc" id="L222">            this.overrides = overrides;</span>
+<span class="fc" id="L223">            scan();</span>
+<span class="fc" id="L224">        }</span>
+        
+        public List&lt;String&gt; getOrderedVariableNames() {
+<span class="fc" id="L227">            return orderedVariableNames;</span>
+        }
+        
+        // Cut the reference to the variable in a cycle.
+        private void cutCycleAt(String referee, List&lt;String&gt; cycle) {
+            // cycle contains variables in referrer-to-referee order.
+            // This should not be negative, for the first and last one is same.
+<span class="fc" id="L234">            int refererIndex = cycle.lastIndexOf(referee) - 1;</span>
+            
+<span class="pc bpc" id="L236" title="3 of 4 branches missed.">            assert(refererIndex &gt;= 0);</span>
+<span class="fc" id="L237">            String referrer = cycle.get(refererIndex);</span>
+<span class="fc" id="L238">            boolean removed = refereeSetMap.get(referrer).remove(referee);</span>
+<span class="pc bpc" id="L239" title="3 of 4 branches missed.">            assert(removed);</span>
+<span class="fc" id="L240">            LOGGER.warning(String.format(&quot;Cyclic reference detected: %s&quot;, Util.join(cycle,&quot; -&gt; &quot;)));</span>
+<span class="fc" id="L241">            LOGGER.warning(String.format(&quot;Cut the reference %s -&gt; %s&quot;, referrer, referee));</span>
+<span class="fc" id="L242">        }</span>
+        
+        // Cut the variable reference in a cycle.
+        private void cutCycle(List&lt;String&gt; cycle) {
+            // if an existing variable is contained in that cycle,
+            // cut the cycle with that variable:
+            // existing:
+            //   PATH=/usr/bin
+            // overriding:
+            //   PATH1=/usr/local/bin:${PATH}
+            //   PATH=/opt/something/bin:${PATH1}
+            // then consider reference PATH1 -&gt; PATH can be ignored.
+<span class="fc bfc" id="L254" title="All 2 branches covered.">            for (String referee: cycle) {</span>
+<span class="fc bfc" id="L255" title="All 2 branches covered.">                if (target.containsKey(referee)) {</span>
+<span class="fc" id="L256">                    cutCycleAt(referee, cycle);</span>
+<span class="fc" id="L257">                    return;</span>
+                }
+            }
+            
+            // if not, cut the reference to the first one.
+<span class="fc" id="L262">            cutCycleAt(cycle.get(0), cycle);</span>
+<span class="fc" id="L263">        }</span>
+        
+        /**
+         * Scan all variables and list all referring variables.
+         */
+        public void scan() {
+<span class="fc" id="L269">            refereeSetMap = new TreeMap&lt;String, Set&lt;String&gt;&gt;(comparator);</span>
+<span class="fc" id="L270">            List&lt;String&gt; extendingVariableNames = new ArrayList&lt;String&gt;();</span>
+            
+<span class="fc" id="L272">            TraceResolver resolver = new TraceResolver(comparator);</span>
+            
+<span class="fc bfc" id="L274" title="All 2 branches covered.">            for (Map.Entry&lt;String, String&gt; entry: overrides.entrySet()) {</span>
+<span class="fc bfc" id="L275" title="All 2 branches covered.">                if (entry.getKey().indexOf('+') &gt; 0) {</span>
+                    // XYZ+AAA variables should be always processed in last.
+<span class="fc" id="L277">                    extendingVariableNames.add(entry.getKey());</span>
+<span class="fc" id="L278">                    continue;</span>
+                }
+<span class="fc" id="L280">                resolver.clear();</span>
+<span class="fc" id="L281">                Util.replaceMacro(entry.getValue(), resolver);</span>
+                
+                // Variables directly referred from the current scanning variable.
+<span class="fc" id="L284">                Set&lt;String&gt; refereeSet = resolver.referredVariables;</span>
+                // Ignore self reference.
+<span class="fc" id="L286">                refereeSet.remove(entry.getKey());</span>
+<span class="fc" id="L287">                refereeSetMap.put(entry.getKey(), refereeSet);</span>
+            }
+            
+            VariableReferenceSorter sorter;
+<span class="fc" id="L291">            while(true) {</span>
+<span class="fc" id="L292">                sorter = new VariableReferenceSorter(refereeSetMap);</span>
+                try {
+<span class="fc" id="L294">                    sorter.run(refereeSetMap.keySet());</span>
+<span class="fc" id="L295">                } catch(CycleDetectedException e) {</span>
+                    // cyclic reference found.
+                    // cut the cycle and retry.
+                    @SuppressWarnings(&quot;unchecked&quot;)
+<span class="fc" id="L299">                    List&lt;String&gt; cycle = e.cycle;</span>
+<span class="fc" id="L300">                    cutCycle(cycle);</span>
+                    continue;
+                }
+                break;
+            }
+            
+            // When A refers B, the last appearance of B always comes after
+            // the last appearance of A.
+<span class="fc" id="L308">            List&lt;String&gt; reversedDuplicatedOrder = new ArrayList&lt;String&gt;(sorter.getSorted());</span>
+<span class="fc" id="L309">            Collections.reverse(reversedDuplicatedOrder);</span>
+            
+<span class="fc" id="L311">            orderedVariableNames = new ArrayList&lt;String&gt;(overrides.size());</span>
+<span class="fc bfc" id="L312" title="All 2 branches covered.">            for(String key: reversedDuplicatedOrder) {</span>
+<span class="pc bpc" id="L313" title="1 of 4 branches missed.">                if(overrides.containsKey(key) &amp;&amp; !orderedVariableNames.contains(key)) {</span>
+<span class="fc" id="L314">                    orderedVariableNames.add(key);</span>
+                }
+            }
+<span class="fc" id="L317">            Collections.reverse(orderedVariableNames);</span>
+<span class="fc" id="L318">            orderedVariableNames.addAll(extendingVariableNames);</span>
+<span class="fc" id="L319">        }</span>
+    }
+    
+
+    /**
+     * Overrides all values in the map by the given map. Expressions in values will be expanded.
+     * See {@link #override(String, String)}.
+     * @return this
+     */
+    public EnvVars overrideExpandingAll(Map&lt;String,String&gt; all) {
+<span class="fc bfc" id="L329" title="All 2 branches covered.">        for (String key : new OverrideOrderCalculator(this, all).getOrderedVariableNames()) {</span>
+<span class="fc" id="L330">            override(key, expand(all.get(key)));</span>
+        }
+<span class="fc" id="L332">        return this;</span>
+    }
+
+    /**
+     * Resolves environment variables against each other.
+     */
+	public static void resolve(Map&lt;String, String&gt; env) {
+<span class="nc bnc" id="L339" title="All 2 branches missed.">		for (Map.Entry&lt;String,String&gt; entry: env.entrySet()) {</span>
+<span class="nc" id="L340">			entry.setValue(Util.replaceMacro(entry.getValue(), env));</span>
+		}
+<span class="nc" id="L342">	}</span>
+
+    /**
+     * Convenience message
+     * @since 1.485
+     **/
+    public String get(String key, String defaultValue) {
+<span class="nc" id="L349">        String v = get(key);</span>
+<span class="nc bnc" id="L350" title="All 2 branches missed.">        if (v==null)    v=defaultValue;</span>
+<span class="nc" id="L351">        return v;</span>
+    }
+
+    @Override
+    public String put(String key, String value) {
+<span class="pc bpc" id="L356" title="1 of 2 branches missed.">        if (value==null)    throw new IllegalArgumentException(&quot;Null value not allowed as an environment variable: &quot;+key);</span>
+<span class="fc" id="L357">        return super.put(key,value);</span>
+    }
+
+    /**
+     * Add a key/value but only if the value is not-null. Otherwise no-op.
+     * @since 1.556
+     */
+    public void putIfNotNull(String key, String value) {
+<span class="nc bnc" id="L365" title="All 2 branches missed.">        if (value!=null)</span>
+<span class="nc" id="L366">            put(key,value);</span>
+<span class="nc" id="L367">    }</span>
+    
+    /**
+     * Takes a string that looks like &quot;a=b&quot; and adds that to this map.
+     */
+    public void addLine(String line) {
+<span class="fc" id="L373">        int sep = line.indexOf('=');</span>
+<span class="pc bpc" id="L374" title="1 of 2 branches missed.">        if(sep &gt; 0) {</span>
+<span class="fc" id="L375">            put(line.substring(0,sep),line.substring(sep+1));</span>
+        }
+<span class="fc" id="L377">    }</span>
+
+    /**
+     * Expands the variables in the given string by using environment variables represented in 'this'.
+     */
+    public String expand(String s) {
+<span class="fc" id="L383">        return Util.replaceMacro(s, this);</span>
+    }
+
+    /**
+     * Creates a magic cookie that can be used as the model environment variable
+     * when we later kill the processes.
+     */
+    public static EnvVars createCookie() {
+<span class="fc" id="L391">        return new EnvVars(&quot;HUDSON_COOKIE&quot;, UUID.randomUUID().toString());</span>
+    }
+
+    /**
+     * Obtains the environment variables of a remote peer.
+     *
+     * @param channel
+     *      Can be null, in which case the map indicating &quot;N/A&quot; will be returned.
+     * @return
+     *      A fresh copy that can be owned and modified by the caller.
+     */
+    public static EnvVars getRemote(VirtualChannel channel) throws IOException, InterruptedException {
+<span class="nc bnc" id="L403" title="All 2 branches missed.">        if(channel==null)</span>
+<span class="nc" id="L404">            return new EnvVars(&quot;N/A&quot;,&quot;N/A&quot;);</span>
+<span class="nc" id="L405">        return channel.call(new GetEnvVars());</span>
+    }
+
+<span class="nc" id="L408">    private static final class GetEnvVars extends MasterToSlaveCallable&lt;EnvVars,RuntimeException&gt; {</span>
+        public EnvVars call() {
+<span class="nc" id="L410">            return new EnvVars(EnvVars.masterEnvVars);</span>
+        }
+        private static final long serialVersionUID = 1L;
+    }
+
+    /**
+     * Environmental variables that we've inherited.
+     *
+     * &lt;p&gt;
+     * Despite what the name might imply, this is the environment variable
+     * of the current JVM process. And therefore, it is Jenkins master's environment
+     * variables only when you access this from the master.
+     *
+     * &lt;p&gt;
+     * If you access this field from slaves, then this is the environment
+     * variable of the slave agent.
+     */
+<span class="fc" id="L427">    public static final Map&lt;String,String&gt; masterEnvVars = initMaster();</span>
+
+    private static EnvVars initMaster() {
+<span class="fc" id="L430">        EnvVars vars = new EnvVars(System.getenv());</span>
+<span class="fc" id="L431">        vars.platform = Platform.current();</span>
+<span class="pc bpc" id="L432" title="2 of 4 branches missed.">        if(Main.isUnitTest || Main.isDevelopmentMode)</span>
+            // if unit test is launched with maven debug switch,
+            // we need to prevent forked Maven processes from seeing it, or else
+            // they'll hang
+<span class="nc" id="L436">            vars.remove(&quot;MAVEN_OPTS&quot;);</span>
+<span class="fc" id="L437">        return vars;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

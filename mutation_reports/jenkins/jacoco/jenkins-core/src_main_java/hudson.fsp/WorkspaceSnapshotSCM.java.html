@@ -1,0 +1,150 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>WorkspaceSnapshotSCM.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.fsp</a> &gt; <span class="el_source">WorkspaceSnapshotSCM.java</span></div><h1>WorkspaceSnapshotSCM.java</h1><pre class="source lang-java linenums">/*
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc., Kohsuke Kawaguchi
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.fsp;
+
+import hudson.scm.PollingResult;
+import hudson.scm.SCM;
+import hudson.scm.ChangeLogParser;
+import hudson.scm.SCMDescriptor;
+import hudson.scm.SCMRevisionState;
+import hudson.model.AbstractProject;
+import hudson.model.TaskListener;
+import hudson.model.AbstractBuild;
+import hudson.model.BuildListener;
+import jenkins.model.Jenkins;
+import hudson.model.Result;
+import hudson.model.PermalinkProjectAction.Permalink;
+import hudson.Launcher;
+import hudson.FilePath;
+import hudson.WorkspaceSnapshot;
+import hudson.PermalinkList;
+
+import java.io.IOException;
+import java.io.File;
+
+import org.kohsuke.stapler.DataBoundConstructor;
+
+/**
+ * {@link SCM} that inherits the workspace from another build through {@link WorkspaceSnapshot}
+ *
+ * @author Kohsuke Kawaguchi
+ */
+public class WorkspaceSnapshotSCM extends SCM {
+    /**
+     * The job name from which we inherit the workspace.
+     */
+    public String jobName;
+    /**
+     * The permalink name indicating the build from which to inherit the workspace.
+     */
+    public String permalink;
+
+    @DataBoundConstructor
+<span class="nc" id="L64">    public WorkspaceSnapshotSCM(String jobName, String permalink) {</span>
+<span class="nc" id="L65">        this.jobName = jobName;</span>
+<span class="nc" id="L66">        this.permalink = permalink;</span>
+<span class="nc" id="L67">    }</span>
+
+    /**
+     * {@link Exception} indicating that the resolution of the job/permalink failed.
+     */
+    private final class ResolvedFailedException extends Exception {
+<span class="nc" id="L73">        private ResolvedFailedException(String message) {</span>
+<span class="nc" id="L74">            super(message);</span>
+<span class="nc" id="L75">        }</span>
+    }
+
+    private static class Snapshot {
+        final WorkspaceSnapshot snapshot;
+        final AbstractBuild&lt;?,?&gt; owner;
+<span class="nc" id="L81">        private Snapshot(WorkspaceSnapshot snapshot, AbstractBuild&lt;?,?&gt; owner) {</span>
+<span class="nc" id="L82">            this.snapshot = snapshot;</span>
+<span class="nc" id="L83">            this.owner = owner;</span>
+<span class="nc" id="L84">        }</span>
+
+        void restoreTo(FilePath dst,TaskListener listener) throws IOException, InterruptedException {
+<span class="nc" id="L87">            snapshot.restoreTo(owner,dst,listener);</span>
+<span class="nc" id="L88">        }</span>
+    }
+    /**
+     * Obtains the {@link WorkspaceSnapshot} object that this {@link SCM} points to,
+     * or throws {@link hudson.fsp.WorkspaceSnapshotSCM.ResolvedFailedException} upon failing.
+     *
+     * @return never null.
+     */
+    public Snapshot resolve() throws ResolvedFailedException {
+<span class="nc" id="L97">        Jenkins h = Jenkins.getInstance();</span>
+<span class="nc" id="L98">        AbstractProject&lt;?,?&gt; job = h.getItemByFullName(jobName, AbstractProject.class);</span>
+<span class="nc bnc" id="L99" title="All 2 branches missed.">        if(job==null) {</span>
+<span class="nc bnc" id="L100" title="All 2 branches missed.">            if(h.getItemByFullName(jobName)==null) {</span>
+<span class="nc" id="L101">                AbstractProject nearest = AbstractProject.findNearest(jobName);</span>
+<span class="nc" id="L102">                throw new ResolvedFailedException(Messages.WorkspaceSnapshotSCM_NoSuchJob(jobName,nearest.getFullName()));</span>
+            } else
+<span class="nc" id="L104">                throw new ResolvedFailedException(Messages.WorkspaceSnapshotSCM_IncorrectJobType(jobName));</span>
+        }
+
+<span class="nc" id="L107">        PermalinkList permalinks = job.getPermalinks();</span>
+<span class="nc" id="L108">        Permalink p = permalinks.get(permalink);</span>
+<span class="nc bnc" id="L109" title="All 2 branches missed.">        if(p==null)</span>
+<span class="nc" id="L110">            throw new ResolvedFailedException(Messages.WorkspaceSnapshotSCM_NoSuchPermalink(permalink,jobName));</span>
+
+<span class="nc" id="L112">        AbstractBuild&lt;?,?&gt; b = (AbstractBuild&lt;?,?&gt;)p.resolve(job);</span>
+<span class="nc bnc" id="L113" title="All 2 branches missed.">        if(b==null)</span>
+<span class="nc" id="L114">            throw new ResolvedFailedException(Messages.WorkspaceSnapshotSCM_NoBuild(permalink,jobName));</span>
+
+<span class="nc" id="L116">        WorkspaceSnapshot snapshot = b.getAction(WorkspaceSnapshot.class);</span>
+<span class="nc bnc" id="L117" title="All 2 branches missed.">        if(snapshot==null)</span>
+<span class="nc" id="L118">            throw new ResolvedFailedException(Messages.WorkspaceSnapshotSCM_NoWorkspace(jobName,permalink));</span>
+
+<span class="nc" id="L120">        return new Snapshot(snapshot,b);</span>
+    }
+
+    @Override public SCMRevisionState calcRevisionsFromBuild(AbstractBuild&lt;?, ?&gt; build, Launcher launcher, TaskListener listener) throws IOException, InterruptedException {
+<span class="nc" id="L124">        return null;</span>
+    }
+
+    @Override protected PollingResult compareRemoteRevisionWith(AbstractProject project, Launcher launcher, FilePath workspace, TaskListener listener, SCMRevisionState baseline) throws IOException, InterruptedException {
+<span class="nc" id="L128">        return PollingResult.NO_CHANGES;</span>
+    }
+
+    @Override public boolean checkout(AbstractBuild build, Launcher launcher, FilePath workspace, BuildListener listener, File changelogFile) throws IOException, InterruptedException {
+        try {
+<span class="nc" id="L133">            resolve().restoreTo(workspace,listener);</span>
+<span class="nc" id="L134">            return true;</span>
+<span class="nc" id="L135">        } catch (ResolvedFailedException e) {</span>
+<span class="nc" id="L136">            listener.error(e.getMessage()); // stack trace is meaningless</span>
+<span class="nc" id="L137">            build.setResult(Result.FAILURE);</span>
+<span class="nc" id="L138">            return false;</span>
+        }
+    }
+
+    @Override public ChangeLogParser createChangeLogParser() {
+<span class="nc" id="L143">        return null;</span>
+    }
+
+    @Override public SCMDescriptor&lt;?&gt; getDescriptor() {
+<span class="nc" id="L147">        return null;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

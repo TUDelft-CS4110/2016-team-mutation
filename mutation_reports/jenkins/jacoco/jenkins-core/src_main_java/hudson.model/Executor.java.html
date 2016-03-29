@@ -1,0 +1,1002 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>Executor.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.model</a> &gt; <span class="el_source">Executor.java</span></div><h1>Executor.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">/*</span>
+ * The MIT License
+ *
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc., Kohsuke Kawaguchi, Brian Westrich, Red Hat, Inc., Stephen Connolly, Tom Huybrechts
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.model;
+
+import hudson.FilePath;
+import hudson.Util;
+import hudson.model.Queue.Executable;
+import hudson.model.queue.Executables;
+import hudson.model.queue.SubTask;
+import hudson.model.queue.Tasks;
+import hudson.model.queue.WorkUnit;
+import hudson.security.ACL;
+import hudson.util.InterceptingProxy;
+import hudson.util.TimeUnit2;
+import jenkins.model.CauseOfInterruption;
+import jenkins.model.CauseOfInterruption.UserInterruption;
+import jenkins.model.InterruptedBuildAction;
+import jenkins.model.Jenkins;
+import org.acegisecurity.Authentication;
+import org.kohsuke.stapler.HttpResponse;
+import org.kohsuke.stapler.HttpResponses;
+import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.StaplerResponse;
+import org.kohsuke.stapler.export.Exported;
+import org.kohsuke.stapler.export.ExportedBean;
+import org.kohsuke.stapler.interceptor.RequirePOST;
+
+import javax.annotation.concurrent.GuardedBy;
+import javax.servlet.ServletException;
+import java.io.IOException;
+import java.io.PrintWriter;
+import java.io.StringWriter;
+import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.Vector;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+import static hudson.model.queue.Executables.*;
+import java.util.Collection;
+import static java.util.logging.Level.*;
+import javax.annotation.CheckForNull;
+import javax.annotation.Nonnull;
+import jenkins.model.queue.AsynchronousExecution;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
+
+
+/**
+ * Thread that executes builds.
+ * Since 1.536, {@link Executor}s start threads on-demand.
+ * &lt;p&gt;Callers should use {@link #isActive()} instead of {@link #isAlive()}.
+ * @author Kohsuke Kawaguchi
+ */
+@ExportedBean
+public class Executor extends Thread implements ModelObject {
+    protected final @Nonnull Computer owner;
+    private final Queue queue;
+<span class="nc" id="L85">    private final ReadWriteLock lock = new ReentrantReadWriteLock();</span>
+
+    @GuardedBy(&quot;lock&quot;)
+    private long startTime;
+    /**
+     * Used to track when a job was last executed.
+     */
+<span class="nc" id="L92">    private final long creationTime = System.currentTimeMillis();</span>
+
+    /**
+     * Executor number that identifies it among other executors for the same {@link Computer}.
+     */
+    private int number;
+    /**
+     * {@link hudson.model.Queue.Executable} being executed right now, or null if the executor is idle.
+     */
+    @GuardedBy(&quot;lock&quot;)
+    private Queue.Executable executable;
+
+    /**
+     * Used to mark that the execution is continuing asynchronously even though {@link Executor} as {@link Thread}
+     * has finished.
+     */
+    @GuardedBy(&quot;lock&quot;)
+    private AsynchronousExecution asynchronousExecution;
+
+    /**
+     * When {@link Queue} allocates a work for this executor, this field is set
+     * and the executor is {@linkplain Thread#start() started}.
+     */
+    @GuardedBy(&quot;lock&quot;)
+    private WorkUnit workUnit;
+
+    private Throwable causeOfDeath;
+
+    private boolean induceDeath;
+
+    @GuardedBy(&quot;lock&quot;)
+    private boolean started;
+
+    /**
+     * When the executor is interrupted, we allow the code that interrupted the thread to override the
+     * result code it prefers.
+     */
+    @GuardedBy(&quot;lock&quot;)
+    private Result interruptStatus;
+
+    /**
+     * Cause of interruption. Access needs to be synchronized.
+     */
+    @GuardedBy(&quot;lock&quot;)
+<span class="nc" id="L136">    private final List&lt;CauseOfInterruption&gt; causes = new Vector&lt;CauseOfInterruption&gt;();</span>
+
+    public Executor(@Nonnull Computer owner, int n) {
+<span class="nc" id="L139">        super(&quot;Executor #&quot;+n+&quot; for &quot;+owner.getDisplayName());</span>
+<span class="nc" id="L140">        this.owner = owner;</span>
+<span class="nc" id="L141">        this.queue = Jenkins.getInstance().getQueue();</span>
+<span class="nc" id="L142">        this.number = n;</span>
+<span class="nc" id="L143">    }</span>
+
+    @Override
+    public void interrupt() {
+<span class="nc bnc" id="L147" title="All 2 branches missed.">        if (Thread.currentThread() == this) {</span>
+            // If you catch an InterruptedException the &quot;correct&quot; options are limited to one of two choices:
+            //   1. Propagate the exception;
+            //   2. Restore the Thread.currentThread().interrupted() flag
+            // The JVM locking support assumes such behaviour.
+            // Evil Jenkins overrides the interrupt() method so that when a different thread interrupts this thread
+            // we abort the build.
+            // but that causes JENKINS-28690 style deadlocks when the correctly written code does
+            //
+            // try {
+            //   ... some long running thing ...
+            // } catch (InterruptedException e) {
+            //   ... some tidy up
+            //   // restore interrupted flag
+            //   Thread.currentThread().interrupted();
+            // }
+            //
+            // What about why we do not set the Result.ABORTED on this branch?
+            // That is a good question to ask, the answer is that the only time a thread should be restoring
+            // its own interrupted flag is when that thread has already been interrupted by another thread
+            // as such we should assume that the result has already been applied. If that assumption were
+            // incorrect, then the Run.execute's catch (InterruptedException) block will either set the result
+            // or have been escaped - in which case the result of the run has been sealed anyway so it does not
+            // matter.
+<span class="nc" id="L171">            super.interrupt();</span>
+<span class="nc" id="L172">        } else {</span>
+<span class="nc" id="L173">            interrupt(Result.ABORTED);</span>
+        }
+<span class="nc" id="L175">    }</span>
+
+    void interruptForShutdown() {
+<span class="nc" id="L178">        interrupt(Result.ABORTED, true);</span>
+<span class="nc" id="L179">    }</span>
+    /**
+     * Interrupt the execution,
+     * but instead of marking the build as aborted, mark it as specified result.
+     *
+     * @since 1.417
+     */
+    public void interrupt(Result result) {
+<span class="nc" id="L187">        interrupt(result, false);</span>
+<span class="nc" id="L188">    }</span>
+
+    private void interrupt(Result result, boolean forShutdown) {
+<span class="nc" id="L191">        Authentication a = Jenkins.getAuthentication();</span>
+<span class="nc bnc" id="L192" title="All 2 branches missed.">        if (a == ACL.SYSTEM)</span>
+<span class="nc" id="L193">            interrupt(result, forShutdown, new CauseOfInterruption[0]);</span>
+        else {
+            // worth recording who did it
+            // avoid using User.get() to avoid deadlock.
+<span class="nc" id="L197">            interrupt(result, forShutdown, new UserInterruption(a.getName()));</span>
+        }
+<span class="nc" id="L199">    }</span>
+
+    /**
+     * Interrupt the execution. Mark the cause and the status accordingly.
+     */
+    public void interrupt(Result result, CauseOfInterruption... causes) {
+<span class="nc" id="L205">        interrupt(result, false, causes);</span>
+<span class="nc" id="L206">    }</span>
+
+    private void interrupt(Result result, boolean forShutdown, CauseOfInterruption... causes) {
+<span class="nc bnc" id="L209" title="All 2 branches missed.">        if (LOGGER.isLoggable(FINE))</span>
+<span class="nc" id="L210">            LOGGER.log(FINE, String.format(&quot;%s is interrupted(%s): %s&quot;, getDisplayName(), result, Util.join(Arrays.asList(causes),&quot;,&quot;)), new InterruptedException());</span>
+
+<span class="nc" id="L212">        lock.writeLock().lock();</span>
+        try {
+<span class="nc bnc" id="L214" title="All 2 branches missed.">            if (!started) {</span>
+                // not yet started, so simply dispose this
+<span class="nc" id="L216">                owner.removeExecutor(this);</span>
+<span class="nc" id="L217">                return;</span>
+            }
+
+<span class="nc" id="L220">            interruptStatus = result;</span>
+
+<span class="nc bnc" id="L222" title="All 2 branches missed.">            for (CauseOfInterruption c : causes) {</span>
+<span class="nc bnc" id="L223" title="All 2 branches missed.">                if (!this.causes.contains(c))</span>
+<span class="nc" id="L224">                    this.causes.add(c);</span>
+            }
+<span class="nc bnc" id="L226" title="All 2 branches missed.">            if (asynchronousExecution != null) {</span>
+<span class="nc" id="L227">                asynchronousExecution.interrupt(forShutdown);</span>
+<span class="nc" id="L228">            } else {</span>
+<span class="nc" id="L229">                super.interrupt();</span>
+            }
+<span class="nc" id="L231">        } finally {</span>
+<span class="nc" id="L232">            lock.writeLock().unlock();</span>
+<span class="nc" id="L233">        }</span>
+<span class="nc" id="L234">    }</span>
+
+    public Result abortResult() {
+        // this method is almost always called as a result of the current thread being interrupted
+        // as a result we need to clean the interrupt flag so that the lock's lock method doesn't
+        // get confused and think it was interrupted while awaiting the lock
+<span class="nc" id="L240">        Thread.interrupted(); </span>
+        // we need to use a write lock as we may be repeatedly interrupted while processing and
+        // we need the same lock as used in void interrupt(Result,boolean,CauseOfInterruption...)
+        // JENKINS-28690
+<span class="nc" id="L244">        lock.writeLock().lock();</span>
+        try {
+<span class="nc" id="L246">            Result r = interruptStatus;</span>
+<span class="nc bnc" id="L247" title="All 2 branches missed.">            if (r == null) r =</span>
+<span class="nc" id="L248">                    Result.ABORTED; // this is when we programmatically throw InterruptedException instead of calling the interrupt method.</span>
+
+<span class="nc" id="L250">            return r;</span>
+<span class="nc" id="L251">        } finally {</span>
+<span class="nc" id="L252">            lock.writeLock().unlock();</span>
+<span class="nc" id="L253">        }</span>
+    }
+
+    /**
+     * report cause of interruption and record it to the build, if available.
+     *
+     * @since 1.425
+     */
+    public void recordCauseOfInterruption(Run&lt;?,?&gt; build, TaskListener listener) {
+        List&lt;CauseOfInterruption&gt; r;
+
+        // atomically get&amp;clear causes.
+<span class="nc" id="L265">        lock.writeLock().lock();</span>
+        try {
+<span class="nc bnc" id="L267" title="All 2 branches missed.">            if (causes.isEmpty())   return;</span>
+<span class="nc" id="L268">            r = new ArrayList&lt;CauseOfInterruption&gt;(causes);</span>
+<span class="nc" id="L269">            causes.clear();</span>
+<span class="nc" id="L270">        } finally {</span>
+<span class="nc" id="L271">            lock.writeLock().unlock();</span>
+<span class="nc" id="L272">        }</span>
+
+<span class="nc" id="L274">        build.addAction(new InterruptedBuildAction(r));</span>
+<span class="nc bnc" id="L275" title="All 2 branches missed.">        for (CauseOfInterruption c : r)</span>
+<span class="nc" id="L276">            c.print(listener);</span>
+<span class="nc" id="L277">    }</span>
+
+    /**
+     * There are some cases where an executor is started but the node is removed or goes off-line before we are ready
+     * to start executing the assigned work unit. This method is called to clear the assigned work unit so that
+     * the {@link Queue#maintain()} method can return the item to the buildable state.
+     *
+     * Note: once we create the {@link Executable} we cannot unwind the state and the build will have to end up being
+     * marked as a failure.
+     */
+    private void resetWorkUnit(String reason) {
+<span class="nc" id="L288">        StringWriter writer = new StringWriter();</span>
+<span class="nc" id="L289">        PrintWriter pw = new PrintWriter(writer);</span>
+        try {
+<span class="nc" id="L291">            pw.printf(&quot;%s grabbed %s from queue but %s %s. &quot;, getName(), workUnit, owner.getDisplayName(), reason);</span>
+<span class="nc bnc" id="L292" title="All 2 branches missed.">            if (owner.getTerminatedBy().isEmpty()) {</span>
+<span class="nc" id="L293">                pw.print(&quot;No termination trace available.&quot;);</span>
+<span class="nc" id="L294">            } else {</span>
+<span class="nc" id="L295">                pw.println(&quot;Termination trace follows:&quot;);</span>
+<span class="nc bnc" id="L296" title="All 2 branches missed.">                for (Computer.TerminationRequest request: owner.getTerminatedBy()) {</span>
+<span class="nc" id="L297">                    request.printStackTrace(pw);</span>
+                }
+            }
+<span class="nc" id="L300">        } finally {</span>
+<span class="nc" id="L301">            pw.close();</span>
+<span class="nc" id="L302">        }</span>
+<span class="nc" id="L303">        LOGGER.log(WARNING, writer.toString());</span>
+<span class="nc" id="L304">        lock.writeLock().lock();</span>
+        try {
+<span class="nc bnc" id="L306" title="All 2 branches missed.">            if (executable != null) {</span>
+<span class="nc" id="L307">                throw new IllegalStateException(&quot;Cannot reset the work unit after the executable has been created&quot;);</span>
+            }
+<span class="nc" id="L309">            workUnit = null;</span>
+<span class="nc" id="L310">        } finally {</span>
+<span class="nc" id="L311">            lock.writeLock().unlock();</span>
+<span class="nc" id="L312">        }</span>
+<span class="nc" id="L313">    }</span>
+
+    @Override
+    public void run() {
+<span class="nc bnc" id="L317" title="All 2 branches missed.">        if (!owner.isOnline()) {</span>
+<span class="nc" id="L318">            resetWorkUnit(&quot;went off-line before the task's worker thread started&quot;);</span>
+<span class="nc" id="L319">            owner.removeExecutor(this);</span>
+<span class="nc" id="L320">            queue.scheduleMaintenance();</span>
+<span class="nc" id="L321">            return;</span>
+        }
+<span class="nc bnc" id="L323" title="All 2 branches missed.">        if (owner.getNode() == null) {</span>
+<span class="nc" id="L324">            resetWorkUnit(&quot;was removed before the task's worker thread started&quot;);</span>
+<span class="nc" id="L325">            owner.removeExecutor(this);</span>
+<span class="nc" id="L326">            queue.scheduleMaintenance();</span>
+<span class="nc" id="L327">            return;</span>
+        }
+        final WorkUnit workUnit;
+<span class="nc" id="L330">        lock.writeLock().lock();</span>
+        try {
+<span class="nc" id="L332">            startTime = System.currentTimeMillis();</span>
+<span class="nc" id="L333">            workUnit = this.workUnit;</span>
+<span class="nc" id="L334">        } finally {</span>
+<span class="nc" id="L335">            lock.writeLock().unlock();</span>
+<span class="nc" id="L336">        }</span>
+
+<span class="nc" id="L338">        ACL.impersonate(ACL.SYSTEM);</span>
+
+        try {
+<span class="nc bnc" id="L341" title="All 2 branches missed.">            if (induceDeath)        throw new ThreadDeath();</span>
+
+            SubTask task;
+            // transition from idle to building.
+            // perform this state change as an atomic operation wrt other queue operations
+<span class="nc" id="L346">            task = Queue.withLock(new java.util.concurrent.Callable&lt;SubTask&gt;() {</span>
+                @Override
+                public SubTask call() throws Exception {
+<span class="nc bnc" id="L349" title="All 2 branches missed.">                    if (!owner.isOnline()) {</span>
+<span class="nc" id="L350">                        resetWorkUnit(&quot;went off-line before the task's worker thread was ready to execute&quot;);</span>
+<span class="nc" id="L351">                        return null;</span>
+                    }
+<span class="nc bnc" id="L353" title="All 2 branches missed.">                    if (owner.getNode() == null) {</span>
+<span class="nc" id="L354">                        resetWorkUnit(&quot;was removed before the task's worker thread was ready to execute&quot;);</span>
+<span class="nc" id="L355">                        return null;</span>
+                    }
+                    // after this point we cannot unwind the assignment of the work unit, if the owner
+                    // is removed or goes off-line then the build will just have to fail.
+<span class="nc" id="L359">                    workUnit.setExecutor(Executor.this);</span>
+<span class="nc" id="L360">                    queue.onStartExecuting(Executor.this);</span>
+<span class="nc bnc" id="L361" title="All 2 branches missed.">                    if (LOGGER.isLoggable(FINE))</span>
+<span class="nc" id="L362">                        LOGGER.log(FINE, getName()+&quot; grabbed &quot;+workUnit+&quot; from queue&quot;);</span>
+<span class="nc" id="L363">                    SubTask task = workUnit.work;</span>
+<span class="nc" id="L364">                    Executable executable = task.createExecutable();</span>
+<span class="nc" id="L365">                    lock.writeLock().lock();</span>
+                    try {
+<span class="nc" id="L367">                        Executor.this.executable = executable;</span>
+<span class="nc" id="L368">                    } finally {</span>
+<span class="nc" id="L369">                        lock.writeLock().unlock();</span>
+<span class="nc" id="L370">                    }</span>
+<span class="nc" id="L371">                    workUnit.setExecutable(executable);</span>
+<span class="nc" id="L372">                    return task;</span>
+                }
+            });
+            Executable executable;
+<span class="nc" id="L376">            lock.readLock().lock();</span>
+            try {
+<span class="nc bnc" id="L378" title="All 2 branches missed.">                if (this.workUnit == null) {</span>
+                    // we called resetWorkUnit, so bail. Outer finally will remove this and schedule queue maintenance
+<span class="nc" id="L380">                    return;</span>
+                }
+<span class="nc" id="L382">                executable = this.executable;</span>
+<span class="nc" id="L383">            } finally {</span>
+<span class="nc" id="L384">                lock.readLock().unlock();</span>
+<span class="nc" id="L385">            }</span>
+<span class="nc bnc" id="L386" title="All 2 branches missed.">            if (LOGGER.isLoggable(FINE))</span>
+<span class="nc" id="L387">                LOGGER.log(FINE, getName()+&quot; is going to execute &quot;+executable);</span>
+
+<span class="nc" id="L389">            Throwable problems = null;</span>
+            try {
+<span class="nc" id="L391">                workUnit.context.synchronizeStart();</span>
+
+                // this code handles the behavior of null Executables returned
+                // by tasks. In such case Jenkins starts the workUnit in order
+                // to report results to console outputs.
+<span class="nc bnc" id="L396" title="All 2 branches missed.">                if (executable == null) {</span>
+<span class="nc" id="L397">                    throw new Error(&quot;The null Executable has been created for &quot;+workUnit+&quot;. The task cannot be executed&quot;);</span>
+                }
+
+<span class="nc bnc" id="L400" title="All 2 branches missed.">                if (executable instanceof Actionable) {</span>
+<span class="nc bnc" id="L401" title="All 2 branches missed.">                    for (Action action: workUnit.context.actions) {</span>
+<span class="nc" id="L402">                        ((Actionable) executable).addAction(action);</span>
+                    }
+                }
+
+<span class="nc" id="L406">                ACL.impersonate(workUnit.context.item.authenticate());</span>
+<span class="nc" id="L407">                setName(getName() + &quot; : executing &quot; + executable.toString());</span>
+<span class="nc bnc" id="L408" title="All 2 branches missed.">                if (LOGGER.isLoggable(FINE))</span>
+<span class="nc" id="L409">                    LOGGER.log(FINE, getName()+&quot; is now executing &quot;+executable);</span>
+<span class="nc" id="L410">                queue.execute(executable, task);</span>
+<span class="nc" id="L411">            } catch (AsynchronousExecution x) {</span>
+<span class="nc" id="L412">                lock.writeLock().lock();</span>
+                try {
+<span class="nc" id="L414">                    x.setExecutor(this);</span>
+<span class="nc" id="L415">                    this.asynchronousExecution = x;</span>
+<span class="nc" id="L416">                } finally {</span>
+<span class="nc" id="L417">                    lock.writeLock().unlock();</span>
+<span class="nc" id="L418">                }</span>
+<span class="nc" id="L419">            } catch (Throwable e) {</span>
+<span class="nc" id="L420">                problems = e;</span>
+<span class="nc" id="L421">            } finally {</span>
+                boolean needFinish1;
+<span class="nc" id="L423">                lock.readLock().lock();</span>
+                try {
+<span class="nc bnc" id="L425" title="All 8 branches missed.">                    needFinish1 = asynchronousExecution == null;</span>
+<span class="nc" id="L426">                } finally {</span>
+<span class="nc" id="L427">                    lock.readLock().unlock();</span>
+<span class="nc" id="L428">                }</span>
+<span class="nc bnc" id="L429" title="All 8 branches missed.">                if (needFinish1) {</span>
+<span class="nc" id="L430">                    finish1(problems);</span>
+                }
+<span class="nc" id="L432">            }</span>
+<span class="nc" id="L433">        } catch (InterruptedException e) {</span>
+<span class="nc" id="L434">            LOGGER.log(FINE, getName()+&quot; interrupted&quot;,e);</span>
+            // die peacefully
+<span class="nc" id="L436">        } catch(Exception e) {</span>
+<span class="nc" id="L437">            causeOfDeath = e;</span>
+<span class="nc" id="L438">            LOGGER.log(SEVERE, &quot;Unexpected executor death&quot;, e);</span>
+<span class="nc" id="L439">        } catch (Error e) {</span>
+<span class="nc" id="L440">            causeOfDeath = e;</span>
+<span class="nc" id="L441">            LOGGER.log(SEVERE, &quot;Unexpected executor death&quot;, e);</span>
+<span class="nc" id="L442">        } finally {</span>
+<span class="nc bnc" id="L443" title="All 12 branches missed.">            if (asynchronousExecution == null) {</span>
+<span class="nc" id="L444">                finish2();</span>
+            }
+<span class="nc" id="L446">        }</span>
+<span class="nc" id="L447">    }</span>
+
+    private void finish1(@CheckForNull Throwable problems) {
+<span class="nc bnc" id="L450" title="All 2 branches missed.">        if (problems != null) {</span>
+            // for some reason the executor died. this is really
+            // a bug in the code, but we don't want the executor to die,
+            // so just leave some info and go on to build other things
+<span class="nc" id="L454">            LOGGER.log(Level.SEVERE, &quot;Executor threw an exception&quot;, problems);</span>
+<span class="nc" id="L455">            workUnit.context.abort(problems);</span>
+        }
+<span class="nc" id="L457">       long time = System.currentTimeMillis() - startTime;</span>
+<span class="nc" id="L458">        LOGGER.log(FINE, &quot;{0} completed {1} in {2}ms&quot;, new Object[]{getName(), executable, time});</span>
+        try {
+<span class="nc" id="L460">            workUnit.context.synchronizeEnd(this, executable, problems, time);</span>
+<span class="nc" id="L461">        } catch (InterruptedException e) {</span>
+<span class="nc" id="L462">            workUnit.context.abort(e);</span>
+<span class="nc" id="L463">        } finally {</span>
+<span class="nc" id="L464">            workUnit.setExecutor(null);</span>
+<span class="nc" id="L465">        }</span>
+<span class="nc" id="L466">    }</span>
+
+    private void finish2() {
+<span class="nc bnc" id="L469" title="All 2 branches missed.">        for (RuntimeException e1 : owner.getTerminatedBy()) {</span>
+<span class="nc" id="L470">            LOGGER.log(Level.FINE, String.format(&quot;%s termination trace&quot;, getName()), e1);</span>
+        }
+<span class="nc bnc" id="L472" title="All 2 branches missed.">        if (causeOfDeath == null) {// let this thread die and be replaced by a fresh unstarted instance</span>
+<span class="nc" id="L473">            owner.removeExecutor(this);</span>
+        }
+<span class="nc bnc" id="L475" title="All 2 branches missed.">        if (this instanceof OneOffExecutor) {</span>
+<span class="nc" id="L476">            owner.remove((OneOffExecutor) this);</span>
+        }
+<span class="nc" id="L478">        queue.scheduleMaintenance();</span>
+<span class="nc" id="L479">    }</span>
+
+    @Restricted(NoExternalUse.class)
+    public void completedAsynchronous(@CheckForNull Throwable error) {
+        try {
+<span class="nc" id="L484">            finish1(error);</span>
+<span class="nc" id="L485">        } finally {</span>
+<span class="nc" id="L486">            finish2();</span>
+<span class="nc" id="L487">        }</span>
+<span class="nc" id="L488">        asynchronousExecution = null;</span>
+<span class="nc" id="L489">    }</span>
+
+    /**
+     * For testing only. Simulate a fatal unexpected failure.
+     */
+    public void killHard() {
+<span class="nc" id="L495">        induceDeath = true;</span>
+<span class="nc" id="L496">    }</span>
+
+    /**
+     * Returns the current build this executor is running.
+     *
+     * @return
+     *      null if the executor is idle.
+     */
+    @Exported
+    public @CheckForNull Queue.Executable getCurrentExecutable() {
+<span class="nc" id="L506">        lock.readLock().lock();</span>
+        try {
+<span class="nc" id="L508">            return executable;</span>
+<span class="nc" id="L509">        } finally {</span>
+<span class="nc" id="L510">            lock.readLock().unlock();</span>
+<span class="nc" id="L511">        }</span>
+    }
+    
+    /**
+     * Returns causes of interruption.
+     *
+     * @return Unmodifiable collection of causes of interruption.
+     * @since  1.617    
+     */
+    public @Nonnull Collection&lt;CauseOfInterruption&gt; getCausesOfInterruption() {
+<span class="nc" id="L521">        return Collections.unmodifiableCollection(causes);</span>
+    }
+
+    /**
+     * Returns the current {@link WorkUnit} (of {@link #getCurrentExecutable() the current executable})
+     * that this executor is running.
+     *
+     * @return
+     *      null if the executor is idle.
+     */
+    @Exported
+    public WorkUnit getCurrentWorkUnit() {
+<span class="nc" id="L533">        lock.readLock().lock();</span>
+        try {
+<span class="nc" id="L535">            return workUnit;</span>
+<span class="nc" id="L536">        } finally {</span>
+<span class="nc" id="L537">            lock.readLock().unlock();</span>
+<span class="nc" id="L538">        }</span>
+    }
+
+    /**
+     * If {@linkplain #getCurrentExecutable() current executable} is {@link AbstractBuild},
+     * return the workspace that this executor is using, or null if the build hasn't gotten
+     * to that point yet.
+     */
+    public FilePath getCurrentWorkspace() {
+<span class="nc" id="L547">        lock.readLock().lock();</span>
+        try {
+<span class="nc bnc" id="L549" title="All 2 branches missed.">            if (executable == null) {</span>
+<span class="nc" id="L550">                return null;</span>
+            }
+<span class="nc bnc" id="L552" title="All 2 branches missed.">            if (executable instanceof AbstractBuild) {</span>
+<span class="nc" id="L553">                AbstractBuild ab = (AbstractBuild) executable;</span>
+<span class="nc" id="L554">                return ab.getWorkspace();</span>
+            }
+<span class="nc" id="L556">            return null;</span>
+<span class="nc" id="L557">        } finally {</span>
+<span class="nc" id="L558">            lock.readLock().unlock();</span>
+<span class="nc" id="L559">        }</span>
+    }
+
+    /**
+     * Same as {@link #getName()}.
+     */
+    public String getDisplayName() {
+<span class="nc" id="L566">        return &quot;Executor #&quot;+getNumber();</span>
+    }
+
+    /**
+     * Gets the executor number that uniquely identifies it among
+     * other {@link Executor}s for the same computer.
+     *
+     * @return
+     *      a sequential number starting from 0.
+     */
+    @Exported
+    public int getNumber() {
+<span class="nc" id="L578">        return number;</span>
+    }
+
+    /**
+     * Returns true if this {@link Executor} is ready for action.
+     */
+    @Exported
+    public boolean isIdle() {
+<span class="nc" id="L586">        lock.readLock().lock();</span>
+        try {
+<span class="nc bnc" id="L588" title="All 4 branches missed.">            return workUnit == null &amp;&amp; executable == null;</span>
+<span class="nc" id="L589">        } finally {</span>
+<span class="nc" id="L590">            lock.readLock().unlock();</span>
+<span class="nc" id="L591">        }</span>
+    }
+
+    /**
+     * The opposite of {@link #isIdle()} &amp;mdash; the executor is doing some work.
+     */
+    public boolean isBusy() {
+<span class="nc" id="L598">        lock.readLock().lock();</span>
+        try {
+<span class="nc bnc" id="L600" title="All 4 branches missed.">            return workUnit != null || executable != null;</span>
+<span class="nc" id="L601">        } finally {</span>
+<span class="nc" id="L602">            lock.readLock().unlock();</span>
+<span class="nc" id="L603">        }</span>
+    }
+
+    /**
+     * Check if executor is ready to accept tasks.
+     * This method becomes the critical one since 1.536, which introduces the
+     * on-demand creation of executor threads. Callers should use
+     * this method instead of {@link #isAlive()}, which would be incorrect for
+     * non-started threads or running {@link AsynchronousExecution}.
+     * @return True if the executor is available for tasks
+     * @since 1.536
+     */
+    public boolean isActive() {
+<span class="nc" id="L616">        lock.readLock().lock();</span>
+        try {
+<span class="nc bnc" id="L618" title="All 6 branches missed.">            return !started || asynchronousExecution != null || isAlive();</span>
+<span class="nc" id="L619">        } finally {</span>
+<span class="nc" id="L620">            lock.readLock().unlock();</span>
+<span class="nc" id="L621">        }</span>
+    }
+
+    /**
+     * If currently running in asynchronous mode, returns that handle.
+     * @since 1.607
+     */
+    public @CheckForNull AsynchronousExecution getAsynchronousExecution() {
+<span class="nc" id="L629">        lock.readLock().lock();</span>
+        try {
+<span class="nc" id="L631">            return asynchronousExecution;</span>
+<span class="nc" id="L632">        } finally {</span>
+<span class="nc" id="L633">            lock.readLock().unlock();</span>
+<span class="nc" id="L634">        }</span>
+    }
+
+    /**
+     * If this executor is running an {@link AsynchronousExecution} and that execution wants to hide the display
+     * cell for the executor (because there is another executor displaying the job progress and we don't want to
+     * confuse the user) then this method will return {@code false} to indicate to {@code executors.jelly} that
+     * the executor cell should be hidden.
+     *
+     * @return {@code true} iff the {@code executorCell.jelly} for this {@link Executor} should be displayed in
+     *         {@code executors.jelly}.
+     * @since 1.607
+     * @see AsynchronousExecution#displayCell()
+     */
+    public boolean isDisplayCell() {
+<span class="nc" id="L649">        AsynchronousExecution asynchronousExecution = getAsynchronousExecution();</span>
+<span class="nc bnc" id="L650" title="All 4 branches missed.">        return asynchronousExecution == null || asynchronousExecution.displayCell();</span>
+    }
+
+    /**
+     * Returns true if this executor is waiting for a task to execute.
+     */
+    public boolean isParking() {
+<span class="nc" id="L657">        lock.readLock().lock();</span>
+        try {
+<span class="nc bnc" id="L659" title="All 2 branches missed.">            return !started;</span>
+<span class="nc" id="L660">        } finally {</span>
+<span class="nc" id="L661">            lock.readLock().unlock();</span>
+<span class="nc" id="L662">        }</span>
+    }
+
+    /**
+     * If this thread dies unexpectedly, obtain the cause of the failure.
+     *
+     * @return null if the death is expected death or the thread {@link #isActive}.
+     * @since 1.142
+     */
+    public @CheckForNull Throwable getCauseOfDeath() {
+<span class="nc" id="L672">        return causeOfDeath;</span>
+    }
+
+    /**
+     * Returns the progress of the current build in the number between 0-100.
+     *
+     * @return -1
+     *      if it's impossible to estimate the progress.
+     */
+    @Exported
+    public int getProgress() {
+        long d;
+<span class="nc" id="L684">        lock.readLock().lock();</span>
+        try {
+<span class="nc bnc" id="L686" title="All 2 branches missed.">            if (executable == null) {</span>
+<span class="nc" id="L687">                return -1;</span>
+            }
+<span class="nc" id="L689">            d = Executables.getEstimatedDurationFor(executable);</span>
+<span class="nc" id="L690">        } finally {</span>
+<span class="nc" id="L691">            lock.readLock().unlock();</span>
+<span class="nc" id="L692">        }</span>
+<span class="nc bnc" id="L693" title="All 2 branches missed.">        if (d &lt;= 0) {</span>
+<span class="nc" id="L694">            return -1;</span>
+        }
+
+<span class="nc" id="L697">        int num = (int) (getElapsedTime() * 100 / d);</span>
+<span class="nc bnc" id="L698" title="All 2 branches missed.">        if (num &gt;= 100) {</span>
+<span class="nc" id="L699">            num = 99;</span>
+        }
+<span class="nc" id="L701">        return num;</span>
+    }
+
+    /**
+     * Returns true if the current build is likely stuck.
+     *
+     * &lt;p&gt;
+     * This is a heuristics based approach, but if the build is suspiciously taking for a long time,
+     * this method returns true.
+     */
+    @Exported
+    public boolean isLikelyStuck() {
+        long d;
+        long elapsed;
+<span class="nc" id="L715">        lock.readLock().lock();</span>
+        try {
+<span class="nc bnc" id="L717" title="All 2 branches missed.">            if (executable == null) {</span>
+<span class="nc" id="L718">                return false;</span>
+            }
+
+<span class="nc" id="L721">            elapsed = getElapsedTime();</span>
+<span class="nc" id="L722">            d = Executables.getEstimatedDurationFor(executable);</span>
+<span class="nc" id="L723">        } finally {</span>
+<span class="nc" id="L724">            lock.readLock().unlock();</span>
+<span class="nc" id="L725">        }</span>
+<span class="nc bnc" id="L726" title="All 2 branches missed.">        if (d &gt;= 0) {</span>
+            // if it's taking 10 times longer than ETA, consider it stuck
+<span class="nc bnc" id="L728" title="All 2 branches missed.">            return d * 10 &lt; elapsed;</span>
+        } else {
+            // if no ETA is available, a build taking longer than a day is considered stuck
+<span class="nc bnc" id="L731" title="All 2 branches missed.">            return TimeUnit2.MILLISECONDS.toHours(elapsed) &gt; 24;</span>
+        }
+    }
+
+    public long getElapsedTime() {
+<span class="nc" id="L736">        lock.readLock().lock();</span>
+        try {
+<span class="nc" id="L738">            return System.currentTimeMillis() - startTime;</span>
+<span class="nc" id="L739">        } finally {</span>
+<span class="nc" id="L740">            lock.readLock().unlock();</span>
+<span class="nc" id="L741">        }</span>
+    }
+
+    /**
+     * Returns the number of milli-seconds the currently executing job spent in the queue
+     * waiting for an available executor. This excludes the quiet period time of the job.
+     * @since 1.440
+     */
+    public long getTimeSpentInQueue() {
+<span class="nc" id="L750">        lock.readLock().lock();</span>
+        try {
+<span class="nc" id="L752">            return startTime - workUnit.context.item.buildableStartMilliseconds;</span>
+<span class="nc" id="L753">        } finally {</span>
+<span class="nc" id="L754">            lock.readLock().unlock();</span>
+<span class="nc" id="L755">        }</span>
+    }
+
+    /**
+     * Gets the string that says how long since this build has started.
+     *
+     * @return
+     *      string like &quot;3 minutes&quot; &quot;1 day&quot; etc.
+     */
+    public String getTimestampString() {
+<span class="nc" id="L765">        return Util.getPastTimeString(getElapsedTime());</span>
+    }
+
+    /**
+     * Computes a human-readable text that shows the expected remaining time
+     * until the build completes.
+     */
+    public String getEstimatedRemainingTime() {
+        long d;
+<span class="nc" id="L774">        lock.readLock().lock();</span>
+        try {
+<span class="nc bnc" id="L776" title="All 2 branches missed.">            if (executable == null) {</span>
+<span class="nc" id="L777">                return Messages.Executor_NotAvailable();</span>
+            }
+
+<span class="nc" id="L780">            d = Executables.getEstimatedDurationFor(executable);</span>
+<span class="nc" id="L781">        } finally {</span>
+<span class="nc" id="L782">            lock.readLock().unlock();</span>
+<span class="nc" id="L783">        }</span>
+<span class="nc bnc" id="L784" title="All 2 branches missed.">        if (d &lt; 0) {</span>
+<span class="nc" id="L785">            return Messages.Executor_NotAvailable();</span>
+        }
+
+<span class="nc" id="L788">        long eta = d - getElapsedTime();</span>
+<span class="nc bnc" id="L789" title="All 2 branches missed.">        if (eta &lt;= 0) {</span>
+<span class="nc" id="L790">            return Messages.Executor_NotAvailable();</span>
+        }
+
+<span class="nc" id="L793">        return Util.getTimeSpanString(eta);</span>
+    }
+
+    /**
+     * The same as {@link #getEstimatedRemainingTime()} but return
+     * it as a number of milli-seconds.
+     */
+    public long getEstimatedRemainingTimeMillis() {
+        long d;
+<span class="nc" id="L802">        lock.readLock().lock();</span>
+        try {
+<span class="nc bnc" id="L804" title="All 2 branches missed.">            if (executable == null) {</span>
+<span class="nc" id="L805">                return -1;</span>
+            }
+
+<span class="nc" id="L808">            d = Executables.getEstimatedDurationFor(executable);</span>
+<span class="nc" id="L809">        } finally {</span>
+<span class="nc" id="L810">            lock.readLock().unlock();</span>
+<span class="nc" id="L811">        }</span>
+<span class="nc bnc" id="L812" title="All 2 branches missed.">        if (d &lt; 0) {</span>
+<span class="nc" id="L813">            return -1;</span>
+        }
+
+<span class="nc" id="L816">        long eta = d - getElapsedTime();</span>
+<span class="nc bnc" id="L817" title="All 2 branches missed.">        if (eta &lt;= 0) {</span>
+<span class="nc" id="L818">            return -1;</span>
+        }
+
+<span class="nc" id="L821">        return eta;</span>
+    }
+
+    /**
+     * Can't start executor like you normally start a thread.
+     *
+     * @see #start(WorkUnit)
+     */
+    @Override
+    public void start() {
+<span class="nc" id="L831">        throw new UnsupportedOperationException();</span>
+    }
+
+    /*protected*/ void start(WorkUnit task) {
+<span class="nc" id="L835">        lock.writeLock().lock();</span>
+        try {
+<span class="nc" id="L837">            this.workUnit = task;</span>
+<span class="nc" id="L838">            super.start();</span>
+<span class="nc" id="L839">            started = true;</span>
+<span class="nc" id="L840">        } finally {</span>
+<span class="nc" id="L841">            lock.writeLock().unlock();</span>
+<span class="nc" id="L842">        }</span>
+<span class="nc" id="L843">    }</span>
+
+
+    /**
+     * @deprecated as of 1.489
+     *      Use {@link #doStop()}.
+     */
+    @RequirePOST
+    @Deprecated
+    public void doStop( StaplerRequest req, StaplerResponse rsp ) throws IOException, ServletException {
+<span class="nc" id="L853">        doStop().generateResponse(req,rsp,this);</span>
+<span class="nc" id="L854">    }</span>
+
+    /**
+     * Stops the current build.
+     *
+     * @since 1.489
+     */
+    @RequirePOST
+    public HttpResponse doStop() {
+<span class="nc" id="L863">        lock.writeLock().lock(); // need write lock as interrupt will change the field</span>
+        try {
+<span class="nc bnc" id="L865" title="All 2 branches missed.">            if (executable != null) {</span>
+<span class="nc" id="L866">                Tasks.getOwnerTaskOf(getParentOf(executable)).checkAbortPermission();</span>
+<span class="nc" id="L867">                interrupt();</span>
+            }
+<span class="nc" id="L869">        } finally {</span>
+<span class="nc" id="L870">            lock.writeLock().unlock();</span>
+<span class="nc" id="L871">        }</span>
+<span class="nc" id="L872">        return HttpResponses.forwardToPreviousPage();</span>
+    }
+
+    /**
+     * Throws away this executor and get a new one.
+     */
+    @RequirePOST
+    public HttpResponse doYank() {
+<span class="nc" id="L880">        Jenkins.getInstance().checkPermission(Jenkins.ADMINISTER);</span>
+<span class="nc bnc" id="L881" title="All 2 branches missed.">        if (isActive())</span>
+<span class="nc" id="L882">            throw new Failure(&quot;Can't yank a live executor&quot;);</span>
+<span class="nc" id="L883">        owner.removeExecutor(this);</span>
+<span class="nc" id="L884">        return HttpResponses.redirectViaContextPath(&quot;/&quot;);</span>
+    }
+
+    /**
+     * Checks if the current user has a permission to stop this build.
+     */
+    public boolean hasStopPermission() {
+<span class="nc" id="L891">        lock.readLock().lock();</span>
+        try {
+<span class="nc bnc" id="L893" title="All 4 branches missed.">            return executable != null &amp;&amp; Tasks.getOwnerTaskOf(getParentOf(executable)).hasAbortPermission();</span>
+<span class="nc" id="L894">        } finally {</span>
+<span class="nc" id="L895">            lock.readLock().unlock();</span>
+<span class="nc" id="L896">        }</span>
+    }
+
+    public @Nonnull Computer getOwner() {
+<span class="nc" id="L900">        return owner;</span>
+    }
+
+    /**
+     * Returns when this executor started or should start being idle.
+     */
+    public long getIdleStartMilliseconds() {
+<span class="nc" id="L907">        lock.readLock().lock();</span>
+        try {
+<span class="nc bnc" id="L909" title="All 2 branches missed.">            if (isIdle())</span>
+<span class="nc" id="L910">                return Math.max(creationTime, owner.getConnectTime());</span>
+            else {
+<span class="nc" id="L912">                return Math.max(startTime + Math.max(0, Executables.getEstimatedDurationFor(executable)),</span>
+<span class="nc" id="L913">                        System.currentTimeMillis() + 15000);</span>
+            }
+<span class="nc" id="L915">        } finally {</span>
+<span class="nc" id="L916">            lock.readLock().unlock();</span>
+<span class="nc" id="L917">        }</span>
+    }
+
+    /**
+     * Exposes the executor to the remote API.
+     */
+    public Api getApi() {
+<span class="nc" id="L924">        return new Api(this);</span>
+    }
+
+    /**
+     * Creates a proxy object that executes the callee in the context that impersonates
+     * this executor. Useful to export an object to a remote channel.
+     */
+    public &lt;T&gt; T newImpersonatingProxy(Class&lt;T&gt; type, T core) {
+<span class="nc" id="L932">        return new InterceptingProxy() {</span>
+            protected Object call(Object o, Method m, Object[] args) throws Throwable {
+<span class="nc" id="L934">                final Executor old = IMPERSONATION.get();</span>
+<span class="nc" id="L935">                IMPERSONATION.set(Executor.this);</span>
+                try {
+<span class="nc" id="L937">                    return m.invoke(o,args);</span>
+<span class="nc" id="L938">                } finally {</span>
+<span class="nc" id="L939">                    IMPERSONATION.set(old);</span>
+<span class="nc" id="L940">                }</span>
+            }
+<span class="nc" id="L942">        }.wrap(type,core);</span>
+    }
+
+    /**
+     * Returns the executor of the current thread or null if current thread is not an executor.
+     */
+    public static @CheckForNull Executor currentExecutor() {
+<span class="nc" id="L949">        Thread t = Thread.currentThread();</span>
+<span class="nc bnc" id="L950" title="All 2 branches missed.">        if (t instanceof Executor) return (Executor) t;</span>
+<span class="nc" id="L951">        return IMPERSONATION.get();</span>
+    }
+
+    /**
+     * Finds the executor currently running a given process.
+     * @param executable a possibly running executable
+     * @return the executor (possibly a {@link OneOffExecutor}) whose {@link Executor#getCurrentExecutable} matches that,
+     *          or null if it could not be found (for example because the execution has already completed)
+     * @since 1.607
+     */
+    public static @CheckForNull Executor of(Executable executable) {
+<span class="nc" id="L962">        Jenkins jenkins = Jenkins.getInstance();</span>
+<span class="nc bnc" id="L963" title="All 2 branches missed.">        if (jenkins == null) {</span>
+<span class="nc" id="L964">            return null;</span>
+        }
+<span class="nc bnc" id="L966" title="All 2 branches missed.">        for (Computer computer : jenkins.getComputers()) {</span>
+<span class="nc bnc" id="L967" title="All 2 branches missed.">            for (Executor executor : computer.getExecutors()) {</span>
+<span class="nc bnc" id="L968" title="All 2 branches missed.">                if (executor.getCurrentExecutable() == executable) {</span>
+<span class="nc" id="L969">                    return executor;</span>
+                }
+            }
+<span class="nc bnc" id="L972" title="All 2 branches missed.">            for (Executor executor : computer.getOneOffExecutors()) {</span>
+<span class="nc bnc" id="L973" title="All 2 branches missed.">                if (executor.getCurrentExecutable() == executable) {</span>
+<span class="nc" id="L974">                    return executor;</span>
+                }
+            }
+        }
+<span class="nc" id="L978">        return null;</span>
+    }
+
+    /**
+     * Returns the estimated duration for the executable.
+     * Protects against {@link AbstractMethodError}s if the {@link Executable} implementation
+     * was compiled against Hudson &lt; 1.383
+     *
+     * @deprecated as of 1.388
+     *      Use {@link Executables#getEstimatedDurationFor(Queue.Executable)}
+     */
+    @Deprecated
+    public static long getEstimatedDurationFor(Executable e) {
+<span class="nc" id="L991">        return Executables.getEstimatedDurationFor(e);</span>
+    }
+
+    /**
+     * Mechanism to allow threads (in particular the channel request handling threads) to
+     * run on behalf of {@link Executor}.
+     */
+<span class="nc" id="L998">    private static final ThreadLocal&lt;Executor&gt; IMPERSONATION = new ThreadLocal&lt;Executor&gt;();</span>
+
+<span class="nc" id="L1000">    private static final Logger LOGGER = Logger.getLogger(Executor.class.getName());</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

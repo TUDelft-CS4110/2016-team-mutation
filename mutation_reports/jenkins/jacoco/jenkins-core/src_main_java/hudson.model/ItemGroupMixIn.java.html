@@ -1,0 +1,338 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>ItemGroupMixIn.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.model</a> &gt; <span class="el_source">ItemGroupMixIn.java</span></div><h1>ItemGroupMixIn.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">/*</span>
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc., Kohsuke Kawaguchi, CloudBees, Inc.
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.model;
+
+import hudson.Util;
+import hudson.XmlFile;
+import hudson.model.listeners.ItemListener;
+import hudson.security.AccessControlled;
+import hudson.util.CopyOnWriteMap;
+import hudson.util.Function1;
+import jenkins.model.Jenkins;
+import jenkins.util.xml.XMLUtils;
+import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.StaplerResponse;
+
+import javax.servlet.ServletException;
+import javax.servlet.http.HttpServletResponse;
+import javax.xml.transform.Source;
+import javax.xml.transform.TransformerException;
+import javax.xml.transform.stream.StreamResult;
+import javax.xml.transform.stream.StreamSource;
+import java.io.File;
+import java.io.FileFilter;
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.Map;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import jenkins.security.NotReallyRoleSensitiveCallable;
+import org.xml.sax.SAXException;
+
+/**
+ * Defines a bunch of static methods to be used as a &quot;mix-in&quot; for {@link ItemGroup}
+ * implementations. Not meant for a consumption from outside {@link ItemGroup}s.
+ *
+ * @author Kohsuke Kawaguchi
+ * @see ViewGroupMixIn
+ */
+public abstract class ItemGroupMixIn {
+    /**
+     * {@link ItemGroup} for which we are working.
+     */
+    private final ItemGroup parent;
+    private final AccessControlled acl;
+
+<span class="nc" id="L67">    protected ItemGroupMixIn(ItemGroup parent, AccessControlled acl) {</span>
+<span class="nc" id="L68">        this.parent = parent;</span>
+<span class="nc" id="L69">        this.acl = acl;</span>
+<span class="nc" id="L70">    }</span>
+
+    /*
+    * Callback methods to be implemented by the ItemGroup implementation.
+    */
+
+    /**
+     * Adds a newly created item to the parent.
+     */
+    protected abstract void add(TopLevelItem item);
+
+    /**
+     * Assigns the root directory for a prospective item.
+     */
+    protected abstract File getRootDirFor(String name);
+
+
+/*
+ * The rest is the methods that provide meat.
+ */
+
+    /**
+     * Loads all the child {@link Item}s.
+     *
+     * @param modulesDir
+     *      Directory that contains sub-directories for each child item.
+     */
+    public static &lt;K,V extends Item&gt; Map&lt;K,V&gt; loadChildren(ItemGroup parent, File modulesDir, Function1&lt;? extends K,? super V&gt; key) {
+<span class="nc" id="L98">        modulesDir.mkdirs(); // make sure it exists</span>
+
+<span class="nc" id="L100">        File[] subdirs = modulesDir.listFiles(new FileFilter() {</span>
+            public boolean accept(File child) {
+<span class="nc" id="L102">                return child.isDirectory();</span>
+            }
+        });
+<span class="nc" id="L105">        CopyOnWriteMap.Tree&lt;K,V&gt; configurations = new CopyOnWriteMap.Tree&lt;K,V&gt;();</span>
+<span class="nc bnc" id="L106" title="All 2 branches missed.">        for (File subdir : subdirs) {</span>
+            try {
+                // Try to retain the identity of an existing child object if we can.
+<span class="nc" id="L109">                V item = (V) parent.getItem(subdir.getName());</span>
+<span class="nc bnc" id="L110" title="All 2 branches missed.">                if (item == null) {</span>
+<span class="nc" id="L111">                    XmlFile xmlFile = Items.getConfigFile(subdir);</span>
+<span class="nc bnc" id="L112" title="All 2 branches missed.">                    if (xmlFile.exists()) {</span>
+<span class="nc" id="L113">                        item = (V) Items.load(parent, subdir);</span>
+<span class="nc" id="L114">                    } else {</span>
+<span class="nc" id="L115">                        Logger.getLogger(ItemGroupMixIn.class.getName()).log(Level.WARNING, &quot;could not find file &quot; + xmlFile.getFile());</span>
+<span class="nc" id="L116">                        continue;</span>
+                    }
+                } else {
+<span class="nc" id="L119">                    item.onLoad(parent, subdir.getName());</span>
+                }
+<span class="nc" id="L121">                configurations.put(key.call(item), item);</span>
+<span class="nc" id="L122">            } catch (Exception e) {</span>
+<span class="nc" id="L123">                Logger.getLogger(ItemGroupMixIn.class.getName()).log(Level.WARNING, &quot;could not load &quot; + subdir, e);</span>
+            }
+        }
+
+<span class="nc" id="L127">        return configurations;</span>
+    }
+
+    /**
+     * {@link Item} -&gt; name function.
+     */
+<span class="nc" id="L133">    public static final Function1&lt;String,Item&gt; KEYED_BY_NAME = new Function1&lt;String, Item&gt;() {</span>
+        public String call(Item item) {
+<span class="nc" id="L135">            return item.getName();</span>
+        }
+<span class="nc" id="L137">    };</span>
+
+    /**
+     * Creates a {@link TopLevelItem} from the submission of the '/lib/hudson/newFromList/formList'
+     * or throws an exception if it fails.
+     */
+    public synchronized TopLevelItem createTopLevelItem( StaplerRequest req, StaplerResponse rsp ) throws IOException, ServletException {
+<span class="nc" id="L144">        acl.checkPermission(Item.CREATE);</span>
+
+        TopLevelItem result;
+
+<span class="nc" id="L148">        String requestContentType = req.getContentType();</span>
+<span class="nc" id="L149">        String mode = req.getParameter(&quot;mode&quot;);</span>
+<span class="nc bnc" id="L150" title="All 2 branches missed.">        if (requestContentType == null</span>
+<span class="nc bnc" id="L151" title="All 4 branches missed.">                &amp;&amp; !(mode != null &amp;&amp; mode.equals(&quot;copy&quot;)))</span>
+<span class="nc" id="L152">            throw new Failure(&quot;No Content-Type header set&quot;);</span>
+
+<span class="nc bnc" id="L154" title="All 2 branches missed.">        boolean isXmlSubmission = requestContentType != null</span>
+<span class="nc bnc" id="L155" title="All 2 branches missed.">            &amp;&amp; (requestContentType.startsWith(&quot;application/xml&quot;)</span>
+<span class="nc bnc" id="L156" title="All 2 branches missed.">                    || requestContentType.startsWith(&quot;text/xml&quot;));</span>
+
+<span class="nc" id="L158">        String name = req.getParameter(&quot;name&quot;);</span>
+<span class="nc bnc" id="L159" title="All 2 branches missed.">        if(name==null)</span>
+<span class="nc" id="L160">            throw new Failure(&quot;Query parameter 'name' is required&quot;);</span>
+
+        {// check if the name looks good
+<span class="nc" id="L163">            Jenkins.checkGoodName(name);</span>
+<span class="nc" id="L164">            name = name.trim();</span>
+<span class="nc bnc" id="L165" title="All 2 branches missed.">            if(parent.getItem(name)!=null)</span>
+<span class="nc" id="L166">                throw new Failure(Messages.Hudson_JobAlreadyExists(name));</span>
+        }
+
+<span class="nc bnc" id="L169" title="All 4 branches missed.">        if(mode!=null &amp;&amp; mode.equals(&quot;copy&quot;)) {</span>
+<span class="nc" id="L170">            String from = req.getParameter(&quot;from&quot;);</span>
+
+            // resolve a name to Item
+<span class="nc" id="L173">            Item src = null;</span>
+<span class="nc bnc" id="L174" title="All 2 branches missed.">            if (!from.startsWith(&quot;/&quot;))</span>
+<span class="nc" id="L175">                src = parent.getItem(from);</span>
+<span class="nc bnc" id="L176" title="All 2 branches missed.">            if (src==null)</span>
+<span class="nc" id="L177">                src = Jenkins.getInstance().getItemByFullName(from);</span>
+
+<span class="nc bnc" id="L179" title="All 2 branches missed.">            if(src==null) {</span>
+<span class="nc bnc" id="L180" title="All 2 branches missed.">                if(Util.fixEmpty(from)==null)</span>
+<span class="nc" id="L181">                    throw new Failure(&quot;Specify which job to copy&quot;);</span>
+                else
+<span class="nc" id="L183">                    throw new Failure(&quot;No such job: &quot;+from);</span>
+            }
+<span class="nc bnc" id="L185" title="All 2 branches missed.">            if (!(src instanceof TopLevelItem))</span>
+<span class="nc" id="L186">                throw new Failure(from+&quot; cannot be copied&quot;);</span>
+
+<span class="nc" id="L188">            result = copy((TopLevelItem) src,name);</span>
+<span class="nc" id="L189">        } else {</span>
+<span class="nc bnc" id="L190" title="All 2 branches missed.">            if(isXmlSubmission) {</span>
+<span class="nc" id="L191">                result = createProjectFromXML(name, req.getInputStream());</span>
+<span class="nc" id="L192">                rsp.setStatus(HttpServletResponse.SC_OK);</span>
+<span class="nc" id="L193">                return result;</span>
+            } else {
+<span class="nc bnc" id="L195" title="All 2 branches missed.">                if(mode==null)</span>
+<span class="nc" id="L196">                    throw new Failure(&quot;No mode given&quot;);</span>
+<span class="nc" id="L197">                TopLevelItemDescriptor descriptor = Items.all().findByName(mode);</span>
+<span class="nc bnc" id="L198" title="All 2 branches missed.">                if (descriptor == null) {</span>
+<span class="nc" id="L199">                    throw new Failure(&quot;No item type ‘&quot; + mode + &quot;’ is known&quot;);</span>
+                }
+<span class="nc" id="L201">                descriptor.checkApplicableIn(parent);</span>
+<span class="nc" id="L202">                acl.getACL().checkCreatePermission(parent, descriptor);</span>
+
+                // create empty job and redirect to the project config screen
+<span class="nc" id="L205">                result = createProject(descriptor, name, true);</span>
+            }
+        }
+
+<span class="nc" id="L209">        rsp.sendRedirect2(redirectAfterCreateItem(req, result));</span>
+<span class="nc" id="L210">        return result;</span>
+    }
+
+    /**
+     * Computes the redirection target URL for the newly created {@link TopLevelItem}.
+     */
+    protected String redirectAfterCreateItem(StaplerRequest req, TopLevelItem result) throws IOException {
+<span class="nc" id="L217">        return req.getContextPath()+'/'+result.getUrl()+&quot;configure&quot;;</span>
+    }
+
+    /**
+     * Copies an existing {@link TopLevelItem} to a new name.
+     */
+    @SuppressWarnings({&quot;unchecked&quot;})
+    public synchronized &lt;T extends TopLevelItem&gt; T copy(T src, String name) throws IOException {
+<span class="nc" id="L225">        acl.checkPermission(Item.CREATE);</span>
+<span class="nc" id="L226">        src.checkPermission(Item.EXTENDED_READ);</span>
+<span class="nc" id="L227">        src.getDescriptor().checkApplicableIn(parent);</span>
+<span class="nc" id="L228">        acl.getACL().checkCreatePermission(parent, src.getDescriptor());</span>
+
+<span class="nc" id="L230">        T result = (T)createProject(src.getDescriptor(),name,false);</span>
+
+        // copy config
+<span class="nc" id="L233">        Util.copyFile(Items.getConfigFile(src).getFile(),Items.getConfigFile(result).getFile());</span>
+
+        // reload from the new config
+<span class="nc" id="L236">        final File rootDir = result.getRootDir();</span>
+<span class="nc" id="L237">        result = Items.whileUpdatingByXml(new NotReallyRoleSensitiveCallable&lt;T,IOException&gt;() {</span>
+            @Override public T call() throws IOException {
+<span class="nc" id="L239">                return (T) Items.load(parent, rootDir);</span>
+            }
+        });
+<span class="nc" id="L242">        result.onCopiedFrom(src);</span>
+
+<span class="nc" id="L244">        add(result);</span>
+<span class="nc" id="L245">        ItemListener.fireOnCopied(src,result);</span>
+<span class="nc" id="L246">        Jenkins.getInstance().rebuildDependencyGraphAsync();</span>
+
+<span class="nc" id="L248">        return result;</span>
+    }
+
+    public synchronized TopLevelItem createProjectFromXML(String name, InputStream xml) throws IOException {
+<span class="nc" id="L252">        acl.checkPermission(Item.CREATE);</span>
+
+<span class="nc" id="L254">        Jenkins.getInstance().getProjectNamingStrategy().checkName(name);</span>
+<span class="nc bnc" id="L255" title="All 2 branches missed.">        if (parent.getItem(name) != null) {</span>
+<span class="nc" id="L256">            throw new IllegalArgumentException(parent.getDisplayName() + &quot; already contains an item '&quot; + name + &quot;'&quot;);</span>
+        }
+        // TODO what if we have no DISCOVER permission on the existing job?
+
+        // place it as config.xml
+<span class="nc" id="L261">        File configXml = Items.getConfigFile(getRootDirFor(name)).getFile();</span>
+<span class="nc" id="L262">        final File dir = configXml.getParentFile();</span>
+<span class="nc" id="L263">        dir.mkdirs();</span>
+<span class="nc" id="L264">        boolean success = false;</span>
+        try {
+<span class="nc" id="L266">            XMLUtils.safeTransform((Source)new StreamSource(xml), new StreamResult(configXml));</span>
+
+            // load it
+<span class="nc" id="L269">            TopLevelItem result = Items.whileUpdatingByXml(new NotReallyRoleSensitiveCallable&lt;TopLevelItem,IOException&gt;() {</span>
+                @Override public TopLevelItem call() throws IOException {
+<span class="nc" id="L271">                    return (TopLevelItem) Items.load(parent, dir);</span>
+                }
+            });
+
+<span class="nc bnc" id="L275" title="All 2 branches missed.">            success = acl.getACL().hasCreatePermission(Jenkins.getAuthentication(), parent, result.getDescriptor())</span>
+<span class="nc bnc" id="L276" title="All 2 branches missed.">                &amp;&amp; result.getDescriptor().isApplicableIn(parent);</span>
+
+<span class="nc" id="L278">            add(result);</span>
+
+<span class="nc" id="L280">            ItemListener.fireOnCreated(result);</span>
+<span class="nc" id="L281">            Jenkins.getInstance().rebuildDependencyGraphAsync();</span>
+
+<span class="nc" id="L283">            return result;</span>
+<span class="nc" id="L284">        } catch (TransformerException e) {</span>
+<span class="nc" id="L285">            success = false;</span>
+<span class="nc" id="L286">            throw new IOException(&quot;Failed to persist config.xml&quot;, e);</span>
+<span class="nc" id="L287">        } catch (SAXException e) {</span>
+<span class="nc" id="L288">            success = false;</span>
+<span class="nc" id="L289">            throw new IOException(&quot;Failed to persist config.xml&quot;, e);</span>
+<span class="nc" id="L290">        } catch (IOException e) {</span>
+<span class="nc" id="L291">            success = false;</span>
+<span class="nc" id="L292">            throw e;</span>
+<span class="nc" id="L293">        } catch (RuntimeException e) {</span>
+<span class="nc" id="L294">            success = false;</span>
+<span class="nc" id="L295">            throw e;</span>
+<span class="nc" id="L296">        } finally {</span>
+<span class="nc bnc" id="L297" title="All 4 branches missed.">            if (!success) {</span>
+                // if anything fails, delete the config file to avoid further confusion
+<span class="nc" id="L299">                Util.deleteRecursive(dir);</span>
+            }
+<span class="nc" id="L301">        }</span>
+    }
+
+    public synchronized TopLevelItem createProject( TopLevelItemDescriptor type, String name, boolean notify )
+            throws IOException {
+<span class="nc" id="L306">        acl.checkPermission(Item.CREATE);</span>
+<span class="nc" id="L307">        type.checkApplicableIn(parent);</span>
+<span class="nc" id="L308">        acl.getACL().checkCreatePermission(parent, type);</span>
+
+<span class="nc" id="L310">        Jenkins.getInstance().getProjectNamingStrategy().checkName(name);</span>
+<span class="nc bnc" id="L311" title="All 2 branches missed.">        if(parent.getItem(name)!=null)</span>
+<span class="nc" id="L312">            throw new IllegalArgumentException(&quot;Project of the name &quot;+name+&quot; already exists&quot;);</span>
+        // TODO problem with DISCOVER as noted above
+
+<span class="nc" id="L315">        TopLevelItem item = type.newInstance(parent, name);</span>
+        try {
+<span class="nc" id="L317">            callOnCreatedFromScratch(item);</span>
+<span class="nc" id="L318">        } catch (AbstractMethodError e) {</span>
+            // ignore this error. Must be older plugin that doesn't have this method
+        }
+<span class="nc" id="L321">        item.save();</span>
+<span class="nc" id="L322">        add(item);</span>
+<span class="nc" id="L323">        Jenkins.getInstance().rebuildDependencyGraphAsync();</span>
+
+<span class="nc bnc" id="L325" title="All 2 branches missed.">        if (notify)</span>
+<span class="nc" id="L326">            ItemListener.fireOnCreated(item);</span>
+
+<span class="nc" id="L328">        return item;</span>
+    }
+
+    /**
+     * Pointless wrapper to avoid HotSpot problem. See JENKINS-5756
+     */
+    private void callOnCreatedFromScratch(TopLevelItem item) {
+<span class="nc" id="L335">        item.onCreatedFromScratch();</span>
+<span class="nc" id="L336">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

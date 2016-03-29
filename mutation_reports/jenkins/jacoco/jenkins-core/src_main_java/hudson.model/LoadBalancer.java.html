@@ -1,0 +1,171 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>LoadBalancer.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.model</a> &gt; <span class="el_source">LoadBalancer.java</span></div><h1>LoadBalancer.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">/*</span>
+ * The MIT License
+ *
+ * Copyright (c) 2004-2010, Sun Microsystems, Inc., Kohsuke Kawaguchi
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.model;
+
+import com.google.common.collect.Maps;
+import hudson.Extension;
+import hudson.ExtensionPoint;
+import hudson.model.Queue.Task;
+import hudson.model.queue.MappingWorksheet;
+import hudson.model.queue.MappingWorksheet.ExecutorChunk;
+import hudson.model.queue.MappingWorksheet.Mapping;
+import hudson.util.ConsistentHash;
+import hudson.util.ConsistentHash.Hash;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Strategy that decides which {@link Task} gets run on which {@link Executor}.
+ *
+ * &lt;p&gt;
+ * Even though this is marked as {@link ExtensionPoint}, you do not register
+ * your implementation with @{@link Extension}. Instead, call {@link Queue#setLoadBalancer(LoadBalancer)}
+ * to install your implementation.
+ *
+ * @author Kohsuke Kawaguchi
+ * @since 1.301
+ */
+<span class="nc bnc" id="L51" title="All 2 branches missed.">public abstract class LoadBalancer implements ExtensionPoint {</span>
+    /**
+     * Chooses the executor(s) to carry out the build for the given task.
+     *
+     * &lt;p&gt;
+     * This method is invoked from different threads, but the execution is serialized by the caller.
+     * The thread that invokes this method always holds a lock to {@link Queue}, so queue contents
+     * can be safely introspected from this method, if that information is necessary to make
+     * decisions.
+     * 
+     * @param  task
+     *      The task whose execution is being considered. Never null.
+     * @param worksheet
+     *      The work sheet that represents the matching that needs to be made.
+     *      The job of this method is to determine which work units on this worksheet
+     *      are executed on which executors (also on this worksheet.)
+     *
+     * @return
+     *      Build up the mapping by using the given worksheet and return it.
+     *      Return null if you don't want the task to be executed right now,
+     *      in which case this method will be called some time later with the same task.
+     */
+    public abstract Mapping map(Task task, MappingWorksheet worksheet);
+
+    /**
+     * Uses a consistent hash for scheduling.
+     */
+<span class="nc" id="L78">    public static final LoadBalancer CONSISTENT_HASH = new LoadBalancer() {</span>
+        @Override
+        public Mapping map(Task task, MappingWorksheet ws) {
+            // build consistent hash for each work chunk
+<span class="nc" id="L82">            List&lt;ConsistentHash&lt;ExecutorChunk&gt;&gt; hashes = new ArrayList&lt;ConsistentHash&lt;ExecutorChunk&gt;&gt;(ws.works.size());</span>
+<span class="nc bnc" id="L83" title="All 2 branches missed.">            for (int i=0; i&lt;ws.works.size(); i++) {</span>
+<span class="nc" id="L84">                ConsistentHash&lt;ExecutorChunk&gt; hash = new ConsistentHash&lt;ExecutorChunk&gt;(new Hash&lt;ExecutorChunk&gt;() {</span>
+                    public String hash(ExecutorChunk node) {
+<span class="nc" id="L86">                        return node.getName();</span>
+                    }
+                });
+
+                // Build a Map to pass in rather than repeatedly calling hash.add() because each call does lots of expensive work
+<span class="nc" id="L91">                List&lt;ExecutorChunk&gt; chunks = ws.works(i).applicableExecutorChunks();</span>
+<span class="nc" id="L92">                Map&lt;ExecutorChunk, Integer&gt; toAdd = Maps.newHashMapWithExpectedSize(chunks.size());</span>
+<span class="nc bnc" id="L93" title="All 2 branches missed.">                for (ExecutorChunk ec : chunks) {</span>
+<span class="nc" id="L94">                    toAdd.put(ec, ec.size()*100);</span>
+                }
+<span class="nc" id="L96">                hash.addAll(toAdd);</span>
+
+<span class="nc" id="L98">                hashes.add(hash);</span>
+            }
+
+            // do a greedy assignment
+<span class="nc" id="L102">            Mapping m = ws.new Mapping();</span>
+<span class="nc bnc" id="L103" title="All 4 branches missed.">            assert m.size()==ws.works.size();   // just so that you the reader of the source code don't get confused with the for loop index</span>
+
+<span class="nc bnc" id="L105" title="All 2 branches missed.">            if (assignGreedily(m,task,hashes,0)) {</span>
+<span class="nc bnc" id="L106" title="All 4 branches missed.">                assert m.isCompletelyValid();</span>
+<span class="nc" id="L107">                return m;</span>
+            } else
+<span class="nc" id="L109">                return null;</span>
+        }
+
+        private boolean assignGreedily(Mapping m, Task task, List&lt;ConsistentHash&lt;ExecutorChunk&gt;&gt; hashes, int i) {
+<span class="nc bnc" id="L113" title="All 2 branches missed.">            if (i==hashes.size())   return true;    // fully assigned</span>
+
+<span class="nc bnc" id="L115" title="All 2 branches missed.">            String key = task.getFullDisplayName() + (i&gt;0 ? String.valueOf(i) : &quot;&quot;);</span>
+
+<span class="nc bnc" id="L117" title="All 2 branches missed.">            for (ExecutorChunk ec : hashes.get(i).list(key)) {</span>
+                // let's attempt this assignment
+<span class="nc" id="L119">                m.assign(i,ec);</span>
+
+<span class="nc bnc" id="L121" title="All 4 branches missed.">                if (m.isPartiallyValid() &amp;&amp; assignGreedily(m,task,hashes,i+1))</span>
+<span class="nc" id="L122">                    return true;    // successful greedily allocation</span>
+
+                // otherwise 'ec' wasn't a good fit for us. try next.
+            }
+
+            // every attempt failed
+<span class="nc" id="L128">            m.assign(i,null);</span>
+<span class="nc" id="L129">            return false;</span>
+        }
+    };
+
+    /**
+     * Traditional implementation of this.
+     *
+     * @deprecated as of 1.377
+     *      The only implementation in the core now is the one based on consistent hash.
+     */
+    @Deprecated
+<span class="nc" id="L140">    public static final LoadBalancer DEFAULT = CONSISTENT_HASH;</span>
+
+
+    /**
+     * Wraps this {@link LoadBalancer} into a decorator that tests the basic sanity of the implementation.
+     * Only override this if you find some of the checks excessive, but beware that it's like driving without a seat belt.
+     */
+    protected LoadBalancer sanitize() {
+<span class="nc" id="L148">        final LoadBalancer base = this;</span>
+<span class="nc" id="L149">        return new LoadBalancer() {</span>
+            @Override
+            public Mapping map(Task task, MappingWorksheet worksheet) {
+<span class="nc bnc" id="L152" title="All 2 branches missed.">                if (Queue.isBlockedByShutdown(task)) {</span>
+                    // if we are quieting down, don't start anything new so that
+                    // all executors will be eventually free.
+<span class="nc" id="L155">                    return null;</span>
+                }
+<span class="nc" id="L157">                return base.map(task, worksheet);</span>
+            }
+
+            /**
+             * Double-sanitization is pointless.
+             */
+            @Override
+            protected LoadBalancer sanitize() {
+<span class="nc" id="L165">                return this;</span>
+            }
+        };
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

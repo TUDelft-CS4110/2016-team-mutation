@@ -1,0 +1,185 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>DoubleLaunchChecker.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.util</a> &gt; <span class="el_source">DoubleLaunchChecker.java</span></div><h1>DoubleLaunchChecker.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">/*</span>
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc., Kohsuke Kawaguchi
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.util;
+
+import hudson.init.Initializer;
+import jenkins.model.Jenkins;
+import hudson.triggers.SafeTimerTask;
+import jenkins.util.Timer;
+import org.apache.commons.io.FileUtils;
+import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.StaplerResponse;
+
+import javax.servlet.ServletException;
+import javax.servlet.ServletContext;
+
+import static hudson.init.InitMilestone.JOB_LOADED;
+import static javax.servlet.http.HttpServletResponse.SC_INTERNAL_SERVER_ERROR;
+import java.io.File;
+import java.io.IOException;
+import java.util.Random;
+import java.util.concurrent.TimeUnit;
+import java.util.logging.Logger;
+import java.util.logging.Level;
+import java.lang.management.ManagementFactory;
+import java.lang.reflect.Method;
+
+/**
+ * Makes sure that no other Hudson uses our &lt;tt&gt;JENKINS_HOME&lt;/tt&gt; directory,
+ * to forestall the problem of running multiple instances of Hudson that point to the same data directory.
+ *
+ * &lt;p&gt;
+ * This set up error occasionally happens especially when the user is trying to reassign the context path of the app,
+ * and it results in a hard-to-diagnose error, so we actively check this.
+ *
+ * &lt;p&gt;
+ * The mechanism is simple. This class occasionally updates a known file inside the hudson home directory,
+ * and whenever it does so, it monitors the timestamp of the file to make sure no one else is updating
+ * this file. In this way, while we cannot detect the problem right away, within a reasonable time frame
+ * we can detect the collision.
+ *
+ * &lt;p&gt;
+ * More traditional way of doing this is to use a lock file with PID in it, but unfortunately in Java,
+ * there's no reliabe way to obtain PID.
+ *
+ * @author Kohsuke Kawaguchi
+ * @since 1.178
+ */
+public class DoubleLaunchChecker {
+    /**
+     * The timestamp of the owner file when we updated it for the last time.
+     * 0 to indicate that there was no update before.
+     */
+<span class="nc" id="L74">    private long lastWriteTime = 0L;</span>
+
+    /**
+     * Once the error is reported, the user can choose to ignore and proceed anyway,
+     * in which case the flag is set to true.
+     */
+<span class="nc" id="L80">    private boolean ignore = false;</span>
+
+<span class="nc" id="L82">    private final Random random = new Random();</span>
+
+    public final File home;
+
+    /**
+     * ID string of the other Hudson that we are colliding with. 
+     * Can be null.
+     */
+    private String collidingId;
+
+<span class="nc" id="L92">    public DoubleLaunchChecker() {</span>
+<span class="nc" id="L93">        home = Jenkins.getInstance().getRootDir();</span>
+<span class="nc" id="L94">    }</span>
+
+    protected void execute() {
+<span class="nc" id="L97">        File timestampFile = new File(home,&quot;.owner&quot;);</span>
+
+<span class="nc" id="L99">        long t = timestampFile.lastModified();</span>
+<span class="nc bnc" id="L100" title="All 8 branches missed.">        if(t!=0 &amp;&amp; lastWriteTime!=0 &amp;&amp; t!=lastWriteTime &amp;&amp; !ignore) {</span>
+            try {
+<span class="nc" id="L102">                collidingId = FileUtils.readFileToString(timestampFile);</span>
+<span class="nc" id="L103">            } catch (IOException e) {</span>
+<span class="nc" id="L104">                LOGGER.log(Level.SEVERE, &quot;Failed to read collision file&quot;, e);</span>
+            }
+            // we noticed that someone else have updated this file.
+            // switch GUI to display this error.
+<span class="nc" id="L108">            Jenkins.getInstance().servletContext.setAttribute(&quot;app&quot;,this);</span>
+<span class="nc" id="L109">            LOGGER.severe(&quot;Collision detected. timestamp=&quot;+t+&quot;, expected=&quot;+lastWriteTime);</span>
+            // we need to continue updating this file, so that the other Hudson would notice the problem, too.
+        }
+
+        try {
+<span class="nc" id="L114">            FileUtils.writeStringToFile(timestampFile, getId());</span>
+<span class="nc" id="L115">            lastWriteTime = timestampFile.lastModified();</span>
+<span class="nc" id="L116">        } catch (IOException e) {</span>
+            // if failed to write, err on the safe side and assume things are OK.
+<span class="nc" id="L118">            lastWriteTime=0;</span>
+        }
+
+<span class="nc" id="L121">        schedule();</span>
+<span class="nc" id="L122">    }</span>
+
+    /**
+     * Figures out a string that identifies this instance of Hudson.
+     */
+    public String getId() {
+<span class="nc" id="L128">        Jenkins h = Jenkins.getInstance();</span>
+
+        // in servlet 2.5, we can get the context path
+<span class="nc" id="L131">        String contextPath=&quot;&quot;;</span>
+        try {
+<span class="nc" id="L133">            Method m = ServletContext.class.getMethod(&quot;getContextPath&quot;);</span>
+<span class="nc" id="L134">            contextPath=&quot; contextPath=\&quot;&quot;+m.invoke(h.servletContext)+&quot;\&quot;&quot;;</span>
+<span class="nc" id="L135">        } catch (Exception e) {</span>
+            // maybe running with Servlet 2.4
+        }
+
+<span class="nc" id="L139">        return h.hashCode()+contextPath+&quot; at &quot;+ManagementFactory.getRuntimeMXBean().getName();</span>
+    }
+
+    public String getCollidingId() {
+<span class="nc" id="L143">        return collidingId;</span>
+    }
+
+    /**
+     * Schedules the next execution.
+     */
+    public void schedule() {
+        // randomize the scheduling so that multiple Hudson instances will write at the file at different time
+<span class="nc" id="L151">        long MINUTE = 1000*60;</span>
+
+<span class="nc" id="L153">        Timer.get()</span>
+<span class="nc" id="L154">            .schedule(new SafeTimerTask() {</span>
+                protected void doRun() {
+<span class="nc" id="L156">                    execute();</span>
+<span class="nc" id="L157">                }</span>
+<span class="nc" id="L158">            }, (random.nextInt(30) + 60) * MINUTE, TimeUnit.MILLISECONDS);</span>
+<span class="nc" id="L159">    }</span>
+
+    @Initializer(after= JOB_LOADED)
+    public static void init() {
+<span class="nc" id="L163">        new DoubleLaunchChecker().schedule();</span>
+<span class="nc" id="L164">    }</span>
+
+    /**
+     * Serve all URLs with the index view.
+     */
+    public void doDynamic(StaplerRequest req, StaplerResponse rsp) throws IOException, ServletException {
+<span class="nc" id="L170">        rsp.setStatus(SC_INTERNAL_SERVER_ERROR);</span>
+<span class="nc" id="L171">        req.getView(this,&quot;index.jelly&quot;).forward(req,rsp);</span>
+<span class="nc" id="L172">    }</span>
+
+    /**
+     * Ignore the problem and go back to using Hudson.
+     */
+    public void doIgnore(StaplerRequest req, StaplerResponse rsp) throws IOException {
+<span class="nc" id="L178">        ignore = true;</span>
+<span class="nc" id="L179">        Jenkins.getInstance().servletContext.setAttribute(&quot;app&quot;, Jenkins.getInstance());</span>
+<span class="nc" id="L180">        rsp.sendRedirect2(req.getContextPath()+'/');</span>
+<span class="nc" id="L181">    }</span>
+
+<span class="nc" id="L183">    private static final Logger LOGGER = Logger.getLogger(DoubleLaunchChecker.class.getName());</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

@@ -1,0 +1,424 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>AbstractLazyLoadRunMapTest.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/test/java</a> &gt; <a href="index.source.html" class="el_package">jenkins.model.lazy</a> &gt; <span class="el_source">AbstractLazyLoadRunMapTest.java</span></div><h1>AbstractLazyLoadRunMapTest.java</h1><pre class="source lang-java linenums"><span class="fc" id="L1">/*</span>
+ * The MIT License
+ *
+ * Copyright (c) 2012, CloudBees, Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package jenkins.model.lazy;
+
+import java.io.File;
+import static org.junit.Assert.*;
+
+import jenkins.model.lazy.AbstractLazyLoadRunMap.Direction;
+import org.junit.Before;
+import org.junit.Rule;
+import org.junit.Test;
+
+import java.io.IOException;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.NoSuchElementException;
+import java.util.Set;
+import java.util.SortedMap;
+import java.util.concurrent.Callable;
+import java.util.concurrent.Future;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.logging.Level;
+import jenkins.util.Timer;
+import org.junit.BeforeClass;
+import org.jvnet.hudson.test.Issue;
+
+/**
+ * @author Kohsuke Kawaguchi
+ */
+<span class="pc bpc" id="L54" title="1 of 2 branches missed.">public class AbstractLazyLoadRunMapTest {</span>
+    // A=1, B=3, C=5
+    @Rule
+<span class="fc" id="L57">    public FakeMapBuilder aBuilder = new FakeMapBuilder();</span>
+    private FakeMap a;
+
+    // empty map
+    @Rule
+<span class="fc" id="L62">    public FakeMapBuilder bBuilder = new FakeMapBuilder();</span>
+    private FakeMap b;
+
+    @Rule
+<span class="fc" id="L66">    public FakeMapBuilder localBuilder = new FakeMapBuilder();</span>
+
+    @Rule
+<span class="fc" id="L69">    public FakeMapBuilder localExpiredBuilder = new FakeMapBuilder() {</span>
+        @Override
+        public FakeMap make() {
+<span class="pc bpc" id="L72" title="3 of 4 branches missed.">            assert getDir()!=null;</span>
+<span class="fc" id="L73">            return new FakeMap(getDir()) {</span>
+                @Override
+                protected BuildReference&lt;Build&gt; createReference(Build r) {
+<span class="fc" id="L76">                    return new BuildReference&lt;Build&gt;(Integer.toString(r.n), /* pretend referent expired */ null);</span>
+                }
+            };
+        }
+    };
+ 
+<span class="fc" id="L82">    private final Map&lt;Integer,Semaphore&gt; slowBuilderStartSemaphores = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L83">    private final Map&lt;Integer,Semaphore&gt; slowBuilderEndSemaphores = new HashMap&lt;&gt;();</span>
+<span class="fc" id="L84">    private final Map&lt;Integer,AtomicInteger&gt; slowBuilderLoadCount = new HashMap&lt;&gt;();</span>
+    @Rule
+<span class="fc" id="L86">    public FakeMapBuilder slowBuilder = new FakeMapBuilder() {</span>
+        @Override
+        public FakeMap make() {
+<span class="fc" id="L89">            return new FakeMap(getDir()) {</span>
+                @Override
+                protected Build retrieve(File dir) throws IOException {
+<span class="fc" id="L92">                    Build b = super.retrieve(dir);</span>
+<span class="fc" id="L93">                    slowBuilderStartSemaphores.get(b.n).release();</span>
+                    try {
+<span class="fc" id="L95">                        slowBuilderEndSemaphores.get(b.n).acquire();</span>
+<span class="pc" id="L96">                    } catch (InterruptedException x) {</span>
+<span class="nc" id="L97">                        throw new IOException(x);</span>
+                    }
+<span class="fc" id="L99">                    slowBuilderLoadCount.get(b.n).incrementAndGet();</span>
+<span class="fc" id="L100">                    return b;</span>
+                }
+            };
+        }
+    };
+    
+    @BeforeClass
+    public static void setUpClass() {
+<span class="fc" id="L108">        AbstractLazyLoadRunMap.LOGGER.setLevel(Level.OFF);</span>
+<span class="fc" id="L109">    }</span>
+
+    @Before
+    public void setUp() throws Exception {
+<span class="fc" id="L113">        a = aBuilder.add(1).add(3).add(5).make();</span>
+
+<span class="fc" id="L115">        b = bBuilder.make();</span>
+<span class="fc" id="L116">    }</span>
+
+    @Test
+    public void lookup() {
+<span class="fc" id="L120">        assertNull(a.get(0));</span>
+<span class="fc" id="L121">        a.get(1).asserts(1);</span>
+<span class="fc" id="L122">        assertNull(a.get(2));</span>
+<span class="fc" id="L123">        a.get(3).asserts(3);</span>
+<span class="fc" id="L124">        assertNull(a.get(4));</span>
+<span class="fc" id="L125">        a.get(5).asserts(5);</span>
+<span class="fc" id="L126">        assertNull(a.get(6));</span>
+
+<span class="fc" id="L128">        assertNull(b.get(1));</span>
+<span class="fc" id="L129">        assertNull(b.get(3));</span>
+<span class="fc" id="L130">        assertNull(b.get(5));</span>
+<span class="fc" id="L131">    }</span>
+
+    @Test
+    public void lookup2() {
+<span class="fc" id="L135">        assertNull(a.get(6));</span>
+<span class="fc" id="L136">    }</span>
+
+    @Test
+    public void idempotentLookup() {
+<span class="fc bfc" id="L140" title="All 2 branches covered.">        for (int i=0; i&lt;5; i++) {</span>
+<span class="fc" id="L141">            a.get(1).asserts(1);</span>
+<span class="fc" id="L142">            a.get((Object)1).asserts(1);</span>
+        }
+<span class="fc" id="L144">    }</span>
+
+    @Test
+    public void lookupWithBogusKeyType() {
+<span class="fc" id="L148">        assertNull(a.get(null));</span>
+<span class="fc" id="L149">        assertNull(a.get(&quot;foo&quot;));</span>
+<span class="fc" id="L150">        assertNull(a.get(this));</span>
+<span class="fc" id="L151">    }</span>
+
+    @Test
+    public void firstKey() {
+<span class="fc" id="L155">        assertEquals(5, a.firstKey().intValue());</span>
+
+        try {
+<span class="nc" id="L158">            b.firstKey();</span>
+<span class="nc" id="L159">            fail();</span>
+<span class="pc" id="L160">        } catch (NoSuchElementException e) {</span>
+            // as expected
+        }
+<span class="fc" id="L163">    }</span>
+
+    @Issue(&quot;JENKINS-26690&quot;)
+    @Test public void headMap() {
+<span class="fc" id="L167">        assertEquals(&quot;[]&quot;, a.headMap(Integer.MAX_VALUE).keySet().toString());</span>
+<span class="fc" id="L168">        assertEquals(&quot;[]&quot;, a.headMap(6).keySet().toString());</span>
+<span class="fc" id="L169">        assertEquals(&quot;[]&quot;, a.headMap(5).keySet().toString());</span>
+<span class="fc" id="L170">        assertEquals(&quot;[5]&quot;, a.headMap(4).keySet().toString());</span>
+<span class="fc" id="L171">        assertEquals(&quot;[5]&quot;, a.headMap(3).keySet().toString());</span>
+<span class="fc" id="L172">        assertEquals(&quot;[5, 3]&quot;, a.headMap(2).keySet().toString());</span>
+<span class="fc" id="L173">        assertEquals(&quot;[5, 3]&quot;, a.headMap(1).keySet().toString());</span>
+<span class="fc" id="L174">        assertEquals(&quot;[5, 3, 1]&quot;, a.headMap(0).keySet().toString());</span>
+<span class="fc" id="L175">        assertEquals(&quot;[5, 3, 1]&quot;, a.headMap(-1).keySet().toString());</span>
+<span class="fc" id="L176">        assertEquals(&quot;[5, 3, 1]&quot;, a.headMap(-2).keySet().toString()); // this failed</span>
+<span class="fc" id="L177">        assertEquals(&quot;[5, 3, 1]&quot;, a.headMap(Integer.MIN_VALUE).keySet().toString());</span>
+<span class="fc" id="L178">    }</span>
+
+    @Test
+    public void lastKey() {
+<span class="fc" id="L182">        assertEquals(1, a.lastKey().intValue());</span>
+        try {
+<span class="nc" id="L184">            b.lastKey();</span>
+<span class="nc" id="L185">            fail();</span>
+<span class="pc" id="L186">        } catch (NoSuchElementException e) {</span>
+            // as expected
+        }
+<span class="fc" id="L189">    }</span>
+
+    @Test
+    public void search() {
+        // searching toward non-existent direction
+<span class="fc" id="L194">        assertNull(a.search(99, Direction.ASC));</span>
+<span class="fc" id="L195">        assertNull(a.search(-99, Direction.DESC));</span>
+<span class="fc" id="L196">    }</span>
+
+    @Issue(&quot;JENKINS-19418&quot;)
+    @Test
+    public void searchExactWhenIndexedButSoftReferenceExpired() throws IOException {
+<span class="fc" id="L201">        final FakeMap m = localExpiredBuilder.add(1).add(2).make();</span>
+
+        // force index creation
+<span class="fc" id="L204">        m.entrySet();</span>
+
+<span class="fc" id="L206">        m.search(1, Direction.EXACT).asserts(1);</span>
+<span class="fc" id="L207">        assertNull(m.search(3, Direction.EXACT));</span>
+<span class="fc" id="L208">        assertNull(m.search(0, Direction.EXACT));</span>
+<span class="fc" id="L209">    }</span>
+
+    @Issue(&quot;JENKINS-22681&quot;)
+    @Test public void exactSearchShouldNotReload() throws Exception {
+<span class="fc" id="L213">        FakeMap m = localBuilder.add(1).add(2).make();</span>
+<span class="fc" id="L214">        assertNull(m.search(0, Direction.EXACT));</span>
+<span class="fc" id="L215">        Build a = m.search(1, Direction.EXACT);</span>
+<span class="fc" id="L216">        a.asserts(1);</span>
+<span class="fc" id="L217">        Build b = m.search(2, Direction.EXACT);</span>
+<span class="fc" id="L218">        b.asserts(2);</span>
+<span class="fc" id="L219">        assertNull(m.search(0, Direction.EXACT));</span>
+<span class="fc" id="L220">        assertSame(a, m.search(1, Direction.EXACT));</span>
+<span class="fc" id="L221">        assertSame(b, m.search(2, Direction.EXACT));</span>
+<span class="fc" id="L222">        assertNull(m.search(3, Direction.EXACT));</span>
+<span class="fc" id="L223">        assertNull(m.search(0, Direction.EXACT));</span>
+<span class="fc" id="L224">        assertSame(a, m.search(1, Direction.EXACT));</span>
+<span class="fc" id="L225">        assertSame(&quot;#2 should not have been reloaded by searching for #3&quot;, b, m.search(2, Direction.EXACT));</span>
+<span class="fc" id="L226">        assertNull(m.search(3, Direction.EXACT));</span>
+<span class="fc" id="L227">    }</span>
+
+    /**
+     * If load fails, search needs to gracefully handle it
+     */
+    @Test
+    public void unloadableData() throws IOException {
+<span class="fc" id="L234">        FakeMap m = localBuilder.add(1).addUnloadable(3).add(5).make();</span>
+
+<span class="fc" id="L236">        assertNull(m.search(3, Direction.EXACT));</span>
+<span class="fc" id="L237">        m.search(3,Direction.DESC).asserts(1);</span>
+<span class="fc" id="L238">        m.search(3, Direction.ASC ).asserts(5);</span>
+<span class="fc" id="L239">    }</span>
+
+    @Test
+    public void eagerLoading() throws IOException {
+<span class="fc" id="L243">        Map.Entry[] b = a.entrySet().toArray(new Map.Entry[3]);</span>
+<span class="fc" id="L244">        ((Build)b[0].getValue()).asserts(5);</span>
+<span class="fc" id="L245">        ((Build)b[1].getValue()).asserts(3);</span>
+<span class="fc" id="L246">        ((Build)b[2].getValue()).asserts(1);</span>
+<span class="fc" id="L247">    }</span>
+
+    @Test
+    public void fastSubMap() throws Exception {
+<span class="fc" id="L251">        SortedMap&lt;Integer,Build&gt; m = a.subMap(99, 2);</span>
+<span class="fc" id="L252">        assertEquals(2, m.size());</span>
+
+<span class="fc" id="L254">        Build[] b = m.values().toArray(new Build[2]);</span>
+<span class="fc" id="L255">        assertEquals(2, b.length);</span>
+<span class="fc" id="L256">        b[0].asserts(5);</span>
+<span class="fc" id="L257">        b[1].asserts(3);</span>
+<span class="fc" id="L258">    }</span>
+
+    @Test
+    public void identity() {
+<span class="fc" id="L262">        assertTrue(a.equals(a));</span>
+<span class="pc bpc" id="L263" title="1 of 2 branches missed.">        assertTrue(!a.equals(b));</span>
+<span class="fc" id="L264">        a.hashCode();</span>
+<span class="fc" id="L265">        b.hashCode();</span>
+<span class="fc" id="L266">    }</span>
+
+    @Issue(&quot;JENKINS-15439&quot;)
+    @Test
+    public void indexOutOfBounds() throws Exception {
+<span class="fc" id="L271">        FakeMapBuilder f = localBuilder;</span>
+<span class="fc" id="L272">        f.add(100)</span>
+<span class="fc" id="L273">            .addUnloadable(150)</span>
+<span class="fc" id="L274">            .addUnloadable(151)</span>
+<span class="fc" id="L275">            .addUnloadable(152)</span>
+<span class="fc" id="L276">            .addUnloadable(153)</span>
+<span class="fc" id="L277">            .addUnloadable(154)</span>
+<span class="fc" id="L278">            .addUnloadable(155)</span>
+<span class="fc" id="L279">            .add(200)</span>
+<span class="fc" id="L280">            .add(201);</span>
+<span class="fc" id="L281">        FakeMap map = f.make();</span>
+
+<span class="fc" id="L283">        Build x = map.search(Integer.MAX_VALUE, Direction.DESC);</span>
+<span class="pc bpc" id="L284" title="3 of 4 branches missed.">        assert x.n==201;</span>
+<span class="fc" id="L285">    }</span>
+
+    @Issue(&quot;JENKINS-18065&quot;)
+    @Test public void all() throws Exception {
+<span class="fc" id="L289">        assertEquals(&quot;[]&quot;, a.getLoadedBuilds().keySet().toString());</span>
+<span class="fc" id="L290">        Set&lt;Map.Entry&lt;Integer,Build&gt;&gt; entries = a.entrySet();</span>
+<span class="fc" id="L291">        assertEquals(&quot;[]&quot;, a.getLoadedBuilds().keySet().toString());</span>
+<span class="fc" id="L292">        assertFalse(entries.isEmpty());</span>
+<span class="fc" id="L293">        assertEquals(&quot;5 since it is the latest&quot;, &quot;[5]&quot;, a.getLoadedBuilds().keySet().toString());</span>
+<span class="fc" id="L294">        assertEquals(5, a.getById(&quot;5&quot;).n);</span>
+<span class="fc" id="L295">        assertEquals(&quot;[5]&quot;, a.getLoadedBuilds().keySet().toString());</span>
+<span class="fc" id="L296">        assertEquals(1, a.getByNumber(1).n);</span>
+<span class="fc" id="L297">        assertEquals(&quot;[5, 1]&quot;, a.getLoadedBuilds().keySet().toString());</span>
+<span class="fc" id="L298">        a.purgeCache();</span>
+<span class="fc" id="L299">        assertEquals(&quot;[]&quot;, a.getLoadedBuilds().keySet().toString());</span>
+<span class="fc" id="L300">        Iterator&lt;Map.Entry&lt;Integer,Build&gt;&gt; iterator = entries.iterator();</span>
+<span class="fc" id="L301">        assertEquals(&quot;[5]&quot;, a.getLoadedBuilds().keySet().toString());</span>
+<span class="fc" id="L302">        assertTrue(iterator.hasNext());</span>
+<span class="fc" id="L303">        assertEquals(&quot;[5]&quot;, a.getLoadedBuilds().keySet().toString());</span>
+<span class="fc" id="L304">        Map.Entry&lt;Integer,Build&gt; entry = iterator.next();</span>
+<span class="fc" id="L305">        assertEquals(&quot;[5, 3]&quot;, a.getLoadedBuilds().keySet().toString());</span>
+<span class="fc" id="L306">        assertEquals(5, entry.getKey().intValue());</span>
+<span class="fc" id="L307">        assertEquals(&quot;[5, 3]&quot;, a.getLoadedBuilds().keySet().toString());</span>
+<span class="fc" id="L308">        assertEquals(5, entry.getValue().n);</span>
+<span class="fc" id="L309">        assertEquals(&quot;[5, 3]&quot;, a.getLoadedBuilds().keySet().toString());</span>
+<span class="fc" id="L310">        assertTrue(iterator.hasNext());</span>
+<span class="fc" id="L311">        entry = iterator.next();</span>
+<span class="fc" id="L312">        assertEquals(3, entry.getKey().intValue());</span>
+<span class="fc" id="L313">        assertEquals(&quot;.next() precomputes the one after that too&quot;, &quot;[5, 3, 1]&quot;, a.getLoadedBuilds().keySet().toString());</span>
+<span class="fc" id="L314">        assertEquals(3, entry.getValue().n);</span>
+<span class="fc" id="L315">        assertEquals(&quot;[5, 3, 1]&quot;, a.getLoadedBuilds().keySet().toString());</span>
+<span class="fc" id="L316">        assertTrue(iterator.hasNext());</span>
+<span class="fc" id="L317">        entry = iterator.next();</span>
+<span class="fc" id="L318">        assertEquals(1, entry.getKey().intValue());</span>
+<span class="fc" id="L319">        assertEquals(&quot;[5, 3, 1]&quot;, a.getLoadedBuilds().keySet().toString());</span>
+<span class="fc" id="L320">        assertEquals(1, entry.getValue().n);</span>
+<span class="fc" id="L321">        assertEquals(&quot;[5, 3, 1]&quot;, a.getLoadedBuilds().keySet().toString());</span>
+<span class="fc" id="L322">        assertFalse(iterator.hasNext());</span>
+<span class="fc" id="L323">    }</span>
+
+    @Issue(&quot;JENKINS-18065&quot;)
+    @Test
+    public void entrySetIterator() {
+<span class="fc" id="L328">        Iterator&lt;Entry&lt;Integer, Build&gt;&gt; itr = a.entrySet().iterator();</span>
+
+        // iterator, when created fresh, shouldn't force loading everything
+        // this involves binary searching, so it can load several.
+<span class="pc bpc" id="L332" title="1 of 2 branches missed.">        assertTrue(a.getLoadedBuilds().size() &lt; 3);</span>
+
+        // check if the first entry is legit
+<span class="fc" id="L335">        assertTrue(itr.hasNext());</span>
+<span class="fc" id="L336">        Entry&lt;Integer, Build&gt; e = itr.next();</span>
+<span class="fc" id="L337">        assertEquals((Integer)5,e.getKey());</span>
+<span class="fc" id="L338">        e.getValue().asserts(5);</span>
+
+        // now that the first entry is returned, we expect there to be two loaded
+<span class="pc bpc" id="L341" title="1 of 2 branches missed.">        assertTrue(a.getLoadedBuilds().size() &lt; 3);</span>
+
+        // check if the second entry is legit
+<span class="fc" id="L344">        assertTrue(itr.hasNext());</span>
+<span class="fc" id="L345">        e = itr.next();</span>
+<span class="fc" id="L346">        assertEquals((Integer)3, e.getKey());</span>
+<span class="fc" id="L347">        e.getValue().asserts(3);</span>
+
+        // repeat the process for the third one
+<span class="pc bpc" id="L350" title="1 of 2 branches missed.">        assertTrue(a.getLoadedBuilds().size() &lt;= 3);</span>
+
+        // check if the third entry is legit
+<span class="fc" id="L353">        assertTrue(itr.hasNext());</span>
+<span class="fc" id="L354">        e = itr.next();</span>
+<span class="fc" id="L355">        assertEquals((Integer) 1, e.getKey());</span>
+<span class="fc" id="L356">        e.getValue().asserts(1);</span>
+
+<span class="fc" id="L358">        assertFalse(itr.hasNext());</span>
+<span class="fc" id="L359">        assertEquals(3, a.getLoadedBuilds().size());</span>
+<span class="fc" id="L360">    }</span>
+
+    @Issue(&quot;JENKINS-18065&quot;)
+    @Test
+    public void entrySetEmpty() {
+        // entrySet().isEmpty() shouldn't cause full data load
+<span class="fc" id="L366">        assertFalse(a.entrySet().isEmpty());</span>
+<span class="pc bpc" id="L367" title="1 of 2 branches missed.">        assertTrue(a.getLoadedBuilds().size() &lt; 3);</span>
+<span class="fc" id="L368">    }</span>
+
+    @Issue(&quot;JENKINS-18065&quot;)
+    @Test
+    public void entrySetSize() {
+<span class="fc" id="L373">        assertEquals(3, a.entrySet().size());</span>
+<span class="fc" id="L374">        assertEquals(0, b.entrySet().size());</span>
+<span class="fc" id="L375">    }</span>
+
+    @Issue(&quot;JENKINS-25655&quot;)
+    @Test public void entrySetChanges() {
+<span class="fc" id="L379">        assertEquals(3, a.entrySet().size());</span>
+<span class="fc" id="L380">        a.put(new Build(7));</span>
+<span class="fc" id="L381">        assertEquals(4, a.entrySet().size());</span>
+<span class="fc" id="L382">    }</span>
+
+    @Issue(&quot;JENKINS-18065&quot;)
+    @Test
+    public void entrySetContains() {
+<span class="fc bfc" id="L387" title="All 2 branches covered.">        for (Entry&lt;Integer, Build&gt; e : a.entrySet()) {</span>
+<span class="fc" id="L388">            assertTrue(a.entrySet().contains(e));</span>
+        }
+<span class="fc" id="L390">    }</span>
+
+    @Issue(&quot;JENKINS-22767&quot;)
+    @Test
+    public void slowRetrieve() throws Exception {
+<span class="fc bfc" id="L395" title="All 2 branches covered.">        for (int i = 1; i &lt;= 3; i++) {</span>
+<span class="fc" id="L396">            slowBuilder.add(i);</span>
+<span class="fc" id="L397">            slowBuilderStartSemaphores.put(i, new Semaphore(0));</span>
+<span class="fc" id="L398">            slowBuilderEndSemaphores.put(i, new Semaphore(0));</span>
+<span class="fc" id="L399">            slowBuilderLoadCount.put(i, new AtomicInteger());</span>
+        }
+<span class="fc" id="L401">        final FakeMap m = slowBuilder.make();</span>
+<span class="fc" id="L402">        Future&lt;Build&gt; firstLoad = Timer.get().submit(new Callable&lt;Build&gt;() {</span>
+            @Override
+            public Build call() throws Exception {
+<span class="fc" id="L405">                return m.getByNumber(2);</span>
+            }
+        });
+<span class="fc" id="L408">        Future&lt;Build&gt; secondLoad = Timer.get().submit(new Callable&lt;Build&gt;() {</span>
+            @Override
+            public Build call() throws Exception {
+<span class="fc" id="L411">                return m.getByNumber(2);</span>
+            }
+        });
+<span class="fc" id="L414">        slowBuilderStartSemaphores.get(2).acquire(1);</span>
+        // now one of them is inside retrieve(…); the other is waiting for the lock
+<span class="fc" id="L416">        slowBuilderEndSemaphores.get(2).release(2); // allow both to proceed</span>
+<span class="fc" id="L417">        Build first = firstLoad.get();</span>
+<span class="fc" id="L418">        Build second = secondLoad.get();</span>
+<span class="fc" id="L419">        assertEquals(1, slowBuilderLoadCount.get(2).get());</span>
+<span class="fc" id="L420">        assertSame(second, first);</span>
+<span class="fc" id="L421">    }</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

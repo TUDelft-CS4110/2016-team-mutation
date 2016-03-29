@@ -1,0 +1,267 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>SimpleScheduledRetentionStrategy.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.slaves</a> &gt; <span class="el_source">SimpleScheduledRetentionStrategy.java</span></div><h1>SimpleScheduledRetentionStrategy.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">/*</span>
+ * The MIT License
+ *
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc., Kohsuke Kawaguchi, Stephen Connolly
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.slaves;
+
+import antlr.ANTLRException;
+import hudson.Extension;
+import static hudson.Util.fixNull;
+import hudson.model.Computer;
+import hudson.model.Descriptor;
+import hudson.model.Queue;
+import hudson.scheduler.CronTabList;
+import hudson.util.FormValidation;
+import org.kohsuke.stapler.DataBoundConstructor;
+import org.kohsuke.stapler.QueryParameter;
+
+import javax.annotation.concurrent.GuardedBy;
+import java.io.InvalidObjectException;
+import java.io.ObjectStreamException;
+import java.util.Calendar;
+import java.util.GregorianCalendar;
+import java.util.concurrent.ExecutionException;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import static java.util.logging.Level.INFO;
+
+/**
+ * {@link RetentionStrategy} that controls the slave based on a schedule.
+ *
+ * @author Stephen Connolly
+ * @since 1.275
+ */
+public class SimpleScheduledRetentionStrategy extends RetentionStrategy&lt;SlaveComputer&gt; {
+
+<span class="nc" id="L55">    private static final Logger LOGGER = Logger.getLogger(SimpleScheduledRetentionStrategy.class.getName());</span>
+
+    private final String startTimeSpec;
+    private transient CronTabList tabs;
+    private transient Calendar lastChecked;
+<span class="nc" id="L60">    private transient long nextStop = Long.MIN_VALUE;</span>
+<span class="nc" id="L61">    private transient long nextStart = Long.MIN_VALUE;</span>
+<span class="nc" id="L62">    private transient long lastStop = Long.MAX_VALUE;</span>
+<span class="nc" id="L63">    private transient long lastStart = Long.MAX_VALUE;</span>
+    private final int upTimeMins;
+    private final boolean keepUpWhenActive;
+
+    @DataBoundConstructor
+<span class="nc" id="L68">    public SimpleScheduledRetentionStrategy(String startTimeSpec, int upTimeMins, boolean keepUpWhenActive)</span>
+            throws ANTLRException {
+<span class="nc" id="L70">        this.startTimeSpec = startTimeSpec;</span>
+<span class="nc" id="L71">        this.keepUpWhenActive = keepUpWhenActive;</span>
+<span class="nc" id="L72">        this.tabs = CronTabList.create(startTimeSpec);</span>
+<span class="nc" id="L73">        this.lastChecked = new GregorianCalendar();</span>
+<span class="nc" id="L74">        this.upTimeMins = Math.max(1, upTimeMins);</span>
+<span class="nc" id="L75">        this.lastChecked.add(Calendar.MINUTE, -1);</span>
+<span class="nc" id="L76">    }</span>
+
+    public int getUpTimeMins() {
+<span class="nc" id="L79">        return upTimeMins;</span>
+    }
+
+    public boolean isKeepUpWhenActive() {
+<span class="nc" id="L83">        return keepUpWhenActive;</span>
+    }
+
+    public String getStartTimeSpec() {
+<span class="nc" id="L87">        return startTimeSpec;</span>
+    }
+
+    private synchronized void updateStartStopWindow() {
+<span class="nc bnc" id="L91" title="All 4 branches missed.">        if (lastStart == Long.MAX_VALUE &amp;&amp; lastStop == Long.MAX_VALUE) {</span>
+            // we need to initialize
+
+            // get some useful default values for the lastStart and lastStop... they should be in the past and at least
+            // less than any useful real last start/stop
+            // so default lastStart = now - upTime * 3, and lastStop = now - upTime * 2
+<span class="nc" id="L97">            Calendar time = new GregorianCalendar();</span>
+<span class="nc" id="L98">            time.add(Calendar.MINUTE, -upTimeMins);</span>
+<span class="nc" id="L99">            time.add(Calendar.MINUTE, -upTimeMins);</span>
+<span class="nc" id="L100">            time.add(Calendar.MINUTE, -upTimeMins);</span>
+<span class="nc" id="L101">            lastStart = time.getTimeInMillis();</span>
+<span class="nc" id="L102">            time.add(Calendar.MINUTE, upTimeMins);</span>
+<span class="nc" id="L103">            lastStop = time.getTimeInMillis();</span>
+
+            // we're only interested in the last start if it is less than the upTimeMins ago
+            // any older and last Start is not relevant as the node should be stopped
+<span class="nc" id="L107">            time = new GregorianCalendar();</span>
+<span class="nc" id="L108">            time.add(Calendar.MINUTE, -upTimeMins);</span>
+<span class="nc" id="L109">            time.add(Calendar.MINUTE, -1);</span>
+
+<span class="nc bnc" id="L111" title="All 2 branches missed.">            while (System.currentTimeMillis() + 1000 &gt; time.getTimeInMillis()) {</span>
+<span class="nc bnc" id="L112" title="All 2 branches missed.">                if (tabs.check(time)) {</span>
+<span class="nc" id="L113">                    lastStart = time.getTimeInMillis();</span>
+<span class="nc" id="L114">                    time.add(Calendar.MINUTE, upTimeMins);</span>
+<span class="nc" id="L115">                    lastStop = time.getTimeInMillis();</span>
+<span class="nc" id="L116">                    break;</span>
+                }
+<span class="nc" id="L118">                time.add(Calendar.MINUTE, 1);</span>
+            }
+<span class="nc" id="L120">            nextStart = lastStart;</span>
+<span class="nc" id="L121">            nextStop = lastStop;</span>
+        }
+<span class="nc bnc" id="L123" title="All 2 branches missed.">        if (nextStop &lt; System.currentTimeMillis()) {</span>
+            // next stop is in the past
+<span class="nc" id="L125">            lastStart = nextStart;</span>
+<span class="nc" id="L126">            lastStop = nextStop;</span>
+
+            // we don't want to look too far into the future
+<span class="nc" id="L129">            Calendar time = new GregorianCalendar();</span>
+<span class="nc" id="L130">            time.add(Calendar.MINUTE, Math.min(15, upTimeMins));</span>
+<span class="nc" id="L131">            long stopLooking = time.getTimeInMillis();</span>
+<span class="nc" id="L132">            time.setTimeInMillis(nextStop);</span>
+<span class="nc bnc" id="L133" title="All 2 branches missed.">            while (stopLooking &gt; time.getTimeInMillis()) {</span>
+<span class="nc bnc" id="L134" title="All 2 branches missed.">                if (tabs.check(time)) {</span>
+<span class="nc" id="L135">                    nextStart = time.getTimeInMillis();</span>
+<span class="nc" id="L136">                    time.add(Calendar.MINUTE, upTimeMins);</span>
+<span class="nc" id="L137">                    nextStop = time.getTimeInMillis();</span>
+<span class="nc" id="L138">                    break;</span>
+                }
+<span class="nc" id="L140">                time.add(Calendar.MINUTE, 1);</span>
+            }
+        }
+<span class="nc" id="L143">    }</span>
+
+    protected synchronized Object readResolve() throws ObjectStreamException {
+        try {
+<span class="nc" id="L147">            tabs = CronTabList.create(startTimeSpec);</span>
+<span class="nc" id="L148">            lastChecked = new GregorianCalendar();</span>
+<span class="nc" id="L149">            this.lastChecked.add(Calendar.MINUTE, -1);</span>
+<span class="nc" id="L150">            nextStop = Long.MIN_VALUE;</span>
+<span class="nc" id="L151">            nextStart = Long.MIN_VALUE;</span>
+<span class="nc" id="L152">            lastStop = Long.MAX_VALUE;</span>
+<span class="nc" id="L153">            lastStart = Long.MAX_VALUE;</span>
+<span class="nc" id="L154">        } catch (ANTLRException e) {</span>
+<span class="nc" id="L155">            InvalidObjectException x = new InvalidObjectException(e.getMessage());</span>
+<span class="nc" id="L156">            x.initCause(e);</span>
+<span class="nc" id="L157">            throw x;</span>
+        }
+<span class="nc" id="L159">        return this;</span>
+    }
+
+    @Override
+    public boolean isManualLaunchAllowed(final SlaveComputer c) {
+<span class="nc" id="L164">        return isOnlineScheduled();</span>
+    }
+
+    @GuardedBy(&quot;hudson.model.Queue.lock&quot;)
+    public synchronized long check(final SlaveComputer c) {
+<span class="nc" id="L169">        boolean shouldBeOnline = isOnlineScheduled();</span>
+<span class="nc" id="L170">        LOGGER.log(Level.FINE, &quot;Checking computer {0} against schedule. online = {1}, shouldBeOnline = {2}&quot;,</span>
+<span class="nc" id="L171">                new Object[]{c.getName(), c.isOnline(), shouldBeOnline});</span>
+<span class="nc bnc" id="L172" title="All 4 branches missed.">        if (shouldBeOnline &amp;&amp; c.isOffline()) {</span>
+<span class="nc" id="L173">            LOGGER.log(INFO, &quot;Trying to launch computer {0} as schedule says it should be on-line at &quot;</span>
+<span class="nc" id="L174">                    + &quot;this point in time&quot;, new Object[]{c.getName()});</span>
+<span class="nc bnc" id="L175" title="All 2 branches missed.">            if (c.isLaunchSupported()) {</span>
+<span class="nc" id="L176">                Computer.threadPoolForRemoting.submit(new Runnable() {</span>
+                    public void run() {
+                        try {
+<span class="nc" id="L179">                            c.connect(true).get();</span>
+<span class="nc bnc" id="L180" title="All 2 branches missed.">                            if (c.isOnline()) {</span>
+<span class="nc" id="L181">                                LOGGER.log(INFO, &quot;Launched computer {0} per schedule&quot;, new Object[]{c.getName()});</span>
+                            }
+<span class="nc bnc" id="L183" title="All 6 branches missed.">                            if (keepUpWhenActive &amp;&amp; c.isOnline() &amp;&amp; !c.isAcceptingTasks()) {</span>
+<span class="nc" id="L184">                                LOGGER.log(INFO,</span>
+<span class="nc" id="L185">                                        &quot;Enabling new jobs for computer {0} as it has started its scheduled uptime&quot;,</span>
+<span class="nc" id="L186">                                        new Object[]{c.getName()});</span>
+<span class="nc" id="L187">                                c.setAcceptingTasks(true);</span>
+                            }
+<span class="nc" id="L189">                        } catch (InterruptedException e) {</span>
+<span class="nc" id="L190">                        } catch (ExecutionException e) {</span>
+                        }
+<span class="nc" id="L192">                    }</span>
+                });
+            }
+<span class="nc bnc" id="L195" title="All 4 branches missed.">        } else if (!shouldBeOnline &amp;&amp; c.isOnline()) {</span>
+<span class="nc bnc" id="L196" title="All 2 branches missed.">            if (keepUpWhenActive) {</span>
+<span class="nc bnc" id="L197" title="All 4 branches missed.">                if (!c.isIdle() &amp;&amp; c.isAcceptingTasks()) {</span>
+<span class="nc" id="L198">                    c.setAcceptingTasks(false);</span>
+<span class="nc" id="L199">                    LOGGER.log(INFO,</span>
+<span class="nc" id="L200">                            &quot;Disabling new jobs for computer {0} as it has finished its scheduled uptime&quot;,</span>
+<span class="nc" id="L201">                            new Object[]{c.getName()});</span>
+<span class="nc" id="L202">                    return 1;</span>
+<span class="nc bnc" id="L203" title="All 4 branches missed.">                } else if (c.isIdle() &amp;&amp; c.isAcceptingTasks()) {</span>
+<span class="nc" id="L204">                    Queue.withLock(new Runnable() {</span>
+                        @Override
+                        public void run() {
+<span class="nc bnc" id="L207" title="All 2 branches missed.">                            if (c.isIdle()) {</span>
+<span class="nc" id="L208">                                LOGGER.log(INFO, &quot;Disconnecting computer {0} as it has finished its scheduled uptime&quot;,</span>
+<span class="nc" id="L209">                                        new Object[]{c.getName()});</span>
+<span class="nc" id="L210">                                c.disconnect(OfflineCause</span>
+<span class="nc" id="L211">                                        .create(Messages._SimpleScheduledRetentionStrategy_FinishedUpTime()));</span>
+<span class="nc" id="L212">                            } else {</span>
+<span class="nc" id="L213">                                c.setAcceptingTasks(false);</span>
+                            }
+<span class="nc" id="L215">                        }</span>
+                    });
+<span class="nc bnc" id="L217" title="All 4 branches missed.">                } else if (c.isIdle() &amp;&amp; !c.isAcceptingTasks()) {</span>
+<span class="nc" id="L218">                    Queue.withLock(new Runnable() {</span>
+                        @Override
+                        public void run() {
+<span class="nc bnc" id="L221" title="All 2 branches missed.">                            if (c.isIdle()) {</span>
+<span class="nc" id="L222">                                LOGGER.log(INFO, &quot;Disconnecting computer {0} as it has finished all jobs running when &quot;</span>
+<span class="nc" id="L223">                                        + &quot;it completed its scheduled uptime&quot;, new Object[]{c.getName()});</span>
+<span class="nc" id="L224">                                c.disconnect(OfflineCause</span>
+<span class="nc" id="L225">                                        .create(Messages._SimpleScheduledRetentionStrategy_FinishedUpTime()));</span>
+                            }
+<span class="nc" id="L227">                        }</span>
+                    });
+                }
+<span class="nc" id="L230">            } else {</span>
+                // no need to get the queue lock as the user has selected the break builds option!
+<span class="nc" id="L232">                LOGGER.log(INFO, &quot;Disconnecting computer {0} as it has finished its scheduled uptime&quot;,</span>
+<span class="nc" id="L233">                        new Object[]{c.getName()});</span>
+<span class="nc" id="L234">                c.disconnect(OfflineCause.create(Messages._SimpleScheduledRetentionStrategy_FinishedUpTime()));</span>
+            }
+        }
+<span class="nc" id="L237">        return 1;</span>
+    }
+
+    private boolean isOnlineScheduled() {
+<span class="nc" id="L241">        updateStartStopWindow();</span>
+<span class="nc" id="L242">        long now = System.currentTimeMillis();</span>
+<span class="nc bnc" id="L243" title="All 8 branches missed.">        return (lastStart &lt; now &amp;&amp; lastStop &gt; now) || (nextStart &lt; now &amp;&amp; nextStop &gt; now);</span>
+    }
+
+    @Extension
+<span class="nc" id="L247">    public static class DescriptorImpl extends Descriptor&lt;RetentionStrategy&lt;?&gt;&gt; {</span>
+        public String getDisplayName() {
+<span class="nc" id="L249">            return Messages.SimpleScheduledRetentionStrategy_displayName();</span>
+        }
+
+        /**
+         * Performs syntax check.
+         */
+        public FormValidation doCheck(@QueryParameter String value) {
+            try {
+<span class="nc" id="L257">                String msg = CronTabList.create(fixNull(value)).checkSanity();</span>
+<span class="nc bnc" id="L258" title="All 2 branches missed.">                if (msg != null)</span>
+<span class="nc" id="L259">                    return FormValidation.warning(msg);</span>
+<span class="nc" id="L260">                return FormValidation.ok();</span>
+<span class="nc" id="L261">            } catch (ANTLRException e) {</span>
+<span class="nc" id="L262">                return FormValidation.error(e.getMessage());</span>
+            }
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

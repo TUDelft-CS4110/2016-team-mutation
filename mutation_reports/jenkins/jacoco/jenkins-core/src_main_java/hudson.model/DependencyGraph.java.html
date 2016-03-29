@@ -1,0 +1,492 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>DependencyGraph.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.model</a> &gt; <span class="el_source">DependencyGraph.java</span></div><h1>DependencyGraph.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">/*</span>
+ * The MIT License
+ *
+ * Copyright (c) 2004-2010, Sun Microsystems, Inc., Kohsuke Kawaguchi,
+ * Martin Eigenbrodt. Seiji Sogabe, Alan Harder
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.model;
+
+import jenkins.model.DependencyDeclarer;
+import com.google.common.collect.ImmutableList;
+import hudson.security.ACL;
+import jenkins.model.Jenkins;
+import jenkins.util.DirectedGraph;
+import jenkins.util.DirectedGraph.SCC;
+import org.acegisecurity.context.SecurityContext;
+import org.acegisecurity.context.SecurityContextHolder;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.ListIterator;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Set;
+import java.util.Stack;
+
+/**
+ * Maintains the build dependencies between {@link AbstractProject}s
+ * for efficient dependency computation.
+ *
+ * &lt;p&gt;
+ * The &quot;master&quot; data of dependencies are owned/persisted/maintained by
+ * individual {@link AbstractProject}s, but because of that, it's relatively
+ * slow  to compute backward edges.
+ *
+ * &lt;p&gt;
+ * This class builds the complete bi-directional dependency graph
+ * by collecting information from all {@link AbstractProject}s.
+ *
+ * &lt;p&gt;
+ * Once built, {@link DependencyGraph} is immutable, and every time
+ * there's a change (which is relatively rare), a new instance
+ * will be created. This eliminates the need of synchronization.
+ *
+ * @see Jenkins#getDependencyGraph()
+ * @author Kohsuke Kawaguchi
+ */
+public class DependencyGraph implements Comparator&lt;AbstractProject&gt; {
+
+<span class="nc" id="L73">    private Map&lt;AbstractProject, List&lt;DependencyGroup&gt;&gt; forward = new HashMap&lt;AbstractProject, List&lt;DependencyGroup&gt;&gt;();</span>
+<span class="nc" id="L74">    private Map&lt;AbstractProject, List&lt;DependencyGroup&gt;&gt; backward = new HashMap&lt;AbstractProject, List&lt;DependencyGroup&gt;&gt;();</span>
+
+    private transient Map&lt;Class&lt;?&gt;, Object&gt; computationalData;
+
+    private boolean built;
+
+    private Comparator&lt;AbstractProject&lt;?,?&gt;&gt; topologicalOrder;
+    private List&lt;AbstractProject&lt;?,?&gt;&gt; topologicallySorted;
+
+    /**
+     * Builds the dependency graph.
+     */
+<span class="nc" id="L86">    public DependencyGraph() {</span>
+<span class="nc" id="L87">    }</span>
+    
+    public void build() {
+        // Set full privileges while computing to avoid missing any projects the current user cannot see.
+<span class="nc" id="L91">        SecurityContext saveCtx = ACL.impersonate(ACL.SYSTEM);</span>
+        try {
+<span class="nc" id="L93">            this.computationalData = new HashMap&lt;Class&lt;?&gt;, Object&gt;();</span>
+<span class="nc bnc" id="L94" title="All 2 branches missed.">            for( AbstractProject p : getAllProjects() )</span>
+<span class="nc" id="L95">                p.buildDependencyGraph(this);</span>
+
+<span class="nc" id="L97">            forward = finalize(forward);</span>
+<span class="nc" id="L98">            backward = finalize(backward);</span>
+<span class="nc" id="L99">            topologicalDagSort();</span>
+<span class="nc" id="L100">            this.computationalData = null;</span>
+<span class="nc" id="L101">            built = true;</span>
+<span class="nc" id="L102">        } finally {</span>
+<span class="nc" id="L103">            SecurityContextHolder.setContext(saveCtx);</span>
+<span class="nc" id="L104">        }</span>
+<span class="nc" id="L105">    }</span>
+
+    /**
+     *
+     *
+     * See http://en.wikipedia.org/wiki/Tarjan's_strongly_connected_components_algorithm
+     */
+    private void topologicalDagSort() {
+<span class="nc" id="L113">        DirectedGraph&lt;AbstractProject&gt; g = new DirectedGraph&lt;AbstractProject&gt;() {</span>
+            @Override
+            protected Collection&lt;AbstractProject&gt; nodes() {
+<span class="nc" id="L116">                final Set&lt;AbstractProject&gt; nodes = new HashSet&lt;AbstractProject&gt;();</span>
+<span class="nc" id="L117">                nodes.addAll(forward.keySet());</span>
+<span class="nc" id="L118">                nodes.addAll(backward.keySet());</span>
+<span class="nc" id="L119">                return nodes;</span>
+            }
+
+            @Override
+            protected Collection&lt;AbstractProject&gt; forward(AbstractProject node) {
+<span class="nc" id="L124">                return getDownstream(node);</span>
+            }
+        };
+
+<span class="nc" id="L128">        List&lt;SCC&lt;AbstractProject&gt;&gt; sccs = g.getStronglyConnectedComponents();</span>
+
+<span class="nc" id="L130">        final Map&lt;AbstractProject,Integer&gt; topoOrder = new HashMap&lt;AbstractProject,Integer&gt;();</span>
+<span class="nc" id="L131">        topologicallySorted = new ArrayList&lt;AbstractProject&lt;?,?&gt;&gt;();</span>
+<span class="nc" id="L132">        int idx=0;</span>
+<span class="nc bnc" id="L133" title="All 2 branches missed.">        for (SCC&lt;AbstractProject&gt; scc : sccs) {</span>
+<span class="nc bnc" id="L134" title="All 2 branches missed.">            for (AbstractProject n : scc) {</span>
+<span class="nc" id="L135">                topoOrder.put(n,idx++);</span>
+<span class="nc" id="L136">                topologicallySorted.add(n);</span>
+            }
+        }
+
+<span class="nc" id="L140">        topologicalOrder = new Comparator&lt;AbstractProject&lt;?, ?&gt;&gt;() {</span>
+            @Override
+            public int compare(AbstractProject&lt;?,?&gt; o1, AbstractProject&lt;?,?&gt; o2) {
+<span class="nc" id="L143">                return topoOrder.get(o1)-topoOrder.get(o2);</span>
+            }
+        };
+
+<span class="nc" id="L147">        topologicallySorted = Collections.unmodifiableList(topologicallySorted);</span>
+<span class="nc" id="L148">    }</span>
+
+    Collection&lt;AbstractProject&gt; getAllProjects() {
+<span class="nc" id="L151">        return Jenkins.getInstance().getAllItems(AbstractProject.class);</span>
+    }
+
+    /**
+     * Special constructor for creating an empty graph
+     */
+<span class="nc" id="L157">    private DependencyGraph(boolean dummy) {</span>
+<span class="nc" id="L158">        forward = backward = Collections.emptyMap();</span>
+<span class="nc" id="L159">        topologicalDagSort();</span>
+<span class="nc" id="L160">        built = true;</span>
+<span class="nc" id="L161">    }</span>
+
+    /**
+     * Adds data which is useful for the time when the dependency graph is built up.
+     * All this data will be cleaned once the dependency graph creation has finished.
+     */
+    public &lt;T&gt; void putComputationalData(Class&lt;T&gt; key, T value) {
+<span class="nc" id="L168">        this.computationalData.put(key, value);</span>
+<span class="nc" id="L169">    }</span>
+
+    /**
+     * Gets temporary data which is needed for building up the dependency graph.
+     */
+    public &lt;T&gt; T getComputationalData(Class&lt;T&gt; key) {
+        @SuppressWarnings(&quot;unchecked&quot;)
+<span class="nc" id="L176">        T result = (T) this.computationalData.get(key);</span>
+<span class="nc" id="L177">        return result;</span>
+    }
+
+    /**
+     * Gets all the immediate downstream projects (IOW forward edges) of the given project.
+     *
+     * @return
+     *      can be empty but never null.
+     */
+    public List&lt;AbstractProject&gt; getDownstream(AbstractProject p) {
+<span class="nc" id="L187">        return get(forward,p,false);</span>
+    }
+
+    /**
+     * Gets all the immediate upstream projects (IOW backward edges) of the given project.
+     *
+     * @return
+     *      can be empty but never null.
+     */
+    public List&lt;AbstractProject&gt; getUpstream(AbstractProject p) {
+<span class="nc" id="L197">        return get(backward,p,true);</span>
+    }
+
+    private List&lt;AbstractProject&gt; get(Map&lt;AbstractProject, List&lt;DependencyGroup&gt;&gt; map, AbstractProject src, boolean up) {
+<span class="nc" id="L201">        List&lt;DependencyGroup&gt; v = map.get(src);</span>
+<span class="nc bnc" id="L202" title="All 2 branches missed.">        if(v==null) return Collections.emptyList();</span>
+<span class="nc" id="L203">        List&lt;AbstractProject&gt; result = new ArrayList&lt;AbstractProject&gt;(v.size());</span>
+<span class="nc bnc" id="L204" title="All 4 branches missed.">        for (DependencyGroup d : v) result.add(up ? d.getUpstreamProject() : d.getDownstreamProject());</span>
+<span class="nc" id="L205">        return result;</span>
+    }
+
+    /**
+     * @since 1.341
+     */
+    public List&lt;Dependency&gt; getDownstreamDependencies(AbstractProject p) {
+<span class="nc" id="L212">        return get(forward,p);</span>
+    }
+
+    /**
+     * @since 1.341
+     */
+    public List&lt;Dependency&gt; getUpstreamDependencies(AbstractProject p) {
+<span class="nc" id="L219">        return get(backward,p);</span>
+    }
+
+    private List&lt;Dependency&gt; get(Map&lt;AbstractProject, List&lt;DependencyGroup&gt;&gt; map, AbstractProject src) {
+<span class="nc" id="L223">        List&lt;DependencyGroup&gt; v = map.get(src);</span>
+<span class="nc bnc" id="L224" title="All 2 branches missed.">        if(v==null) {</span>
+<span class="nc" id="L225">            return ImmutableList.of();</span>
+        } else {
+<span class="nc" id="L227">            ImmutableList.Builder&lt;Dependency&gt; builder = ImmutableList.builder();</span>
+<span class="nc bnc" id="L228" title="All 2 branches missed.">            for (DependencyGroup dependencyGroup : v) {</span>
+<span class="nc" id="L229">                builder.addAll(dependencyGroup.getGroup());</span>
+            }
+<span class="nc" id="L231">            return builder.build();</span>
+        }
+
+    }
+
+    /**
+     * @deprecated since 1.341; use {@link #addDependency(Dependency)}
+     */
+    @Deprecated
+    public void addDependency(AbstractProject upstream, AbstractProject downstream) {
+<span class="nc" id="L241">        addDependency(new Dependency(upstream,downstream));</span>
+<span class="nc" id="L242">    }</span>
+
+    /**
+     * Called during the dependency graph build phase to add a dependency edge.
+     */
+    public void addDependency(Dependency dep) {
+<span class="nc bnc" id="L248" title="All 2 branches missed.">        if(built)</span>
+<span class="nc" id="L249">            throw new IllegalStateException();</span>
+<span class="nc" id="L250">        add(forward,dep.getUpstreamProject(),dep);</span>
+<span class="nc" id="L251">        add(backward, dep.getDownstreamProject(), dep);</span>
+<span class="nc" id="L252">    }</span>
+
+    /**
+     * @deprecated since 1.341
+     */
+    @Deprecated
+    public void addDependency(AbstractProject upstream, Collection&lt;? extends AbstractProject&gt; downstream) {
+<span class="nc bnc" id="L259" title="All 2 branches missed.">        for (AbstractProject p : downstream)</span>
+<span class="nc" id="L260">            addDependency(upstream,p);</span>
+<span class="nc" id="L261">    }</span>
+
+    /**
+     * @deprecated since 1.341
+     */
+    @Deprecated
+    public void addDependency(Collection&lt;? extends AbstractProject&gt; upstream, AbstractProject downstream) {
+<span class="nc bnc" id="L268" title="All 2 branches missed.">        for (AbstractProject p : upstream)</span>
+<span class="nc" id="L269">            addDependency(p,downstream);</span>
+<span class="nc" id="L270">    }</span>
+
+    /**
+     * Lists up {@link DependencyDeclarer} from the collection and let them builds dependencies.
+     */
+    public void addDependencyDeclarers(AbstractProject upstream, Collection&lt;?&gt; possibleDependecyDeclarers) {
+<span class="nc bnc" id="L276" title="All 2 branches missed.">        for (Object o : possibleDependecyDeclarers) {</span>
+<span class="nc bnc" id="L277" title="All 2 branches missed.">            if (o instanceof DependencyDeclarer) {</span>
+<span class="nc" id="L278">                DependencyDeclarer dd = (DependencyDeclarer) o;</span>
+<span class="nc" id="L279">                dd.buildDependencyGraph(upstream,this);</span>
+            }
+        }
+<span class="nc" id="L282">    }</span>
+
+    /**
+     * Returns true if a project has a non-direct dependency to another project.
+     * &lt;p&gt;
+     * A non-direct dependency is a path of dependency &quot;edge&quot;s from the source to the destination,
+     * where the length is greater than 1.
+     */
+    public boolean hasIndirectDependencies(AbstractProject src, AbstractProject dst) {
+<span class="nc" id="L291">        Set&lt;AbstractProject&gt; visited = new HashSet&lt;AbstractProject&gt;();</span>
+<span class="nc" id="L292">        Stack&lt;AbstractProject&gt; queue = new Stack&lt;AbstractProject&gt;();</span>
+
+<span class="nc" id="L294">        queue.addAll(getDownstream(src));</span>
+<span class="nc" id="L295">        queue.remove(dst);</span>
+
+<span class="nc bnc" id="L297" title="All 2 branches missed.">        while(!queue.isEmpty()) {</span>
+<span class="nc" id="L298">            AbstractProject p = queue.pop();</span>
+<span class="nc bnc" id="L299" title="All 2 branches missed.">            if(p==dst)</span>
+<span class="nc" id="L300">                return true;</span>
+<span class="nc bnc" id="L301" title="All 2 branches missed.">            if(visited.add(p))</span>
+<span class="nc" id="L302">                queue.addAll(getDownstream(p));</span>
+        }
+
+<span class="nc" id="L305">        return false;</span>
+    }
+
+    /**
+     * Gets all the direct and indirect upstream dependencies of the given project.
+     */
+    public Set&lt;AbstractProject&gt; getTransitiveUpstream(AbstractProject src) {
+<span class="nc" id="L312">        return getTransitive(backward,src,true);</span>
+    }
+
+    /**
+     * Gets all the direct and indirect downstream dependencies of the given project.
+     */
+    public Set&lt;AbstractProject&gt; getTransitiveDownstream(AbstractProject src) {
+<span class="nc" id="L319">        return getTransitive(forward,src,false);</span>
+    }
+
+    private Set&lt;AbstractProject&gt; getTransitive(Map&lt;AbstractProject, List&lt;DependencyGroup&gt;&gt; direction, AbstractProject src, boolean up) {
+<span class="nc" id="L323">        Set&lt;AbstractProject&gt; visited = new HashSet&lt;AbstractProject&gt;();</span>
+<span class="nc" id="L324">        Stack&lt;AbstractProject&gt; queue = new Stack&lt;AbstractProject&gt;();</span>
+
+<span class="nc" id="L326">        queue.add(src);</span>
+
+<span class="nc bnc" id="L328" title="All 2 branches missed.">        while(!queue.isEmpty()) {</span>
+<span class="nc" id="L329">            AbstractProject p = queue.pop();</span>
+
+<span class="nc bnc" id="L331" title="All 2 branches missed.">            for (AbstractProject child : get(direction,p,up)) {</span>
+<span class="nc bnc" id="L332" title="All 2 branches missed.">                if(visited.add(child))</span>
+<span class="nc" id="L333">                    queue.add(child);</span>
+            }
+        }
+
+<span class="nc" id="L337">        return visited;</span>
+    }
+
+    private void add(Map&lt;AbstractProject, List&lt;DependencyGroup&gt;&gt; map, AbstractProject key, Dependency dep) {
+<span class="nc" id="L341">        List&lt;DependencyGroup&gt; set = map.get(key);</span>
+<span class="nc bnc" id="L342" title="All 2 branches missed.">        if(set==null) {</span>
+<span class="nc" id="L343">            set = new ArrayList&lt;DependencyGroup&gt;();</span>
+<span class="nc" id="L344">            map.put(key,set);</span>
+        }
+<span class="nc bnc" id="L346" title="All 2 branches missed.">        for (ListIterator&lt;DependencyGroup&gt; it = set.listIterator(); it.hasNext();) {</span>
+<span class="nc" id="L347">            DependencyGroup d = it.next();</span>
+            // Check for existing edge that connects the same two projects:
+<span class="nc bnc" id="L349" title="All 4 branches missed.">            if (d.getUpstreamProject()==dep.getUpstreamProject() &amp;&amp; d.getDownstreamProject()==dep.getDownstreamProject()) {</span>
+<span class="nc" id="L350">                d.add(dep);</span>
+<span class="nc" id="L351">                return;</span>
+            }
+        }
+        // Otherwise add to list:
+<span class="nc" id="L355">        set.add(new DependencyGroup(dep));</span>
+<span class="nc" id="L356">    }</span>
+
+    private Map&lt;AbstractProject, List&lt;DependencyGroup&gt;&gt; finalize(Map&lt;AbstractProject, List&lt;DependencyGroup&gt;&gt; m) {
+<span class="nc bnc" id="L359" title="All 2 branches missed.">        for (Entry&lt;AbstractProject, List&lt;DependencyGroup&gt;&gt; e : m.entrySet()) {</span>
+<span class="nc" id="L360">            Collections.sort( e.getValue(), NAME_COMPARATOR );</span>
+<span class="nc" id="L361">            e.setValue( Collections.unmodifiableList(e.getValue()) );</span>
+        }
+<span class="nc" id="L363">        return Collections.unmodifiableMap(m);</span>
+    }
+
+<span class="nc" id="L366">    private static final Comparator&lt;DependencyGroup&gt; NAME_COMPARATOR = new Comparator&lt;DependencyGroup&gt;() {</span>
+        public int compare(DependencyGroup lhs, DependencyGroup rhs) {
+<span class="nc" id="L368">            int cmp = lhs.getUpstreamProject().getName().compareTo(rhs.getUpstreamProject().getName());</span>
+<span class="nc bnc" id="L369" title="All 2 branches missed.">            return cmp != 0 ? cmp : lhs.getDownstreamProject().getName().compareTo(rhs.getDownstreamProject().getName());</span>
+        }
+    };
+
+<span class="nc" id="L373">    public static final DependencyGraph EMPTY = new DependencyGraph(false);</span>
+
+    /**
+     * Compare two Projects based on the topological order defined by this Dependency Graph
+     */
+    public int compare(AbstractProject o1, AbstractProject o2) {
+<span class="nc" id="L379">        return topologicalOrder.compare(o1,o2);</span>
+    }
+
+    /**
+     * Returns all the projects in the topological order of the dependency.
+     *
+     * Intuitively speaking, the first one in the list is the source of the dependency graph,
+     * and the last one is the sink.
+     *
+     * @since 1.521
+     */
+    public List&lt;AbstractProject&lt;?,?&gt;&gt; getTopologicallySorted() {
+<span class="nc" id="L391">        return topologicallySorted;</span>
+    }
+
+    /**
+     * Represents an edge in the dependency graph.
+     * @since 1.341
+     */
+    public static class Dependency {
+        private AbstractProject upstream, downstream;
+
+<span class="nc" id="L401">        public Dependency(AbstractProject upstream, AbstractProject downstream) {</span>
+<span class="nc" id="L402">            this.upstream = upstream;</span>
+<span class="nc" id="L403">            this.downstream = downstream;</span>
+<span class="nc" id="L404">        }</span>
+
+        public AbstractProject getUpstreamProject() {
+<span class="nc" id="L407">            return upstream;</span>
+        }
+
+        public AbstractProject getDownstreamProject() {
+<span class="nc" id="L411">            return downstream;</span>
+        }
+
+        /**
+         * Decide whether build should be triggered and provide any Actions for the build.
+         * Default implementation always returns true (for backward compatibility), and
+         * adds no Actions. Subclasses may override to control how/if the build is triggered.
+         * &lt;p&gt;The authentication in effect ({@link Jenkins#getAuthentication}) will be that of the upstream build.
+         * An implementation is expected to perform any relevant access control checks:
+         * that an upstream project can both see and build a downstream project,
+         * or that a downstream project can see an upstream project.
+         * @param build Build of upstream project that just completed
+         * @param listener For any error/log output
+         * @param actions Add Actions for the triggered build to this list; never null
+         * @return True to trigger a build of the downstream project
+         */
+        public boolean shouldTriggerBuild(AbstractBuild build, TaskListener listener,
+                                          List&lt;Action&gt; actions) {
+<span class="nc" id="L429">            return true;</span>
+        }
+
+        /**
+         * Does this method point to itself?
+         */
+        public boolean pointsItself() {
+<span class="nc bnc" id="L436" title="All 2 branches missed.">            return upstream==downstream;</span>
+        }
+
+        @Override
+        public boolean equals(Object obj) {
+<span class="nc bnc" id="L441" title="All 2 branches missed.">            if (obj == null) return false;</span>
+<span class="nc bnc" id="L442" title="All 2 branches missed.">            if (getClass() != obj.getClass()) return false;</span>
+
+<span class="nc" id="L444">            final Dependency that = (Dependency) obj;</span>
+<span class="nc bnc" id="L445" title="All 4 branches missed.">            return this.upstream == that.upstream || this.downstream == that.downstream;</span>
+        }
+
+        @Override
+        public int hashCode() {
+<span class="nc" id="L450">            int hash = 7;</span>
+<span class="nc" id="L451">            hash = 23 * hash + this.upstream.hashCode();</span>
+<span class="nc" id="L452">            hash = 23 * hash + this.downstream.hashCode();</span>
+<span class="nc" id="L453">            return hash;</span>
+        }
+
+        @Override public String toString() {
+<span class="nc" id="L457">            return super.toString() + &quot;[&quot; + upstream + &quot;-&gt;&quot; + downstream + &quot;]&quot;;</span>
+        }
+    }
+
+    /**
+     * Collect multiple dependencies between the same two projects.
+     */
+    private static class DependencyGroup {
+<span class="nc" id="L465">        private Set&lt;Dependency&gt; group = new LinkedHashSet&lt;Dependency&gt;();</span>
+
+<span class="nc" id="L467">        DependencyGroup(Dependency first) {</span>
+<span class="nc" id="L468">            this.upstream = first.getUpstreamProject();</span>
+<span class="nc" id="L469">            this.downstream= first.getDownstreamProject();</span>
+<span class="nc" id="L470">            group.add(first);</span>
+<span class="nc" id="L471">        }</span>
+
+        private void add(Dependency next) {
+<span class="nc" id="L474">            group.add(next);</span>
+<span class="nc" id="L475">        }</span>
+
+        public Set&lt;Dependency&gt; getGroup() {
+<span class="nc" id="L478">            return group;</span>
+        }
+
+        private AbstractProject upstream, downstream;
+
+        public AbstractProject getUpstreamProject() {
+<span class="nc" id="L484">            return upstream;</span>
+        }
+
+        public AbstractProject getDownstreamProject() {
+<span class="nc" id="L488">            return downstream;</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

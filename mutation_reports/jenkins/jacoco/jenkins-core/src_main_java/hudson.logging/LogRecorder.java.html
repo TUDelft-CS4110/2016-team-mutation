@@ -1,0 +1,419 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>LogRecorder.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.logging</a> &gt; <span class="el_source">LogRecorder.java</span></div><h1>LogRecorder.java</h1><pre class="source lang-java linenums"><span class="pc" id="L1">/*</span>
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc., Kohsuke Kawaguchi
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.logging;
+
+import com.thoughtworks.xstream.XStream;
+import hudson.BulkChange;
+import hudson.Extension;
+import hudson.FilePath;
+import hudson.Util;
+import hudson.XmlFile;
+import hudson.model.*;
+import hudson.util.HttpResponses;
+import jenkins.model.Jenkins;
+import hudson.model.listeners.SaveableListener;
+import hudson.remoting.Channel;
+import hudson.remoting.VirtualChannel;
+import hudson.slaves.ComputerListener;
+import hudson.util.CopyOnWriteList;
+import hudson.util.RingBufferLogHandler;
+import hudson.util.XStream2;
+import jenkins.security.MasterToSlaveCallable;
+import net.sf.json.JSONObject;
+import org.kohsuke.stapler.*;
+import org.kohsuke.stapler.interceptor.RequirePOST;
+
+import javax.servlet.ServletException;
+import java.io.File;
+import java.io.IOException;
+import java.text.Collator;
+import java.util.*;
+import java.util.logging.Level;
+import java.util.logging.LogManager;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
+
+/**
+ * Records a selected set of logs so that the system administrator
+ * can diagnose a specific aspect of the system.
+ *
+ * TODO: still a work in progress.
+ *
+ * &lt;h3&gt;Access Control&lt;/h3&gt;
+ * {@link LogRecorder} is only visible for administrators, and this access control happens at
+ * {@link jenkins.model.Jenkins#getLog()}, the sole entry point for binding {@link LogRecorder} to URL.
+ *
+ * @author Kohsuke Kawaguchi
+ * @see LogRecorderManager
+ */
+public class LogRecorder extends AbstractModelObject implements Saveable {
+    private volatile String name;
+
+<span class="fc" id="L75">    public final CopyOnWriteList&lt;Target&gt; targets = new CopyOnWriteList&lt;Target&gt;();</span>
+
+    @Restricted(NoExternalUse.class)
+    Target[] orderedTargets() {
+        // will contain targets ordered by reverse name length (place specific targets at the beginning)
+<span class="fc" id="L80">        Target[] ts = targets.toArray(new Target[]{});</span>
+
+<span class="fc" id="L82">        Arrays.sort(ts, new Comparator&lt;Target&gt;() {</span>
+            public int compare(Target left, Target right) {
+<span class="fc" id="L84">                return right.getName().length() - left.getName().length();</span>
+            }
+        });
+
+<span class="fc" id="L88">        return ts;</span>
+    }
+
+    @Restricted(NoExternalUse.class)
+    public AutoCompletionCandidates doAutoCompleteLoggerName(@QueryParameter String value) {
+<span class="nc" id="L93">        AutoCompletionCandidates candidates = new AutoCompletionCandidates();</span>
+<span class="nc" id="L94">        Enumeration&lt;String&gt; loggerNames = LogManager.getLogManager().getLoggerNames();</span>
+<span class="nc bnc" id="L95" title="All 2 branches missed.">        while (loggerNames.hasMoreElements()) {</span>
+<span class="nc" id="L96">            String loggerName = loggerNames.nextElement();</span>
+<span class="nc bnc" id="L97" title="All 2 branches missed.">            if (loggerName.toLowerCase(Locale.ENGLISH).contains(value.toLowerCase(Locale.ENGLISH))) {</span>
+<span class="nc" id="L98">                candidates.add(loggerName);</span>
+            }
+        }
+<span class="nc" id="L101">        return candidates;</span>
+    }
+
+    @Restricted(NoExternalUse.class)
+<span class="fc" id="L105">    transient /*almost final*/ RingBufferLogHandler handler = new RingBufferLogHandler() {</span>
+        @Override
+        public void publish(LogRecord record) {
+<span class="pc bpc" id="L108" title="1 of 2 branches missed.">            for (Target t : orderedTargets()) {</span>
+<span class="fc" id="L109">                Boolean match = t.matches(record);</span>
+<span class="fc bfc" id="L110" title="All 2 branches covered.">                if (match == null) {</span>
+                    // domain does not match, so continue looking
+<span class="fc" id="L112">                    continue;</span>
+                }
+
+<span class="fc bfc" id="L115" title="All 2 branches covered.">                if (match.booleanValue()) {</span>
+                    // most specific logger matches, so publish
+<span class="fc" id="L117">                    super.publish(record);</span>
+                }
+                // most specific logger does not match, so don't publish
+                // allows reducing log level for more specific loggers
+<span class="fc" id="L121">                return;</span>
+            }
+<span class="nc" id="L123">        }</span>
+    };
+
+    /**
+     * Logger that this recorder monitors, and its log level.
+     * Just a pair of (logger name,level) with convenience methods.
+     */
+    public static final class Target {
+        public final String name;
+        private final int level;
+        private transient /* almost final*/ Logger logger;
+
+        public Target(String name, Level level) {
+<span class="fc" id="L136">            this(name,level.intValue());</span>
+<span class="fc" id="L137">        }</span>
+
+<span class="fc" id="L139">        public Target(String name, int level) {</span>
+<span class="fc" id="L140">            this.name = name;</span>
+<span class="fc" id="L141">            this.level = level;</span>
+<span class="fc" id="L142">        }</span>
+
+        @DataBoundConstructor
+        public Target(String name, String level) {
+<span class="nc" id="L146">            this(name,Level.parse(level));</span>
+<span class="nc" id="L147">        }</span>
+
+        public Level getLevel() {
+<span class="nc" id="L150">            return Level.parse(String.valueOf(level));</span>
+        }
+
+        public String getName() {
+<span class="fc" id="L154">            return name;</span>
+        }
+
+        @Deprecated
+        public boolean includes(LogRecord r) {
+<span class="pc bpc" id="L159" title="1 of 2 branches missed.">            if(r.getLevel().intValue() &lt; level)</span>
+<span class="nc" id="L160">                return false;   // below the threshold</span>
+<span class="fc bfc" id="L161" title="All 2 branches covered.">            if (name.length() == 0) {</span>
+<span class="fc" id="L162">                return true; // like root logger, includes everything</span>
+            }
+<span class="fc" id="L164">            String logName = r.getLoggerName();</span>
+<span class="pc bpc" id="L165" title="1 of 4 branches missed.">            if(logName==null || !logName.startsWith(name))</span>
+<span class="fc" id="L166">                return false;   // not within this logger</span>
+<span class="fc" id="L167">            String rest = logName.substring(name.length());</span>
+<span class="fc bfc" id="L168" title="All 4 branches covered.">            return rest.startsWith(&quot;.&quot;) || rest.length()==0;</span>
+        }
+
+        public Boolean matches(LogRecord r) {
+<span class="fc bfc" id="L172" title="All 2 branches covered.">            boolean levelSufficient = r.getLevel().intValue() &gt;= level;</span>
+<span class="fc bfc" id="L173" title="All 2 branches covered.">            if (name.length() == 0) {</span>
+<span class="fc" id="L174">                return Boolean.valueOf(levelSufficient); // include if level matches</span>
+            }
+<span class="fc" id="L176">            String logName = r.getLoggerName();</span>
+<span class="pc bpc" id="L177" title="1 of 4 branches missed.">            if(logName==null || !logName.startsWith(name))</span>
+<span class="fc" id="L178">                return null; // not in the domain of this logger</span>
+<span class="fc" id="L179">            String rest = logName.substring(name.length());</span>
+<span class="fc bfc" id="L180" title="All 4 branches covered.">            if (rest.startsWith(&quot;.&quot;) || rest.length()==0) {</span>
+<span class="fc" id="L181">                return Boolean.valueOf(levelSufficient); // include if level matches</span>
+            }
+<span class="fc" id="L183">            return null;</span>
+        }
+
+        public Logger getLogger() {
+<span class="nc bnc" id="L187" title="All 2 branches missed.">            if (logger == null) {</span>
+<span class="nc" id="L188">                logger = Logger.getLogger(name);</span>
+            }
+<span class="nc" id="L190">            return logger;</span>
+        }
+
+        /**
+         * Makes sure that the logger passes through messages at the correct level to us.
+         */
+        public void enable() {
+<span class="nc" id="L197">            Logger l = getLogger();</span>
+<span class="nc bnc" id="L198" title="All 2 branches missed.">            if(!l.isLoggable(getLevel()))</span>
+<span class="nc" id="L199">                l.setLevel(getLevel());</span>
+<span class="nc" id="L200">            new SetLevel(name, getLevel()).broadcast();</span>
+<span class="nc" id="L201">        }</span>
+
+        public void disable() {
+<span class="nc" id="L204">            getLogger().setLevel(null);</span>
+<span class="nc" id="L205">            new SetLevel(name, null).broadcast();</span>
+<span class="nc" id="L206">        }</span>
+
+    }
+
+    private static final class SetLevel extends MasterToSlaveCallable&lt;Void,Error&gt; {
+        /** known loggers (kept per slave), to avoid GC */
+<span class="nc" id="L212">        @SuppressWarnings(&quot;MismatchedQueryAndUpdateOfCollection&quot;) private static final Set&lt;Logger&gt; loggers = new HashSet&lt;Logger&gt;();</span>
+        private final String name;
+        private final Level level;
+<span class="nc" id="L215">        SetLevel(String name, Level level) {</span>
+<span class="nc" id="L216">            this.name = name;</span>
+<span class="nc" id="L217">            this.level = level;</span>
+<span class="nc" id="L218">        }</span>
+        @Override public Void call() throws Error {
+<span class="nc" id="L220">            Logger logger = Logger.getLogger(name);</span>
+<span class="nc" id="L221">            loggers.add(logger);</span>
+<span class="nc" id="L222">            logger.setLevel(level);</span>
+<span class="nc" id="L223">            return null;</span>
+        }
+        void broadcast() {
+<span class="nc bnc" id="L226" title="All 2 branches missed.">            for (Computer c : Jenkins.getInstance().getComputers()) {</span>
+<span class="nc bnc" id="L227" title="All 2 branches missed.">                if (c.getName().length() &gt; 0) { // i.e. not master</span>
+<span class="nc" id="L228">                    VirtualChannel ch = c.getChannel();</span>
+<span class="nc bnc" id="L229" title="All 2 branches missed.">                    if (ch != null) {</span>
+                        try {
+<span class="nc" id="L231">                            ch.call(this);</span>
+<span class="nc" id="L232">                        } catch (Exception x) {</span>
+<span class="nc" id="L233">                            Logger.getLogger(LogRecorder.class.getName()).log(Level.WARNING, &quot;could not set up logging on &quot; + c, x);</span>
+                        }
+                    }
+                }
+            }
+<span class="nc" id="L238">        }</span>
+    }
+
+<span class="nc" id="L241">    @Extension @Restricted(NoExternalUse.class) public static final class ComputerLogInitializer extends ComputerListener {</span>
+        @Override public void preOnline(Computer c, Channel channel, FilePath root, TaskListener listener) throws IOException, InterruptedException {
+<span class="nc bnc" id="L243" title="All 2 branches missed.">            for (LogRecorder recorder : Jenkins.getInstance().getLog().logRecorders.values()) {</span>
+<span class="nc bnc" id="L244" title="All 2 branches missed.">                for (Target t : recorder.targets) {</span>
+<span class="nc" id="L245">                    channel.call(new SetLevel(t.name, t.getLevel()));</span>
+                }
+            }
+<span class="nc" id="L248">        }</span>
+    }
+
+<span class="fc" id="L251">    public LogRecorder(String name) {</span>
+<span class="fc" id="L252">        this.name = name;</span>
+        // register it only once when constructed, and when this object dies
+        // WeakLogHandler will remove it
+<span class="fc" id="L255">        new WeakLogHandler(handler,Logger.getLogger(&quot;&quot;));</span>
+<span class="fc" id="L256">    }</span>
+
+    public String getDisplayName() {
+<span class="nc" id="L259">        return name;</span>
+    }
+
+    public String getSearchUrl() {
+<span class="nc" id="L263">        return Util.rawEncode(name);</span>
+    }
+
+    public String getName() {
+<span class="nc" id="L267">        return name;</span>
+    }
+
+    public LogRecorderManager getParent() {
+<span class="nc" id="L271">        return Jenkins.getInstance().getLog();</span>
+    }
+
+    /**
+     * Accepts submission from the configuration page.
+     */
+    @RequirePOST
+    public synchronized void doConfigSubmit( StaplerRequest req, StaplerResponse rsp ) throws IOException, ServletException {
+<span class="nc" id="L279">        JSONObject src = req.getSubmittedForm();</span>
+
+<span class="nc" id="L281">        String newName = src.getString(&quot;name&quot;), redirect = &quot;.&quot;;</span>
+<span class="nc" id="L282">        XmlFile oldFile = null;</span>
+<span class="nc bnc" id="L283" title="All 2 branches missed.">        if(!name.equals(newName)) {</span>
+<span class="nc" id="L284">            Jenkins.checkGoodName(newName);</span>
+<span class="nc" id="L285">            oldFile = getConfigFile();</span>
+            // rename
+<span class="nc" id="L287">            getParent().logRecorders.remove(name);</span>
+<span class="nc" id="L288">            this.name = newName;</span>
+<span class="nc" id="L289">            getParent().logRecorders.put(name,this);</span>
+<span class="nc" id="L290">            redirect = &quot;../&quot; + Util.rawEncode(newName) + '/';</span>
+        }
+
+<span class="nc" id="L293">        List&lt;Target&gt; newTargets = req.bindJSONToList(Target.class, src.get(&quot;targets&quot;));</span>
+<span class="nc bnc" id="L294" title="All 2 branches missed.">        for (Target t : newTargets)</span>
+<span class="nc" id="L295">            t.enable();</span>
+<span class="nc" id="L296">        targets.replaceBy(newTargets);</span>
+
+<span class="nc" id="L298">        save();</span>
+<span class="nc bnc" id="L299" title="All 2 branches missed.">        if (oldFile!=null) oldFile.delete();</span>
+<span class="nc" id="L300">        rsp.sendRedirect2(redirect);</span>
+<span class="nc" id="L301">    }</span>
+
+    @RequirePOST
+    public HttpResponse doClear() throws IOException {
+<span class="fc" id="L305">        handler.clear();</span>
+<span class="fc" id="L306">        return HttpResponses.redirectToDot();</span>
+    }
+
+    /**
+     * Loads the settings from a file.
+     */
+    public synchronized void load() throws IOException {
+<span class="nc" id="L313">        getConfigFile().unmarshal(this);</span>
+<span class="nc bnc" id="L314" title="All 2 branches missed.">        for (Target t : targets)</span>
+<span class="nc" id="L315">            t.enable();</span>
+<span class="nc" id="L316">    }</span>
+
+    /**
+     * Save the settings to a file.
+     */
+    public synchronized void save() throws IOException {
+<span class="nc bnc" id="L322" title="All 2 branches missed.">        if(BulkChange.contains(this))   return;</span>
+<span class="nc" id="L323">        getConfigFile().write(this);</span>
+<span class="nc" id="L324">        SaveableListener.fireOnChange(this, getConfigFile());</span>
+<span class="nc" id="L325">    }</span>
+
+    /**
+     * Deletes this recorder, then go back to the parent.
+     */
+    @RequirePOST
+    public synchronized void doDoDelete(StaplerResponse rsp) throws IOException, ServletException {
+<span class="nc" id="L332">        getConfigFile().delete();</span>
+<span class="nc" id="L333">        getParent().logRecorders.remove(name);</span>
+        // Disable logging for all our targets,
+        // then reenable all other loggers in case any also log the same targets
+<span class="nc bnc" id="L336" title="All 2 branches missed.">        for (Target t : targets)</span>
+<span class="nc" id="L337">            t.disable();</span>
+<span class="nc bnc" id="L338" title="All 2 branches missed.">        for (LogRecorder log : getParent().logRecorders.values())</span>
+<span class="nc bnc" id="L339" title="All 2 branches missed.">            for (Target t : log.targets)</span>
+<span class="nc" id="L340">                t.enable();</span>
+<span class="nc" id="L341">        rsp.sendRedirect2(&quot;..&quot;);</span>
+<span class="nc" id="L342">    }</span>
+
+    /**
+     * RSS feed for log entries.
+     */
+    public void doRss( StaplerRequest req, StaplerResponse rsp ) throws IOException, ServletException {
+<span class="nc" id="L348">        LogRecorderManager.doRss(req,rsp,getLogRecords());</span>
+<span class="nc" id="L349">    }</span>
+
+    /**
+     * The file we save our configuration.
+     */
+    private XmlFile getConfigFile() {
+<span class="nc" id="L355">        return new XmlFile(XSTREAM, new File(LogRecorderManager.configDir(), name + &quot;.xml&quot;));</span>
+    }
+
+    /**
+     * Gets a view of the log records.
+     */
+    public List&lt;LogRecord&gt; getLogRecords() {
+<span class="nc" id="L362">        return handler.getView();</span>
+    }
+
+    /**
+     * Gets a view of log records per slave matching this recorder.
+     * @return a map (sorted by display name) from computer to (nonempty) list of log records
+     * @since 1.519
+     */
+    public Map&lt;Computer,List&lt;LogRecord&gt;&gt; getSlaveLogRecords() {
+<span class="nc" id="L371">        Map&lt;Computer,List&lt;LogRecord&gt;&gt; result = new TreeMap&lt;Computer,List&lt;LogRecord&gt;&gt;(new Comparator&lt;Computer&gt;() {</span>
+<span class="nc" id="L372">            final Collator COLL = Collator.getInstance();</span>
+            public int compare(Computer c1, Computer c2) {
+<span class="nc" id="L374">                return COLL.compare(c1.getDisplayName(), c2.getDisplayName());</span>
+            }
+        });
+<span class="nc bnc" id="L377" title="All 2 branches missed.">        for (Computer c : Jenkins.getInstance().getComputers()) {</span>
+<span class="nc bnc" id="L378" title="All 2 branches missed.">            if (c.getName().length() == 0) {</span>
+<span class="nc" id="L379">                continue; // master</span>
+            }
+<span class="nc" id="L381">            List&lt;LogRecord&gt; recs = new ArrayList&lt;LogRecord&gt;();</span>
+            try {
+<span class="nc bnc" id="L383" title="All 2 branches missed.">                for (LogRecord rec : c.getLogRecords()) {</span>
+<span class="nc bnc" id="L384" title="All 2 branches missed.">                    for (Target t : targets) {</span>
+<span class="nc bnc" id="L385" title="All 2 branches missed.">                        if (t.includes(rec)) {</span>
+<span class="nc" id="L386">                            recs.add(rec);</span>
+<span class="nc" id="L387">                            break;</span>
+                        }
+                    }
+                }
+<span class="nc" id="L391">            } catch (IOException x) {</span>
+<span class="nc" id="L392">                continue;</span>
+<span class="nc" id="L393">            } catch (InterruptedException x) {</span>
+<span class="nc" id="L394">                continue;</span>
+            }
+<span class="nc bnc" id="L396" title="All 2 branches missed.">            if (!recs.isEmpty()) {</span>
+<span class="nc" id="L397">                result.put(c, recs);</span>
+            }
+        }
+<span class="nc" id="L400">        return result;</span>
+    }
+
+    /**
+     * Thread-safe reusable {@link XStream}.
+     */
+<span class="fc" id="L406">    public static final XStream XSTREAM = new XStream2();</span>
+
+    static {
+<span class="fc" id="L409">        XSTREAM.alias(&quot;log&quot;,LogRecorder.class);</span>
+<span class="fc" id="L410">        XSTREAM.alias(&quot;target&quot;,Target.class);</span>
+    }
+
+    /**
+     * Log levels that can be configured for {@link Target}.
+     */
+<span class="fc" id="L416">    public static List&lt;Level&gt; LEVELS =</span>
+<span class="fc" id="L417">            Arrays.asList(Level.ALL, Level.FINEST, Level.FINER, Level.FINE, Level.CONFIG, Level.INFO, Level.WARNING, Level.SEVERE);</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

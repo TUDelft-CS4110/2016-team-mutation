@@ -1,0 +1,522 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>ListView.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.model</a> &gt; <span class="el_source">ListView.java</span></div><h1>ListView.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">/*</span>
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2010, Sun Microsystems, Inc., Kohsuke Kawaguchi,
+ * Erik Ramfelt, Seiji Sogabe, Martin Eigenbrodt, Alan Harder
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.model;
+
+import hudson.Extension;
+import hudson.Util;
+import hudson.diagnosis.OldDataMonitor;
+import hudson.model.Descriptor.FormException;
+import hudson.model.listeners.ItemListener;
+import hudson.security.ACL;
+import hudson.util.CaseInsensitiveComparator;
+import hudson.util.DescribableList;
+import hudson.util.FormValidation;
+import hudson.util.HttpResponses;
+import hudson.views.ListViewColumn;
+import hudson.views.ViewJobFilter;
+
+import java.io.IOException;
+import java.util.*;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import java.util.regex.Pattern;
+import java.util.regex.PatternSyntaxException;
+
+import javax.annotation.concurrent.GuardedBy;
+import javax.servlet.ServletException;
+import jenkins.model.Jenkins;
+
+import net.sf.json.JSONObject;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
+
+import org.kohsuke.stapler.DataBoundConstructor;
+import org.kohsuke.stapler.HttpResponse;
+import org.kohsuke.stapler.QueryParameter;
+import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.StaplerResponse;
+import org.kohsuke.stapler.interceptor.RequirePOST;
+
+/**
+ * Displays {@link Job}s in a flat list view.
+ *
+ * @author Kohsuke Kawaguchi
+ */
+public class ListView extends View implements DirectlyModifiableView {
+
+    /**
+     * List of job names. This is what gets serialized.
+     */
+    @GuardedBy(&quot;this&quot;)
+<span class="nc" id="L73">    /*package*/ /*almost-final*/ SortedSet&lt;String&gt; jobNames = new TreeSet&lt;String&gt;(CaseInsensitiveComparator.INSTANCE);</span>
+    
+    private DescribableList&lt;ViewJobFilter, Descriptor&lt;ViewJobFilter&gt;&gt; jobFilters;
+
+    private DescribableList&lt;ListViewColumn, Descriptor&lt;ListViewColumn&gt;&gt; columns;
+
+    /**
+     * Include regex string.
+     */
+    private String includeRegex;
+    
+    /**
+     * Whether to recurse in ItemGroups
+     */
+    private boolean recurse;
+    
+    /**
+     * Compiled include pattern from the includeRegex string.
+     */
+    private transient Pattern includePattern;
+
+    /**
+     * Filter by enabled/disabled status of jobs.
+     * Null for no filter, true for enabled-only, false for disabled-only.
+     */
+    private Boolean statusFilter;
+
+    @DataBoundConstructor
+    public ListView(String name) {
+<span class="nc" id="L102">        super(name);</span>
+<span class="nc" id="L103">        initColumns();</span>
+<span class="nc" id="L104">        initJobFilters();</span>
+<span class="nc" id="L105">    }</span>
+
+    public ListView(String name, ViewGroup owner) {
+<span class="nc" id="L108">        this(name);</span>
+<span class="nc" id="L109">        this.owner = owner;</span>
+<span class="nc" id="L110">    }</span>
+
+    private Object readResolve() {
+<span class="nc bnc" id="L113" title="All 2 branches missed.">        if(includeRegex!=null) {</span>
+            try {
+<span class="nc" id="L115">                includePattern = Pattern.compile(includeRegex);</span>
+<span class="nc" id="L116">            } catch (PatternSyntaxException x) {</span>
+<span class="nc" id="L117">                includeRegex = null;</span>
+<span class="nc" id="L118">                OldDataMonitor.report(this, Collections.&lt;Throwable&gt;singleton(x));</span>
+            }
+        }
+<span class="nc bnc" id="L121" title="All 2 branches missed.">        if (jobNames == null) {</span>
+<span class="nc" id="L122">            jobNames = new TreeSet&lt;String&gt;(CaseInsensitiveComparator.INSTANCE);</span>
+        }
+<span class="nc" id="L124">        initColumns();</span>
+<span class="nc" id="L125">        initJobFilters();</span>
+<span class="nc" id="L126">        return this;</span>
+    }
+
+    protected void initColumns() {
+<span class="nc bnc" id="L130" title="All 2 branches missed.">        if (columns == null)</span>
+<span class="nc" id="L131">            columns = new DescribableList&lt;ListViewColumn, Descriptor&lt;ListViewColumn&gt;&gt;(this,ListViewColumn.createDefaultInitialColumnList());</span>
+<span class="nc" id="L132">    }</span>
+
+    protected void initJobFilters() {
+<span class="nc bnc" id="L135" title="All 2 branches missed.">        if (jobFilters == null)</span>
+<span class="nc" id="L136">            jobFilters = new DescribableList&lt;ViewJobFilter, Descriptor&lt;ViewJobFilter&gt;&gt;(this);</span>
+<span class="nc" id="L137">    }</span>
+
+    /**
+     * Used to determine if we want to display the Add button.
+     */
+    public boolean hasJobFilterExtensions() {
+<span class="nc bnc" id="L143" title="All 2 branches missed.">    	return !ViewJobFilter.all().isEmpty();</span>
+    }
+
+    public DescribableList&lt;ViewJobFilter, Descriptor&lt;ViewJobFilter&gt;&gt; getJobFilters() {
+<span class="nc" id="L147">    	return jobFilters;</span>
+    }
+
+    @Override
+    public DescribableList&lt;ListViewColumn, Descriptor&lt;ListViewColumn&gt;&gt; getColumns() {
+<span class="nc" id="L152">        return columns;</span>
+    }
+    
+    /**
+     * Returns a read-only view of all {@link Job}s in this view.
+     *
+     * &lt;p&gt;
+     * This method returns a separate copy each time to avoid
+     * concurrent modification issue.
+     */
+    @Override
+    public List&lt;TopLevelItem&gt; getItems() {
+        SortedSet&lt;String&gt; names;
+<span class="nc" id="L165">        List&lt;TopLevelItem&gt; items = new ArrayList&lt;TopLevelItem&gt;();</span>
+
+<span class="nc" id="L167">        synchronized (this) {</span>
+<span class="nc" id="L168">            names = new TreeSet&lt;String&gt;(jobNames);</span>
+        }
+
+<span class="nc" id="L171">        ItemGroup&lt;? extends TopLevelItem&gt; parent = getOwnerItemGroup();</span>
+<span class="nc" id="L172">        List&lt;TopLevelItem&gt; parentItems = new ArrayList&lt;TopLevelItem&gt;(parent.getItems());</span>
+<span class="nc" id="L173">        includeItems(parent, parentItems, names);</span>
+
+<span class="nc" id="L175">        Boolean statusFilter = this.statusFilter; // capture the value to isolate us from concurrent update</span>
+        Iterable&lt;? extends TopLevelItem&gt; candidates;
+<span class="nc bnc" id="L177" title="All 2 branches missed.">        if (recurse) {</span>
+<span class="nc" id="L178">            candidates = Items.getAllItems(parent, TopLevelItem.class);</span>
+<span class="nc" id="L179">        } else {</span>
+<span class="nc" id="L180">            candidates = parent.getItems();</span>
+        }
+<span class="nc bnc" id="L182" title="All 2 branches missed.">        for (TopLevelItem item : candidates) {</span>
+<span class="nc bnc" id="L183" title="All 2 branches missed.">            if (!names.contains(item.getRelativeNameFrom(getOwnerItemGroup()))) continue;</span>
+            // Add if no status filter or filter matches enabled/disabled status:
+<span class="nc bnc" id="L185" title="All 4 branches missed.">            if(statusFilter == null || !(item instanceof AbstractProject)</span>
+<span class="nc bnc" id="L186" title="All 2 branches missed.">                              || ((AbstractProject)item).isDisabled() ^ statusFilter)</span>
+<span class="nc" id="L187">                items.add(item);</span>
+        }
+
+        // check the filters
+<span class="nc" id="L191">        Iterable&lt;ViewJobFilter&gt; jobFilters = getJobFilters();</span>
+<span class="nc" id="L192">        List&lt;TopLevelItem&gt; allItems = new ArrayList&lt;TopLevelItem&gt;(parentItems);</span>
+<span class="nc bnc" id="L193" title="All 2 branches missed.">        if (recurse) allItems = expand(allItems, new ArrayList&lt;TopLevelItem&gt;());</span>
+<span class="nc bnc" id="L194" title="All 2 branches missed.">    	for (ViewJobFilter jobFilter: jobFilters) {</span>
+<span class="nc" id="L195">    		items = jobFilter.filter(items, allItems, this);</span>
+    	}
+        // for sanity, trim off duplicates
+<span class="nc" id="L198">        items = new ArrayList&lt;TopLevelItem&gt;(new LinkedHashSet&lt;TopLevelItem&gt;(items));</span>
+        
+<span class="nc" id="L200">        return items;</span>
+    }
+
+    private List&lt;TopLevelItem&gt; expand(Collection&lt;TopLevelItem&gt; items, List&lt;TopLevelItem&gt; allItems) {
+<span class="nc bnc" id="L204" title="All 2 branches missed.">        for (TopLevelItem item : items) {</span>
+<span class="nc bnc" id="L205" title="All 2 branches missed.">            if (item instanceof ItemGroup) {</span>
+<span class="nc" id="L206">                ItemGroup&lt;? extends Item&gt; ig = (ItemGroup&lt;? extends Item&gt;) item;</span>
+<span class="nc" id="L207">                expand(Util.filter(ig.getItems(), TopLevelItem.class), allItems);</span>
+            }
+<span class="nc" id="L209">            allItems.add(item);</span>
+        }
+<span class="nc" id="L211">        return allItems;</span>
+    }
+    
+    @Override
+    public boolean contains(TopLevelItem item) {
+<span class="nc" id="L216">      return getItems().contains(item);</span>
+    }
+    
+    private void includeItems(ItemGroup&lt;? extends TopLevelItem&gt; root, Collection&lt;? extends Item&gt; parentItems, SortedSet&lt;String&gt; names) {
+<span class="nc bnc" id="L220" title="All 2 branches missed.">        if (includePattern != null) {</span>
+<span class="nc bnc" id="L221" title="All 2 branches missed.">            for (Item item : parentItems) {</span>
+<span class="nc bnc" id="L222" title="All 4 branches missed.">                if (recurse &amp;&amp; item instanceof ItemGroup) {</span>
+<span class="nc" id="L223">                    ItemGroup&lt;?&gt; ig = (ItemGroup&lt;?&gt;) item;</span>
+<span class="nc" id="L224">                    includeItems(root, ig.getItems(), names);</span>
+                }
+<span class="nc bnc" id="L226" title="All 2 branches missed.">                if (item instanceof TopLevelItem) {</span>
+<span class="nc" id="L227">                    String itemName = item.getRelativeNameFrom(root);</span>
+<span class="nc bnc" id="L228" title="All 2 branches missed.">                    if (includePattern.matcher(itemName).matches()) {</span>
+<span class="nc" id="L229">                        names.add(itemName);</span>
+                    }
+                }
+            }
+        }
+<span class="nc" id="L234">    }</span>
+    
+    public synchronized boolean jobNamesContains(TopLevelItem item) {
+<span class="nc bnc" id="L237" title="All 2 branches missed.">        if (item == null) return false;</span>
+<span class="nc" id="L238">        return jobNames.contains(item.getRelativeNameFrom(getOwnerItemGroup()));</span>
+    }
+
+    /**
+     * Adds the given item to this view.
+     *
+     * @since 1.389
+     */
+    @Override
+    public void add(TopLevelItem item) throws IOException {
+<span class="nc" id="L248">        synchronized (this) {</span>
+<span class="nc" id="L249">            jobNames.add(item.getRelativeNameFrom(getOwnerItemGroup()));</span>
+        }
+<span class="nc" id="L251">        save();</span>
+<span class="nc" id="L252">    }</span>
+
+    /**
+     * Removes given item from this view.
+     *
+     * @since 1.566
+     */
+    @Override
+    public boolean remove(TopLevelItem item) throws IOException {
+<span class="nc" id="L261">        synchronized (this) {</span>
+<span class="nc" id="L262">            String name = item.getRelativeNameFrom(getOwnerItemGroup());</span>
+<span class="nc bnc" id="L263" title="All 2 branches missed.">            if (!jobNames.remove(name)) return false;</span>
+        }
+<span class="nc" id="L265">        save();</span>
+<span class="nc" id="L266">        return true;</span>
+    }
+
+    public String getIncludeRegex() {
+<span class="nc" id="L270">        return includeRegex;</span>
+    }
+    
+    public boolean isRecurse() {
+<span class="nc" id="L274">        return recurse;</span>
+    }
+    
+    /**
+     * @since 1.568
+     */
+    public void setRecurse(boolean recurse) {
+<span class="nc" id="L281">        this.recurse = recurse;</span>
+<span class="nc" id="L282">    }</span>
+
+    /**
+     * Filter by enabled/disabled status of jobs.
+     * Null for no filter, true for enabled-only, false for disabled-only.
+     */
+    public Boolean getStatusFilter() {
+<span class="nc" id="L289">        return statusFilter;</span>
+    }
+
+    @Override
+    @RequirePOST
+    public Item doCreateItem(StaplerRequest req, StaplerResponse rsp) throws IOException, ServletException {
+<span class="nc" id="L295">        ItemGroup&lt;? extends TopLevelItem&gt; ig = getOwnerItemGroup();</span>
+<span class="nc bnc" id="L296" title="All 2 branches missed.">        if (ig instanceof ModifiableItemGroup) {</span>
+<span class="nc" id="L297">            TopLevelItem item = ((ModifiableItemGroup&lt;? extends TopLevelItem&gt;)ig).doCreateItem(req, rsp);</span>
+<span class="nc bnc" id="L298" title="All 2 branches missed.">            if(item!=null) {</span>
+<span class="nc" id="L299">                synchronized (this) {</span>
+<span class="nc" id="L300">                    jobNames.add(item.getRelativeNameFrom(getOwnerItemGroup()));</span>
+                }
+<span class="nc" id="L302">                owner.save();</span>
+            }
+<span class="nc" id="L304">            return item;</span>
+        }
+<span class="nc" id="L306">        return null;</span>
+    }
+
+    @Override
+    @RequirePOST
+    public HttpResponse doAddJobToView(@QueryParameter String name) throws IOException, ServletException {
+<span class="nc" id="L312">        checkPermission(View.CONFIGURE);</span>
+<span class="nc bnc" id="L313" title="All 2 branches missed.">        if(name==null)</span>
+<span class="nc" id="L314">            throw new Failure(&quot;Query parameter 'name' is required&quot;);</span>
+
+<span class="nc" id="L316">        TopLevelItem item = resolveName(name);</span>
+<span class="nc bnc" id="L317" title="All 2 branches missed.">        if (item == null)</span>
+<span class="nc" id="L318">            throw new Failure(&quot;Query parameter 'name' does not correspond to a known item&quot;);</span>
+
+<span class="nc bnc" id="L320" title="All 2 branches missed.">        if (contains(item)) return HttpResponses.ok();</span>
+
+<span class="nc" id="L322">        add(item);</span>
+<span class="nc" id="L323">        owner.save();</span>
+
+<span class="nc" id="L325">        return HttpResponses.ok();</span>
+    }
+
+    @Override
+    @RequirePOST
+    public HttpResponse doRemoveJobFromView(@QueryParameter String name) throws IOException, ServletException {
+<span class="nc" id="L331">        checkPermission(View.CONFIGURE);</span>
+<span class="nc bnc" id="L332" title="All 2 branches missed.">        if(name==null)</span>
+<span class="nc" id="L333">            throw new Failure(&quot;Query parameter 'name' is required&quot;);</span>
+
+<span class="nc" id="L335">        TopLevelItem item = resolveName(name);</span>
+<span class="nc bnc" id="L336" title="All 2 branches missed.">        if (remove(item))</span>
+<span class="nc" id="L337">            owner.save();</span>
+
+<span class="nc" id="L339">        return HttpResponses.ok();</span>
+    }
+
+    private TopLevelItem resolveName(String name) {
+<span class="nc" id="L343">        TopLevelItem item = getOwnerItemGroup().getItem(name);</span>
+<span class="nc bnc" id="L344" title="All 2 branches missed.">        if (item == null) {</span>
+<span class="nc" id="L345">            name = Items.getCanonicalName(getOwnerItemGroup(), name);</span>
+<span class="nc" id="L346">            item = Jenkins.getInstance().getItemByFullName(name, TopLevelItem.class);</span>
+        }
+<span class="nc" id="L348">        return item;</span>
+    }
+
+    /**
+     * Handles the configuration submission.
+     *
+     * Load view-specific properties here.
+     */
+    @Override
+    protected void submit(StaplerRequest req) throws ServletException, FormException, IOException {
+<span class="nc" id="L358">        JSONObject json = req.getSubmittedForm();</span>
+<span class="nc" id="L359">        synchronized (this) {</span>
+<span class="nc" id="L360">            recurse = json.optBoolean(&quot;recurse&quot;, true);</span>
+<span class="nc" id="L361">            jobNames.clear();</span>
+            Iterable&lt;? extends TopLevelItem&gt; items;
+<span class="nc bnc" id="L363" title="All 2 branches missed.">            if (recurse) {</span>
+<span class="nc" id="L364">                items = Items.getAllItems(getOwnerItemGroup(), TopLevelItem.class);</span>
+<span class="nc" id="L365">            } else {</span>
+<span class="nc" id="L366">                items = getOwnerItemGroup().getItems();</span>
+            }
+<span class="nc bnc" id="L368" title="All 2 branches missed.">            for (TopLevelItem item : items) {</span>
+<span class="nc" id="L369">                String relativeNameFrom = item.getRelativeNameFrom(getOwnerItemGroup());</span>
+<span class="nc bnc" id="L370" title="All 2 branches missed.">                if(req.getParameter(relativeNameFrom)!=null) {</span>
+<span class="nc" id="L371">                    jobNames.add(relativeNameFrom);</span>
+                }
+            }
+        }
+
+<span class="nc bnc" id="L376" title="All 2 branches missed.">        setIncludeRegex(req.getParameter(&quot;useincluderegex&quot;) != null ? req.getParameter(&quot;includeRegex&quot;) : null);</span>
+
+<span class="nc bnc" id="L378" title="All 2 branches missed.">        if (columns == null) {</span>
+<span class="nc" id="L379">            columns = new DescribableList&lt;ListViewColumn,Descriptor&lt;ListViewColumn&gt;&gt;(this);</span>
+        }
+<span class="nc" id="L381">        columns.rebuildHetero(req, json, ListViewColumn.all(), &quot;columns&quot;);</span>
+        
+<span class="nc bnc" id="L383" title="All 2 branches missed.">        if (jobFilters == null) {</span>
+<span class="nc" id="L384">        	jobFilters = new DescribableList&lt;ViewJobFilter,Descriptor&lt;ViewJobFilter&gt;&gt;(this);</span>
+        }
+<span class="nc" id="L386">        jobFilters.rebuildHetero(req, json, ViewJobFilter.all(), &quot;jobFilters&quot;);</span>
+
+<span class="nc" id="L388">        String filter = Util.fixEmpty(req.getParameter(&quot;statusFilter&quot;));</span>
+<span class="nc bnc" id="L389" title="All 2 branches missed.">        statusFilter = filter != null ? &quot;1&quot;.equals(filter) : null;</span>
+<span class="nc" id="L390">    }</span>
+    
+    /** @since 1.526 */
+    public void setIncludeRegex(String includeRegex) {
+<span class="nc" id="L394">        this.includeRegex = Util.nullify(includeRegex);</span>
+<span class="nc bnc" id="L395" title="All 2 branches missed.">        if (this.includeRegex == null)</span>
+<span class="nc" id="L396">            this.includePattern = null;</span>
+        else
+<span class="nc" id="L398">            this.includePattern = Pattern.compile(includeRegex);</span>
+<span class="nc" id="L399">    }</span>
+
+    @Extension
+<span class="nc" id="L402">    public static class DescriptorImpl extends ViewDescriptor {</span>
+        @Override
+        public String getDisplayName() {
+<span class="nc" id="L405">            return Messages.ListView_DisplayName();</span>
+        }
+
+        /**
+         * Checks if the include regular expression is valid.
+         */
+        public FormValidation doCheckIncludeRegex( @QueryParameter String value ) throws IOException, ServletException, InterruptedException  {
+<span class="nc" id="L412">            String v = Util.fixEmpty(value);</span>
+<span class="nc bnc" id="L413" title="All 2 branches missed.">            if (v != null) {</span>
+                try {
+<span class="nc" id="L415">                    Pattern.compile(v);</span>
+<span class="nc" id="L416">                } catch (PatternSyntaxException pse) {</span>
+<span class="nc" id="L417">                    return FormValidation.error(pse.getMessage());</span>
+                }
+            }
+<span class="nc" id="L420">            return FormValidation.ok();</span>
+        }
+    }
+
+    /**
+     * @deprecated as of 1.391
+     *  Use {@link ListViewColumn#createDefaultInitialColumnList()}
+     */
+    @Deprecated
+    public static List&lt;ListViewColumn&gt; getDefaultColumns() {
+<span class="nc" id="L430">        return ListViewColumn.createDefaultInitialColumnList();</span>
+    }
+
+    @Restricted(NoExternalUse.class)
+<span class="nc" id="L434">    @Extension public static final class Listener extends ItemListener {</span>
+        @Override public void onLocationChanged(final Item item, final String oldFullName, final String newFullName) {
+<span class="nc" id="L436">            ACL.impersonate(ACL.SYSTEM, new Runnable() {</span>
+                @Override public void run() {
+<span class="nc" id="L438">                    locationChanged(item, oldFullName, newFullName);</span>
+<span class="nc" id="L439">                }</span>
+            });
+<span class="nc" id="L441">        }</span>
+        private void locationChanged(Item item, String oldFullName, String newFullName) {
+<span class="nc" id="L443">            final Jenkins jenkins = Jenkins.getInstance();</span>
+<span class="nc bnc" id="L444" title="All 2 branches missed.">            for (View view: jenkins.getViews()) {</span>
+<span class="nc bnc" id="L445" title="All 2 branches missed.">                if (view instanceof ListView) {</span>
+<span class="nc" id="L446">                    renameViewItem(oldFullName, newFullName, jenkins, (ListView) view);</span>
+                }
+            }
+<span class="nc bnc" id="L449" title="All 2 branches missed.">            for (Item g : jenkins.getAllItems()) {</span>
+<span class="nc bnc" id="L450" title="All 2 branches missed.">                if (g instanceof ViewGroup) {</span>
+<span class="nc" id="L451">                    ViewGroup vg = (ViewGroup) g;</span>
+<span class="nc bnc" id="L452" title="All 2 branches missed.">                    for (View v : vg.getViews()) {</span>
+<span class="nc bnc" id="L453" title="All 2 branches missed.">                        if (v instanceof ListView) {</span>
+<span class="nc" id="L454">                            renameViewItem(oldFullName, newFullName, vg, (ListView) v);</span>
+                        }
+                    }
+                }
+            }
+<span class="nc" id="L459">        }</span>
+
+        private void renameViewItem(String oldFullName, String newFullName, ViewGroup vg, ListView lv) {
+            boolean needsSave;
+<span class="nc" id="L463">            synchronized (lv) {</span>
+<span class="nc" id="L464">                Set&lt;String&gt; oldJobNames = new HashSet&lt;String&gt;(lv.jobNames);</span>
+<span class="nc" id="L465">                lv.jobNames.clear();</span>
+<span class="nc bnc" id="L466" title="All 2 branches missed.">                for (String oldName : oldJobNames) {</span>
+<span class="nc" id="L467">                    lv.jobNames.add(Items.computeRelativeNamesAfterRenaming(oldFullName, newFullName, oldName, vg.getItemGroup()));</span>
+                }
+<span class="nc bnc" id="L469" title="All 2 branches missed.">                needsSave = !oldJobNames.equals(lv.jobNames);</span>
+            }
+<span class="nc bnc" id="L471" title="All 2 branches missed.">            if (needsSave) { // do not hold ListView lock at the time</span>
+                try {
+<span class="nc" id="L473">                    lv.save();</span>
+<span class="nc" id="L474">                } catch (IOException x) {</span>
+<span class="nc" id="L475">                    Logger.getLogger(ListView.class.getName()).log(Level.WARNING, null, x);</span>
+                }
+            }
+<span class="nc" id="L478">        }</span>
+
+        @Override public void onDeleted(final Item item) {
+<span class="nc" id="L481">            ACL.impersonate(ACL.SYSTEM, new Runnable() {</span>
+                @Override public void run() {
+<span class="nc" id="L483">                    deleted(item);</span>
+<span class="nc" id="L484">                }</span>
+            });
+<span class="nc" id="L486">        }</span>
+        private void deleted(Item item) {
+<span class="nc" id="L488">            final Jenkins jenkins = Jenkins.getInstance();</span>
+<span class="nc bnc" id="L489" title="All 2 branches missed.">            for (View view: jenkins.getViews()) {</span>
+<span class="nc bnc" id="L490" title="All 2 branches missed.">                if (view instanceof ListView) {</span>
+<span class="nc" id="L491">                    deleteViewItem(item, jenkins, (ListView) view);</span>
+                }
+            }
+<span class="nc bnc" id="L494" title="All 2 branches missed.">            for (Item g : jenkins.getAllItems()) {</span>
+<span class="nc bnc" id="L495" title="All 2 branches missed.">                if (g instanceof ViewGroup) {</span>
+<span class="nc" id="L496">                    ViewGroup vg = (ViewGroup) g;</span>
+<span class="nc bnc" id="L497" title="All 2 branches missed.">                    for (View v : vg.getViews()) {</span>
+<span class="nc bnc" id="L498" title="All 2 branches missed.">                        if (v instanceof ListView) {</span>
+<span class="nc" id="L499">                            deleteViewItem(item, vg, (ListView) v);</span>
+                        }
+                    }
+                }
+            }
+<span class="nc" id="L504">        }</span>
+
+        private void deleteViewItem(Item item, ViewGroup vg, ListView lv) {
+            boolean needsSave;
+<span class="nc" id="L508">            synchronized (lv) {</span>
+<span class="nc" id="L509">                needsSave = lv.jobNames.remove(item.getRelativeNameFrom(vg.getItemGroup()));</span>
+            }
+<span class="nc bnc" id="L511" title="All 2 branches missed.">            if (needsSave) {</span>
+                try {
+<span class="nc" id="L513">                    lv.save();</span>
+<span class="nc" id="L514">                } catch (IOException x) {</span>
+<span class="nc" id="L515">                    Logger.getLogger(ListView.class.getName()).log(Level.WARNING, null, x);</span>
+                }
+            }
+<span class="nc" id="L518">        }</span>
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

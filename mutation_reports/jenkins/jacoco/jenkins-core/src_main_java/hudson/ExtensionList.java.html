@@ -1,0 +1,422 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>ExtensionList.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson</a> &gt; <span class="el_source">ExtensionList.java</span></div><h1>ExtensionList.java</h1><pre class="source lang-java linenums"><span class="pc" id="L1">/*</span>
+ * The MIT License
+ *
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson;
+
+import com.google.common.collect.Lists;
+import hudson.init.InitMilestone;
+import hudson.model.Hudson;
+import jenkins.ExtensionComponentSet;
+import jenkins.model.Jenkins;
+import hudson.util.AdaptedIterator;
+import hudson.util.DescriptorList;
+import hudson.util.Memoizer;
+import hudson.util.Iterators;
+import hudson.ExtensionPoint.LegacyInstancesAreScopedToHudson;
+
+import java.util.AbstractList;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Vector;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import javax.annotation.CheckForNull;
+import javax.annotation.Nonnull;
+
+/**
+ * Retains the known extension instances for the given type 'T'.
+ *
+ * &lt;p&gt;
+ * Extensions are loaded lazily on demand and automatically by using {@link ExtensionFinder}, but this
+ * class also provides a mechanism to provide compatibility with the older {@link DescriptorList}-based
+ * manual registration,
+ *
+ * &lt;p&gt;
+ * All {@link ExtensionList} instances should be owned by {@link jenkins.model.Jenkins}, even though
+ * extension points can be defined by anyone on any type. Use {@link jenkins.model.Jenkins#getExtensionList(Class)}
+ * and {@link jenkins.model.Jenkins#getDescriptorList(Class)} to obtain the instances.
+ *
+ * @param &lt;T&gt;
+ *      Type of the extension point. This class holds instances of the subtypes of 'T'. 
+ *
+ * @author Kohsuke Kawaguchi
+ * @since 1.286
+ * @see jenkins.model.Jenkins#getExtensionList(Class)
+ * @see jenkins.model.Jenkins#getDescriptorList(Class)
+ */
+public class ExtensionList&lt;T&gt; extends AbstractList&lt;T&gt; {
+    /**
+     * @deprecated as of 1.417
+     *      Use {@link #jenkins}
+     */
+    @Deprecated
+    public final Hudson hudson;
+    public final @CheckForNull Jenkins jenkins;
+    public final Class&lt;T&gt; extensionType;
+
+    /**
+     * Once discovered, extensions are retained here.
+     */
+    @CopyOnWrite
+    private volatile List&lt;ExtensionComponent&lt;T&gt;&gt; extensions;
+
+<span class="fc" id="L87">    private final List&lt;ExtensionListListener&gt; listeners = new CopyOnWriteArrayList&lt;ExtensionListListener&gt;();</span>
+
+    /**
+     * Place to store manually registered instances with the per-Hudson scope.
+     * {@link CopyOnWriteArrayList} is used here to support concurrent iterations and mutation.
+     */
+    private final CopyOnWriteArrayList&lt;ExtensionComponent&lt;T&gt;&gt; legacyInstances;
+
+    /**
+     * @deprecated as of 1.416
+     *      Use {@link #ExtensionList(Jenkins, Class)}
+     */
+    @Deprecated
+    protected ExtensionList(Hudson hudson, Class&lt;T&gt; extensionType) {
+<span class="nc" id="L101">        this((Jenkins)hudson,extensionType);</span>
+<span class="nc" id="L102">    }</span>
+
+    protected ExtensionList(Jenkins jenkins, Class&lt;T&gt; extensionType) {
+<span class="nc" id="L105">        this(jenkins,extensionType,new CopyOnWriteArrayList&lt;ExtensionComponent&lt;T&gt;&gt;());</span>
+<span class="nc" id="L106">    }</span>
+
+    /**
+     * @deprecated as of 1.416
+     *      Use {@link #ExtensionList(Jenkins, Class, CopyOnWriteArrayList)}
+     */
+    @Deprecated
+    protected ExtensionList(Hudson hudson, Class&lt;T&gt; extensionType, CopyOnWriteArrayList&lt;ExtensionComponent&lt;T&gt;&gt; legacyStore) {
+<span class="nc" id="L114">        this((Jenkins)hudson,extensionType,legacyStore);</span>
+<span class="nc" id="L115">    }</span>
+
+    /**
+     *
+     * @param legacyStore
+     *      Place to store manually registered instances. The version of the constructor that
+     *      omits this uses a new {@link Vector}, making the storage lifespan tied to the life of  {@link ExtensionList}.
+     *      If the manually registered instances are scoped to VM level, the caller should pass in a static list. 
+     */
+<span class="fc" id="L124">    protected ExtensionList(Jenkins jenkins, Class&lt;T&gt; extensionType, CopyOnWriteArrayList&lt;ExtensionComponent&lt;T&gt;&gt; legacyStore) {</span>
+<span class="fc" id="L125">        this.hudson = (Hudson)jenkins;</span>
+<span class="fc" id="L126">        this.jenkins = jenkins;</span>
+<span class="fc" id="L127">        this.extensionType = extensionType;</span>
+<span class="fc" id="L128">        this.legacyInstances = legacyStore;</span>
+<span class="pc bpc" id="L129" title="1 of 2 branches missed.">        if (jenkins == null) {</span>
+<span class="fc" id="L130">            extensions = Collections.emptyList();</span>
+        }
+<span class="fc" id="L132">    }</span>
+
+    /**
+     * Add a listener to the extension list.
+     * @param listener The listener.
+     */
+    public void addListener(@Nonnull ExtensionListListener listener) {
+<span class="nc" id="L139">        listeners.add(listener);</span>
+<span class="nc" id="L140">    }</span>
+
+    /**
+     * Looks for the extension instance of the given type (subclasses excluded),
+     * or return null.
+     */
+    public @CheckForNull &lt;U extends T&gt; U get(Class&lt;U&gt; type) {
+<span class="nc bnc" id="L147" title="All 2 branches missed.">        for (T ext : this)</span>
+<span class="nc bnc" id="L148" title="All 2 branches missed.">            if(ext.getClass()==type)</span>
+<span class="nc" id="L149">                return type.cast(ext);</span>
+<span class="nc" id="L150">        return null;</span>
+    }
+
+    @Override
+    public Iterator&lt;T&gt; iterator() {
+        // we need to intercept mutation, so for now don't allow Iterator.remove 
+<span class="fc" id="L156">        return new AdaptedIterator&lt;ExtensionComponent&lt;T&gt;,T&gt;(Iterators.readOnly(ensureLoaded().iterator())) {</span>
+            protected T adapt(ExtensionComponent&lt;T&gt; item) {
+<span class="nc" id="L158">                return item.getInstance();</span>
+            }
+        };
+    }
+
+    /**
+     * Gets the same thing as the 'this' list represents, except as {@link ExtensionComponent}s.
+     */
+    public List&lt;ExtensionComponent&lt;T&gt;&gt; getComponents() {
+<span class="nc" id="L167">        return Collections.unmodifiableList(ensureLoaded());</span>
+    }
+
+    public T get(int index) {
+<span class="nc" id="L171">        return ensureLoaded().get(index).getInstance();</span>
+    }
+    
+    public int size() {
+<span class="nc" id="L175">        return ensureLoaded().size();</span>
+    }
+
+    /**
+     * Gets the read-only view of this {@link ExtensionList} where components are reversed.
+     */
+    public List&lt;T&gt; reverseView() {
+<span class="nc" id="L182">        return new AbstractList&lt;T&gt;() {</span>
+            @Override
+            public T get(int index) {
+<span class="nc" id="L185">                return ExtensionList.this.get(size()-index-1);</span>
+            }
+
+            @Override
+            public int size() {
+<span class="nc" id="L190">                return ExtensionList.this.size();</span>
+            }
+        };
+    }
+
+    @Override
+    public boolean remove(Object o) {
+        try {
+<span class="nc" id="L198">            return removeSync(o);</span>
+<span class="nc" id="L199">        } finally {</span>
+<span class="nc bnc" id="L200" title="All 4 branches missed.">            if(extensions!=null) {</span>
+<span class="nc" id="L201">                fireOnChangeListeners();</span>
+            }
+<span class="nc" id="L203">        }</span>
+    }
+
+    private synchronized boolean removeSync(Object o) {
+<span class="nc" id="L207">        boolean removed = removeComponent(legacyInstances, o);</span>
+<span class="nc bnc" id="L208" title="All 2 branches missed.">        if(extensions!=null) {</span>
+<span class="nc" id="L209">            List&lt;ExtensionComponent&lt;T&gt;&gt; r = new ArrayList&lt;ExtensionComponent&lt;T&gt;&gt;(extensions);</span>
+<span class="nc" id="L210">            removed |= removeComponent(r,o);</span>
+<span class="nc" id="L211">            extensions = sort(r);</span>
+        }
+<span class="nc" id="L213">        return removed;</span>
+    }
+
+    private &lt;T&gt; boolean removeComponent(Collection&lt;ExtensionComponent&lt;T&gt;&gt; collection, Object t) {
+<span class="nc bnc" id="L217" title="All 2 branches missed.">        for (Iterator&lt;ExtensionComponent&lt;T&gt;&gt; itr = collection.iterator(); itr.hasNext();) {</span>
+<span class="nc" id="L218">            ExtensionComponent&lt;T&gt; c =  itr.next();</span>
+<span class="nc bnc" id="L219" title="All 2 branches missed.">            if (c.getInstance().equals(t)) {</span>
+<span class="nc" id="L220">                return collection.remove(c);</span>
+            }
+        }
+<span class="nc" id="L223">        return false;</span>
+    }
+
+    @Override
+    public final synchronized T remove(int index) {
+<span class="nc" id="L228">        T t = get(index);</span>
+<span class="nc" id="L229">        remove(t);</span>
+<span class="nc" id="L230">        return t;</span>
+    }
+
+    /**
+     * Write access will put the instance into a legacy store.
+     *
+     * @deprecated since 2009-02-23.
+     *      Prefer automatic registration.
+     */
+    @Override
+    @Deprecated
+    public boolean add(T t) {
+        try {
+<span class="nc" id="L243">            return addSync(t);</span>
+<span class="nc" id="L244">        } finally {</span>
+<span class="nc bnc" id="L245" title="All 4 branches missed.">            if(extensions!=null) {</span>
+<span class="nc" id="L246">                fireOnChangeListeners();</span>
+            }
+<span class="nc" id="L248">        }</span>
+    }
+
+    private synchronized boolean addSync(T t) {
+<span class="nc" id="L252">        legacyInstances.add(new ExtensionComponent&lt;T&gt;(t));</span>
+        // if we've already filled extensions, add it
+<span class="nc bnc" id="L254" title="All 2 branches missed.">        if(extensions!=null) {</span>
+<span class="nc" id="L255">            List&lt;ExtensionComponent&lt;T&gt;&gt; r = new ArrayList&lt;ExtensionComponent&lt;T&gt;&gt;(extensions);</span>
+<span class="nc" id="L256">            r.add(new ExtensionComponent&lt;T&gt;(t));</span>
+<span class="nc" id="L257">            extensions = sort(r);</span>
+        }
+<span class="nc" id="L259">        return true;</span>
+    }
+
+    @Override
+    public void add(int index, T element) {
+<span class="nc" id="L264">        add(element);</span>
+<span class="nc" id="L265">    }</span>
+
+    /**
+     * Used to bind extension to URLs by their class names.
+     *
+     * @since 1.349
+     */
+    public T getDynamic(String className) {
+<span class="nc bnc" id="L273" title="All 2 branches missed.">        for (T t : this)</span>
+<span class="nc bnc" id="L274" title="All 2 branches missed.">            if (t.getClass().getName().equals(className))</span>
+<span class="nc" id="L275">                return t;</span>
+<span class="nc" id="L276">        return null;</span>
+    }
+
+    private List&lt;ExtensionComponent&lt;T&gt;&gt; ensureLoaded() {
+<span class="pc bpc" id="L280" title="1 of 2 branches missed.">        if(extensions!=null)</span>
+<span class="fc" id="L281">            return extensions; // already loaded</span>
+<span class="nc bnc" id="L282" title="All 2 branches missed.">        if (jenkins.getInitLevel().compareTo(InitMilestone.PLUGINS_PREPARED)&lt;0)</span>
+<span class="nc" id="L283">            return legacyInstances; // can't perform the auto discovery until all plugins are loaded, so just make the legacy instances visible</span>
+
+<span class="nc" id="L285">        synchronized (getLoadLock()) {</span>
+<span class="nc bnc" id="L286" title="All 2 branches missed.">            if(extensions==null) {</span>
+<span class="nc" id="L287">                List&lt;ExtensionComponent&lt;T&gt;&gt; r = load();</span>
+<span class="nc" id="L288">                r.addAll(legacyInstances);</span>
+<span class="nc" id="L289">                extensions = sort(r);</span>
+            }
+<span class="nc" id="L291">            return extensions;</span>
+        }
+    }
+
+    /**
+     * Chooses the object that locks the loading of the extension instances.
+     */
+    protected Object getLoadLock() {
+<span class="nc" id="L299">        return jenkins.lookup.setIfNull(Lock.class,new Lock());</span>
+    }
+
+    /**
+     * Used during {@link Jenkins#refreshExtensions()} to add new components into existing {@link ExtensionList}s.
+     * Do not call from anywhere else.
+     */
+    public void refresh(ExtensionComponentSet delta) {
+<span class="nc" id="L307">        boolean fireOnChangeListeners = false;</span>
+<span class="nc" id="L308">        synchronized (getLoadLock()) {</span>
+<span class="nc bnc" id="L309" title="All 2 branches missed.">            if (extensions==null)</span>
+<span class="nc" id="L310">                return;     // not yet loaded. when we load it, we'll load everything visible by then, so no work needed</span>
+
+<span class="nc" id="L312">            Collection&lt;ExtensionComponent&lt;T&gt;&gt; found = load(delta);</span>
+<span class="nc bnc" id="L313" title="All 2 branches missed.">            if (!found.isEmpty()) {</span>
+<span class="nc" id="L314">                List&lt;ExtensionComponent&lt;T&gt;&gt; l = Lists.newArrayList(extensions);</span>
+<span class="nc" id="L315">                l.addAll(found);</span>
+<span class="nc" id="L316">                extensions = sort(l);</span>
+<span class="nc" id="L317">                fireOnChangeListeners = true;</span>
+            }
+        }
+<span class="nc bnc" id="L320" title="All 2 branches missed.">        if (fireOnChangeListeners) {</span>
+<span class="nc" id="L321">            fireOnChangeListeners();</span>
+        }
+<span class="nc" id="L323">    }</span>
+
+    private void fireOnChangeListeners() {
+<span class="nc bnc" id="L326" title="All 2 branches missed.">        for (ExtensionListListener listener : listeners) {</span>
+            try {
+<span class="nc" id="L328">                listener.onChange();</span>
+<span class="nc" id="L329">            } catch (Exception e) {</span>
+<span class="nc" id="L330">                LOGGER.log(Level.SEVERE, &quot;Error firing ExtensionListListener.onChange().&quot;, e);</span>
+            }
+        }
+<span class="nc" id="L333">    }</span>
+
+    /**
+     * Loading an {@link ExtensionList} can result in a nested loading of another {@link ExtensionList}.
+     * What that means is that we need a single lock that spans across all the {@link ExtensionList}s,
+     * or else we can end up in a dead lock.
+     */
+<span class="nc" id="L340">    private static final class Lock {}</span>
+
+    /**
+     * Loads all the extensions.
+     */
+    protected List&lt;ExtensionComponent&lt;T&gt;&gt; load() {
+<span class="nc bnc" id="L346" title="All 2 branches missed.">        if (LOGGER.isLoggable(Level.FINE))</span>
+<span class="nc" id="L347">            LOGGER.log(Level.FINE,&quot;Loading ExtensionList: &quot;+extensionType, new Throwable());</span>
+
+<span class="nc" id="L349">        return jenkins.getPluginManager().getPluginStrategy().findComponents(extensionType, hudson);</span>
+    }
+
+    /**
+     * Picks up extensions that we care from the given list.
+     */
+    protected Collection&lt;ExtensionComponent&lt;T&gt;&gt; load(ExtensionComponentSet delta) {
+<span class="nc" id="L356">        return delta.find(extensionType);</span>
+    }
+
+
+    /**
+     * If the {@link ExtensionList} implementation requires sorting extensions,
+     * override this method to do so.
+     *
+     * &lt;p&gt;
+     * The implementation should copy a list, do a sort, and return the new instance.
+     */
+    protected List&lt;ExtensionComponent&lt;T&gt;&gt; sort(List&lt;ExtensionComponent&lt;T&gt;&gt; r) {
+<span class="nc" id="L368">        r = new ArrayList&lt;ExtensionComponent&lt;T&gt;&gt;(r);</span>
+<span class="nc" id="L369">        Collections.sort(r);</span>
+<span class="nc" id="L370">        return r;</span>
+    }
+
+    /**
+     * @deprecated as of 1.416
+     *      Use {@link #create(Jenkins, Class)}
+     */
+    @Deprecated
+    public static &lt;T&gt; ExtensionList&lt;T&gt; create(Hudson hudson, Class&lt;T&gt; type) {
+<span class="nc" id="L379">        return create((Jenkins)hudson,type);</span>
+    }
+
+    public static &lt;T&gt; ExtensionList&lt;T&gt; create(Jenkins jenkins, Class&lt;T&gt; type) {
+<span class="pc bpc" id="L383" title="1 of 2 branches missed.">        if(type.getAnnotation(LegacyInstancesAreScopedToHudson.class)!=null)</span>
+<span class="nc" id="L384">            return new ExtensionList&lt;T&gt;(jenkins,type);</span>
+        else {
+<span class="fc" id="L386">            return new ExtensionList&lt;T&gt;(jenkins,type,staticLegacyInstances.get(type));</span>
+        }
+    }
+
+    /**
+     * Gets the extension list for a given type.
+     * Normally calls {@link Jenkins#getExtensionList(Class)} but falls back to an empty list
+     * in case {@link Jenkins#getInstance} is null.
+     * Thus it is useful to call from {@code all()} methods which need to behave gracefully during startup or shutdown.
+     * @param type the extension point type
+     * @return some list
+     * @since 1.572
+     */
+    public static @Nonnull &lt;T&gt; ExtensionList&lt;T&gt; lookup(Class&lt;T&gt; type) {
+<span class="fc" id="L400">        Jenkins j = Jenkins.getInstance();</span>
+<span class="pc bpc" id="L401" title="1 of 2 branches missed.">        return j == null ? create((Jenkins) null, type) : j.getExtensionList(type);</span>
+    }
+
+    /**
+     * Places to store static-scope legacy instances.
+     */
+<span class="fc" id="L407">    private static final Memoizer&lt;Class,CopyOnWriteArrayList&gt; staticLegacyInstances = new Memoizer&lt;Class,CopyOnWriteArrayList&gt;() {</span>
+        public CopyOnWriteArrayList compute(Class key) {
+<span class="fc" id="L409">            return new CopyOnWriteArrayList();</span>
+        }
+    };
+
+    /**
+     * Exposed for the test harness to clear all legacy extension instances.
+     */
+    public static void clearLegacyInstances() {
+<span class="nc" id="L417">        staticLegacyInstances.clear();</span>
+<span class="nc" id="L418">    }</span>
+
+<span class="fc" id="L420">    private static final Logger LOGGER = Logger.getLogger(ExtensionList.class.getName());</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

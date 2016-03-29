@@ -1,0 +1,124 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>ClientAuthenticationCache.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.cli</a> &gt; <span class="el_source">ClientAuthenticationCache.java</span></div><h1>ClientAuthenticationCache.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">package hudson.cli;</span>
+
+import hudson.FilePath;
+import hudson.remoting.Channel;
+import hudson.util.Secret;
+import jenkins.model.Jenkins;
+import jenkins.security.MasterToSlaveCallable;
+import org.acegisecurity.Authentication;
+import org.acegisecurity.AuthenticationException;
+import org.acegisecurity.providers.UsernamePasswordAuthenticationToken;
+import org.acegisecurity.userdetails.UserDetails;
+import org.springframework.dao.DataAccessException;
+
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.io.Serializable;
+import java.util.Properties;
+
+/**
+ * Represents the authentication credential store of the CLI client.
+ *
+ * &lt;p&gt;
+ * This object encapsulates a remote manipulation of the credential store.
+ * We store encrypted user names.
+ *
+ * @author Kohsuke Kawaguchi
+ * @since 1.351
+ */
+public class ClientAuthenticationCache implements Serializable {
+    /**
+     * Where the store should be placed.
+     */
+    private final FilePath store;
+
+    /**
+     * Loaded contents of the store.
+     */
+<span class="nc" id="L40">    private final Properties props = new Properties();</span>
+
+<span class="nc" id="L42">    public ClientAuthenticationCache(Channel channel) throws IOException, InterruptedException {</span>
+<span class="nc bnc" id="L43" title="All 2 branches missed.">        store = (channel==null ? FilePath.localChannel :  channel).call(new MasterToSlaveCallable&lt;FilePath, IOException&gt;() {</span>
+            public FilePath call() throws IOException {
+<span class="nc" id="L45">                File home = new File(System.getProperty(&quot;user.home&quot;));</span>
+<span class="nc" id="L46">                File hudsonHome = new File(home, &quot;.hudson&quot;);</span>
+<span class="nc bnc" id="L47" title="All 2 branches missed.">                if (hudsonHome.exists()) {</span>
+<span class="nc" id="L48">                    return new FilePath(new File(hudsonHome, &quot;cli-credentials&quot;));</span>
+                }
+<span class="nc" id="L50">                return new FilePath(new File(home, &quot;.jenkins/cli-credentials&quot;));</span>
+            }
+        });
+<span class="nc bnc" id="L53" title="All 2 branches missed.">        if (store.exists()) {</span>
+<span class="nc" id="L54">            InputStream istream = store.read();</span>
+            try {
+<span class="nc" id="L56">                props.load(istream);</span>
+<span class="nc" id="L57">            } finally {</span>
+<span class="nc" id="L58">                istream.close();</span>
+<span class="nc" id="L59">            }</span>
+        }
+<span class="nc" id="L61">    }</span>
+
+    /**
+     * Gets the persisted authentication for this Jenkins.
+     *
+     * @return {@link jenkins.model.Jenkins#ANONYMOUS} if no such credential is found, or if the stored credential is invalid.
+     */
+    public Authentication get() {
+<span class="nc" id="L69">        Jenkins h = Jenkins.getActiveInstance();</span>
+<span class="nc" id="L70">        Secret userName = Secret.decrypt(props.getProperty(getPropertyKey()));</span>
+<span class="nc bnc" id="L71" title="All 2 branches missed.">        if (userName==null) return Jenkins.ANONYMOUS; // failed to decrypt</span>
+        try {
+<span class="nc" id="L73">            UserDetails u = h.getSecurityRealm().loadUserByUsername(userName.getPlainText());</span>
+<span class="nc" id="L74">            return new UsernamePasswordAuthenticationToken(u.getUsername(), &quot;&quot;, u.getAuthorities());</span>
+<span class="nc" id="L75">        } catch (AuthenticationException e) {</span>
+<span class="nc" id="L76">            return Jenkins.ANONYMOUS;</span>
+<span class="nc" id="L77">        } catch (DataAccessException e) {</span>
+<span class="nc" id="L78">            return Jenkins.ANONYMOUS;</span>
+        }
+    }
+
+    /**
+     * Computes the key that identifies this Hudson among other Hudsons that the user has a credential for.
+     */
+    private String getPropertyKey() {
+<span class="nc" id="L86">        String url = Jenkins.getActiveInstance().getRootUrl();</span>
+<span class="nc bnc" id="L87" title="All 2 branches missed.">        if (url!=null)  return url;</span>
+<span class="nc" id="L88">        return Secret.fromString(&quot;key&quot;).toString();</span>
+    }
+
+    /**
+     * Persists the specified authentication.
+     */
+    public void set(Authentication a) throws IOException, InterruptedException {
+<span class="nc" id="L95">        Jenkins h = Jenkins.getActiveInstance();</span>
+
+        // make sure that this security realm is capable of retrieving the authentication by name,
+        // as it's not required.
+<span class="nc" id="L99">        UserDetails u = h.getSecurityRealm().loadUserByUsername(a.getName());</span>
+<span class="nc" id="L100">        props.setProperty(getPropertyKey(), Secret.fromString(u.getUsername()).getEncryptedValue());</span>
+
+<span class="nc" id="L102">        save();</span>
+<span class="nc" id="L103">    }</span>
+
+    /**
+     * Removes the persisted credential, if there's one.
+     */
+    public void remove() throws IOException, InterruptedException {
+<span class="nc bnc" id="L109" title="All 2 branches missed.">        if (props.remove(getPropertyKey())!=null)</span>
+<span class="nc" id="L110">            save();</span>
+<span class="nc" id="L111">    }</span>
+
+    private void save() throws IOException, InterruptedException {
+<span class="nc" id="L114">        OutputStream os = store.write();</span>
+        try {
+<span class="nc" id="L116">            props.store(os,&quot;Credential store&quot;);</span>
+<span class="nc" id="L117">        } finally {</span>
+<span class="nc" id="L118">            os.close();</span>
+<span class="nc" id="L119">        }</span>
+        // try to protect this file from other users, if we can.
+<span class="nc" id="L121">        store.chmod(0600);</span>
+<span class="nc" id="L122">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

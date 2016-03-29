@@ -1,0 +1,176 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>CheckPoint.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.model</a> &gt; <span class="el_source">CheckPoint.java</span></div><h1>CheckPoint.java</h1><pre class="source lang-java linenums">/*
+ * The MIT License
+ *
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.model;
+
+import hudson.tasks.BuildStep;
+import hudson.tasks.Recorder;
+import hudson.tasks.Builder;
+import hudson.scm.SCM;
+import javax.annotation.Nonnull;
+
+/**
+ * Provides a mechanism for synchronizing build executions in the face of concurrent builds.
+ *
+ * &lt;p&gt;
+ * At certain points of a build, {@link BuildStep}s and other extension points often need
+ * to refer to what happened in its earlier build. For example, a {@link SCM} check out
+ * can run concurrently, but the changelog computation requires that the check out of the
+ * earlier build has completed. Or if Hudson is sending out an e-mail, he needs to know
+ * the result of the previous build, so that he can decide an e-mail is necessary or not.
+ *
+ * &lt;p&gt;
+ * Check pointing is a primitive mechanism to provide this sort of synchronization.
+ * These methods can be only invoked from {@link Executor} threads.
+ *
+ * &lt;p&gt;
+ * Each {@link CheckPoint} instance represents unique check points. {@link CheckPoint}
+ * instances are normally created as a static instance, because two builds of the same project
+ * needs to refer to the same check point instance for synchronization to happen properly.
+ *
+ * &lt;p&gt;
+ * This class defines a few well-known check point instances. plugins can define
+ * their additional check points for their own use.
+ *
+ * &lt;p&gt;Note that not all job types support checkpoints.
+ *
+ * &lt;h2&gt;Example&lt;/h2&gt;
+ * &lt;p&gt;
+ * {@code JUnitResultArchiver} provides a good example of how a {@link Recorder} can
+ * depend on its earlier result.
+ *
+ * @author Kohsuke Kawaguchi
+ * @see BuildStep#getRequiredMonitorService() 
+ * @since 1.319
+ */
+public final class CheckPoint {
+    private final Object identity;
+    private final String internalName;
+
+    /**
+     * For advanced uses. Creates a check point that uses the given object as its identity.
+     */
+<span class="nc" id="L73">    public CheckPoint(String internalName, Object identity) {</span>
+<span class="nc" id="L74">        this.internalName = internalName;</span>
+<span class="nc" id="L75">        this.identity = identity;</span>
+<span class="nc" id="L76">    }</span>
+
+    /**
+     * @param internalName
+     *      Name of this check point that's used in the logging, stack traces, debug messages, and so on.
+     *      This is not displayed to users. No need for i18n.
+     */
+    public CheckPoint(String internalName) {
+<span class="nc" id="L84">        this(internalName, new Object());</span>
+<span class="nc" id="L85">    }</span>
+
+    @Override
+    public boolean equals(Object that) {
+<span class="nc bnc" id="L89" title="All 4 branches missed.">        if (that == null || getClass() != that.getClass()) return false;</span>
+<span class="nc bnc" id="L90" title="All 2 branches missed.">        return identity== ((CheckPoint) that).identity;</span>
+    }
+
+    @Override
+    public int hashCode() {
+<span class="nc" id="L95">        return identity.hashCode();</span>
+    }
+
+    @Override
+    public String toString() {
+<span class="nc" id="L100">        return &quot;Check point &quot;+internalName;</span>
+    }
+
+    /**
+     * Records that the execution of the build has reached to a check point, idenified
+     * by the given identifier.
+     *
+     * &lt;p&gt;
+     * If the successive builds are {@linkplain #block() waiting for this check point},
+     * they'll be released.
+     *
+     * &lt;p&gt;
+     * This method can be only called from an {@link Executor} thread.
+     */
+    public void report() {
+<span class="nc" id="L115">        Run.reportCheckpoint(this);</span>
+<span class="nc" id="L116">    }</span>
+
+    /**
+     * Waits until the previous build in progress reaches a check point, identified
+     * by the given identifier, or until the current executor becomes the youngest build in progress.
+     *
+     * &lt;p&gt;
+     * Note that &quot;previous build in progress&quot; should be interpreted as &quot;previous (build in progress)&quot; instead of
+     * &quot;(previous build) if it's in progress&quot;. This makes a difference around builds that are aborted or
+     * failed very early without reporting the check points. Imagine the following time sequence:
+     *
+     * &lt;ol&gt;
+     * &lt;li&gt;Build #1, #2, and #3 happens around the same time
+     * &lt;li&gt;Build #3 waits for check point {@code JUnitResultArchiver}
+     * &lt;li&gt;Build #2 aborts before getting to that check point
+     * &lt;li&gt;Build #1 finally checks in {@code JUnitResultArchiver}
+     * &lt;/ol&gt;
+     *
+     * &lt;p&gt;
+     * Using this method, build #3 correctly waits until the step 4. Because of this behavior,
+     * the {@link #report()}/{@link #block()} pair can normally
+     * be used without a try/finally block.
+     *
+     * &lt;p&gt;
+     * This method can be only called from an {@link Executor} thread.
+     *
+     * @throws InterruptedException
+     *      If the build (represented by the calling executor thread) is aborted while it's waiting.  
+     */
+    public void block() throws InterruptedException {
+<span class="nc" id="L146">        Run.waitForCheckpoint(this, null, null);</span>
+<span class="nc" id="L147">    }</span>
+
+    /**
+     * Like {@link #block()} but allows for richer logging.
+     * @param listener an optional listener to which
+     * @param waiter a description of what component is requesting the wait, such as {@link Descriptor#getDisplayName}
+     * @throws InterruptedException if the build is aborted while waiting
+     * @since 1.528
+     */
+    public void block(@Nonnull BuildListener listener, @Nonnull String waiter) throws InterruptedException {
+<span class="nc" id="L157">        Run.waitForCheckpoint(this, listener, waiter);</span>
+<span class="nc" id="L158">    }</span>
+
+    /**
+     * {@link CheckPoint} that indicates that {@link AbstractBuild#getCulprits()} is computed.
+     */
+<span class="nc" id="L163">    public static final CheckPoint CULPRITS_DETERMINED = new CheckPoint(&quot;CULPRITS_DETERMINED&quot;);</span>
+    /**
+     * {@link CheckPoint} that indicates that the build is completed.
+     * ({@link AbstractBuild#isBuilding()}==false)
+     */
+<span class="nc" id="L168">    public static final CheckPoint COMPLETED = new CheckPoint(&quot;COMPLETED&quot;);</span>
+    /**
+     * {@link CheckPoint} that indicates that the build has finished executing the &quot;main&quot; portion
+     * ({@link Builder}s in case of {@link FreeStyleProject}) and now moving on to the post-build
+     * steps.
+     */
+<span class="nc" id="L174">    public static final CheckPoint MAIN_COMPLETED = new CheckPoint(&quot;MAIN_COMPLETED&quot;);</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

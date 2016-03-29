@@ -1,0 +1,427 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>LazyBuildMixIn.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">jenkins.model.lazy</a> &gt; <span class="el_source">LazyBuildMixIn.java</span></div><h1>LazyBuildMixIn.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">/*</span>
+ * The MIT License
+ *
+ * Copyright 2014 Jesse Glick.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+
+package jenkins.model.lazy;
+
+import hudson.Extension;
+import hudson.model.Item;
+import hudson.model.ItemGroup;
+import hudson.model.Job;
+import hudson.model.Queue;
+import hudson.model.Run;
+import hudson.model.RunMap;
+import hudson.model.listeners.ItemListener;
+import hudson.widgets.BuildHistoryWidget;
+import hudson.widgets.HistoryWidget;
+import java.io.File;
+import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import javax.annotation.CheckForNull;
+import javax.annotation.Nonnull;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.DoNotUse;
+
+import static java.util.logging.Level.FINER;
+import jenkins.model.RunIdMigrator;
+
+/**
+ * Makes it easier to use a lazy {@link RunMap} from a {@link Job} implementation.
+ * Provides method implementations for some abstract {@link Job} methods,
+ * as well as some methods which are not abstract but which you should override.
+ * &lt;p&gt;Should be kept in a {@code transient} field in the job.
+ * @since 1.556
+ */
+@SuppressWarnings({&quot;unchecked&quot;, &quot;rawtypes&quot;}) // BuildHistoryWidget, and AbstractItem.getParent
+<span class="nc bnc" id="L58" title="All 2 branches missed.">public abstract class LazyBuildMixIn&lt;JobT extends Job&lt;JobT,RunT&gt; &amp; Queue.Task &amp; LazyBuildMixIn.LazyLoadingJob&lt;JobT,RunT&gt;, RunT extends Run&lt;JobT,RunT&gt; &amp; LazyBuildMixIn.LazyLoadingRun&lt;JobT,RunT&gt;&gt; {</span>
+
+<span class="nc" id="L60">    private static final Logger LOGGER = Logger.getLogger(LazyBuildMixIn.class.getName());</span>
+
+    @SuppressWarnings(&quot;deprecation&quot;) // [JENKINS-15156] builds accessed before onLoad or onCreatedFromScratch called
+<span class="nc" id="L63">    private @Nonnull RunMap&lt;RunT&gt; builds = new RunMap&lt;RunT&gt;();</span>
+
+    /**
+     * Initializes this mixin.
+     * Call this from a constructor and {@link AbstractItem#onLoad} to make sure it is always initialized.
+     */
+<span class="nc" id="L69">    protected LazyBuildMixIn() {}</span>
+
+    protected abstract JobT asJob();
+
+    /**
+     * Gets the raw model.
+     * Normally should not be called as such.
+     * Note that the initial value is replaced during {@link #onCreatedFromScratch} or {@link #onLoad}.
+     */
+    public final @Nonnull RunMap&lt;RunT&gt; getRunMap() {
+<span class="nc" id="L79">        return builds;</span>
+    }
+
+    /**
+     * Same as {@link #getRunMap} but suitable for {@link Job#_getRuns}.
+     */
+    public final RunMap&lt;RunT&gt; _getRuns() {
+<span class="nc bnc" id="L86" title="All 4 branches missed.">        assert builds.baseDirInitialized() : &quot;neither onCreatedFromScratch nor onLoad called on &quot; + asJob() + &quot; yet&quot;;</span>
+<span class="nc" id="L87">        return builds;</span>
+    }
+
+    /**
+     * Something to be called from {@link Job#onCreatedFromScratch}.
+     */
+    public final void onCreatedFromScratch() {
+<span class="nc" id="L94">        builds = createBuildRunMap();</span>
+<span class="nc" id="L95">    }</span>
+
+    /**
+     * Something to be called from {@link Job#onLoad}.
+     */
+    @SuppressWarnings(&quot;unchecked&quot;)
+    public void onLoad(ItemGroup&lt;? extends Item&gt; parent, String name) throws IOException {
+<span class="nc" id="L102">        RunMap&lt;RunT&gt; _builds = createBuildRunMap();</span>
+<span class="nc" id="L103">        RunMap&lt;RunT&gt; currentBuilds = this.builds;</span>
+<span class="nc bnc" id="L104" title="All 2 branches missed.">        if (parent != null) {</span>
+            // are we overwriting what currently exist?
+            // this is primarily when Jenkins is getting reloaded
+            Item current;
+            try {
+<span class="nc" id="L109">                current = parent.getItem(name);</span>
+<span class="nc" id="L110">            } catch (RuntimeException x) {</span>
+<span class="nc" id="L111">                LOGGER.log(Level.WARNING, &quot;failed to look up &quot; + name + &quot; in &quot; + parent, x);</span>
+<span class="nc" id="L112">                current = null;</span>
+            }
+<span class="nc bnc" id="L114" title="All 4 branches missed.">            if (current != null &amp;&amp; current.getClass() == asJob().getClass()) {</span>
+<span class="nc" id="L115">                currentBuilds = (RunMap&lt;RunT&gt;) ((LazyLoadingJob) current).getLazyBuildMixIn().builds;</span>
+            }
+        }
+<span class="nc bnc" id="L118" title="All 2 branches missed.">        if (currentBuilds != null) {</span>
+            // if we are reloading, keep all those that are still building intact
+<span class="nc bnc" id="L120" title="All 2 branches missed.">            for (RunT r : currentBuilds.getLoadedBuilds().values()) {</span>
+<span class="nc bnc" id="L121" title="All 2 branches missed.">                if (r.isBuilding()) {</span>
+                    // Do not use RunMap.put(Run):
+<span class="nc" id="L123">                    _builds.put(r.getNumber(), r);</span>
+                }
+            }
+        }
+<span class="nc" id="L127">        this.builds = _builds;</span>
+<span class="nc" id="L128">    }</span>
+
+    private RunMap&lt;RunT&gt; createBuildRunMap() {
+<span class="nc" id="L131">        RunMap&lt;RunT&gt; r = new RunMap&lt;RunT&gt;(asJob().getBuildDir(), new RunMap.Constructor&lt;RunT&gt;() {</span>
+            @Override public RunT create(File dir) throws IOException {
+<span class="nc" id="L133">                return loadBuild(dir);</span>
+            }
+        });
+<span class="nc" id="L136">        RunIdMigrator runIdMigrator = asJob().runIdMigrator;</span>
+<span class="nc bnc" id="L137" title="All 4 branches missed.">        assert runIdMigrator != null;</span>
+<span class="nc" id="L138">        r.runIdMigrator = runIdMigrator;</span>
+<span class="nc" id="L139">        return r;</span>
+    }
+
+    /**
+     * Type token for the build type.
+     * The build class must have two constructors:
+     * one taking the project type ({@code P});
+     * and one taking {@code P}, then {@link File}.
+     */
+    protected abstract Class&lt;RunT&gt; getBuildClass();
+
+    /**
+     * Loads an existing build record from disk.
+     * The default implementation just calls the ({@link Job}, {@link File}) constructor of {@link #getBuildClass}.
+     */
+    public RunT loadBuild(File dir) throws IOException {
+        try {
+<span class="nc" id="L156">            return getBuildClass().getConstructor(asJob().getClass(), File.class).newInstance(asJob(), dir);</span>
+<span class="nc" id="L157">        } catch (InstantiationException e) {</span>
+<span class="nc" id="L158">            throw new Error(e);</span>
+<span class="nc" id="L159">        } catch (IllegalAccessException e) {</span>
+<span class="nc" id="L160">            throw new Error(e);</span>
+<span class="nc" id="L161">        } catch (InvocationTargetException e) {</span>
+<span class="nc" id="L162">            throw handleInvocationTargetException(e);</span>
+<span class="nc" id="L163">        } catch (NoSuchMethodException e) {</span>
+<span class="nc" id="L164">            throw new Error(e);</span>
+        }
+    }
+
+    /**
+     * Creates a new build of this project for immediate execution.
+     * Calls the ({@link Job}) constructor of {@link #getBuildClass}.
+     * Suitable for {@link SubTask#createExecutable}.
+     */
+    public final synchronized RunT newBuild() throws IOException {
+        try {
+<span class="nc" id="L175">            RunT lastBuild = getBuildClass().getConstructor(asJob().getClass()).newInstance(asJob());</span>
+<span class="nc" id="L176">            builds.put(lastBuild);</span>
+<span class="nc" id="L177">            lastBuild.getPreviousBuild(); // JENKINS-20662: create connection to previous build</span>
+<span class="nc" id="L178">            return lastBuild;</span>
+<span class="nc" id="L179">        } catch (InstantiationException e) {</span>
+<span class="nc" id="L180">            throw new Error(e);</span>
+<span class="nc" id="L181">        } catch (IllegalAccessException e) {</span>
+<span class="nc" id="L182">            throw new Error(e);</span>
+<span class="nc" id="L183">        } catch (InvocationTargetException e) {</span>
+<span class="nc" id="L184">            throw handleInvocationTargetException(e);</span>
+<span class="nc" id="L185">        } catch (NoSuchMethodException e) {</span>
+<span class="nc" id="L186">            throw new Error(e);</span>
+        }
+    }
+
+    private IOException handleInvocationTargetException(InvocationTargetException e) {
+<span class="nc" id="L191">        Throwable t = e.getTargetException();</span>
+<span class="nc bnc" id="L192" title="All 2 branches missed.">        if (t instanceof Error) {</span>
+<span class="nc" id="L193">            throw (Error) t;</span>
+        }
+<span class="nc bnc" id="L195" title="All 2 branches missed.">        if (t instanceof RuntimeException) {</span>
+<span class="nc" id="L196">            throw (RuntimeException) t;</span>
+        }
+<span class="nc bnc" id="L198" title="All 2 branches missed.">        if (t instanceof IOException) {</span>
+<span class="nc" id="L199">            return (IOException) t;</span>
+        }
+<span class="nc" id="L201">        throw new Error(t);</span>
+    }
+
+    /**
+     * Suitable for {@link Job#removeRun}.
+     */
+    public final void removeRun(RunT run) {
+<span class="nc bnc" id="L208" title="All 2 branches missed.">        if (!builds.remove(run)) {</span>
+<span class="nc" id="L209">            LOGGER.log(Level.WARNING, &quot;{0} did not contain {1} to begin with&quot;, new Object[] {asJob(), run});</span>
+        }
+<span class="nc" id="L211">    }</span>
+
+    /**
+     * Suitable for {@link Job#getBuild}.
+     */
+    public final RunT getBuild(String id) {
+<span class="nc" id="L217">        return builds.getById(id);</span>
+    }
+
+    /**
+     * Suitable for {@link Job#getBuildByNumber}.
+     */
+    public final RunT getBuildByNumber(int n) {
+<span class="nc" id="L224">        return builds.getByNumber(n);</span>
+    }
+
+    /**
+     * Suitable for {@link Job#getFirstBuild}.
+     */
+    public final RunT getFirstBuild() {
+<span class="nc" id="L231">        return builds.oldestBuild();</span>
+    }
+
+    /**
+     * Suitable for {@link Job#getLastBuild}.
+     */
+    public final @CheckForNull RunT getLastBuild() {
+<span class="nc" id="L238">        return builds.newestBuild();</span>
+    }
+
+    /**
+     * Suitable for {@link Job#getNearestBuild}.
+     */
+    public final RunT getNearestBuild(int n) {
+<span class="nc" id="L245">        return builds.search(n, AbstractLazyLoadRunMap.Direction.ASC);</span>
+    }
+
+    /**
+     * Suitable for {@link Job#getNearestOldBuild}.
+     */
+    public final RunT getNearestOldBuild(int n) {
+<span class="nc" id="L252">        return builds.search(n, AbstractLazyLoadRunMap.Direction.DESC);</span>
+    }
+
+    /**
+     * Suitable for {@link Job#createHistoryWidget}.
+     */
+    public final HistoryWidget createHistoryWidget() {
+<span class="nc" id="L259">        return new BuildHistoryWidget(asJob(), builds, Job.HISTORY_ADAPTER);</span>
+    }
+
+    /**
+     * Marker for a {@link Job} which uses this mixin.
+     */
+    public interface LazyLoadingJob&lt;JobT extends Job&lt;JobT,RunT&gt; &amp; Queue.Task &amp; LazyBuildMixIn.LazyLoadingJob&lt;JobT,RunT&gt;, RunT extends Run&lt;JobT,RunT&gt; &amp; LazyLoadingRun&lt;JobT,RunT&gt;&gt; {
+        LazyBuildMixIn&lt;JobT,RunT&gt; getLazyBuildMixIn();
+    }
+
+    public interface LazyLoadingRun&lt;JobT extends Job&lt;JobT,RunT&gt; &amp; Queue.Task &amp; LazyBuildMixIn.LazyLoadingJob&lt;JobT,RunT&gt;, RunT extends Run&lt;JobT,RunT&gt; &amp; LazyLoadingRun&lt;JobT,RunT&gt;&gt; {
+        RunMixIn&lt;JobT,RunT&gt; getRunMixIn();
+    }
+
+    /**
+     * Accompanying helper for the run type.
+     * Stateful but should be held in a {@code transient final} field.
+     */
+    public static abstract class RunMixIn&lt;JobT extends Job&lt;JobT,RunT&gt; &amp; Queue.Task &amp; LazyBuildMixIn.LazyLoadingJob&lt;JobT,RunT&gt;, RunT extends Run&lt;JobT,RunT&gt; &amp; LazyLoadingRun&lt;JobT,RunT&gt;&gt; {
+
+        /**
+         * Pointers to form bi-directional link between adjacent runs using
+         * {@link LazyBuildMixIn}.
+         *
+         * &lt;p&gt;
+         * Some {@link Run}s do lazy-loading, so we don't use
+         * {@link #previousBuildR} and {@link #nextBuildR}, and instead use these
+         * fields and point to {@link #selfReference} (or {@link #none}) of
+         * adjacent builds.
+         */
+        private volatile BuildReference&lt;RunT&gt; previousBuildR, nextBuildR;
+
+        /**
+         * Used in {@link #previousBuildR} and {@link #nextBuildR} to indicate
+         * that we know there is no next/previous build (as opposed to {@code null},
+         * which is used to indicate we haven't determined if there is a next/previous
+         * build.)
+         */
+        @SuppressWarnings({&quot;unchecked&quot;, &quot;rawtypes&quot;})
+<span class="nc" id="L298">        private static final BuildReference NONE = new BuildReference(&quot;NONE&quot;, null);</span>
+
+        @SuppressWarnings(&quot;unchecked&quot;)
+        private BuildReference&lt;RunT&gt; none() {
+<span class="nc" id="L302">            return NONE;</span>
+        }
+
+        private BuildReference&lt;RunT&gt; selfReference;
+
+<span class="nc" id="L307">        protected RunMixIn() {}</span>
+
+        protected abstract RunT asRun();
+
+        /**
+         * To implement {@link Run#createReference}.
+         */
+        public final synchronized BuildReference&lt;RunT&gt; createReference() {
+<span class="nc bnc" id="L315" title="All 2 branches missed.">            if (selfReference == null) {</span>
+<span class="nc" id="L316">                selfReference = new BuildReference&lt;RunT&gt;(asRun().getId(), asRun());</span>
+            }
+<span class="nc" id="L318">            return selfReference;</span>
+        }
+
+        /**
+         * To implement {@link Run#dropLinks}.
+         */
+        public final void dropLinks() {
+<span class="nc bnc" id="L325" title="All 2 branches missed.">            if (nextBuildR != null) {</span>
+<span class="nc" id="L326">                RunT nb = nextBuildR.get();</span>
+<span class="nc bnc" id="L327" title="All 2 branches missed.">                if (nb != null) {</span>
+<span class="nc" id="L328">                    nb.getRunMixIn().previousBuildR = previousBuildR;</span>
+                }
+            }
+<span class="nc bnc" id="L331" title="All 2 branches missed.">            if (previousBuildR != null) {</span>
+<span class="nc" id="L332">                RunT pb = previousBuildR.get();</span>
+<span class="nc bnc" id="L333" title="All 2 branches missed.">                if (pb != null) {</span>
+<span class="nc" id="L334">                    pb.getRunMixIn().nextBuildR = nextBuildR;</span>
+                }
+            }
+
+            // make this build object unreachable by other Runs
+<span class="nc" id="L339">            createReference().clear();</span>
+<span class="nc" id="L340">        }</span>
+
+        /**
+         * To implement {@link Run#getPreviousBuild}.
+         */
+        public final RunT getPreviousBuild() {
+<span class="nc" id="L346">            while (true) {</span>
+<span class="nc" id="L347">                BuildReference&lt;RunT&gt; r = previousBuildR;    // capture the value once</span>
+
+<span class="nc bnc" id="L349" title="All 2 branches missed.">                if (r == null) {</span>
+                    // having two neighbors pointing to each other is important to make RunMap.removeValue work
+<span class="nc" id="L351">                    JobT _parent = asRun().getParent();</span>
+<span class="nc bnc" id="L352" title="All 2 branches missed.">                    if (_parent == null) {</span>
+<span class="nc" id="L353">                        throw new IllegalStateException(&quot;no parent for &quot; + asRun().number);</span>
+                    }
+<span class="nc" id="L355">                    RunT pb = _parent.getLazyBuildMixIn()._getRuns().search(asRun().number - 1, AbstractLazyLoadRunMap.Direction.DESC);</span>
+<span class="nc bnc" id="L356" title="All 2 branches missed.">                    if (pb != null) {</span>
+<span class="nc" id="L357">                        pb.getRunMixIn().nextBuildR = createReference();   // establish bi-di link</span>
+<span class="nc" id="L358">                        this.previousBuildR = pb.getRunMixIn().createReference();</span>
+<span class="nc" id="L359">                        LOGGER.log(FINER, &quot;Linked {0}&lt;-&gt;{1} in getPreviousBuild()&quot;, new Object[]{this, pb});</span>
+<span class="nc" id="L360">                        return pb;</span>
+                    } else {
+<span class="nc" id="L362">                        this.previousBuildR = none();</span>
+<span class="nc" id="L363">                        return null;</span>
+                    }
+                }
+<span class="nc bnc" id="L366" title="All 2 branches missed.">                if (r == none()) {</span>
+<span class="nc" id="L367">                    return null;</span>
+                }
+
+<span class="nc" id="L370">                RunT referent = r.get();</span>
+<span class="nc bnc" id="L371" title="All 2 branches missed.">                if (referent != null) {</span>
+<span class="nc" id="L372">                    return referent;</span>
+                }
+
+                // the reference points to a GC-ed object, drop the reference and do it again
+<span class="nc" id="L376">                this.previousBuildR = null;</span>
+            }
+        }
+
+        /**
+         * To implement {@link Run#getNextBuild}.
+         */
+        public final RunT getNextBuild() {
+<span class="nc" id="L384">            while (true) {</span>
+<span class="nc" id="L385">                BuildReference&lt;RunT&gt; r = nextBuildR;    // capture the value once</span>
+
+<span class="nc bnc" id="L387" title="All 2 branches missed.">                if (r == null) {</span>
+                    // having two neighbors pointing to each other is important to make RunMap.removeValue work
+<span class="nc" id="L389">                    RunT nb = asRun().getParent().getLazyBuildMixIn()._getRuns().search(asRun().number + 1, AbstractLazyLoadRunMap.Direction.ASC);</span>
+<span class="nc bnc" id="L390" title="All 2 branches missed.">                    if (nb != null) {</span>
+<span class="nc" id="L391">                        nb.getRunMixIn().previousBuildR = createReference();   // establish bi-di link</span>
+<span class="nc" id="L392">                        this.nextBuildR = nb.getRunMixIn().createReference();</span>
+<span class="nc" id="L393">                        LOGGER.log(FINER, &quot;Linked {0}&lt;-&gt;{1} in getNextBuild()&quot;, new Object[]{this, nb});</span>
+<span class="nc" id="L394">                        return nb;</span>
+                    } else {
+<span class="nc" id="L396">                        this.nextBuildR = none();</span>
+<span class="nc" id="L397">                        return null;</span>
+                    }
+                }
+<span class="nc bnc" id="L400" title="All 2 branches missed.">                if (r == none()) {</span>
+<span class="nc" id="L401">                    return null;</span>
+                }
+
+<span class="nc" id="L404">                RunT referent = r.get();</span>
+<span class="nc bnc" id="L405" title="All 2 branches missed.">                if (referent != null) {</span>
+<span class="nc" id="L406">                    return referent;</span>
+                }
+
+                // the reference points to a GC-ed object, drop the reference and do it again
+<span class="nc" id="L410">                this.nextBuildR = null;</span>
+            }
+        }
+
+    }
+
+    @Restricted(DoNotUse.class)
+<span class="nc" id="L417">    @Extension public static final class ItemListenerImpl extends ItemListener {</span>
+        @Override public void onLocationChanged(Item item, String oldFullName, String newFullName) {
+<span class="nc bnc" id="L419" title="All 2 branches missed.">            if (item instanceof LazyLoadingJob) {</span>
+<span class="nc" id="L420">                RunMap&lt;?&gt; builds = ((LazyLoadingJob) item).getLazyBuildMixIn().builds;</span>
+<span class="nc" id="L421">                builds.updateBaseDir(((Job) item).getBuildDir());</span>
+            }
+<span class="nc" id="L423">        }</span>
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

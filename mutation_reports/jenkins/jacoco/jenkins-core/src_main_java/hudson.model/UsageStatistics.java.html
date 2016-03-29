@@ -1,0 +1,281 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>UsageStatistics.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.model</a> &gt; <span class="el_source">UsageStatistics.java</span></div><h1>UsageStatistics.java</h1><pre class="source lang-java linenums">/*
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2010, Sun Microsystems, Inc., Kohsuke Kawaguchi
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.model;
+
+import com.trilead.ssh2.crypto.Base64;
+import hudson.PluginWrapper;
+import hudson.Util;
+import hudson.Extension;
+import hudson.node_monitors.ArchitectureMonitor.DescriptorImpl;
+import hudson.util.IOUtils;
+import hudson.util.Secret;
+import static hudson.util.TimeUnit2.DAYS;
+import static hudson.init.InitMilestone.COMPLETED;
+
+import jenkins.model.Jenkins;
+import net.sf.json.JSONObject;
+import org.apache.commons.io.output.ByteArrayOutputStream;
+import org.kohsuke.stapler.StaplerRequest;
+
+import javax.crypto.Cipher;
+import javax.crypto.CipherOutputStream;
+import javax.crypto.KeyGenerator;
+import javax.crypto.SecretKey;
+import javax.crypto.CipherInputStream;
+import javax.crypto.spec.IvParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
+import java.io.IOException;
+import java.io.OutputStreamWriter;
+import java.io.FilterOutputStream;
+import java.io.OutputStream;
+import java.io.FilterInputStream;
+import java.io.InputStream;
+import java.io.DataInputStream;
+import java.security.GeneralSecurityException;
+import java.security.Key;
+import java.security.KeyFactory;
+import java.security.PublicKey;
+import java.security.interfaces.RSAKey;
+import java.security.interfaces.RSAPublicKey;
+import java.security.spec.X509EncodedKeySpec;
+import java.util.ArrayList;
+import java.util.List;
+import com.jcraft.jzlib.GZIPOutputStream;
+
+/**
+ * @author Kohsuke Kawaguchi
+ */
+@Extension
+public class UsageStatistics extends PageDecorator {
+    private final String keyImage;
+
+    /**
+     * Lazily computed {@link PublicKey} representation of {@link #keyImage}.
+     */
+    private volatile transient RSAPublicKey key;
+
+    /**
+     * When was the last time we asked a browser to send the usage stats for us?
+     */
+<span class="nc" id="L81">    private volatile transient long lastAttempt = -1;</span>
+
+    public UsageStatistics() {
+<span class="nc" id="L84">        this(DEFAULT_KEY_BYTES);</span>
+<span class="nc" id="L85">    }</span>
+
+    /**
+     * Creates an instance with a specific public key image.
+     */
+<span class="nc" id="L90">    public UsageStatistics(String keyImage) {</span>
+<span class="nc" id="L91">        this.keyImage = keyImage;</span>
+<span class="nc" id="L92">        load();</span>
+<span class="nc" id="L93">    }</span>
+
+    /**
+     * Returns true if it's time for us to check for new version.
+     */
+    public boolean isDue() {
+<span class="nc" id="L99">        final Jenkins j = Jenkins.getInstance();</span>
+        // user opted out or Jenkins not fully initialized. no data collection.
+<span class="nc bnc" id="L101" title="All 8 branches missed.">        if (j == null || j.isUsageStatisticsCollected() || DISABLED || COMPLETED.compareTo(j.getInitLevel()) &gt; 0) {</span>
+<span class="nc" id="L102">            return false;</span>
+        }
+
+<span class="nc" id="L105">        long now = System.currentTimeMillis();</span>
+<span class="nc bnc" id="L106" title="All 2 branches missed.">        if(now - lastAttempt &gt; DAY) {</span>
+<span class="nc" id="L107">            lastAttempt = now;</span>
+<span class="nc" id="L108">            return true;</span>
+        }
+<span class="nc" id="L110">        return false;</span>
+    }
+
+    private RSAPublicKey getKey() {
+        try {
+<span class="nc bnc" id="L115" title="All 2 branches missed.">            if (key == null) {</span>
+<span class="nc" id="L116">                KeyFactory keyFactory = KeyFactory.getInstance(&quot;RSA&quot;);</span>
+<span class="nc" id="L117">                key = (RSAPublicKey)keyFactory.generatePublic(new X509EncodedKeySpec(Util.fromHexString(keyImage)));</span>
+            }
+<span class="nc" id="L119">            return key;</span>
+<span class="nc" id="L120">        } catch (GeneralSecurityException e) {</span>
+<span class="nc" id="L121">            throw new Error(e); // impossible</span>
+        }
+    }
+
+    /**
+     * Gets the encrypted usage stat data to be sent to the Hudson server.
+     */
+    public String getStatData() throws IOException {
+<span class="nc" id="L129">        Jenkins j = Jenkins.getInstance();</span>
+
+<span class="nc" id="L131">        JSONObject o = new JSONObject();</span>
+<span class="nc" id="L132">        o.put(&quot;stat&quot;,1);</span>
+<span class="nc" id="L133">        o.put(&quot;install&quot;, j.getLegacyInstanceId());</span>
+<span class="nc" id="L134">        o.put(&quot;servletContainer&quot;, j.servletContext.getServerInfo());</span>
+<span class="nc" id="L135">        o.put(&quot;version&quot;, Jenkins.VERSION);</span>
+
+<span class="nc" id="L137">        List&lt;JSONObject&gt; nodes = new ArrayList&lt;JSONObject&gt;();</span>
+<span class="nc bnc" id="L138" title="All 2 branches missed.">        for( Computer c : j.getComputers() ) {</span>
+<span class="nc" id="L139">            JSONObject  n = new JSONObject();</span>
+<span class="nc bnc" id="L140" title="All 2 branches missed.">            if(c.getNode()==j) {</span>
+<span class="nc" id="L141">                n.put(&quot;master&quot;,true);</span>
+<span class="nc" id="L142">                n.put(&quot;jvm-vendor&quot;, System.getProperty(&quot;java.vm.vendor&quot;));</span>
+<span class="nc" id="L143">                n.put(&quot;jvm-name&quot;, System.getProperty(&quot;java.vm.name&quot;));</span>
+<span class="nc" id="L144">                n.put(&quot;jvm-version&quot;, System.getProperty(&quot;java.version&quot;));</span>
+            }
+<span class="nc" id="L146">            n.put(&quot;executors&quot;,c.getNumExecutors());</span>
+<span class="nc" id="L147">            DescriptorImpl descriptor = j.getDescriptorByType(DescriptorImpl.class);</span>
+<span class="nc" id="L148">            n.put(&quot;os&quot;, descriptor.get(c));</span>
+<span class="nc" id="L149">            nodes.add(n);</span>
+        }
+<span class="nc" id="L151">        o.put(&quot;nodes&quot;,nodes);</span>
+
+<span class="nc" id="L153">        List&lt;JSONObject&gt; plugins = new ArrayList&lt;JSONObject&gt;();</span>
+<span class="nc bnc" id="L154" title="All 2 branches missed.">        for( PluginWrapper pw : j.getPluginManager().getPlugins() ) {</span>
+<span class="nc bnc" id="L155" title="All 2 branches missed.">            if(!pw.isActive())  continue;   // treat disabled plugins as if they are uninstalled</span>
+<span class="nc" id="L156">            JSONObject p = new JSONObject();</span>
+<span class="nc" id="L157">            p.put(&quot;name&quot;,pw.getShortName());</span>
+<span class="nc" id="L158">            p.put(&quot;version&quot;,pw.getVersion());</span>
+<span class="nc" id="L159">            plugins.add(p);</span>
+        }
+<span class="nc" id="L161">        o.put(&quot;plugins&quot;,plugins);</span>
+
+<span class="nc" id="L163">        JSONObject jobs = new JSONObject();</span>
+<span class="nc" id="L164">        List&lt;TopLevelItem&gt; items = j.getAllItems(TopLevelItem.class);</span>
+<span class="nc bnc" id="L165" title="All 2 branches missed.">        for (TopLevelItemDescriptor d : Items.all()) {</span>
+<span class="nc" id="L166">            int cnt=0;</span>
+<span class="nc bnc" id="L167" title="All 2 branches missed.">            for (TopLevelItem item : items) {</span>
+<span class="nc bnc" id="L168" title="All 2 branches missed.">                if(item.getDescriptor()==d)</span>
+<span class="nc" id="L169">                    cnt++;</span>
+            }
+<span class="nc" id="L171">            jobs.put(d.getJsonSafeClassName(),cnt);</span>
+        }
+<span class="nc" id="L173">        o.put(&quot;jobs&quot;,jobs);</span>
+
+        try {
+<span class="nc" id="L176">            ByteArrayOutputStream baos = new ByteArrayOutputStream();</span>
+
+            // json -&gt; UTF-8 encode -&gt; gzip -&gt; encrypt -&gt; base64 -&gt; string
+<span class="nc" id="L179">            OutputStreamWriter w = new OutputStreamWriter(new GZIPOutputStream(new CombinedCipherOutputStream(baos,getKey(),&quot;AES&quot;)), &quot;UTF-8&quot;);</span>
+            try {
+<span class="nc" id="L181">                o.write(w);</span>
+<span class="nc" id="L182">            } finally {</span>
+<span class="nc" id="L183">                IOUtils.closeQuietly(w);</span>
+<span class="nc" id="L184">            }</span>
+
+<span class="nc" id="L186">            return new String(Base64.encode(baos.toByteArray()));</span>
+<span class="nc" id="L187">        } catch (GeneralSecurityException e) {</span>
+<span class="nc" id="L188">            throw new Error(e); // impossible</span>
+        }
+    }
+
+    @Override
+    public boolean configure(StaplerRequest req, JSONObject json) throws FormException {
+        try {
+            // for backward compatibility reasons, this configuration is stored in Jenkins
+<span class="nc bnc" id="L196" title="All 2 branches missed.">            Jenkins.getInstance().setNoUsageStatistics(json.has(&quot;usageStatisticsCollected&quot;) ? null : true);</span>
+<span class="nc" id="L197">            return true;</span>
+<span class="nc" id="L198">        } catch (IOException e) {</span>
+<span class="nc" id="L199">            throw new FormException(e,&quot;usageStatisticsCollected&quot;);</span>
+        }
+    }
+
+    /**
+     * Asymmetric cipher is slow and in case of Sun RSA implementation it can only encyrypt the first block.
+     *
+     * So first create a symmetric key, then place this key in the beginning of the stream by encrypting it
+     * with the asymmetric cipher. The rest of the stream will be encrypted by a symmetric cipher.
+     */
+    public static final class CombinedCipherOutputStream extends FilterOutputStream {
+        public CombinedCipherOutputStream(OutputStream out, Cipher asym, String algorithm) throws IOException, GeneralSecurityException {
+<span class="nc" id="L211">            super(out);</span>
+
+            // create a new symmetric cipher key used for this stream
+<span class="nc" id="L214">            String keyAlgorithm = getKeyAlgorithm(algorithm);</span>
+<span class="nc" id="L215">            SecretKey symKey = KeyGenerator.getInstance(keyAlgorithm).generateKey();</span>
+
+            // place the symmetric key by encrypting it with asymmetric cipher
+<span class="nc" id="L218">            out.write(asym.doFinal(symKey.getEncoded()));</span>
+
+            // the rest of the data will be encrypted by this symmetric cipher
+<span class="nc" id="L221">            Cipher sym = Secret.getCipher(algorithm);</span>
+<span class="nc bnc" id="L222" title="All 2 branches missed.">            sym.init(Cipher.ENCRYPT_MODE,symKey, keyAlgorithm.equals(algorithm) ? null : new IvParameterSpec(symKey.getEncoded()));</span>
+<span class="nc" id="L223">            super.out = new CipherOutputStream(out,sym);</span>
+<span class="nc" id="L224">        }</span>
+
+        public CombinedCipherOutputStream(OutputStream out, RSAKey key, String algorithm) throws IOException, GeneralSecurityException {
+<span class="nc" id="L227">            this(out,toCipher(key,Cipher.ENCRYPT_MODE),algorithm);</span>
+<span class="nc" id="L228">        }</span>
+    }
+
+    /**
+     * The opposite of the {@link CombinedCipherOutputStream}.
+     */
+    public static final class CombinedCipherInputStream extends FilterInputStream {
+        /**
+         * @param keyLength
+         *      Block size of the asymmetric cipher, in bits. I thought I can get it from {@code asym.getBlockSize()}
+         *      but that doesn't work with Sun's implementation.
+         */
+        public CombinedCipherInputStream(InputStream in, Cipher asym, String algorithm, int keyLength) throws IOException, GeneralSecurityException {
+<span class="nc" id="L241">            super(in);</span>
+
+<span class="nc" id="L243">            String keyAlgorithm = getKeyAlgorithm(algorithm);</span>
+
+            // first read the symmetric key cipher
+<span class="nc" id="L246">            byte[] symKeyBytes = new byte[keyLength/8];</span>
+<span class="nc" id="L247">            new DataInputStream(in).readFully(symKeyBytes);</span>
+<span class="nc" id="L248">            SecretKey symKey = new SecretKeySpec(asym.doFinal(symKeyBytes),keyAlgorithm);</span>
+
+            // the rest of the data will be decrypted by this symmetric cipher
+<span class="nc" id="L251">            Cipher sym = Secret.getCipher(algorithm);</span>
+<span class="nc bnc" id="L252" title="All 2 branches missed.">            sym.init(Cipher.DECRYPT_MODE,symKey, keyAlgorithm.equals(algorithm) ? null : new IvParameterSpec(symKey.getEncoded()));</span>
+<span class="nc" id="L253">            super.in = new CipherInputStream(in,sym);</span>
+<span class="nc" id="L254">        }</span>
+
+        public CombinedCipherInputStream(InputStream in, RSAKey key, String algorithm) throws IOException, GeneralSecurityException {
+<span class="nc" id="L257">            this(in,toCipher(key,Cipher.DECRYPT_MODE),algorithm,key.getModulus().bitLength());</span>
+<span class="nc" id="L258">        }</span>
+    }
+
+    private static String getKeyAlgorithm(String algorithm) {
+<span class="nc" id="L262">        int index = algorithm.indexOf('/');</span>
+<span class="nc bnc" id="L263" title="All 2 branches missed.">        return (index&gt;0)?algorithm.substring(0,index):algorithm;</span>
+    }
+
+    private static Cipher toCipher(RSAKey key, int mode) throws GeneralSecurityException {
+<span class="nc" id="L267">        Cipher cipher = Cipher.getInstance(&quot;RSA&quot;);</span>
+<span class="nc" id="L268">        cipher.init(mode, (Key)key);</span>
+<span class="nc" id="L269">        return cipher;</span>
+    }
+
+    /**
+     * Public key to encrypt the usage statistics
+     */
+    private static final String DEFAULT_KEY_BYTES = &quot;30819f300d06092a864886f70d010101050003818d0030818902818100c14970473bd90fd1f2d20e4fa6e36ea21f7d46db2f4104a3a8f2eb097d6e26278dfadf3fe9ed05bbbb00a4433f4b7151e6683a169182e6ff2f6b4f2bb6490b2cddef73148c37a2a7421fc75f99fb0fadab46f191806599a208652f4829fd6f76e13195fb81ff3f2fce15a8e9a85ebe15c07c90b34ebdb416bd119f0d74105f3b0203010001&quot;;
+
+<span class="nc" id="L277">    private static final long DAY = DAYS.toMillis(1);</span>
+
+<span class="nc" id="L279">    public static boolean DISABLED = Boolean.getBoolean(UsageStatistics.class.getName()+&quot;.disabled&quot;);</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

@@ -1,0 +1,199 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>CommandLauncher.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.slaves</a> &gt; <span class="el_source">CommandLauncher.java</span></div><h1>CommandLauncher.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">/*</span>
+ * The MIT License
+ *
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc., Kohsuke Kawaguchi, Stephen Connolly
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.slaves;
+
+import hudson.AbortException;
+import hudson.EnvVars;
+import hudson.Util;
+import hudson.Extension;
+import hudson.model.Descriptor;
+import hudson.model.Slave;
+import jenkins.model.Jenkins;
+import hudson.model.TaskListener;
+import hudson.remoting.Channel;
+import hudson.util.StreamCopyThread;
+import hudson.util.FormValidation;
+import hudson.util.ProcessTree;
+
+import java.io.IOException;
+import java.util.Date;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+import org.apache.commons.lang.StringUtils;
+import org.kohsuke.stapler.DataBoundConstructor;
+import org.kohsuke.stapler.QueryParameter;
+
+/**
+ * {@link ComputerLauncher} through a remote login mechanism like ssh/rsh.
+ *
+ * @author Stephen Connolly
+ * @author Kohsuke Kawaguchi
+*/
+public class CommandLauncher extends ComputerLauncher {
+
+    /**
+     * Command line to launch the agent, like
+     * &quot;ssh myslave java -jar /path/to/hudson-remoting.jar&quot;
+     */
+    private final String agentCommand;
+
+    /**
+     * Optional environment variables to add to the current environment. Can be null.
+     */
+    private final EnvVars env;
+
+    @DataBoundConstructor
+    public CommandLauncher(String command) {
+<span class="nc" id="L69">        this(command, null);</span>
+<span class="nc" id="L70">    }</span>
+
+<span class="nc" id="L72">    public CommandLauncher(String command, EnvVars env) {</span>
+<span class="nc" id="L73">    	this.agentCommand = command;</span>
+<span class="nc" id="L74">    	this.env = env;</span>
+<span class="nc" id="L75">    }</span>
+
+    public String getCommand() {
+<span class="nc" id="L78">        return agentCommand;</span>
+    }
+
+    /**
+     * Gets the formatted current time stamp.
+     */
+    private static String getTimestamp() {
+<span class="nc" id="L85">        return String.format(&quot;[%1$tD %1$tT]&quot;, new Date());</span>
+    }
+
+    @Override
+    public void launch(SlaveComputer computer, final TaskListener listener) {
+<span class="nc" id="L90">        EnvVars _cookie = null;</span>
+<span class="nc" id="L91">        Process _proc = null;</span>
+        try {
+<span class="nc" id="L93">            Slave node = computer.getNode();</span>
+<span class="nc bnc" id="L94" title="All 2 branches missed.">            if (node == null) {</span>
+<span class="nc" id="L95">                throw new AbortException(&quot;Cannot launch commands on deleted nodes&quot;);</span>
+            }
+
+<span class="nc" id="L98">            listener.getLogger().println(hudson.model.Messages.Slave_Launching(getTimestamp()));</span>
+<span class="nc bnc" id="L99" title="All 2 branches missed.">            if(getCommand().trim().length()==0) {</span>
+<span class="nc" id="L100">                listener.getLogger().println(Messages.CommandLauncher_NoLaunchCommand());</span>
+<span class="nc" id="L101">                return;</span>
+            }
+<span class="nc" id="L103">            listener.getLogger().println(&quot;$ &quot; + getCommand());</span>
+
+<span class="nc" id="L105">            ProcessBuilder pb = new ProcessBuilder(Util.tokenize(getCommand()));</span>
+<span class="nc" id="L106">            final EnvVars cookie = _cookie = EnvVars.createCookie();</span>
+<span class="nc" id="L107">            pb.environment().putAll(cookie);</span>
+<span class="nc" id="L108">            pb.environment().put(&quot;WORKSPACE&quot;, StringUtils.defaultString(computer.getAbsoluteRemoteFs(), node.getRemoteFS())); //path for local slave log</span>
+
+            {// system defined variables
+<span class="nc" id="L111">                String rootUrl = Jenkins.getInstance().getRootUrl();</span>
+<span class="nc bnc" id="L112" title="All 2 branches missed.">                if (rootUrl!=null) {</span>
+<span class="nc" id="L113">                    pb.environment().put(&quot;HUDSON_URL&quot;, rootUrl);    // for backward compatibility</span>
+<span class="nc" id="L114">                    pb.environment().put(&quot;JENKINS_URL&quot;, rootUrl);</span>
+<span class="nc" id="L115">                    pb.environment().put(&quot;SLAVEJAR_URL&quot;, rootUrl+&quot;/jnlpJars/slave.jar&quot;);</span>
+                }
+            }
+
+<span class="nc bnc" id="L119" title="All 2 branches missed.">            if (env != null) {</span>
+<span class="nc" id="L120">            	pb.environment().putAll(env);</span>
+            }
+
+<span class="nc" id="L123">            final Process proc = _proc = pb.start();</span>
+
+            // capture error information from stderr. this will terminate itself
+            // when the process is killed.
+<span class="nc" id="L127">            new StreamCopyThread(&quot;stderr copier for remote agent on &quot; + computer.getDisplayName(),</span>
+<span class="nc" id="L128">                    proc.getErrorStream(), listener.getLogger()).start();</span>
+
+<span class="nc" id="L130">            computer.setChannel(proc.getInputStream(), proc.getOutputStream(), listener.getLogger(), new Channel.Listener() {</span>
+                @Override
+                public void onClosed(Channel channel, IOException cause) {
+<span class="nc" id="L133">                    reportProcessTerminated(proc, listener);</span>
+
+                    try {
+<span class="nc" id="L136">                        ProcessTree.get().killAll(proc, cookie);</span>
+<span class="nc" id="L137">                    } catch (InterruptedException e) {</span>
+<span class="nc" id="L138">                        LOGGER.log(Level.INFO, &quot;interrupted&quot;, e);</span>
+                    }
+<span class="nc" id="L140">                }</span>
+            });
+
+<span class="nc" id="L143">            LOGGER.info(&quot;slave agent launched for &quot; + computer.getDisplayName());</span>
+<span class="nc" id="L144">        } catch (InterruptedException e) {</span>
+<span class="nc" id="L145">            e.printStackTrace(listener.error(Messages.ComputerLauncher_abortedLaunch()));</span>
+<span class="nc" id="L146">        } catch (RuntimeException e) {</span>
+<span class="nc" id="L147">            e.printStackTrace(listener.error(Messages.ComputerLauncher_unexpectedError()));</span>
+<span class="nc" id="L148">        } catch (Error e) {</span>
+<span class="nc" id="L149">            e.printStackTrace(listener.error(Messages.ComputerLauncher_unexpectedError()));</span>
+<span class="nc" id="L150">        } catch (IOException e) {</span>
+<span class="nc" id="L151">            Util.displayIOException(e, listener);</span>
+
+<span class="nc" id="L153">            String msg = Util.getWin32ErrorMessage(e);</span>
+<span class="nc bnc" id="L154" title="All 2 branches missed.">            if (msg == null) {</span>
+<span class="nc" id="L155">                msg = &quot;&quot;;</span>
+<span class="nc" id="L156">            } else {</span>
+<span class="nc" id="L157">                msg = &quot; : &quot; + msg;</span>
+            }
+<span class="nc" id="L159">            msg = hudson.model.Messages.Slave_UnableToLaunch(computer.getDisplayName(), msg);</span>
+<span class="nc" id="L160">            LOGGER.log(Level.SEVERE, msg, e);</span>
+<span class="nc" id="L161">            e.printStackTrace(listener.error(msg));</span>
+
+<span class="nc bnc" id="L163" title="All 2 branches missed.">            if(_proc!=null) {</span>
+<span class="nc" id="L164">                reportProcessTerminated(_proc, listener);</span>
+                try {
+<span class="nc" id="L166">                    ProcessTree.get().killAll(_proc, _cookie);</span>
+<span class="nc" id="L167">                } catch (InterruptedException x) {</span>
+<span class="nc" id="L168">                    x.printStackTrace(listener.error(Messages.ComputerLauncher_abortedLaunch()));</span>
+                }
+            }
+        }
+<span class="nc" id="L172">    }</span>
+
+    private static void reportProcessTerminated(Process proc, TaskListener listener) {
+        try {
+<span class="nc" id="L176">            int exitCode = proc.exitValue();</span>
+<span class="nc" id="L177">            listener.error(&quot;Process terminated with exit code &quot; + exitCode);</span>
+<span class="nc" id="L178">        } catch (IllegalThreadStateException e) {</span>
+            // hasn't terminated yet
+        }
+<span class="nc" id="L181">    }</span>
+
+<span class="nc" id="L183">    private static final Logger LOGGER = Logger.getLogger(CommandLauncher.class.getName());</span>
+
+    @Extension
+<span class="nc" id="L186">    public static class DescriptorImpl extends Descriptor&lt;ComputerLauncher&gt; {</span>
+        public String getDisplayName() {
+<span class="nc" id="L188">            return Messages.CommandLauncher_displayName();</span>
+        }
+
+        public FormValidation doCheckCommand(@QueryParameter String value) {
+<span class="nc bnc" id="L192" title="All 2 branches missed.">            if(Util.fixEmptyAndTrim(value)==null)</span>
+<span class="nc" id="L193">                return FormValidation.error(Messages.CommandLauncher_NoLaunchCommand());</span>
+            else
+<span class="nc" id="L195">                return FormValidation.ok();</span>
+        }
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

@@ -1,0 +1,329 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>AbstractNodeMonitorDescriptor.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.node_monitors</a> &gt; <span class="el_source">AbstractNodeMonitorDescriptor.java</span></div><h1>AbstractNodeMonitorDescriptor.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">/*</span>
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc., Kohsuke Kawaguchi
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.node_monitors;
+
+import hudson.Util;
+import hudson.model.Computer;
+import hudson.model.Descriptor;
+import jenkins.model.Jenkins;
+import hudson.model.ComputerSet;
+import hudson.model.AdministrativeMonitor;
+import hudson.triggers.SafeTimerTask;
+import hudson.slaves.OfflineCause;
+import jenkins.util.Timer;
+
+import javax.annotation.concurrent.GuardedBy;
+import java.io.IOException;
+import java.util.Collections;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+/**
+ * Convenient base class for common {@link NodeMonitor} implementation
+ * where the &quot;monitoring&quot; consists of executing something periodically on every node
+ * and taking some action based on its result.
+ *
+ * @param &lt;T&gt;
+ *     represents the the result of the monitoring.
+ * @author Kohsuke Kawaguchi
+ */
+public abstract class AbstractNodeMonitorDescriptor&lt;T&gt; extends Descriptor&lt;NodeMonitor&gt; {
+    /**
+     * @deprecated as of 1.522
+     *      Extend from {@link AbstractAsyncNodeMonitorDescriptor}
+     */
+    @Deprecated
+    protected AbstractNodeMonitorDescriptor() {
+<span class="nc" id="L62">        this(HOUR);</span>
+<span class="nc" id="L63">    }</span>
+
+    /**
+     * @deprecated as of 1.522
+     *      Extend from {@link AbstractAsyncNodeMonitorDescriptor}
+     */
+    @Deprecated
+<span class="nc" id="L70">    protected AbstractNodeMonitorDescriptor(long interval) {</span>
+<span class="nc" id="L71">        schedule(interval);</span>
+<span class="nc" id="L72">    }</span>
+
+    /**
+     * @deprecated as of 1.522
+     *      Extend from {@link AbstractAsyncNodeMonitorDescriptor}
+     */
+    @Deprecated
+    protected AbstractNodeMonitorDescriptor(Class&lt;? extends NodeMonitor&gt; clazz) {
+<span class="nc" id="L80">        this(clazz,HOUR);</span>
+<span class="nc" id="L81">    }</span>
+
+    /**
+     * @deprecated as of 1.522
+     *      Extend from {@link AbstractAsyncNodeMonitorDescriptor}
+     */
+    @Deprecated
+    protected AbstractNodeMonitorDescriptor(Class&lt;? extends NodeMonitor&gt; clazz, long interval) {
+<span class="nc" id="L89">        super(clazz);</span>
+
+<span class="nc" id="L91">        schedule(interval);</span>
+<span class="nc" id="L92">    }</span>
+
+    private void schedule(long interval) {
+<span class="nc" id="L95">        Timer.get()</span>
+<span class="nc" id="L96">            .scheduleAtFixedRate(new SafeTimerTask() {</span>
+                public void doRun() {
+<span class="nc" id="L98">                    triggerUpdate();</span>
+<span class="nc" id="L99">                }</span>
+<span class="nc" id="L100">            }, interval, interval, TimeUnit.MILLISECONDS);</span>
+<span class="nc" id="L101">    }</span>
+
+    /**
+     * Represents the last record of the update.
+     *
+     * Once set to non-null, never be null.
+     */
+<span class="nc" id="L108">    private transient volatile Record record = null;</span>
+
+    /**
+     * Represents the update activity in progress.
+     */
+    @GuardedBy(&quot;this&quot;)
+<span class="nc" id="L114">    private transient Record inProgress = null;</span>
+
+    /**
+     * Represents when an update activity was last started.
+     */
+    @GuardedBy(&quot;this&quot;)
+<span class="nc" id="L120">    private transient long inProgressStarted = Long.MIN_VALUE;</span>
+
+    /**
+     * Performs monitoring of the given computer object.
+     * This method is invoked periodically to perform the monitoring of the computer.
+     *
+     * @return
+     *      Application-specific value that represents the observed monitoring value
+     *      on the given node. This value will be returned from the {@link #get(Computer)} method.
+     *      If null is returned, it will be interpreted as &quot;no observed value.&quot; This is
+     *      convenient way of abandoning the observation on a particular computer,
+     *      whereas {@link IOException} is useful for indicating a hard error that needs to be
+     *      corrected.
+     */
+    protected abstract T monitor(Computer c) throws IOException,InterruptedException;
+
+    /**
+     * Performs monitoring across the board.
+     *
+     * @return
+     *      For all the computers, report the monitored values.
+     */
+    protected Map&lt;Computer,T&gt; monitor() throws InterruptedException {
+<span class="nc" id="L143">        Map&lt;Computer,T&gt; data = new HashMap&lt;Computer,T&gt;();</span>
+<span class="nc bnc" id="L144" title="All 2 branches missed.">        for( Computer c : Jenkins.getInstance().getComputers() ) {</span>
+            try {
+<span class="nc" id="L146">                Thread.currentThread().setName(&quot;Monitoring &quot;+c.getDisplayName()+&quot; for &quot;+getDisplayName());</span>
+
+<span class="nc bnc" id="L148" title="All 2 branches missed.">                if(c.getChannel()==null)</span>
+<span class="nc" id="L149">                    data.put(c,null);</span>
+                else
+<span class="nc" id="L151">                    data.put(c,monitor(c));</span>
+<span class="nc" id="L152">            } catch (RuntimeException e) {</span>
+<span class="nc" id="L153">                LOGGER.log(Level.WARNING, &quot;Failed to monitor &quot;+c.getDisplayName()+&quot; for &quot;+getDisplayName(), e);</span>
+<span class="nc" id="L154">            } catch (IOException e) {</span>
+<span class="nc" id="L155">                LOGGER.log(Level.WARNING, &quot;Failed to monitor &quot;+c.getDisplayName()+&quot; for &quot;+getDisplayName(), e);</span>
+<span class="nc" id="L156">            } catch (InterruptedException e) {</span>
+<span class="nc" id="L157">                throw (InterruptedException)new InterruptedException(&quot;Node monitoring &quot;+c.getDisplayName()+&quot; for &quot;+getDisplayName()+&quot; aborted.&quot;).initCause(e);</span>
+            }
+        }
+<span class="nc" id="L160">        return data;</span>
+    }
+
+    /**
+     * Obtains the monitoring result currently available, or null if no data is available.
+     *
+     * &lt;p&gt;
+     * If no data is available, a background task to collect data will be started.
+     */
+    public T get(Computer c) {
+<span class="nc bnc" id="L170" title="All 4 branches missed.">        if(record==null || !record.data.containsKey(c)) {</span>
+            // if we don't have the data, schedule the check now
+<span class="nc" id="L172">            triggerUpdate();</span>
+<span class="nc" id="L173">            return null;</span>
+        }
+<span class="nc" id="L175">        return record.data.get(c);</span>
+    }
+
+    /**
+     * Is the monitoring activity currently in progress?
+     */
+    private synchronized boolean isInProgress() {
+<span class="nc bnc" id="L182" title="All 4 branches missed.">        return inProgress !=null &amp;&amp; inProgress.isAlive();</span>
+    }
+
+    /**
+     * The timestamp that indicates when the last round of the monitoring has completed.
+     */
+    public long getTimestamp() {
+<span class="nc bnc" id="L189" title="All 2 branches missed.">        return record==null ? 0L : record.timestamp;</span>
+    }
+
+    public String getTimestampString() {
+<span class="nc bnc" id="L193" title="All 2 branches missed.">        if (record==null)</span>
+<span class="nc" id="L194">            return Messages.AbstractNodeMonitorDescriptor_NoDataYet();</span>
+//        return Messages.AbstractNodeMonitorDescriptor_DataObtainedSometimeAgo(
+//                Util.getTimeSpanString(System.currentTimeMillis()-record.timestamp));
+<span class="nc" id="L197">        return Util.getPastTimeString(System.currentTimeMillis()-record.timestamp);</span>
+    }
+
+    /**
+     * Is this monitor currently ignored?
+     */
+    public boolean isIgnored() {
+<span class="nc" id="L204">        NodeMonitor m = ComputerSet.getMonitors().get(this);</span>
+<span class="nc bnc" id="L205" title="All 4 branches missed.">        return m==null || m.isIgnored();</span>
+    }
+
+    /**
+     * Utility method to mark the computer online for derived classes.
+     * 
+     * @return true 
+     *      if the node was actually taken online by this act (as opposed to us deciding not to do it,
+     *      or the computer was already online.)
+     */
+    protected boolean markOnline(Computer c) {
+<span class="nc bnc" id="L216" title="All 4 branches missed.">        if(isIgnored() || c.isOnline()) return false; // noop</span>
+<span class="nc" id="L217">        c.setTemporarilyOffline(false,null);</span>
+<span class="nc" id="L218">        return true;</span>
+    }
+    
+    /**
+     * Utility method to mark the computer offline for derived classes.
+     *
+     * @return true
+     *      if the node was actually taken offline by this act (as opposed to us deciding not to do it,
+     *      or the computer already marked offline.)
+     */
+    protected boolean markOffline(Computer c, OfflineCause oc) {
+<span class="nc bnc" id="L229" title="All 4 branches missed.">        if(isIgnored() || c.isTemporarilyOffline()) return false; // noop</span>
+
+<span class="nc" id="L231">        c.setTemporarilyOffline(true, oc);</span>
+
+        // notify the admin
+<span class="nc" id="L234">        MonitorMarkedNodeOffline no = AdministrativeMonitor.all().get(MonitorMarkedNodeOffline.class);</span>
+<span class="nc bnc" id="L235" title="All 2 branches missed.">        if(no!=null)</span>
+<span class="nc" id="L236">            no.active = true;</span>
+<span class="nc" id="L237">        return true;</span>
+    }
+
+    /**
+     * @deprecated as of 1.320
+     *      Use {@link #markOffline(Computer, OfflineCause)} to specify the cause.
+     */
+    @Deprecated
+    protected boolean markOffline(Computer c) {
+<span class="nc" id="L246">        return markOffline(c,null);</span>
+    }
+
+    /**
+     * @see NodeMonitor#triggerUpdate()
+     */
+    /*package*/ synchronized Thread triggerUpdate() {
+<span class="nc bnc" id="L253" title="All 2 branches missed.">        if (inProgress != null) {</span>
+<span class="nc bnc" id="L254" title="All 2 branches missed.">            if (!inProgress.isAlive()) {</span>
+<span class="nc" id="L255">                LOGGER.log(Level.WARNING, &quot;Previous {0} monitoring activity died without cleaning up after itself&quot;,</span>
+<span class="nc" id="L256">                    getDisplayName());</span>
+<span class="nc" id="L257">                inProgress = null;</span>
+<span class="nc bnc" id="L258" title="All 2 branches missed.">            } else if (System.currentTimeMillis() &gt; inProgressStarted + getMonitoringTimeOut() + 1000) {</span>
+                // maybe it got stuck?
+<span class="nc" id="L260">                LOGGER.log(Level.WARNING, &quot;Previous {0} monitoring activity still in progress. Interrupting&quot;,</span>
+<span class="nc" id="L261">                        getDisplayName());</span>
+<span class="nc" id="L262">                inProgress.interrupt();</span>
+<span class="nc" id="L263">                inProgress = null; // we interrupted the old one so it's now dead to us.</span>
+<span class="nc" id="L264">            } else {</span>
+                // return the in progress
+<span class="nc" id="L266">                return inProgress;</span>
+            }
+        }
+<span class="nc" id="L269">        final Record t = new Record();</span>
+<span class="nc" id="L270">        t.start();</span>
+        // only store the new thread if we started it
+<span class="nc" id="L272">        inProgress = t;</span>
+<span class="nc" id="L273">        inProgressStarted = System.currentTimeMillis();</span>
+<span class="nc" id="L274">        return inProgress;</span>
+    }
+
+    /**
+     * Controls the time out of monitoring.
+     */
+    protected long getMonitoringTimeOut() {
+<span class="nc" id="L281">        return TimeUnit.SECONDS.toMillis(30);</span>
+    }
+
+    /**
+     * Thread that monitors nodes, as well as the data structure to record
+     * the result.
+     */
+    private final class Record extends Thread {
+        /**
+         * Last computed monitoring result.
+         */
+<span class="nc" id="L292">        private /*final*/ Map&lt;Computer,T&gt; data = Collections.emptyMap();</span>
+
+        private long timestamp;
+
+<span class="nc" id="L296">        public Record() {</span>
+<span class="nc" id="L297">            super(&quot;Monitoring thread for &quot;+getDisplayName()+&quot; started on &quot;+new Date());</span>
+<span class="nc" id="L298">        }</span>
+
+        @Override
+        public void run() {
+            try {
+<span class="nc" id="L303">                long startTime = System.currentTimeMillis();</span>
+<span class="nc" id="L304">                String oldName = getName();</span>
+<span class="nc" id="L305">                data=monitor();</span>
+<span class="nc" id="L306">                setName(oldName);</span>
+
+<span class="nc" id="L308">                timestamp = System.currentTimeMillis();</span>
+<span class="nc" id="L309">                record = this;</span>
+
+<span class="nc" id="L311">                LOGGER.log(Level.FINE, &quot;Node monitoring {0} completed in {1}ms&quot;, new Object[] {getDisplayName(), System.currentTimeMillis()-startTime});</span>
+<span class="nc" id="L312">            } catch (InterruptedException x) {</span>
+                // interrupted by new one, fine
+<span class="nc" id="L314">            } catch (Throwable t) {</span>
+<span class="nc" id="L315">                LOGGER.log(Level.WARNING, &quot;Unexpected node monitoring termination: &quot;+getDisplayName(),t);</span>
+<span class="nc" id="L316">            } finally {</span>
+<span class="nc" id="L317">                synchronized(AbstractNodeMonitorDescriptor.this) {</span>
+<span class="nc bnc" id="L318" title="All 8 branches missed.">                    if (inProgress==this)</span>
+<span class="nc" id="L319">                        inProgress = null;</span>
+                }
+<span class="nc" id="L321">            }</span>
+<span class="nc" id="L322">        }</span>
+    }
+
+<span class="nc" id="L325">    private static final Logger LOGGER = Logger.getLogger(AbstractNodeMonitorDescriptor.class.getName());</span>
+
+<span class="nc" id="L327">    private static final long HOUR = 1000*60*60L;</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

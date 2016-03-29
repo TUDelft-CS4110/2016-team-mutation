@@ -1,0 +1,182 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>BasicAuthenticationFilter.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.security</a> &gt; <span class="el_source">BasicAuthenticationFilter.java</span></div><h1>BasicAuthenticationFilter.java</h1><pre class="source lang-java linenums">/*
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc., Kohsuke Kawaguchi
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.security;
+
+import hudson.model.User;
+import jenkins.model.Jenkins;
+import hudson.util.Scrambler;
+import jenkins.security.ApiTokenProperty;
+import org.acegisecurity.context.SecurityContextHolder;
+
+import javax.servlet.Filter;
+import javax.servlet.FilterChain;
+import javax.servlet.FilterConfig;
+import javax.servlet.RequestDispatcher;
+import javax.servlet.ServletContext;
+import javax.servlet.ServletException;
+import javax.servlet.ServletRequest;
+import javax.servlet.ServletResponse;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+import java.io.IOException;
+import java.net.URLEncoder;
+
+/**
+ * Implements the dual authentcation mechanism.
+ *
+ * &lt;p&gt;
+ * Jenkins supports both the HTTP basic authentication and the form-based authentication.
+ * The former is for scripted clients, and the latter is for humans. Unfortunately,
+ * because the servlet spec does not allow us to programatically authenticate users,
+ * we need to rely on some hack to make it work, and this is the class that implements
+ * that hack.
+ *
+ * &lt;p&gt;
+ * When an HTTP request arrives with an HTTP basic auth header, this filter detects
+ * that and emulate an invocation of &lt;tt&gt;/j_security_check&lt;/tt&gt;
+ * (see &lt;a href=&quot;http://mail-archives.apache.org/mod_mbox/tomcat-users/200105.mbox/%3C9005C0C9C85BD31181B20060085DAC8B10C8EF@tuvi.andmevara.ee%3E&quot;&gt;this page&lt;/a&gt; for the original technique.)
+ *
+ * &lt;p&gt;
+ * This causes the container to perform authentication, but there's no way
+ * to find out whether the user has been successfully authenticated or not.
+ * So to find this out, we then redirect the user to
+ * {@link jenkins.model.Jenkins#doSecured(StaplerRequest, StaplerResponse) &lt;tt&gt;/secured/...&lt;/tt&gt; page}.
+ *
+ * &lt;p&gt;
+ * The handler of the above URL checks if the user is authenticated,
+ * and if not report an HTTP error code. Otherwise the user is
+ * redirected back to the original URL, where the request is served.
+ *
+ * &lt;p&gt;
+ * So all in all, the redirection works like &lt;tt&gt;/abc/def&lt;/tt&gt; -&gt; &lt;tt&gt;/secured/abc/def&lt;/tt&gt;
+ * -&gt; &lt;tt&gt;/abc/def&lt;/tt&gt;.
+ *
+ * &lt;h2&gt;Notes&lt;/h2&gt;
+ * &lt;ul&gt;
+ * &lt;li&gt;
+ * The technique of getting a request dispatcher for &lt;tt&gt;/j_security_check&lt;/tt&gt; may not
+ * work for all containers, but so far that seems like the only way to make this work.
+ * &lt;li&gt;
+ * This A-&gt;B-&gt;A redirect is a cyclic redirection, so we need to watch out for clients
+ * that detect this as an error.
+ * &lt;/ul&gt; 
+ *
+ * @author Kohsuke Kawaguchi
+ */
+<span class="nc" id="L87">public class BasicAuthenticationFilter implements Filter {</span>
+    private ServletContext servletContext;
+
+    public void init(FilterConfig filterConfig) throws ServletException {
+<span class="nc" id="L91">        servletContext = filterConfig.getServletContext();</span>
+<span class="nc" id="L92">    }</span>
+
+    @SuppressWarnings(&quot;ACL.impersonate&quot;)
+    public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain) throws IOException, ServletException {
+<span class="nc" id="L96">        HttpServletRequest req = (HttpServletRequest) request;</span>
+<span class="nc" id="L97">        HttpServletResponse rsp = (HttpServletResponse) response;</span>
+<span class="nc" id="L98">        String authorization = req.getHeader(&quot;Authorization&quot;);</span>
+
+<span class="nc" id="L100">        String path = req.getServletPath();</span>
+<span class="nc bnc" id="L101" title="All 6 branches missed.">        if(authorization==null || req.getUserPrincipal() !=null || path.startsWith(&quot;/secured/&quot;)</span>
+<span class="nc bnc" id="L102" title="All 2 branches missed.">        || !Jenkins.getInstance().isUseSecurity()) {</span>
+            // normal requests, or security not enabled
+<span class="nc bnc" id="L104" title="All 2 branches missed.">            if(req.getUserPrincipal()!=null) {</span>
+                // before we route this request, integrate the container authentication
+                // to Acegi. For anonymous users that doesn't have user principal,
+                // AnonymousProcessingFilter that follows this should create
+                // an Authentication object.
+<span class="nc" id="L109">                SecurityContextHolder.getContext().setAuthentication(new ContainerAuthentication(req));</span>
+            }
+            try {
+<span class="nc" id="L112">                chain.doFilter(request,response);</span>
+<span class="nc" id="L113">            } finally {</span>
+<span class="nc" id="L114">                SecurityContextHolder.clearContext();</span>
+<span class="nc" id="L115">            }</span>
+<span class="nc" id="L116">            return;</span>
+        }
+
+        // authenticate the user
+<span class="nc" id="L120">        String username = null;</span>
+<span class="nc" id="L121">        String password = null;</span>
+<span class="nc" id="L122">        String uidpassword = Scrambler.descramble(authorization.substring(6));</span>
+<span class="nc" id="L123">        int idx = uidpassword.indexOf(':');</span>
+<span class="nc bnc" id="L124" title="All 2 branches missed.">        if (idx &gt;= 0) {</span>
+<span class="nc" id="L125">            username = uidpassword.substring(0, idx);</span>
+<span class="nc" id="L126">            password = uidpassword.substring(idx+1);</span>
+        }
+
+<span class="nc bnc" id="L129" title="All 2 branches missed.">        if(username==null) {</span>
+<span class="nc" id="L130">            rsp.setStatus(HttpServletResponse.SC_UNAUTHORIZED);</span>
+<span class="nc" id="L131">            rsp.setHeader(&quot;WWW-Authenticate&quot;,&quot;Basic realm=\&quot;Jenkins user\&quot;&quot;);</span>
+<span class="nc" id="L132">            return;</span>
+        }
+
+        {// attempt to authenticate as API token
+<span class="nc" id="L136">            User u = User.get(username);</span>
+<span class="nc" id="L137">            ApiTokenProperty t = u.getProperty(ApiTokenProperty.class);</span>
+<span class="nc bnc" id="L138" title="All 4 branches missed.">            if (t!=null &amp;&amp; t.matchesPassword(password)) {</span>
+<span class="nc" id="L139">                SecurityContextHolder.getContext().setAuthentication(u.impersonate());</span>
+                try {
+<span class="nc" id="L141">                    chain.doFilter(request,response);</span>
+<span class="nc" id="L142">                } finally {</span>
+<span class="nc" id="L143">                    SecurityContextHolder.clearContext();</span>
+<span class="nc" id="L144">                }</span>
+<span class="nc" id="L145">                return;</span>
+            }
+        }
+
+
+<span class="nc" id="L150">        path = req.getContextPath()+&quot;/secured&quot;+path;</span>
+<span class="nc" id="L151">        String q = req.getQueryString();</span>
+<span class="nc bnc" id="L152" title="All 2 branches missed.">        if(q!=null)</span>
+<span class="nc" id="L153">            path += '?'+q;</span>
+
+        // prepare a redirect
+<span class="nc" id="L156">        rsp.setStatus(HttpServletResponse.SC_MOVED_TEMPORARILY);</span>
+<span class="nc" id="L157">        rsp.setHeader(&quot;Location&quot;,path);</span>
+
+        // ... but first let the container authenticate this request
+<span class="nc" id="L160">        RequestDispatcher d = servletContext.getRequestDispatcher(&quot;/j_security_check?j_username=&quot;+</span>
+<span class="nc" id="L161">            URLEncoder.encode(username,&quot;UTF-8&quot;)+&quot;&amp;j_password=&quot;+URLEncoder.encode(password,&quot;UTF-8&quot;));</span>
+<span class="nc" id="L162">        d.include(req,rsp);</span>
+<span class="nc" id="L163">    }</span>
+
+    //public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain) throws IOException, ServletException {
+    //    HttpServletRequest req = (HttpServletRequest) request;
+    //    String authorization = req.getHeader(&quot;Authorization&quot;);
+    //
+    //    String path = req.getServletPath();
+    //    if(authorization==null || req.getUserPrincipal()!=null || path.startsWith(&quot;/secured/&quot;)) {
+    //        chain.doFilter(request,response);
+    //    } else {
+    //        if(req.getQueryString()!=null)
+    //            path += req.getQueryString();
+    //        ((HttpServletResponse)response).sendRedirect(req.getContextPath()+&quot;/secured&quot;+path);
+    //    }
+    //}
+
+    public void destroy() {
+<span class="nc" id="L180">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

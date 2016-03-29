@@ -1,0 +1,351 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>ChunkedInputStream.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.util</a> &gt; <span class="el_source">ChunkedInputStream.java</span></div><h1>ChunkedInputStream.java</h1><pre class="source lang-java linenums">/*
+ * $Header: /home/jerenkrantz/tmp/commons/commons-convert/cvs/home/cvs/jakarta-commons//httpclient/src/java/org/apache/commons/httpclient/ChunkedInputStream.java,v 1.24 2004/10/10 15:18:55 olegk Exp $
+ * $Revision: 480424 $
+ * $Date: 2006-11-29 06:56:49 +0100 (Wed, 29 Nov 2006) $
+ *
+ * ====================================================================
+ *
+ *  Licensed to the Apache Software Foundation (ASF) under one or more
+ *  contributor license agreements.  See the NOTICE file distributed with
+ *  this work for additional information regarding copyright ownership.
+ *  The ASF licenses this file to You under the Apache License, Version 2.0
+ *  (the &quot;License&quot;); you may not use this file except in compliance with
+ *  the License.  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ * ====================================================================
+ *
+ * This software consists of voluntary contributions made by many
+ * individuals on behalf of the Apache Software Foundation.  For more
+ * information on the Apache Software Foundation, please see
+ * &lt;http://www.apache.org/&gt;.
+ *
+ */
+
+package hudson.util;
+
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.logging.Logger;
+
+
+/**
+ * &lt;p&gt;Transparently coalesces chunks of a HTTP stream that uses
+ * Transfer-Encoding chunked.&lt;/p&gt;
+ *
+ * &lt;p&gt;Note that this class NEVER closes the underlying stream, even when close
+ * gets called.  Instead, it will read until the &quot;end&quot; of its chunking on close,
+ * which allows for the seamless invocation of subsequent HTTP 1.1 calls, while
+ * not requiring the client to remember to read the entire contents of the
+ * response.&lt;/p&gt;
+ *
+ * @author Ortwin Glueck
+ * @author Sean C. Sullivan
+ * @author Martin Elwin
+ * @author Eric Johnson
+ * @author &lt;a href=&quot;mailto:mbowler@GargoyleSoftware.com&quot;&gt;Mike Bowler&lt;/a&gt;
+ * @author Michael Becke
+ * @author &lt;a href=&quot;mailto:oleg@ural.ru&quot;&gt;Oleg Kalnichevski&lt;/a&gt;
+ *
+ * @since 2.0
+ *
+ */
+public class ChunkedInputStream extends InputStream {
+    /** The inputstream that we're wrapping */
+    private InputStream in;
+
+    /** The chunk size */
+    private int chunkSize;
+
+    /** The current position within the current chunk */
+    private int pos;
+
+    /** True if we'are at the beginning of stream */
+<span class="nc" id="L71">    private boolean bof = true;</span>
+
+    /** True if we've reached the end of stream */
+<span class="nc" id="L74">    private boolean eof = false;</span>
+
+    /** True if this stream is closed */
+<span class="nc" id="L77">    private boolean closed = false;</span>
+
+    /** Log object for this class. */
+<span class="nc" id="L80">    private static final Logger LOGGER = Logger.getLogger(ChunkedInputStream.class.getName());</span>
+
+    /**
+     * ChunkedInputStream constructor
+     *
+     * @param in the raw input stream
+     *
+     * @throws IOException If an IO error occurs
+     */
+<span class="nc" id="L89">    public ChunkedInputStream(</span>
+        final InputStream in) throws IOException {
+
+<span class="nc bnc" id="L92" title="All 2 branches missed.">        if (in == null) {</span>
+<span class="nc" id="L93">            throw new IllegalArgumentException(&quot;InputStream parameter may not be null&quot;);</span>
+        }
+<span class="nc" id="L95">        this.in = in;</span>
+<span class="nc" id="L96">        this.pos = 0;</span>
+<span class="nc" id="L97">    }</span>
+
+    /**
+     * &lt;p&gt; Returns all the data in a chunked stream in coalesced form. A chunk
+     * is followed by a CRLF. The method returns -1 as soon as a chunksize of 0
+     * is detected.&lt;/p&gt;
+     *
+     * &lt;p&gt; Trailer headers are read automcatically at the end of the stream and
+     * can be obtained with the getResponseFooters() method.&lt;/p&gt;
+     *
+     * @return -1 of the end of the stream has been reached or the next data
+     * byte
+     * @throws IOException If an IO problem occurs
+     */
+    public int read() throws IOException {
+
+<span class="nc bnc" id="L113" title="All 2 branches missed.">        if (closed) {</span>
+<span class="nc" id="L114">            throw new IOException(&quot;Attempted read from closed stream.&quot;);</span>
+        }
+<span class="nc bnc" id="L116" title="All 2 branches missed.">        if (eof) {</span>
+<span class="nc" id="L117">            return -1;</span>
+        }
+<span class="nc bnc" id="L119" title="All 2 branches missed.">        if (pos &gt;= chunkSize) {</span>
+<span class="nc" id="L120">            nextChunk();</span>
+<span class="nc bnc" id="L121" title="All 2 branches missed.">            if (eof) {</span>
+<span class="nc" id="L122">                return -1;</span>
+            }
+        }
+<span class="nc" id="L125">        pos++;</span>
+<span class="nc" id="L126">        return in.read();</span>
+    }
+
+    /**
+     * Read some bytes from the stream.
+     * @param b The byte array that will hold the contents from the stream.
+     * @param off The offset into the byte array at which bytes will start to be
+     * placed.
+     * @param len the maximum number of bytes that can be returned.
+     * @return The number of bytes returned or -1 if the end of stream has been
+     * reached.
+     * @see java.io.InputStream#read(byte[], int, int)
+     * @throws IOException if an IO problem occurs.
+     */
+    @Override
+    public int read (byte[] b, int off, int len) throws IOException {
+
+<span class="nc bnc" id="L143" title="All 2 branches missed.">        if (closed) {</span>
+<span class="nc" id="L144">            throw new IOException(&quot;Attempted read from closed stream.&quot;);</span>
+        }
+
+<span class="nc bnc" id="L147" title="All 2 branches missed.">        if (eof) {</span>
+<span class="nc" id="L148">            return -1;</span>
+        }
+<span class="nc bnc" id="L150" title="All 2 branches missed.">        if (pos &gt;= chunkSize) {</span>
+<span class="nc" id="L151">            nextChunk();</span>
+<span class="nc bnc" id="L152" title="All 2 branches missed.">            if (eof) {</span>
+<span class="nc" id="L153">                return -1;</span>
+            }
+        }
+<span class="nc" id="L156">        len = Math.min(len, chunkSize - pos);</span>
+<span class="nc" id="L157">        int count = in.read(b, off, len);</span>
+<span class="nc" id="L158">        pos += count;</span>
+<span class="nc" id="L159">        return count;</span>
+    }
+
+    /**
+     * Read some bytes from the stream.
+     * @param b The byte array that will hold the contents from the stream.
+     * @return The number of bytes returned or -1 if the end of stream has been
+     * reached.
+     * @see java.io.InputStream#read(byte[])
+     * @throws IOException if an IO problem occurs.
+     */
+    @Override
+    public int read (byte[] b) throws IOException {
+<span class="nc" id="L172">        return read(b, 0, b.length);</span>
+    }
+
+    /**
+     * Read the CRLF terminator.
+     * @throws IOException If an IO error occurs.
+     */
+    private void readCRLF() throws IOException {
+<span class="nc" id="L180">        int cr = in.read();</span>
+<span class="nc" id="L181">        int lf = in.read();</span>
+<span class="nc bnc" id="L182" title="All 4 branches missed.">        if ((cr != '\r') || (lf != '\n')) {</span>
+<span class="nc" id="L183">            throw new IOException(</span>
+<span class="nc" id="L184">                &quot;CRLF expected at end of chunk: &quot; + cr + &quot;/&quot; + lf);</span>
+        }
+<span class="nc" id="L186">    }</span>
+
+
+    /**
+     * Read the next chunk.
+     * @throws IOException If an IO error occurs.
+     */
+    private void nextChunk() throws IOException {
+<span class="nc bnc" id="L194" title="All 2 branches missed.">        if (!bof) {</span>
+<span class="nc" id="L195">            readCRLF();</span>
+        }
+<span class="nc" id="L197">        chunkSize = getChunkSizeFromInputStream(in);</span>
+<span class="nc" id="L198">        bof = false;</span>
+<span class="nc" id="L199">        pos = 0;</span>
+<span class="nc bnc" id="L200" title="All 2 branches missed.">        if (chunkSize == 0) {</span>
+<span class="nc" id="L201">            eof = true;</span>
+<span class="nc" id="L202">            parseTrailerHeaders();</span>
+        }
+<span class="nc" id="L204">    }</span>
+
+    /**
+     * Expects the stream to start with a chunksize in hex with optional
+     * comments after a semicolon. The line must end with a CRLF: &quot;a3; some
+     * comment\r\n&quot; Positions the stream at the start of the next line.
+     *
+     * @param in The new input stream.
+     * @return the chunk size as integer
+     *
+     * @throws IOException when the chunk size could not be parsed
+     */
+    private static int getChunkSizeFromInputStream(final InputStream in)
+      throws IOException {
+
+<span class="nc" id="L219">        ByteArrayOutputStream baos = new ByteArrayOutputStream();</span>
+        // States: 0=normal, 1=\r was scanned, 2=inside quoted string, -1=end
+<span class="nc" id="L221">        int state = 0;</span>
+<span class="nc bnc" id="L222" title="All 2 branches missed.">        while (state != -1) {</span>
+<span class="nc" id="L223">        int b = in.read();</span>
+<span class="nc bnc" id="L224" title="All 2 branches missed.">            if (b == -1) {</span>
+<span class="nc" id="L225">                throw new IOException(&quot;chunked stream ended unexpectedly&quot;);</span>
+            }
+<span class="nc bnc" id="L227" title="All 4 branches missed.">            switch (state) {</span>
+                case 0:
+<span class="nc bnc" id="L229" title="All 3 branches missed.">                    switch (b) {</span>
+                        case '\r':
+<span class="nc" id="L231">                            state = 1;</span>
+<span class="nc" id="L232">                            break;</span>
+                        case '\&quot;':
+<span class="nc" id="L234">                            state = 2;</span>
+                            /* fall through */
+                        default:
+<span class="nc" id="L237">                            baos.write(b);</span>
+                    }
+<span class="nc" id="L239">                    break;</span>
+
+                case 1:
+<span class="nc bnc" id="L242" title="All 2 branches missed.">                    if (b == '\n') {</span>
+<span class="nc" id="L243">                        state = -1;</span>
+<span class="nc" id="L244">                    } else {</span>
+                        // this was not CRLF
+<span class="nc" id="L246">                        throw new IOException(&quot;Protocol violation: Unexpected&quot;</span>
+                            + &quot; single newline character in chunk size&quot;);
+                    }
+                    break;
+
+                case 2:
+<span class="nc bnc" id="L252" title="All 3 branches missed.">                    switch (b) {</span>
+                        case '\\':
+<span class="nc" id="L254">                            b = in.read();</span>
+<span class="nc" id="L255">                            baos.write(b);</span>
+<span class="nc" id="L256">                            break;</span>
+                        case '\&quot;':
+<span class="nc" id="L258">                            state = 0;</span>
+                            /* fall through */
+                        default:
+<span class="nc" id="L261">                            baos.write(b);</span>
+                    }
+<span class="nc" id="L263">                    break;</span>
+<span class="nc" id="L264">                default: throw new RuntimeException(&quot;assertion failed&quot;);</span>
+            }
+        }
+
+        //parse data
+<span class="nc" id="L269">        String dataString = new String(baos.toByteArray(),&quot;US-ASCII&quot;);</span>
+<span class="nc" id="L270">        int separator = dataString.indexOf(';');</span>
+<span class="nc bnc" id="L271" title="All 2 branches missed.">        dataString = (separator &gt; 0)</span>
+<span class="nc" id="L272">            ? dataString.substring(0, separator).trim()</span>
+<span class="nc" id="L273">            : dataString.trim();</span>
+
+        int result;
+        try {
+<span class="nc" id="L277">            result = Integer.parseInt(dataString.trim(), 16);</span>
+<span class="nc" id="L278">        } catch (NumberFormatException e) {</span>
+<span class="nc" id="L279">            throw new IOException (&quot;Bad chunk size: &quot; + dataString);</span>
+        }
+<span class="nc" id="L281">        return result;</span>
+    }
+
+    /**
+     * Reads and stores the Trailer headers.
+     * @throws IOException If an IO problem occurs
+     */
+    private void parseTrailerHeaders() throws IOException {
+        // I feel lazy. No trailing header support
+<span class="nc" id="L290">        readCRLF();</span>
+
+//        Header[] footers = null;
+//        try {
+//            String charset = &quot;US-ASCII&quot;;
+//            if (this.method != null) {
+//                charset = this.method.getParams().getHttpElementCharset();
+//            }
+//            footers = HttpParser.parseHeaders(in, charset);
+//        } catch(HttpException e) {
+//            LOG.error(&quot;Error parsing trailer headers&quot;, e);
+//            IOException ioe = new IOException(e.getMessage());
+//            ExceptionUtil.initCause(ioe, e);
+//            throw ioe;
+//        }
+//        if (this.method != null) {
+//            for (int i = 0; i &lt; footers.length; i++) {
+//                this.method.addResponseFooter(footers[i]);
+//            }
+//        }
+<span class="nc" id="L310">    }</span>
+
+    /**
+     * Upon close, this reads the remainder of the chunked message,
+     * leaving the underlying socket at a position to start reading the
+     * next response without scanning.
+     * @throws IOException If an IO problem occurs.
+     */
+    @Override
+    public void close() throws IOException {
+<span class="nc bnc" id="L320" title="All 2 branches missed.">        if (!closed) {</span>
+            try {
+<span class="nc bnc" id="L322" title="All 2 branches missed.">                if (!eof) {</span>
+<span class="nc" id="L323">                    exhaustInputStream(this);</span>
+                }
+<span class="nc" id="L325">            } finally {</span>
+<span class="nc" id="L326">                eof = true;</span>
+<span class="nc" id="L327">                closed = true;</span>
+<span class="nc" id="L328">            }</span>
+        }
+<span class="nc" id="L330">    }</span>
+
+    /**
+     * Exhaust an input stream, reading until EOF has been encountered.
+     *
+     * &lt;p&gt;Note that this function is intended as a non-public utility.
+     * This is a little weird, but it seemed silly to make a utility
+     * class for this one function, so instead it is just static and
+     * shared that way.&lt;/p&gt;
+     *
+     * @param inStream The {@link InputStream} to exhaust.
+     * @throws IOException If an IO problem occurs
+     */
+    static void exhaustInputStream(InputStream inStream) throws IOException {
+        // read and discard the remainder of the message
+<span class="nc" id="L345">        byte buffer[] = new byte[1024];</span>
+<span class="nc bnc" id="L346" title="All 2 branches missed.">        while (inStream.read(buffer) &gt;= 0) {</span>
+            ;
+        }
+<span class="nc" id="L349">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

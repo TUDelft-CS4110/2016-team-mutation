@@ -1,0 +1,174 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>BulkChange.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson</a> &gt; <span class="el_source">BulkChange.java</span></div><h1>BulkChange.java</h1><pre class="source lang-java linenums"><span class="fc" id="L1">/*</span>
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc., Kohsuke Kawaguchi
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson;
+
+import hudson.model.Saveable;
+
+import java.io.IOException;
+
+/**
+ * Transaction-like object that can be used to make a bunch of changes to an object, and defer the
+ * {@link Saveable#save()} until the end.
+ *
+ * &lt;p&gt;
+ * The usage of {@link BulkChange} needs to follow a specific closure-like pattern, namely:
+ *
+ * &lt;pre&gt;
+ * BulkChange bc = new BulkChange(someObject);
+ * try {
+ *    ... make changes to 'someObject'
+ * } finally {
+ *    bc.commit();
+ * }
+ * &lt;/pre&gt;
+ *
+ * &lt;p&gt;
+ * ... or if you'd like to avoid saving when something bad happens:
+ *
+ * &lt;pre&gt;
+ * BulkChange bc = new BulkChange(someObject);
+ * try {
+ *    ... make changes to 'someObject'
+ *    bc.commit();
+ * } finally {
+ *    bc.abort();
+ * }
+ * &lt;/pre&gt;
+ *
+ * &lt;p&gt;
+ * Use of this method is optional. If {@link BulkChange} is not used, individual mutator
+ * will perform the save operation, and things will just run somewhat slower.
+ *
+ *
+ * &lt;h2&gt;Cooperation from {@link Saveable}&lt;/h2&gt;
+ * &lt;p&gt;
+ * For this class to work as intended, {@link Saveable} implementations need to co-operate.
+ * Namely,
+ *
+ * &lt;ol&gt;
+ * &lt;li&gt;
+ * Mutater methods should invoke {@code this.save()} so that if the method is called outside
+ * a {@link BulkChange}, the result will be saved immediately.
+ *
+ * &lt;li&gt;
+ * In the {@code save()} method implementation, use {@link #contains(Saveable)} and
+ * only perform the actual I/O operation when this method returns false.
+ * &lt;/ol&gt;
+ *
+ * &lt;p&gt;
+ * See {@link jenkins.model.Jenkins#save()} as an example if you are not sure how to implement {@link Saveable}.
+ *
+ * @author Kohsuke Kawaguchi
+ * @since 1.249
+ */
+public class BulkChange {
+    private final Saveable saveable;
+    public final Exception allocator;
+    private final BulkChange parent;
+
+    private boolean completed;
+
+<span class="fc" id="L92">    public BulkChange(Saveable saveable) {</span>
+<span class="fc" id="L93">        this.parent = current();</span>
+<span class="fc" id="L94">        this.saveable = saveable;</span>
+        // rememeber who allocated this object in case
+        // someone forgot to call save() at the end.
+<span class="fc" id="L97">        allocator = new Exception();</span>
+
+        // in effect at construction
+<span class="fc" id="L100">        INSCOPE.set(this);</span>
+<span class="fc" id="L101">    }</span>
+
+    /**
+     * Saves the accumulated changes.
+     */
+    public void commit() throws IOException {
+<span class="pc bpc" id="L107" title="1 of 2 branches missed.">        if(completed)   return;</span>
+<span class="fc" id="L108">        completed = true;</span>
+
+        // move this object out of the scope first before save, or otherwise the save() method will do nothing.
+<span class="fc" id="L111">        pop();</span>
+<span class="fc" id="L112">        saveable.save();</span>
+<span class="fc" id="L113">    }</span>
+
+    /**
+     * Exits the scope of {@link BulkChange} without saving the changes.
+     *
+     * &lt;p&gt;
+     * This can be used when a bulk change fails in the middle.
+     * Note that unlike a real transaction, this will not roll back the state of the object.
+     *
+     * &lt;p&gt;
+     * The abort method can be called after the commit method, in which case this method does nothing.
+     * This is so that {@link BulkChange} can be used naturally in the try/finally block.
+     */
+    public void abort() {
+<span class="nc bnc" id="L127" title="All 2 branches missed.">        if(completed)   return;</span>
+<span class="nc" id="L128">        completed = true;</span>
+<span class="nc" id="L129">        pop();</span>
+<span class="nc" id="L130">    }</span>
+
+    private void pop() {
+<span class="pc bpc" id="L133" title="1 of 2 branches missed.">        if(current()!=this)</span>
+<span class="nc" id="L134">            throw new AssertionError(&quot;Trying to save BulkChange that's not in scope&quot;);</span>
+<span class="fc" id="L135">        INSCOPE.set(parent);</span>
+<span class="fc" id="L136">    }</span>
+
+    /**
+     * {@link BulkChange}s that are effective currently.
+     */
+<span class="fc" id="L141">    private static final ThreadLocal&lt;BulkChange&gt; INSCOPE = new ThreadLocal&lt;BulkChange&gt;();</span>
+
+    /**
+     * Gets the {@link BulkChange} instance currently in scope for the current thread.
+     */
+    public static BulkChange current() {
+<span class="fc" id="L147">        return INSCOPE.get();</span>
+    }
+
+    /**
+     * Checks if the given {@link Saveable} is currently in the bulk change.
+     *
+     * &lt;p&gt;
+     * The expected usage is from the {@link Saveable#save()} implementation to check
+     * if the actual persistence should happen now or not.
+     */
+    public static boolean contains(Saveable s) {
+<span class="fc bfc" id="L158" title="All 2 branches covered.">        for(BulkChange b=current(); b!=null; b=b.parent)</span>
+<span class="pc bpc" id="L159" title="1 of 4 branches missed.">            if(b.saveable==s || b.saveable==ALL)</span>
+<span class="fc" id="L160">                return true;</span>
+<span class="fc" id="L161">        return false;</span>
+    }
+
+    /**
+     * Magic {@link Saveable} instance that can make {@link BulkChange} veto
+     * all the save operations by making the {@link #contains(Saveable)} method return
+     * true for everything.
+     */
+<span class="fc" id="L169">    public static final Saveable ALL = new Saveable() {</span>
+        public void save() {
+<span class="nc" id="L171">        }</span>
+<span class="fc" id="L172">    };</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

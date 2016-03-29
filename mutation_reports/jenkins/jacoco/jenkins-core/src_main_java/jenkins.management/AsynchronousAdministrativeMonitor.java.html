@@ -1,0 +1,136 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>AsynchronousAdministrativeMonitor.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">jenkins.management</a> &gt; <span class="el_source">AsynchronousAdministrativeMonitor.java</span></div><h1>AsynchronousAdministrativeMonitor.java</h1><pre class="source lang-java linenums">package jenkins.management;
+
+import hudson.AbortException;
+import hudson.console.AnnotatedLargeText;
+import hudson.model.AdministrativeMonitor;
+import hudson.model.TaskListener;
+import hudson.security.ACL;
+import hudson.util.StreamTaskListener;
+import jenkins.model.Jenkins;
+import jenkins.security.RekeySecretAdminMonitor;
+
+import java.io.File;
+import java.io.IOException;
+import java.nio.charset.Charset;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import javax.annotation.Nonnull;
+
+/**
+ * Convenient partial implementation of {@link AdministrativeMonitor} that involves a background &quot;fixing&quot; action
+ * once the user opts in for the execution of it.
+ *
+ * &lt;p&gt;
+ * A subclass defines what that background fixing actually does in {@link #fix(TaskListener)}. The logging output
+ * from it gets persisted, and this class provides a &quot;/log&quot; view that allows the administrator to monitor its progress.
+ *
+ * &lt;p&gt;
+ * See {@link RekeySecretAdminMonitor} for an example of how to subtype this class.
+ *
+ * @author Kohsuke Kawaguchi
+ */
+<span class="nc" id="L32">public abstract class AsynchronousAdministrativeMonitor extends AdministrativeMonitor {</span>
+    /**
+     * Set to non-null once the background activity starts running.
+     */
+    private volatile FixThread fixThread;
+
+    /**
+     * Is there an active execution process going on?
+     */
+    public boolean isFixingActive() {
+<span class="nc bnc" id="L42" title="All 4 branches missed.">        return fixThread !=null &amp;&amp; fixThread.isAlive();</span>
+    }
+
+    /**
+     * Used to URL-bind {@link AnnotatedLargeText}.
+     */
+    public AnnotatedLargeText getLogText() {
+<span class="nc" id="L49">        return new AnnotatedLargeText&lt;AsynchronousAdministrativeMonitor&gt;(</span>
+<span class="nc" id="L50">                getLogFile(), Charset.defaultCharset(),</span>
+<span class="nc bnc" id="L51" title="All 2 branches missed.">                !isFixingActive(), this);</span>
+    }
+
+    /**
+     * Rewrite log file.
+     */
+    protected File getLogFile() {
+<span class="nc" id="L58">        File base = getBaseDir();</span>
+<span class="nc" id="L59">        base.mkdirs();</span>
+<span class="nc" id="L60">        return new File(base,&quot;log&quot;);</span>
+    }
+
+    protected File getBaseDir() {
+<span class="nc" id="L64">        return new File(Jenkins.getInstance().getRootDir(),getClass().getName());</span>
+    }
+
+    public abstract String getDisplayName();
+
+    /**
+     * Starts the background fixing activity.
+     *
+     * @param forceRestart
+     *      If true, any ongoing fixing activity gets interrupted and the new one starts right away.
+     */
+    protected synchronized Thread start(boolean forceRestart) {
+<span class="nc bnc" id="L76" title="All 4 branches missed.">        if (!forceRestart &amp;&amp; isFixingActive()) {</span>
+<span class="nc" id="L77">            fixThread.interrupt();</span>
+        }
+
+<span class="nc bnc" id="L80" title="All 4 branches missed.">        if (forceRestart || !isFixingActive()) {</span>
+<span class="nc" id="L81">            fixThread = new FixThread();</span>
+<span class="nc" id="L82">            fixThread.start();</span>
+        }
+<span class="nc" id="L84">        return fixThread;</span>
+    }
+
+    /**
+     * Run on a separate thread in the background to fix up stuff.
+     */
+    protected abstract void fix(TaskListener listener) throws Exception;
+
+    protected class FixThread extends Thread {
+<span class="nc" id="L93">        FixThread() {</span>
+<span class="nc" id="L94">            super(getDisplayName());</span>
+<span class="nc" id="L95">        }</span>
+
+        @Override
+        public void run() {
+<span class="nc" id="L99">            ACL.impersonate(ACL.SYSTEM);</span>
+<span class="nc" id="L100">            StreamTaskListener listener = null;</span>
+            try {
+<span class="nc" id="L102">                listener = new StreamTaskListener(getLogFile());</span>
+                try {
+<span class="nc" id="L104">                    doRun(listener);</span>
+<span class="nc" id="L105">                } finally {</span>
+<span class="nc" id="L106">                    listener.close();</span>
+<span class="nc" id="L107">                }</span>
+<span class="nc" id="L108">            } catch (IOException ex) {</span>
+<span class="nc bnc" id="L109" title="All 2 branches missed.">                if (listener == null) {</span>
+<span class="nc" id="L110">                    LOGGER.log(Level.SEVERE, &quot;Cannot create listener for &quot; + getName(), ex);</span>
+                    //TODO: throw IllegalStateException?
+<span class="nc" id="L112">                } else {</span>
+<span class="nc" id="L113">                    LOGGER.log(Level.WARNING, &quot;Cannot close listener for &quot; + getName(), ex);</span>
+                }
+            }
+<span class="nc" id="L116">         }</span>
+
+        /**
+         * Runs the monitor and encapsulates all errors within.
+         * @since 1.590
+         */
+        private void doRun(@Nonnull TaskListener listener) {
+            try {
+<span class="nc" id="L124">                fix(listener);</span>
+<span class="nc" id="L125">            } catch (AbortException e) {</span>
+<span class="nc" id="L126">                listener.error(e.getMessage());</span>
+<span class="nc" id="L127">            } catch (Throwable e) {</span>
+<span class="nc" id="L128">                e.printStackTrace(listener.error(getName() + &quot; failed&quot;));</span>
+<span class="nc" id="L129">                LOGGER.log(Level.WARNING, getName() + &quot; failed&quot;, e);</span>
+            }
+<span class="nc" id="L131">        }</span>
+    }
+
+<span class="nc" id="L134">    private static final Logger LOGGER = Logger.getLogger(AsynchronousAdministrativeMonitor.class.getName());</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

@@ -1,0 +1,373 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>HealthReport.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.model</a> &gt; <span class="el_source">HealthReport.java</span></div><h1>HealthReport.java</h1><pre class="source lang-java linenums">/*
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2010, Sun Microsystems, Inc., Kohsuke Kawaguchi, Stephen Connolly
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.model;
+
+import com.thoughtworks.xstream.converters.UnmarshallingContext;
+import hudson.diagnosis.OldDataMonitor;
+import hudson.util.XStream2;
+import jenkins.model.Jenkins;
+import jenkins.util.NonLocalizable;
+import org.jvnet.localizer.Localizable;
+import org.kohsuke.stapler.export.Exported;
+import org.kohsuke.stapler.export.ExportedBean;
+
+import java.io.*;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Represents health of something (typically project).
+ * A number between 0-100.
+ *
+ * @author connollys
+ * @since 1.115
+ */
+@ExportedBean(defaultVisibility = 2)
+// this is always exported as a part of Job and never on its own, so start with 2.
+public class HealthReport implements Serializable, Comparable&lt;HealthReport&gt; {
+    // These are now 0-20, 21-40, 41-60, 61-80, 81+ but filenames unchanged for compatibility
+    private static final String HEALTH_OVER_80 = &quot;icon-health-80plus&quot;;
+    private static final String HEALTH_61_TO_80 = &quot;icon-health-60to79&quot;;
+    private static final String HEALTH_41_TO_60 = &quot;icon-health-40to59&quot;;
+    private static final String HEALTH_21_TO_40 = &quot;icon-health-20to39&quot;;
+    private static final String HEALTH_0_TO_20 = &quot;icon-health-00to19&quot;;
+
+    private static final String HEALTH_OVER_80_IMG = &quot;health-80plus.png&quot;;
+    private static final String HEALTH_61_TO_80_IMG = &quot;health-60to79.png&quot;;
+    private static final String HEALTH_41_TO_60_IMG = &quot;health-40to59.png&quot;;
+    private static final String HEALTH_21_TO_40_IMG = &quot;health-20to39.png&quot;;
+    private static final String HEALTH_0_TO_20_IMG = &quot;health-00to19.png&quot;;
+    private static final String HEALTH_UNKNOWN_IMG = &quot;empty.png&quot;;
+
+<span class="nc" id="L65">    private static final Map&lt;String, String&gt; iconIMGToClassMap = new HashMap&lt;String, String&gt;();</span>
+    static {
+<span class="nc" id="L67">        iconIMGToClassMap.put(HEALTH_OVER_80_IMG, HEALTH_OVER_80);</span>
+<span class="nc" id="L68">        iconIMGToClassMap.put(HEALTH_61_TO_80_IMG, HEALTH_61_TO_80);</span>
+<span class="nc" id="L69">        iconIMGToClassMap.put(HEALTH_41_TO_60_IMG, HEALTH_41_TO_60);</span>
+<span class="nc" id="L70">        iconIMGToClassMap.put(HEALTH_21_TO_40_IMG, HEALTH_21_TO_40);</span>
+<span class="nc" id="L71">        iconIMGToClassMap.put(HEALTH_0_TO_20_IMG, HEALTH_0_TO_20);</span>
+<span class="nc" id="L72">    }</span>
+
+    /**
+     * The percentage health score (from 0 to 100 inclusive).
+     */
+    private int score;
+
+    /**
+     * Icon class.
+     */
+    private String iconClassName;
+
+    /**
+     * The path to the icon corresponding to this health score or &lt;code&gt;null&lt;/code&gt; to use the default icon
+     * corresponding to the current health score.
+     * &lt;p/&gt;
+     * If the path begins with a '/' then it will be the absolute path, otherwise the image is assumed to be in one of
+     * &lt;code&gt;/images/16x16/&lt;/code&gt;, &lt;code&gt;/images/24x24/&lt;/code&gt; or &lt;code&gt;/images/32x32/&lt;/code&gt; depending on the icon
+     * size selected by the user.
+     */
+    private String iconUrl;
+
+    /**
+     * Recover the health icon's tool-tip when deserializing.
+     *
+     * @deprecated since 2008-10-18. Use {@link #localizibleDescription}
+     */
+    @Deprecated
+    private transient String description;
+
+    /**
+     * The health icon's tool-tip.
+     */
+    private Localizable localizibleDescription;
+
+    /**
+     * Create a new HealthReport.
+     *
+     * @param score       The percentage health score (from 0 to 100 inclusive).
+     * @param iconUrl     The path to the icon corresponding to this {@link Action}'s health or &lt;code&gt;null&lt;/code&gt; to
+     *                    display the default icon corresponding to the current health score.
+     *                    &lt;p/&gt;
+     *                    If the path begins with a '/' then it will be the absolute path, otherwise the image is
+     *                    assumed to be in one of &lt;code&gt;/images/16x16/&lt;/code&gt;, &lt;code&gt;/images/24x24/&lt;/code&gt; or
+     *                    &lt;code&gt;/images/32x32/&lt;/code&gt; depending on the icon size selected by the user.
+     *                    When calculating the url to display for absolute paths, the getIconUrl(String) method
+     *                    will replace /32x32/ in the path with the appropriate size.
+     * @param description The health icon's tool-tip.
+     * @deprecated since 2008-10-18.
+     *     Use {@link #HealthReport(int, String, org.jvnet.localizer.Localizable)}
+     */
+    @Deprecated
+    public HealthReport(int score, String iconUrl, String description) {
+<span class="nc" id="L125">        this(score, iconUrl, new NonLocalizable(description));</span>
+<span class="nc" id="L126">    }</span>
+
+    /**
+     * Create a new HealthReport.
+     *
+     * @param score       The percentage health score (from 0 to 100 inclusive).
+     * @param iconUrl     The path to the icon corresponding to this {@link Action}'s health or &lt;code&gt;null&lt;/code&gt; to
+     *                    display the default icon corresponding to the current health score.
+     *                    &lt;p/&gt;
+     *                    If the path begins with a '/' then it will be the absolute path, otherwise the image is
+     *                    assumed to be in one of &lt;code&gt;/images/16x16/&lt;/code&gt;, &lt;code&gt;/images/24x24/&lt;/code&gt; or
+     *                    &lt;code&gt;/images/32x32/&lt;/code&gt; depending on the icon size selected by the user.
+     *                    When calculating the url to display for absolute paths, the getIconUrl(String) method
+     *                    will replace /32x32/ in the path with the appropriate size.
+     * @param description The health icon's tool-tip.
+     */
+<span class="nc" id="L142">    public HealthReport(int score, String iconUrl, Localizable description) {</span>
+<span class="nc" id="L143">        this.score = score;</span>
+<span class="nc bnc" id="L144" title="All 2 branches missed.">        if (score &lt;= 20) {</span>
+<span class="nc" id="L145">            this.iconClassName = HEALTH_0_TO_20;</span>
+<span class="nc bnc" id="L146" title="All 2 branches missed.">        } else if (score &lt;= 40) {</span>
+<span class="nc" id="L147">            this.iconClassName = HEALTH_21_TO_40;</span>
+<span class="nc bnc" id="L148" title="All 2 branches missed.">        } else if (score &lt;= 60) {</span>
+<span class="nc" id="L149">            this.iconClassName = HEALTH_41_TO_60;</span>
+<span class="nc bnc" id="L150" title="All 2 branches missed.">        } else if (score &lt;= 80) {</span>
+<span class="nc" id="L151">            this.iconClassName = HEALTH_61_TO_80;</span>
+<span class="nc" id="L152">        } else {</span>
+<span class="nc" id="L153">            this.iconClassName = HEALTH_OVER_80;</span>
+        }
+<span class="nc bnc" id="L155" title="All 2 branches missed.">        if (iconUrl == null) {</span>
+<span class="nc bnc" id="L156" title="All 2 branches missed.">            if (score &lt;= 20) {</span>
+<span class="nc" id="L157">                this.iconUrl = HEALTH_0_TO_20_IMG;</span>
+<span class="nc bnc" id="L158" title="All 2 branches missed.">            } else if (score &lt;= 40) {</span>
+<span class="nc" id="L159">                this.iconUrl = HEALTH_21_TO_40_IMG;</span>
+<span class="nc bnc" id="L160" title="All 2 branches missed.">            } else if (score &lt;= 60) {</span>
+<span class="nc" id="L161">                this.iconUrl = HEALTH_41_TO_60_IMG;</span>
+<span class="nc bnc" id="L162" title="All 2 branches missed.">            } else if (score &lt;= 80) {</span>
+<span class="nc" id="L163">                this.iconUrl = HEALTH_61_TO_80_IMG;</span>
+<span class="nc" id="L164">            } else {</span>
+<span class="nc" id="L165">                this.iconUrl = HEALTH_OVER_80_IMG;</span>
+            }
+<span class="nc" id="L167">        } else {</span>
+<span class="nc" id="L168">            this.iconUrl = iconUrl;</span>
+        }
+<span class="nc" id="L170">        this.description = null;</span>
+<span class="nc" id="L171">        setLocalizibleDescription(description);</span>
+<span class="nc" id="L172">    }</span>
+
+    /**
+     * Create a new HealthReport.
+     *
+     * @param score       The percentage health score (from 0 to 100 inclusive).
+     * @param description The health icon's tool-tip.
+     * @deprecated since 2008-10-18.
+     *     Use {@link #HealthReport(int, org.jvnet.localizer.Localizable)}
+     */
+    @Deprecated
+    public HealthReport(int score, String description) {
+<span class="nc" id="L184">        this(score, null, description);</span>
+<span class="nc" id="L185">    }</span>
+
+    /**
+     * Create a new HealthReport.
+     *
+     * @param score       The percentage health score (from 0 to 100 inclusive).
+     * @param description The health icon's tool-tip.
+     */
+    public HealthReport(int score, Localizable description) {
+<span class="nc" id="L194">        this(score, null, description);</span>
+<span class="nc" id="L195">    }</span>
+
+    /**
+     * Create a new HealthReport.
+     */
+    public HealthReport() {
+<span class="nc" id="L201">        this(100, HEALTH_UNKNOWN_IMG, Messages._HealthReport_EmptyString());</span>
+<span class="nc" id="L202">    }</span>
+
+    /**
+     * Getter for property 'score'.
+     *
+     * @return The percentage health score (from 0 to 100 inclusive).
+     */
+    @Exported
+    public int getScore() {
+<span class="nc" id="L211">        return score;</span>
+    }
+
+    /**
+     * Setter for property 'score'.
+     *
+     * @param score Value to set for property 'score'.
+     */
+    public void setScore(int score) {
+<span class="nc" id="L220">        this.score = score;</span>
+<span class="nc" id="L221">    }</span>
+
+
+
+    /**
+     * Getter for property 'iconUrl'.
+     *
+     * @return Value for property 'iconUrl'.
+     */
+    @Exported
+    public String getIconUrl() {
+<span class="nc" id="L232">        return iconUrl;</span>
+    }
+
+    /**
+     * Get health status icon class.
+     *
+     * @return The health status icon class.
+     */
+    @Exported
+    public String getIconClassName() {
+<span class="nc" id="L242">        return iconClassName;</span>
+    }
+
+    /**
+     * Get's the iconUrl relative to the hudson root url, for the correct size.
+     *
+     * @param size The size, e.g. 32x32, 24x24 or 16x16.
+     * @return The url relative to hudson's root url.
+     */
+    public String getIconUrl(String size) {
+<span class="nc bnc" id="L252" title="All 2 branches missed.">        if (iconUrl == null) {</span>
+<span class="nc" id="L253">            return Jenkins.RESOURCE_PATH + &quot;/images/&quot; + size + &quot;/&quot; + HEALTH_UNKNOWN_IMG;</span>
+        }
+<span class="nc bnc" id="L255" title="All 2 branches missed.">        if (iconUrl.startsWith(&quot;/&quot;)) {</span>
+<span class="nc" id="L256">            return iconUrl.replace(&quot;/32x32/&quot;, &quot;/&quot; + size + &quot;/&quot;);</span>
+        }
+<span class="nc" id="L258">        return Jenkins.RESOURCE_PATH + &quot;/images/&quot; + size + &quot;/&quot; + iconUrl;</span>
+    }
+
+    /**
+     * Setter for property 'iconUrl'.
+     *
+     * @param iconUrl Value to set for property 'iconUrl'.
+     */
+    public void setIconUrl(String iconUrl) {
+<span class="nc" id="L267">        this.iconUrl = iconUrl;</span>
+<span class="nc" id="L268">    }</span>
+
+    /**
+     * Getter for property 'description'.
+     *
+     * @return Value for property 'description'.
+     */
+    @Exported
+    public String getDescription() {
+<span class="nc" id="L277">        return getLocalizableDescription().toString();</span>
+    }
+
+    /**
+     * Setter for property 'description'.
+     *
+     * @param description Value to set for property 'description'.
+     */
+    public void setDescription(String description) {
+<span class="nc" id="L286">        setLocalizibleDescription(new NonLocalizable(description));</span>
+<span class="nc" id="L287">    }</span>
+
+    /**
+     * Getter for property 'localizibleDescription'.
+     *
+     * @return Value for property 'localizibleDescription'.
+     */
+    public Localizable getLocalizableDescription() {
+<span class="nc" id="L295">        return localizibleDescription;</span>
+    }
+
+    /**
+     * Setter for property 'localizibleDescription'.
+     *
+     * @param localizibleDescription Value to set for property 'localizibleDescription'.
+     */
+    public void setLocalizibleDescription(Localizable localizibleDescription) {
+<span class="nc" id="L304">        this.localizibleDescription = localizibleDescription;</span>
+<span class="nc" id="L305">    }</span>
+
+    /**
+     * Getter for property 'aggregatedReports'.
+     *
+     * @return Value for property 'aggregatedReports'.
+     */
+    public List&lt;HealthReport&gt; getAggregatedReports() {
+<span class="nc" id="L313">        return Collections.emptyList();</span>
+    }
+
+    /**
+     * Getter for property 'aggregateReport'.
+     *
+     * @return Value for property 'aggregateReport'.
+     */
+    public boolean isAggregateReport() {
+<span class="nc" id="L322">        return false;</span>
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public int compareTo(HealthReport o) {
+<span class="nc bnc" id="L330" title="All 4 branches missed.">        return (this.score &lt; o.score ? -1 : (this.score == o.score ? 0 : 1));</span>
+    }
+
+    /**
+     * Utility method to find the report with the lowest health.
+     */
+    public static HealthReport min(HealthReport a, HealthReport b) {
+<span class="nc bnc" id="L337" title="All 4 branches missed.">        if (a == null &amp;&amp; b == null) return null;</span>
+<span class="nc bnc" id="L338" title="All 2 branches missed.">        if (a == null) return b;</span>
+<span class="nc bnc" id="L339" title="All 2 branches missed.">        if (b == null) return a;</span>
+<span class="nc bnc" id="L340" title="All 2 branches missed.">        if (a.compareTo(b) &lt;= 0) return a;</span>
+<span class="nc" id="L341">        return b;</span>
+    }
+
+    /**
+     * Utility method to find the report with the highest health.
+     */
+    public static HealthReport max(HealthReport a, HealthReport b) {
+<span class="nc bnc" id="L348" title="All 4 branches missed.">        if (a == null &amp;&amp; b == null) return null;</span>
+<span class="nc bnc" id="L349" title="All 2 branches missed.">        if (a == null) return b;</span>
+<span class="nc bnc" id="L350" title="All 2 branches missed.">        if (b == null) return a;</span>
+<span class="nc bnc" id="L351" title="All 2 branches missed.">        if (a.compareTo(b) &gt;= 0) return a;</span>
+<span class="nc" id="L352">        return b;</span>
+    }
+
+    /**
+     * Fix deserialization of older data.
+     */
+    public static class ConverterImpl extends XStream2.PassthruConverter&lt;HealthReport&gt; {
+<span class="nc" id="L359">        public ConverterImpl(XStream2 xstream) { super(xstream); }</span>
+        @Override protected void callback(HealthReport hr, UnmarshallingContext context) {
+            // If we are being read back in from an older version
+<span class="nc bnc" id="L362" title="All 2 branches missed.">            if (hr.localizibleDescription == null) {</span>
+<span class="nc bnc" id="L363" title="All 2 branches missed.">                hr.localizibleDescription = new NonLocalizable(hr.description == null ? &quot;&quot; : hr.description);</span>
+<span class="nc" id="L364">                OldDataMonitor.report(context, &quot;1.256&quot;);</span>
+            }
+
+<span class="nc bnc" id="L367" title="All 6 branches missed.">            if (hr.iconClassName == null &amp;&amp; hr.iconUrl != null &amp;&amp; iconIMGToClassMap.containsKey(hr.iconUrl)) {</span>
+<span class="nc" id="L368">                hr.iconClassName = iconIMGToClassMap.get(hr.iconUrl);</span>
+            }
+<span class="nc" id="L370">        }</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

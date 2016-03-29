@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>EncryptedSlaveAgentJnlpFile.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">jenkins.slaves</a> &gt; <span class="el_source">EncryptedSlaveAgentJnlpFile.java</span></div><h1>EncryptedSlaveAgentJnlpFile.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">package jenkins.slaves;</span>
+
+import hudson.security.AccessControlled;
+import hudson.security.Permission;
+import hudson.slaves.SlaveComputer;
+import hudson.util.Secret;
+import org.kohsuke.stapler.HttpResponse;
+import org.kohsuke.stapler.ResponseImpl;
+import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.StaplerResponse;
+import org.kohsuke.stapler.compression.FilterServletOutputStream;
+
+import javax.crypto.Cipher;
+import javax.crypto.SecretKey;
+import javax.crypto.spec.IvParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
+import javax.servlet.RequestDispatcher;
+import javax.servlet.ServletException;
+import javax.servlet.ServletOutputStream;
+import javax.servlet.http.HttpServletResponseWrapper;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.PrintWriter;
+import java.security.GeneralSecurityException;
+import java.security.SecureRandom;
+
+/**
+ * Serves the JNLP file.
+ *
+ * The client can request an encrypted payload (with JNLP MAC code as the key) or if the client has a suitable permission,
+ * it can request a plain text payload.
+ *
+ * @author Kohsuke Kawaguchi
+ * @since 1.560
+ */
+public class EncryptedSlaveAgentJnlpFile implements HttpResponse {
+    /**
+     * The object that owns the Jelly view that renders JNLP file.
+     * For example {@link SlaveComputer}.
+     */
+    private final AccessControlled it;
+    /**
+     * Name of the view that renders JNLP file that belongs to {@link #it}.
+     */
+    private final String viewName;
+    /**
+     * Name of the slave, which is used to determine secret HMAC code.
+     */
+    private final String slaveName;
+    /**
+     * Permission that allows plain text access. Checked against {@link #it}.
+     */
+    private final Permission connectPermission;
+
+<span class="nc" id="L55">    public EncryptedSlaveAgentJnlpFile(AccessControlled it, String viewName, String slaveName, Permission connectPermission) {</span>
+<span class="nc" id="L56">        this.it = it;</span>
+<span class="nc" id="L57">        this.viewName = viewName;</span>
+<span class="nc" id="L58">        this.slaveName = slaveName;</span>
+<span class="nc" id="L59">        this.connectPermission = connectPermission;</span>
+<span class="nc" id="L60">    }</span>
+
+    @Override
+    public void generateResponse(StaplerRequest req, StaplerResponse res, Object node) throws IOException, ServletException {
+<span class="nc" id="L64">        RequestDispatcher view = req.getView(it, viewName);</span>
+<span class="nc bnc" id="L65" title="All 2 branches missed.">        if (&quot;true&quot;.equals(req.getParameter(&quot;encrypt&quot;))) {</span>
+<span class="nc" id="L66">            final ByteArrayOutputStream baos = new ByteArrayOutputStream();</span>
+<span class="nc" id="L67">            StaplerResponse temp = new ResponseImpl(req.getStapler(), new HttpServletResponseWrapper(res) {</span>
+                @Override public ServletOutputStream getOutputStream() throws IOException {
+<span class="nc" id="L69">                    return new FilterServletOutputStream(baos);</span>
+                }
+                @Override public PrintWriter getWriter() throws IOException {
+<span class="nc" id="L72">                    throw new IllegalStateException();</span>
+                }
+            });
+<span class="nc" id="L75">            view.forward(req, temp);</span>
+
+<span class="nc" id="L77">            byte[] iv = new byte[128/8];</span>
+<span class="nc" id="L78">            new SecureRandom().nextBytes(iv);</span>
+
+<span class="nc" id="L80">            byte[] jnlpMac = JnlpSlaveAgentProtocol.SLAVE_SECRET.mac(slaveName.getBytes(&quot;UTF-8&quot;));</span>
+<span class="nc" id="L81">            SecretKey key = new SecretKeySpec(jnlpMac, 0, /* export restrictions */ 128 / 8, &quot;AES&quot;);</span>
+            byte[] encrypted;
+            try {
+<span class="nc" id="L84">                Cipher c = Secret.getCipher(&quot;AES/CFB8/NoPadding&quot;);</span>
+<span class="nc" id="L85">                c.init(Cipher.ENCRYPT_MODE, key, new IvParameterSpec(iv));</span>
+<span class="nc" id="L86">                encrypted = c.doFinal(baos.toByteArray());</span>
+<span class="nc" id="L87">            } catch (GeneralSecurityException x) {</span>
+<span class="nc" id="L88">                throw new IOException(x);</span>
+            }
+<span class="nc" id="L90">            res.setContentType(&quot;application/octet-stream&quot;);</span>
+<span class="nc" id="L91">            res.getOutputStream().write(iv);</span>
+<span class="nc" id="L92">            res.getOutputStream().write(encrypted);</span>
+<span class="nc" id="L93">        } else {</span>
+<span class="nc" id="L94">            it.checkPermission(connectPermission);</span>
+<span class="nc" id="L95">            view.forward(req, res);</span>
+        }
+<span class="nc" id="L97">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

@@ -1,0 +1,221 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>ResponseTimeMonitor.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.node_monitors</a> &gt; <span class="el_source">ResponseTimeMonitor.java</span></div><h1>ResponseTimeMonitor.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">/*</span>
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc., Kohsuke Kawaguchi, Red Hat, Inc.
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.node_monitors;
+
+import hudson.Util;
+import hudson.Extension;
+import hudson.model.Computer;
+import hudson.remoting.Callable;
+import jenkins.security.MasterToSlaveCallable;
+import net.sf.json.JSONObject;
+import org.kohsuke.stapler.StaplerRequest;
+
+import java.io.IOException;
+import java.io.Serializable;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.logging.Logger;
+import org.kohsuke.stapler.export.Exported;
+import org.kohsuke.stapler.export.ExportedBean;
+
+/**
+ * Monitors the round-trip response time to this slave.
+ *
+ * @author Kohsuke Kawaguchi
+ */
+<span class="nc" id="L47">public class ResponseTimeMonitor extends NodeMonitor {</span>
+    @Extension
+<span class="nc" id="L49">    public static final AbstractNodeMonitorDescriptor&lt;Data&gt; DESCRIPTOR = new AbstractAsyncNodeMonitorDescriptor&lt;Data&gt;() {</span>
+        @Override
+        protected Callable&lt;Data,IOException&gt; createCallable(Computer c) {
+<span class="nc" id="L52">            return new Step1(get(c));</span>
+        }
+
+        @Override
+        protected Map&lt;Computer, Data&gt; monitor() throws InterruptedException {
+<span class="nc" id="L57">            Map&lt;Computer, Data&gt; base = super.monitor();</span>
+<span class="nc bnc" id="L58" title="All 2 branches missed.">            for (Entry&lt;Computer, Data&gt; e : base.entrySet()) {</span>
+<span class="nc" id="L59">                Computer c = e.getKey();</span>
+<span class="nc" id="L60">                Data d = e.getValue();</span>
+<span class="nc bnc" id="L61" title="All 2 branches missed.">                if (d ==null) {</span>
+                    // if we failed to monitor, put in the special value that indicates a failure
+<span class="nc" id="L63">                    e.setValue(d=new Data(get(c),-1L));</span>
+                }
+
+<span class="nc bnc" id="L66" title="All 4 branches missed.">                if(d.hasTooManyTimeouts() &amp;&amp; !isIgnored()) {</span>
+                    // unlike other monitors whose failure still allow us to communicate with the slave,
+                    // the failure in this monitor indicates that we are just unable to make any requests
+                    // to this slave. So we should severe the connection, as opposed to marking it temporarily
+                    // off line, which still keeps the underlying channel open.
+<span class="nc" id="L71">                    c.disconnect(d);</span>
+<span class="nc" id="L72">                    LOGGER.warning(Messages.ResponseTimeMonitor_MarkedOffline(c.getName()));</span>
+                }
+            }
+<span class="nc" id="L75">            return base;</span>
+        }
+
+        public String getDisplayName() {
+<span class="nc" id="L79">            return Messages.ResponseTimeMonitor_DisplayName();</span>
+        }
+
+        @Override
+        public NodeMonitor newInstance(StaplerRequest req, JSONObject formData) throws FormException {
+<span class="nc" id="L84">            return new ResponseTimeMonitor();</span>
+        }
+    };
+
+    private static final class Step1 extends MasterToSlaveCallable&lt;Data,IOException&gt; {
+        private Data cur;
+
+<span class="nc" id="L91">        private Step1(Data cur) {</span>
+<span class="nc" id="L92">            this.cur = cur;</span>
+<span class="nc" id="L93">        }</span>
+
+        public Data call() {
+            // this method must be being invoked locally, which means the roundtrip time is zero and zero forever
+<span class="nc" id="L97">            return new Data(cur,0);</span>
+        }
+
+        private Object writeReplace() {
+<span class="nc" id="L101">            return new Step2(cur);</span>
+        }
+
+        private static final long serialVersionUID = 1L;
+    }
+
+    private static final class Step2 extends MasterToSlaveCallable&lt;Step3,IOException&gt; {
+        private final Data cur;
+<span class="nc" id="L109">        private final long start = System.currentTimeMillis();</span>
+
+<span class="nc" id="L111">        public Step2(Data cur) {</span>
+<span class="nc" id="L112">            this.cur = cur;</span>
+<span class="nc" id="L113">        }</span>
+
+        public Step3 call() {
+            // this method must be being invoked locally, which means the roundtrip time is zero and zero forever
+<span class="nc" id="L117">            return new Step3(cur,start);</span>
+        }
+
+        private static final long serialVersionUID = 1L;
+    }
+
+    private static final class Step3 implements Serializable {
+        private final Data cur;
+        private final long start;
+
+<span class="nc" id="L127">        private Step3(Data cur, long start) {</span>
+<span class="nc" id="L128">            this.cur = cur;</span>
+<span class="nc" id="L129">            this.start = start;</span>
+<span class="nc" id="L130">        }</span>
+
+        private Object readResolve() {
+<span class="nc" id="L133">            long end = System.currentTimeMillis();</span>
+<span class="nc" id="L134">            return new Data(cur,(end-start));</span>
+        }
+
+        private static final long serialVersionUID = 1L;
+    }
+
+    /**
+     * Immutable representation of the monitoring data.
+     */
+    @ExportedBean
+    public static final class Data extends MonitorOfflineCause implements Serializable {
+        /**
+         * Record of the past 5 times. -1 if time out. Otherwise in milliseconds.
+         * Old ones first.
+         */
+        private final long[] past5;
+
+<span class="nc" id="L151">        private Data(Data old, long newDataPoint) {</span>
+<span class="nc bnc" id="L152" title="All 2 branches missed.">            if(old==null)</span>
+<span class="nc" id="L153">                past5 = new long[] {newDataPoint};</span>
+            else {
+<span class="nc" id="L155">                past5 = new long[Math.min(5,old.past5.length+1)];</span>
+<span class="nc" id="L156">                int copyLen = past5.length - 1;</span>
+<span class="nc" id="L157">                System.arraycopy(old.past5, old.past5.length-copyLen, this.past5, 0, copyLen);</span>
+<span class="nc" id="L158">                past5[past5.length-1] = newDataPoint;</span>
+            }
+<span class="nc" id="L160">        }</span>
+
+        /**
+         * Computes the recurrence of the time out
+         */
+        private int failureCount() {
+<span class="nc" id="L166">            int cnt=0;</span>
+<span class="nc bnc" id="L167" title="All 4 branches missed.">            for(int i=past5.length-1; i&gt;=0 &amp;&amp; past5[i]&lt;0; i--, cnt++)</span>
+                ;
+<span class="nc" id="L169">            return cnt;</span>
+        }
+
+        /**
+         * Computes the average response time, by taking the time out into account.
+         */
+        @Exported
+        public long getAverage() {
+<span class="nc" id="L177">            long total=0;</span>
+<span class="nc bnc" id="L178" title="All 2 branches missed.">            for (long l : past5) {</span>
+<span class="nc bnc" id="L179" title="All 2 branches missed.">                if(l&lt;0)     total += TIMEOUT;</span>
+<span class="nc" id="L180">                else        total += l;</span>
+            }
+<span class="nc" id="L182">            return total/past5.length;</span>
+        }
+
+        public boolean hasTooManyTimeouts() {
+<span class="nc bnc" id="L186" title="All 2 branches missed.">            return failureCount()&gt;=5;</span>
+        }
+
+        /**
+         * String rendering of the data
+         */
+        @Override
+        public String toString() {
+//            StringBuilder buf = new StringBuilder();
+//            for (long l : past5) {
+//                if(buf.length()&gt;0)  buf.append(',');
+//                buf.append(l);
+//            }
+//            return buf.toString();
+<span class="nc" id="L200">            int fc = failureCount();</span>
+<span class="nc bnc" id="L201" title="All 2 branches missed.">            if(fc&gt;0)</span>
+<span class="nc" id="L202">                return Messages.ResponseTimeMonitor_TimeOut(fc);</span>
+<span class="nc" id="L203">            return getAverage()+&quot;ms&quot;;</span>
+        }
+
+        @Override
+        public Class&lt;? extends NodeMonitor&gt; getTrigger() {
+<span class="nc" id="L208">            return ResponseTimeMonitor.class;</span>
+        }
+
+        private static final long serialVersionUID = 1L;
+    }
+
+    /**
+     * Time out interval in milliseconds.
+     */
+    private static final long TIMEOUT = 5000;
+
+<span class="nc" id="L219">    private static final Logger LOGGER = Logger.getLogger(ResponseTimeMonitor.class.getName());</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

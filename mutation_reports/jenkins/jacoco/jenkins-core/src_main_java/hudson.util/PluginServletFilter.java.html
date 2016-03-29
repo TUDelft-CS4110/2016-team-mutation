@@ -1,0 +1,147 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>PluginServletFilter.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.util</a> &gt; <span class="el_source">PluginServletFilter.java</span></div><h1>PluginServletFilter.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">/*</span>
+ * The MIT License
+ *
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc., Kohsuke Kawaguchi, Tom Huybrechts
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.util;
+
+import hudson.ExtensionPoint;
+import hudson.security.SecurityRealm;
+import jenkins.model.Jenkins;
+
+import javax.annotation.CheckForNull;
+import javax.servlet.Filter;
+import javax.servlet.FilterChain;
+import javax.servlet.FilterConfig;
+import javax.servlet.ServletContext;
+import javax.servlet.ServletException;
+import javax.servlet.ServletRequest;
+import javax.servlet.ServletResponse;
+import java.io.IOException;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Vector;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+/**
+ * Servlet {@link Filter} that chains multiple {@link Filter}s, provided by plugins
+ *
+ * &lt;p&gt;
+ * While this class by itself is not an extension point, I'm marking this class
+ * as an extension point so that this class will be more discoverable.
+ *
+ * &lt;p&gt;
+ * {@link SecurityRealm} that wants to contribute {@link Filter}s should first
+ * check if {@link SecurityRealm#createFilter(FilterConfig)} is more appropriate.
+ *
+ * @see SecurityRealm
+ */
+<span class="nc" id="L59">public class PluginServletFilter implements Filter, ExtensionPoint {</span>
+<span class="nc" id="L60">    private final List&lt;Filter&gt; list = new CopyOnWriteArrayList&lt;Filter&gt;();</span>
+
+    private /*almost final*/ FilterConfig config;
+
+    /**
+     * For backward compatibility with plugins that might register filters before Jenkins.getInstance()
+     * starts functioning, when we are not sure which Jenkins instance a filter belongs to, put it here,
+     * and let the first Jenkins instance take over.
+     */
+<span class="nc" id="L69">    private static final List&lt;Filter&gt; LEGACY = new Vector&lt;Filter&gt;();</span>
+
+<span class="nc" id="L71">    private static final String KEY = PluginServletFilter.class.getName();</span>
+
+    /**
+     * Lookup the instance from servlet context.
+     *
+     * @param c the ServletContext most of the time taken from a Jenkins instance
+     * @return get the current PluginServletFilter if it is already available
+     */
+    private static @CheckForNull PluginServletFilter getInstance(ServletContext c) {
+<span class="nc" id="L80">        return (PluginServletFilter)c.getAttribute(KEY);</span>
+    }
+
+    public void init(FilterConfig config) throws ServletException {
+<span class="nc" id="L84">        this.config = config;</span>
+<span class="nc" id="L85">        synchronized (LEGACY) {</span>
+<span class="nc" id="L86">            list.addAll(LEGACY);</span>
+<span class="nc" id="L87">            LEGACY.clear();</span>
+        }
+<span class="nc bnc" id="L89" title="All 2 branches missed.">        for (Filter f : list) {</span>
+<span class="nc" id="L90">            f.init(config);</span>
+        }
+<span class="nc" id="L92">        config.getServletContext().setAttribute(KEY,this);</span>
+<span class="nc" id="L93">    }</span>
+
+    public static void addFilter(Filter filter) throws ServletException {
+<span class="nc" id="L96">        Jenkins j = Jenkins.getInstance();</span>
+        
+<span class="nc" id="L98">        PluginServletFilter container = null;</span>
+<span class="nc bnc" id="L99" title="All 2 branches missed.">        if(j != null) {</span>
+<span class="nc" id="L100">            container = getInstance(j.servletContext);</span>
+	}
+        // https://marvelution.atlassian.net/browse/JJI-188
+<span class="nc bnc" id="L103" title="All 4 branches missed.">        if (j==null || container == null) {</span>
+            // report who is doing legacy registration
+<span class="nc" id="L105">            LOGGER.log(Level.WARNING, &quot;Filter instance is registered too early: &quot;+filter, new Exception());</span>
+<span class="nc" id="L106">            LEGACY.add(filter);</span>
+<span class="nc" id="L107">        } else {</span>
+<span class="nc" id="L108">            filter.init(container.config);</span>
+<span class="nc" id="L109">            container.list.add(filter);</span>
+        }
+<span class="nc" id="L111">    }</span>
+
+    public static void removeFilter(Filter filter) throws ServletException {
+<span class="nc" id="L114">        Jenkins j = Jenkins.getInstance();</span>
+<span class="nc bnc" id="L115" title="All 4 branches missed.">        if (j==null || getInstance(j.servletContext) == null) {</span>
+<span class="nc" id="L116">            LEGACY.remove(filter);</span>
+<span class="nc" id="L117">        } else {</span>
+<span class="nc" id="L118">            getInstance(j.servletContext).list.remove(filter);</span>
+        }
+<span class="nc" id="L120">    }</span>
+
+    public void doFilter(ServletRequest request, ServletResponse response, final FilterChain chain) throws IOException, ServletException {
+<span class="nc" id="L123">        new FilterChain() {</span>
+<span class="nc" id="L124">            private final Iterator&lt;Filter&gt; itr = list.iterator();</span>
+
+            public void doFilter(ServletRequest request, ServletResponse response) throws IOException, ServletException {
+<span class="nc bnc" id="L127" title="All 2 branches missed.">                if(itr.hasNext()) {</span>
+                    // call next
+<span class="nc" id="L129">                    itr.next().doFilter(request, response, this);</span>
+<span class="nc" id="L130">                } else {</span>
+                    // reached to the end
+<span class="nc" id="L132">                    chain.doFilter(request,response);</span>
+                }
+<span class="nc" id="L134">            }</span>
+<span class="nc" id="L135">        }.doFilter(request,response);</span>
+<span class="nc" id="L136">    }</span>
+
+    public void destroy() {
+<span class="nc bnc" id="L139" title="All 2 branches missed.">        for (Filter f : list) {</span>
+<span class="nc" id="L140">            f.destroy();</span>
+        }
+<span class="nc" id="L142">        list.clear();</span>
+<span class="nc" id="L143">    }</span>
+
+<span class="nc" id="L145">    private static final Logger LOGGER = Logger.getLogger(PluginServletFilter.class.getName());</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

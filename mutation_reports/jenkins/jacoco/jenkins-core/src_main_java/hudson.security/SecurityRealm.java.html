@@ -1,0 +1,616 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>SecurityRealm.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.security</a> &gt; <span class="el_source">SecurityRealm.java</span></div><h1>SecurityRealm.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">/*</span>
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc., Kohsuke Kawaguchi
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.security;
+
+import groovy.lang.Binding;
+import hudson.ExtensionPoint;
+import hudson.DescriptorExtensionList;
+import hudson.Extension;
+import hudson.cli.CLICommand;
+import hudson.model.AbstractDescribableImpl;
+import hudson.model.Descriptor;
+import jenkins.model.IdStrategy;
+import jenkins.model.Jenkins;
+import hudson.security.FederatedLoginService.FederatedIdentity;
+import hudson.security.captcha.CaptchaSupport;
+import hudson.util.DescriptorList;
+import hudson.util.PluginServletFilter;
+import hudson.util.spring.BeanBuilder;
+import org.acegisecurity.Authentication;
+import org.acegisecurity.AuthenticationManager;
+import org.acegisecurity.GrantedAuthorityImpl;
+import org.acegisecurity.GrantedAuthority;
+import org.acegisecurity.context.SecurityContext;
+import org.acegisecurity.context.SecurityContextHolder;
+import org.acegisecurity.ui.rememberme.RememberMeServices;
+import static org.acegisecurity.ui.rememberme.TokenBasedRememberMeServices.ACEGI_SECURITY_HASHED_REMEMBER_ME_COOKIE_KEY;
+import org.acegisecurity.userdetails.UserDetailsService;
+import org.acegisecurity.userdetails.UserDetails;
+import org.acegisecurity.userdetails.UsernameNotFoundException;
+import org.kohsuke.stapler.HttpResponse;
+import org.kohsuke.stapler.Stapler;
+import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.StaplerResponse;
+import org.springframework.context.ApplicationContext;
+import org.springframework.web.context.WebApplicationContext;
+import org.springframework.dao.DataAccessException;
+
+import javax.servlet.Filter;
+import javax.servlet.FilterConfig;
+import javax.servlet.ServletException;
+import javax.servlet.http.HttpSession;
+import javax.servlet.http.Cookie;
+import java.io.IOException;
+import java.util.List;
+import java.util.Map;
+import java.util.logging.Logger;
+
+/**
+ * Pluggable security realm that connects external user database to Hudson.
+ *
+ * &lt;p&gt;
+ * If additional views/URLs need to be exposed,
+ * an active {@link SecurityRealm} is bound to &lt;tt&gt;CONTEXT_ROOT/securityRealm/&lt;/tt&gt;
+ * through {@link jenkins.model.Jenkins#getSecurityRealm()}, so you can define additional pages and
+ * operations on your {@link SecurityRealm}.
+ *
+ * &lt;h2&gt;How do I implement this class?&lt;/h2&gt;
+ * &lt;p&gt;
+ * For compatibility reasons, there are two somewhat different ways to implement a custom SecurityRealm.
+ *
+ * &lt;p&gt;
+ * One is to override the {@link #createSecurityComponents()} and create key Acegi components
+ * that control the authentication process.
+ * The default {@link SecurityRealm#createFilter(FilterConfig)} implementation then assembles them
+ * into a chain of {@link Filter}s. All the incoming requests to Hudson go through this filter chain,
+ * and when the filter chain is done, {@link SecurityContext#getAuthentication()} would tell us
+ * who the current user is.
+ *
+ * &lt;p&gt;
+ * If your {@link SecurityRealm} needs to touch the default {@link Filter} chain configuration
+ * (e.g., adding new ones), then you can also override {@link #createFilter(FilterConfig)} to do so.
+ *
+ * &lt;p&gt;
+ * This model is expected to fit most {@link SecurityRealm} implementations.
+ *
+ *
+ * &lt;p&gt;
+ * The other way of doing this is to ignore {@link #createSecurityComponents()} completely (by returning
+ * {@link SecurityComponents} created by the default constructor) and just concentrate on {@link #createFilter(FilterConfig)}.
+ * As long as the resulting filter chain properly sets up {@link Authentication} object at the end of the processing,
+ * Hudson doesn't really need you to fit the standard Acegi models like {@link AuthenticationManager} and
+ * {@link UserDetailsService}.
+ *
+ * &lt;p&gt;
+ * This model is for those &quot;weird&quot; implementations.
+ *
+ *
+ * &lt;h2&gt;Views&lt;/h2&gt;
+ * &lt;dl&gt;
+ * &lt;dt&gt;loginLink.jelly&lt;/dt&gt;
+ * &lt;dd&gt;
+ * This view renders the login link on the top right corner of every page, when the user
+ * is anonymous. For {@link SecurityRealm}s that support user sign-up, this is a good place
+ * to show a &quot;sign up&quot; link. See {@link HudsonPrivateSecurityRealm} implementation
+ * for an example of this.
+ *
+ * &lt;dt&gt;config.jelly&lt;/dt&gt;
+ * &lt;dd&gt;
+ * This view is used to render the configuration page in the system config screen.
+ * &lt;/dl&gt;
+ *
+ * @author Kohsuke Kawaguchi
+ * @since 1.160
+ * @see PluginServletFilter
+ */
+<span class="nc" id="L127">public abstract class SecurityRealm extends AbstractDescribableImpl&lt;SecurityRealm&gt; implements ExtensionPoint {</span>
+    /**
+     * Captcha Support to be used with this SecurityRealm for User Signup
+     */
+    private CaptchaSupport captchaSupport;
+
+    /**
+     * Creates fully-configured {@link AuthenticationManager} that performs authentication
+     * against the user realm. The implementation hides how such authentication manager
+     * is configured.
+     *
+     * &lt;p&gt;
+     * {@link AuthenticationManager} instantiation often depends on the user-specified parameters
+     * (for example, if the authentication is based on LDAP, the user needs to specify
+     * the host name of the LDAP server.) Such configuration is expected to be
+     * presented to the user via &lt;tt&gt;config.jelly&lt;/tt&gt; and then
+     * captured as instance variables inside the {@link SecurityRealm} implementation.
+     *
+     * &lt;p&gt;
+     * Your {@link SecurityRealm} may also wants to alter {@link Filter} set up by
+     * overriding {@link #createFilter(FilterConfig)}.
+     */
+    public abstract SecurityComponents createSecurityComponents();
+
+    /**
+     * Returns the {@link IdStrategy} that should be used for turning
+     * {@link org.acegisecurity.userdetails.UserDetails#getUsername()} into an ID.
+     * Mostly this should be {@link IdStrategy.CaseInsensitive} but there may be occasions when either
+     * {@link IdStrategy.CaseSensitive} or {@link IdStrategy.CaseSensitiveEmailAddress} are the correct approach.
+     *
+     * @return the {@link IdStrategy} that should be used for turning
+     *         {@link org.acegisecurity.userdetails.UserDetails#getUsername()} into an ID.
+     * @since 1.566
+     */
+    public IdStrategy getUserIdStrategy() {
+<span class="nc" id="L162">        return IdStrategy.CASE_INSENSITIVE;</span>
+    }
+
+    /**
+     * Returns the {@link IdStrategy} that should be used for turning {@link hudson.security.GroupDetails#getName()}
+     * into an ID.
+     * Note: Mostly this should be the same as {@link #getUserIdStrategy()} but some security realms may have legitimate
+     * reasons for a different strategy.
+     *
+     * @return the {@link IdStrategy} that should be used for turning {@link hudson.security.GroupDetails#getName()}
+     *         into an ID.
+     * @since 1.566
+     */
+    public IdStrategy getGroupIdStrategy() {
+<span class="nc" id="L176">        return getUserIdStrategy();</span>
+    }
+
+    /**
+     * Creates a {@link CliAuthenticator} object that authenticates an invocation of a CLI command.
+     * See {@link CliAuthenticator} for more details.
+     *
+     * @param command
+     *      The command about to be executed.
+     * @return
+     *      never null. By default, this method returns a no-op authenticator that always authenticates
+     *      the session as authenticated by the transport (which is often just {@link jenkins.model.Jenkins#ANONYMOUS}.)
+     */
+    public CliAuthenticator createCliAuthenticator(final CLICommand command) {
+<span class="nc" id="L190">        return new CliAuthenticator() {</span>
+            public Authentication authenticate() {
+<span class="nc" id="L192">                return command.getTransportAuthentication();</span>
+            }
+        };
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * &lt;p&gt;
+     * {@link SecurityRealm} is a singleton resource in Hudson, and therefore
+     * it's always configured through &lt;tt&gt;config.jelly&lt;/tt&gt; and never with
+     * &lt;tt&gt;global.jelly&lt;/tt&gt;. 
+     */
+    @Override
+    public Descriptor&lt;SecurityRealm&gt; getDescriptor() {
+<span class="nc" id="L207">        return super.getDescriptor();</span>
+    }
+
+    /**
+     * Returns the URL to submit a form for the authentication.
+     * There's no need to override this, except for {@link LegacySecurityRealm}.
+     */
+    public String getAuthenticationGatewayUrl() {
+<span class="nc" id="L215">        return &quot;j_acegi_security_check&quot;;</span>
+    }
+
+    /**
+     * Gets the target URL of the &quot;login&quot; link.
+     * There's no need to override this, except for {@link LegacySecurityRealm}.
+     * On legacy implementation this should point to {@code loginEntry}, which
+     * is protected by &lt;tt&gt;web.xml&lt;/tt&gt;, so that the user can be eventually authenticated
+     * by the container.
+     *
+     * &lt;p&gt;
+     * Path is relative from the context root of the Hudson application.
+     * The URL returned by this method will get the &quot;from&quot; query parameter indicating
+     * the page that the user was at.
+     */
+    public String getLoginUrl() {
+<span class="nc" id="L231">        return &quot;login&quot;;</span>
+    }
+
+    /**
+     * Returns true if this {@link SecurityRealm} supports explicit logout operation.
+     *
+     * &lt;p&gt;
+     * If the method returns false, &quot;logout&quot; link will not be displayed. This is useful
+     * when authentication doesn't require an explicit login activity (such as NTLM authentication
+     * or Kerberos authentication, where Hudson has no ability to log off the current user.)
+     *
+     * &lt;p&gt;
+     * By default, this method returns true.
+     *
+     * @since 1.307
+     */
+    public boolean canLogOut() {
+<span class="nc" id="L248">        return true;</span>
+    }
+
+    /**
+     * Controls where the user is sent to after a logout. By default, it's the top page
+     * of Hudson, but you can return arbitrary URL.
+     *
+     * @param req
+     *      {@link StaplerRequest} that represents the current request. Primarily so that
+     *      you can get the context path. By the time this method is called, the session
+     *      is already invalidated. Never null.
+     * @param auth
+     *      The {@link Authentication} object that represents the user that was logging in.
+     *      This parameter allows you to redirect people to different pages depending on who they are.
+     * @return
+     *      never null.
+     * @since 1.314
+     * @see #doLogout(StaplerRequest, StaplerResponse) 
+     */
+    protected String getPostLogOutUrl(StaplerRequest req, Authentication auth) {
+<span class="nc" id="L268">        return req.getContextPath()+&quot;/&quot;;</span>
+    }
+
+    public CaptchaSupport getCaptchaSupport() {
+<span class="nc" id="L272">        return captchaSupport;</span>
+    }
+
+    public void setCaptchaSupport(CaptchaSupport captchaSupport) {
+<span class="nc" id="L276">        this.captchaSupport = captchaSupport;</span>
+<span class="nc" id="L277">    }</span>
+
+    public List&lt;Descriptor&lt;CaptchaSupport&gt;&gt; getCaptchaSupportDescriptors() {
+<span class="nc" id="L280">        return CaptchaSupport.all();</span>
+    }
+
+    /**
+     * Handles the logout processing.
+     *
+     * &lt;p&gt;
+     * The default implementation erases the session and do a few other clean up, then
+     * redirect the user to the URL specified by {@link #getPostLogOutUrl(StaplerRequest, Authentication)}.
+     *
+     * @since 1.314
+     */
+    public void doLogout(StaplerRequest req, StaplerResponse rsp) throws IOException, ServletException {
+<span class="nc" id="L293">        HttpSession session = req.getSession(false);</span>
+<span class="nc bnc" id="L294" title="All 2 branches missed.">        if(session!=null)</span>
+<span class="nc" id="L295">            session.invalidate();</span>
+<span class="nc" id="L296">        Authentication auth = SecurityContextHolder.getContext().getAuthentication();</span>
+<span class="nc" id="L297">        SecurityContextHolder.clearContext();</span>
+
+        // reset remember-me cookie
+<span class="nc" id="L300">        Cookie cookie = new Cookie(ACEGI_SECURITY_HASHED_REMEMBER_ME_COOKIE_KEY,&quot;&quot;);</span>
+<span class="nc bnc" id="L301" title="All 2 branches missed.">        cookie.setPath(req.getContextPath().length()&gt;0 ? req.getContextPath() : &quot;/&quot;);</span>
+<span class="nc" id="L302">        rsp.addCookie(cookie);</span>
+
+<span class="nc" id="L304">        rsp.sendRedirect2(getPostLogOutUrl(req,auth));</span>
+<span class="nc" id="L305">    }</span>
+
+    /**
+     * Returns true if this {@link SecurityRealm} allows online sign-up.
+     * This creates a hyperlink that redirects users to &lt;tt&gt;CONTEXT_ROOT/signUp&lt;/tt&gt;,
+     * which will be served by the &lt;tt&gt;signup.jelly&lt;/tt&gt; view of this class.
+     *
+     * &lt;p&gt;
+     * If the implementation needs to redirect the user to a different URL
+     * for signing up, use the following jelly script as &lt;tt&gt;signup.jelly&lt;/tt&gt;
+     *
+     * &lt;pre&gt;&lt;xmp&gt;
+     * &lt;st:redirect url=&quot;http://www.sun.com/&quot; xmlns:st=&quot;jelly:stapler&quot;/&gt;
+     * &lt;/xmp&gt;&lt;/pre&gt;
+     */
+    public boolean allowsSignup() {
+<span class="nc" id="L321">        Class clz = getClass();</span>
+<span class="nc bnc" id="L322" title="All 2 branches missed.">        return clz.getClassLoader().getResource(clz.getName().replace('.','/')+&quot;/signup.jelly&quot;)!=null;</span>
+    }
+
+    /**
+     * Shortcut for {@link UserDetailsService#loadUserByUsername(String)}.
+     *
+     * @throws UserMayOrMayNotExistException
+     *      If the security realm cannot even tell if the user exists or not.
+     * @return
+     *      never null.
+     */
+    public UserDetails loadUserByUsername(String username) throws UsernameNotFoundException, DataAccessException {
+<span class="nc" id="L334">        return getSecurityComponents().userDetails.loadUserByUsername(username);</span>
+    }
+
+    /**
+     * If this {@link SecurityRealm} supports a look up of {@link GroupDetails} by their names, override this method
+     * to provide the look up.
+     *
+     * &lt;p&gt;
+     * This information, when available, can be used by {@link AuthorizationStrategy}s to improve the UI and
+     * error diagnostics for the user.
+     */
+    public GroupDetails loadGroupByGroupname(String groupname) throws UsernameNotFoundException, DataAccessException {
+<span class="nc" id="L346">        throw new UserMayOrMayNotExistException(groupname);</span>
+    }
+
+    /**
+     * If this {@link SecurityRealm} supports a look up of {@link GroupDetails} by their names, override this method
+     * to provide the look up.
+     * &lt;p/&gt;
+     * &lt;p/&gt;
+     * This information, when available, can be used by {@link AuthorizationStrategy}s to improve the UI and
+     * error diagnostics for the user.
+     *
+     * @param groupname    the name of the group to fetch
+     * @param fetchMembers if {@code true} then try and fetch the members of the group if it exists. Trying does not
+     *                     imply that the members will be fetched and {@link hudson.security.GroupDetails#getMembers()}
+     *                     may still return {@code null}
+     * @throws UserMayOrMayNotExistException if no conclusive result could be determined regarding the group existence.
+     * @throws UsernameNotFoundException     if the group does not exist.
+     * @throws DataAccessException           if the backing security realm could not be connected to.
+     * @since 1.549
+     */
+    public GroupDetails loadGroupByGroupname(String groupname, boolean fetchMembers)
+            throws UsernameNotFoundException, DataAccessException {
+<span class="nc" id="L368">        return loadGroupByGroupname(groupname);</span>
+    }
+
+    /**
+     * Starts the user registration process for a new user that has the given verified identity.
+     *
+     * &lt;p&gt;
+     * If the user logs in through a {@link FederatedLoginService}, verified that the current user
+     * owns an {@linkplain FederatedIdentity identity}, but no existing user account has claimed that identity,
+     * then this method is invoked.
+     *
+     * &lt;p&gt;
+     * The expected behaviour is to confirm that the user would like to create a new account, and
+     * associate this federated identity to the newly created account (via {@link FederatedIdentity#addToCurrentUser()}.
+     *
+     * @throws UnsupportedOperationException
+     *      If this implementation doesn't support the signup through this mechanism.
+     *      This is the default implementation.
+     *
+     * @since 1.394
+     */
+    public HttpResponse commenceSignup(FederatedIdentity identity) {
+<span class="nc" id="L390">        throw new UnsupportedOperationException();</span>
+    }
+
+    /**
+     * Generates a captcha image.
+     */
+    public final void doCaptcha(StaplerRequest req, StaplerResponse rsp) throws IOException {
+<span class="nc bnc" id="L397" title="All 2 branches missed.">        if (captchaSupport != null) {</span>
+<span class="nc" id="L398">            String id = req.getSession().getId();</span>
+<span class="nc" id="L399">            rsp.setContentType(&quot;image/png&quot;);</span>
+<span class="nc" id="L400">            rsp.addHeader(&quot;Cache-Control&quot;, &quot;no-cache&quot;);</span>
+<span class="nc" id="L401">            captchaSupport.generateImage(id, rsp.getOutputStream());</span>
+        }
+<span class="nc" id="L403">    }</span>
+
+    /**
+     * Validates the captcha.
+     */
+    protected final boolean validateCaptcha(String text) {
+<span class="nc bnc" id="L409" title="All 2 branches missed.">        if (captchaSupport != null) {</span>
+<span class="nc" id="L410">            String id = Stapler.getCurrentRequest().getSession().getId();</span>
+<span class="nc" id="L411">            return captchaSupport.validateCaptcha(id, text);</span>
+        }
+
+        // If no Captcha Support then bogus validation always returns true
+<span class="nc" id="L415">        return true;</span>
+    }
+
+    /**
+     * Picks up the instance of the given type from the spring context.
+     * If there are multiple beans of the same type or if there are none,
+     * this method treats that as an {@link IllegalArgumentException}.
+     *
+     * This method is intended to be used to pick up a Acegi object from
+     * spring once the bean definition file is parsed.
+     */
+    public static &lt;T&gt; T findBean(Class&lt;T&gt; type, ApplicationContext context) {
+<span class="nc" id="L427">        Map m = context.getBeansOfType(type);</span>
+<span class="nc bnc" id="L428" title="All 3 branches missed.">        switch(m.size()) {</span>
+        case 0:
+<span class="nc" id="L430">            throw new IllegalArgumentException(&quot;No beans of &quot;+type+&quot; are defined&quot;);</span>
+        case 1:
+<span class="nc" id="L432">            return type.cast(m.values().iterator().next());</span>
+        default:
+<span class="nc" id="L434">            throw new IllegalArgumentException(&quot;Multiple beans of &quot;+type+&quot; are defined: &quot;+m);            </span>
+        }
+    }
+
+    /**
+     * Holder for the SecurityComponents.
+     */
+    private transient SecurityComponents securityComponents;
+
+    /**
+     * Use this function to get the security components, without necessarily
+     * recreating them.
+     */
+    public synchronized SecurityComponents getSecurityComponents() {
+<span class="nc bnc" id="L448" title="All 2 branches missed.">        if (this.securityComponents == null) {</span>
+<span class="nc" id="L449">            this.securityComponents = this.createSecurityComponents();</span>
+        }
+<span class="nc" id="L451">        return this.securityComponents;</span>
+    }
+
+    /**
+     * Creates {@link Filter} that all the incoming HTTP requests will go through
+     * for authentication.
+     *
+     * &lt;p&gt;
+     * The default implementation uses {@link #getSecurityComponents()} and builds
+     * a standard filter chain from /WEB-INF/security/SecurityFilters.groovy.
+     * But subclasses can override this to completely change the filter sequence.
+     *
+     * &lt;p&gt;
+     * For other plugins that want to contribute {@link Filter}, see
+     * {@link PluginServletFilter}.
+     *
+     * @since 1.271
+     */
+    public Filter createFilter(FilterConfig filterConfig) {
+<span class="nc" id="L470">        LOGGER.entering(SecurityRealm.class.getName(), &quot;createFilter&quot;);</span>
+        
+<span class="nc" id="L472">        Binding binding = new Binding();</span>
+<span class="nc" id="L473">        SecurityComponents sc = getSecurityComponents();</span>
+<span class="nc" id="L474">        binding.setVariable(&quot;securityComponents&quot;, sc);</span>
+<span class="nc" id="L475">        binding.setVariable(&quot;securityRealm&quot;,this);</span>
+<span class="nc" id="L476">        BeanBuilder builder = new BeanBuilder();</span>
+<span class="nc" id="L477">        builder.parse(filterConfig.getServletContext().getResourceAsStream(&quot;/WEB-INF/security/SecurityFilters.groovy&quot;),binding);</span>
+<span class="nc" id="L478">        WebApplicationContext context = builder.createApplicationContext();</span>
+<span class="nc" id="L479">        return (Filter) context.getBean(&quot;filter&quot;);</span>
+    }
+
+    /**
+     * Singleton constant that represents &quot;no authentication.&quot;
+     */
+<span class="nc" id="L485">    public static final SecurityRealm NO_AUTHENTICATION = new None();</span>
+
+<span class="nc" id="L487">    private static class None extends SecurityRealm {</span>
+        public SecurityComponents createSecurityComponents() {
+<span class="nc" id="L489">            return new SecurityComponents(new AuthenticationManager() {</span>
+                public Authentication authenticate(Authentication authentication) {
+<span class="nc" id="L491">                    return authentication;</span>
+                }
+<span class="nc" id="L493">            }, new UserDetailsService() {</span>
+                public UserDetails loadUserByUsername(String username) throws UsernameNotFoundException, DataAccessException {
+<span class="nc" id="L495">                    throw new UsernameNotFoundException(username);</span>
+                }
+            });
+        }
+
+        /**
+         * This special instance is not configurable explicitly,
+         * so it doesn't have a descriptor.
+         */
+        @Override
+        public Descriptor&lt;SecurityRealm&gt; getDescriptor() {
+<span class="nc" id="L506">            return null;</span>
+        }
+
+        /**
+         * There's no group.
+         */
+        @Override
+        public GroupDetails loadGroupByGroupname(String groupname) throws UsernameNotFoundException, DataAccessException {
+<span class="nc" id="L514">            throw new UsernameNotFoundException(groupname);</span>
+        }
+
+        /**
+         * We don't need any filter for this {@link SecurityRealm}.
+         */
+        @Override
+        public Filter createFilter(FilterConfig filterConfig) {
+<span class="nc" id="L522">            return new ChainedServletFilter();</span>
+        }
+
+        /**
+         * Maintain singleton semantics.
+         */
+        private Object readResolve() {
+<span class="nc" id="L529">            return NO_AUTHENTICATION;</span>
+        }
+    }
+
+    /**
+     * Just a tuple so that we can create various inter-related security related objects and
+     * return them all at once.
+     *
+     * &lt;p&gt;
+     * None of the fields are ever null.
+     *
+     * @see SecurityRealm#createSecurityComponents() 
+     */
+<span class="nc bnc" id="L542" title="All 2 branches missed.">    public static final class SecurityComponents {</span>
+        public final AuthenticationManager manager;
+        public final UserDetailsService userDetails;
+        public final RememberMeServices rememberMe;
+
+        public SecurityComponents() {
+            // we use AuthenticationManagerProxy here just as an implementation that fails all the time,
+            // not as a proxy. No one is supposed to use this as a proxy.
+<span class="nc" id="L550">            this(new AuthenticationManagerProxy());</span>
+<span class="nc" id="L551">        }</span>
+
+        public SecurityComponents(AuthenticationManager manager) {
+            // we use UserDetailsServiceProxy here just as an implementation that fails all the time,
+            // not as a proxy. No one is supposed to use this as a proxy.
+<span class="nc" id="L556">            this(manager,new UserDetailsServiceProxy());</span>
+<span class="nc" id="L557">        }</span>
+
+        public SecurityComponents(AuthenticationManager manager, UserDetailsService userDetails) {
+<span class="nc" id="L560">            this(manager,userDetails,createRememberMeService(userDetails));</span>
+<span class="nc" id="L561">        }</span>
+
+<span class="nc" id="L563">        public SecurityComponents(AuthenticationManager manager, UserDetailsService userDetails, RememberMeServices rememberMe) {</span>
+<span class="nc bnc" id="L564" title="All 8 branches missed.">            assert manager!=null &amp;&amp; userDetails!=null &amp;&amp; rememberMe!=null;</span>
+<span class="nc" id="L565">            this.manager = manager;</span>
+<span class="nc" id="L566">            this.userDetails = userDetails;</span>
+<span class="nc" id="L567">            this.rememberMe = rememberMe;</span>
+<span class="nc" id="L568">        }</span>
+
+        @SuppressWarnings(&quot;deprecation&quot;)
+        private static RememberMeServices createRememberMeService(UserDetailsService uds) {
+            // create our default TokenBasedRememberMeServices, which depends on the availability of the secret key
+<span class="nc" id="L573">            TokenBasedRememberMeServices2 rms = new TokenBasedRememberMeServices2();</span>
+<span class="nc" id="L574">            rms.setUserDetailsService(uds);</span>
+            /*
+                TokenBasedRememberMeServices needs to be used in conjunction with RememberMeAuthenticationProvider,
+                and both needs to use the same key (this is a reflection of a poor design in AcgeiSecurity, if you ask me)
+                and various security plugins have its own groovy script that configures them.
+
+                So if we change this, it creates a painful situation for those plugins by forcing them to choose
+                to work with earlier version of Jenkins or newer version of Jenkins, and not both.
+
+                So we keep this here.
+             */
+<span class="nc" id="L585">            rms.setKey(Jenkins.getInstance().getSecretKey());</span>
+<span class="nc" id="L586">            rms.setParameter(&quot;remember_me&quot;); // this is the form field name in login.jelly</span>
+<span class="nc" id="L587">            return rms;</span>
+        }
+    }
+
+    /**
+     * All registered {@link SecurityRealm} implementations.
+     *
+     * @deprecated as of 1.286
+     *      Use {@link #all()} for read access, and use {@link Extension} for registration.
+     */
+    @Deprecated
+<span class="nc" id="L598">    public static final DescriptorList&lt;SecurityRealm&gt; LIST = new DescriptorList&lt;SecurityRealm&gt;(SecurityRealm.class);</span>
+
+    /**
+     * Returns all the registered {@link SecurityRealm} descriptors.
+     */
+    public static DescriptorExtensionList&lt;SecurityRealm,Descriptor&lt;SecurityRealm&gt;&gt; all() {
+<span class="nc" id="L604">        return Jenkins.getInstance().&lt;SecurityRealm,Descriptor&lt;SecurityRealm&gt;&gt;getDescriptorList(SecurityRealm.class);</span>
+    }
+
+
+<span class="nc" id="L608">    private static final Logger LOGGER = Logger.getLogger(SecurityRealm.class.getName());</span>
+
+    /**
+     * {@link GrantedAuthority} that represents the built-in &quot;authenticated&quot; role, which is granted to
+     * anyone non-anonymous.
+     */
+<span class="nc" id="L614">    public static final GrantedAuthority AUTHENTICATED_AUTHORITY = new GrantedAuthorityImpl(&quot;authenticated&quot;);</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

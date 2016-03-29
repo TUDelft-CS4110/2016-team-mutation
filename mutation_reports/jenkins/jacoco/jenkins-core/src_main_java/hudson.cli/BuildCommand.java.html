@@ -1,0 +1,265 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>BuildCommand.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.cli</a> &gt; <span class="el_source">BuildCommand.java</span></div><h1>BuildCommand.java</h1><pre class="source lang-java linenums">/*
+ * The MIT License
+ *
+ * Copyright (c) 2004-2010, Sun Microsystems, Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.cli;
+
+import hudson.Util;
+import hudson.console.ModelHyperlinkNote;
+import hudson.model.AbstractBuild;
+import hudson.model.AbstractProject;
+import hudson.model.Cause.UserIdCause;
+import hudson.model.ParametersAction;
+import hudson.model.ParameterValue;
+import hudson.model.ParametersDefinitionProperty;
+import hudson.model.ParameterDefinition;
+import hudson.Extension;
+import hudson.AbortException;
+import hudson.model.Item;
+import hudson.model.TaskListener;
+import hudson.model.User;
+import hudson.model.queue.QueueTaskFuture;
+import hudson.scm.PollingResult.Change;
+import hudson.util.EditDistance;
+import hudson.util.StreamTaskListener;
+import org.kohsuke.args4j.Argument;
+import org.kohsuke.args4j.CmdLineException;
+import org.kohsuke.args4j.Option;
+
+import java.util.Map;
+import java.util.HashMap;
+import java.util.List;
+import java.util.ArrayList;
+import java.util.Map.Entry;
+import java.io.FileNotFoundException;
+import java.io.PrintStream;
+
+import jenkins.model.Jenkins;
+
+/**
+ * Builds a job, and optionally waits until its completion.
+ *
+ * @author Kohsuke Kawaguchi
+ */
+@Extension
+<span class="nc" id="L64">public class BuildCommand extends CLICommand {</span>
+    @Override
+    public String getShortDescription() {
+<span class="nc" id="L67">        return Messages.BuildCommand_ShortDescription();</span>
+    }
+
+    @Argument(metaVar=&quot;JOB&quot;,usage=&quot;Name of the job to build&quot;,required=true)
+    public AbstractProject&lt;?,?&gt; job;
+
+    @Option(name=&quot;-f&quot;, usage=&quot;Follow the build progress. Like -s only interrupts are not passed through to the build.&quot;)
+<span class="nc" id="L74">    public boolean follow = false;</span>
+
+    @Option(name=&quot;-s&quot;,usage=&quot;Wait until the completion/abortion of the command. Interrupts are passed through to the build.&quot;)
+<span class="nc" id="L77">    public boolean sync = false;</span>
+
+    @Option(name=&quot;-w&quot;,usage=&quot;Wait until the start of the command&quot;)
+<span class="nc" id="L80">    public boolean wait = false;</span>
+
+    @Option(name=&quot;-c&quot;,usage=&quot;Check for SCM changes before starting the build, and if there's no change, exit without doing a build&quot;)
+<span class="nc" id="L83">    public boolean checkSCM = false;</span>
+
+    @Option(name=&quot;-p&quot;,usage=&quot;Specify the build parameters in the key=value format.&quot;)
+<span class="nc" id="L86">    public Map&lt;String,String&gt; parameters = new HashMap&lt;String, String&gt;();</span>
+
+    @Option(name=&quot;-v&quot;,usage=&quot;Prints out the console output of the build. Use with -s&quot;)
+<span class="nc" id="L89">    public boolean consoleOutput = false;</span>
+
+    @Option(name=&quot;-r&quot;) @Deprecated
+<span class="nc" id="L92">    public int retryCnt = 10;</span>
+
+    protected static final String BUILD_SCHEDULING_REFUSED = &quot;Build scheduling Refused by an extension, hence not in Queue.&quot;;
+
+    protected int run() throws Exception {
+<span class="nc" id="L97">        job.checkPermission(Item.BUILD);</span>
+
+<span class="nc" id="L99">        ParametersAction a = null;</span>
+<span class="nc bnc" id="L100" title="All 2 branches missed.">        if (!parameters.isEmpty()) {</span>
+<span class="nc" id="L101">            ParametersDefinitionProperty pdp = job.getProperty(ParametersDefinitionProperty.class);</span>
+<span class="nc bnc" id="L102" title="All 2 branches missed.">            if (pdp==null)</span>
+<span class="nc" id="L103">                throw new IllegalStateException(job.getFullDisplayName()+&quot; is not parameterized but the -p option was specified.&quot;);</span>
+
+            //TODO: switch to type annotations after the migration to Java 1.8
+<span class="nc" id="L106">            List&lt;ParameterValue&gt; values = new ArrayList&lt;ParameterValue&gt;();</span>
+
+<span class="nc bnc" id="L108" title="All 2 branches missed.">            for (Entry&lt;String, String&gt; e : parameters.entrySet()) {</span>
+<span class="nc" id="L109">                String name = e.getKey();</span>
+<span class="nc" id="L110">                ParameterDefinition pd = pdp.getParameterDefinition(name);</span>
+<span class="nc bnc" id="L111" title="All 2 branches missed.">                if (pd==null) {</span>
+<span class="nc" id="L112">                    String nearest = EditDistance.findNearest(name, pdp.getParameterDefinitionNames());</span>
+<span class="nc bnc" id="L113" title="All 2 branches missed.">                    throw new CmdLineException(null, nearest == null ?</span>
+<span class="nc" id="L114">                            String.format(&quot;'%s' is not a valid parameter.&quot;, name) :</span>
+<span class="nc" id="L115">                            String.format(&quot;'%s' is not a valid parameter. Did you mean %s?&quot;, name, nearest));</span>
+                }
+<span class="nc" id="L117">                ParameterValue val = pd.createValue(this, Util.fixNull(e.getValue()));</span>
+<span class="nc bnc" id="L118" title="All 2 branches missed.">                if (val == null) {</span>
+<span class="nc" id="L119">                    throw new CmdLineException(null, String.format(&quot;Cannot resolve the value for the parameter '%s'.&quot;,name));</span>
+                }
+<span class="nc" id="L121">                values.add(val);</span>
+            }
+
+            // handle missing parameters by adding as default values ISSUE JENKINS-7162
+<span class="nc bnc" id="L125" title="All 2 branches missed.">            for(ParameterDefinition pd :  pdp.getParameterDefinitions()) {</span>
+<span class="nc bnc" id="L126" title="All 2 branches missed.">                if (parameters.containsKey(pd.getName()))</span>
+<span class="nc" id="L127">                    continue;</span>
+
+                // not passed in use default
+<span class="nc" id="L130">                ParameterValue defaultValue = pd.getDefaultParameterValue();</span>
+<span class="nc bnc" id="L131" title="All 2 branches missed.">                if (defaultValue == null) {</span>
+<span class="nc" id="L132">                    throw new CmdLineException(null, String.format(&quot;No default value for the parameter '%s'.&quot;,pd.getName()));</span>
+                }
+<span class="nc" id="L134">                values.add(defaultValue);</span>
+            }
+
+<span class="nc" id="L137">            a = new ParametersAction(values);</span>
+        }
+
+<span class="nc bnc" id="L140" title="All 2 branches missed.">        if (checkSCM) {</span>
+<span class="nc bnc" id="L141" title="All 2 branches missed.">            if (job.poll(new StreamTaskListener(stdout, getClientCharset())).change == Change.NONE) {</span>
+<span class="nc" id="L142">                return 0;</span>
+            }
+        }
+
+<span class="nc bnc" id="L146" title="All 2 branches missed.">        if (!job.isBuildable()) {</span>
+<span class="nc" id="L147">            String msg = Messages.BuildCommand_CLICause_CannotBuildUnknownReasons(job.getFullDisplayName());</span>
+<span class="nc bnc" id="L148" title="All 2 branches missed.">            if (job.isDisabled()) {</span>
+<span class="nc" id="L149">                msg = Messages.BuildCommand_CLICause_CannotBuildDisabled(job.getFullDisplayName());</span>
+<span class="nc bnc" id="L150" title="All 2 branches missed.">            } else if (job.isHoldOffBuildUntilSave()){</span>
+<span class="nc" id="L151">                msg = Messages.BuildCommand_CLICause_CannotBuildConfigNotSaved(job.getFullDisplayName());</span>
+            }
+<span class="nc" id="L153">            throw new IllegalStateException(msg);</span>
+        }
+
+<span class="nc" id="L156">        QueueTaskFuture&lt;? extends AbstractBuild&gt; f = job.scheduleBuild2(0, new CLICause(Jenkins.getAuthentication().getName()), a);</span>
+        
+<span class="nc bnc" id="L158" title="All 6 branches missed.">        if (wait || sync || follow) {</span>
+<span class="nc bnc" id="L159" title="All 2 branches missed.">            if (f == null) {</span>
+<span class="nc" id="L160">                throw new IllegalStateException(BUILD_SCHEDULING_REFUSED);</span>
+            }
+<span class="nc" id="L162">            AbstractBuild b = f.waitForStart();    // wait for the start</span>
+<span class="nc" id="L163">            stdout.println(&quot;Started &quot;+b.getFullDisplayName());</span>
+<span class="nc" id="L164">            stdout.flush();</span>
+
+<span class="nc bnc" id="L166" title="All 4 branches missed.">            if (sync || follow) {</span>
+                try {
+<span class="nc bnc" id="L168" title="All 2 branches missed.">                    if (consoleOutput) {</span>
+                        // read output in a retry loop, by default try only once
+                        // writeWholeLogTo may fail with FileNotFound
+                        // exception on a slow/busy machine, if it takes
+                        // longish to create the log file
+<span class="nc" id="L173">                        int retryInterval = 100;</span>
+<span class="nc bnc" id="L174" title="All 2 branches missed.">                        for (int i=0;i&lt;=retryCnt;) {</span>
+                            try {
+<span class="nc" id="L176">                                b.writeWholeLogTo(stdout);</span>
+<span class="nc" id="L177">                                break;</span>
+                            }
+<span class="nc" id="L179">                            catch (FileNotFoundException e) {</span>
+<span class="nc bnc" id="L180" title="All 2 branches missed.">                                if ( i == retryCnt ) {</span>
+<span class="nc" id="L181">                                    Exception myException = new AbortException();</span>
+<span class="nc" id="L182">                                    myException.initCause(e);</span>
+<span class="nc" id="L183">                                    throw myException;</span>
+                                }
+<span class="nc" id="L185">                                i++;</span>
+<span class="nc" id="L186">                                Thread.sleep(retryInterval);</span>
+                            }
+                        }
+                    }
+<span class="nc" id="L190">                    f.get();    // wait for the completion</span>
+<span class="nc" id="L191">                    stdout.println(&quot;Completed &quot;+b.getFullDisplayName()+&quot; : &quot;+b.getResult());</span>
+<span class="nc" id="L192">                    return b.getResult().ordinal;</span>
+<span class="nc" id="L193">                } catch (InterruptedException e) {</span>
+<span class="nc bnc" id="L194" title="All 2 branches missed.">                    if (follow) {</span>
+<span class="nc" id="L195">                        return 125;</span>
+                    } else {
+                        // if the CLI is aborted, try to abort the build as well
+<span class="nc" id="L198">                        f.cancel(true);</span>
+<span class="nc" id="L199">                        Exception myException = new AbortException();</span>
+<span class="nc" id="L200">                        myException.initCause(e);</span>
+<span class="nc" id="L201">                        throw myException;</span>
+                    }
+                }
+            }
+        }
+
+<span class="nc" id="L207">        return 0;</span>
+    }
+
+    @Override
+    protected void printUsageSummary(PrintStream stderr) {
+<span class="nc" id="L212">        stderr.println(</span>
+<span class="nc" id="L213">            &quot;Starts a build, and optionally waits for a completion.\n&quot; +</span>
+            &quot;Aside from general scripting use, this command can be\n&quot; +
+            &quot;used to invoke another job from within a build of one job.\n&quot; +
+            &quot;With the -s option, this command changes the exit code based on\n&quot; +
+            &quot;the outcome of the build (exit code 0 indicates a success)\n&quot; +
+            &quot;and interrupting the command will interrupt the job.\n&quot; +
+            &quot;With the -f option, this command changes the exit code based on\n&quot; +
+            &quot;the outcome of the build (exit code 0 indicates a success)\n&quot; +
+            &quot;however, unlike -s, interrupting the command will not interrupt\n&quot; +
+            &quot;the job (exit code 125 indicates the command was interrupted).\n&quot; +
+            &quot;With the -c option, a build will only run if there has been\n&quot; +
+            &quot;an SCM change.&quot;
+        );
+<span class="nc" id="L226">    }</span>
+
+    public static class CLICause extends UserIdCause {
+
+    	private String startedBy;
+
+<span class="nc" id="L232">    	public CLICause(){</span>
+<span class="nc" id="L233">    		startedBy = &quot;unknown&quot;;</span>
+<span class="nc" id="L234">    	}</span>
+
+<span class="nc" id="L236">    	public CLICause(String startedBy){</span>
+<span class="nc" id="L237">    		this.startedBy = startedBy;</span>
+<span class="nc" id="L238">    	}</span>
+
+        @Override
+        public String getShortDescription() {
+<span class="nc" id="L242">            User user = User.get(startedBy, false);</span>
+<span class="nc bnc" id="L243" title="All 2 branches missed.">            String userName = user != null ? user.getDisplayName() : startedBy;</span>
+<span class="nc" id="L244">            return Messages.BuildCommand_CLICause_ShortDescription(userName);</span>
+        }
+
+        @Override
+        public void print(TaskListener listener) {
+<span class="nc" id="L249">            listener.getLogger().println(Messages.BuildCommand_CLICause_ShortDescription(</span>
+<span class="nc" id="L250">                    ModelHyperlinkNote.encodeTo(&quot;/user/&quot; + startedBy, startedBy)));</span>
+<span class="nc" id="L251">        }</span>
+
+        @Override
+        public boolean equals(Object o) {
+<span class="nc" id="L255">            return o instanceof CLICause;</span>
+        }
+
+        @Override
+        public int hashCode() {
+<span class="nc" id="L260">            return 7;</span>
+        }
+    }
+}
+
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

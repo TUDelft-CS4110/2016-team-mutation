@@ -1,0 +1,231 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>ViewJob.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.model</a> &gt; <span class="el_source">ViewJob.java</span></div><h1>ViewJob.java</h1><pre class="source lang-java linenums">/*
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc., Kohsuke Kawaguchi
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.model;
+
+import hudson.model.Descriptor.FormException;
+import java.io.IOException;
+import java.util.LinkedHashSet;
+import java.util.Set;
+import java.util.SortedMap;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import javax.servlet.ServletException;
+import jenkins.model.Jenkins;
+import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.StaplerResponse;
+
+/**
+ * {@link Job} that monitors activities that happen outside Hudson,
+ * which requires occasional batch reload activity to obtain the up-to-date information.
+ *
+ * &lt;p&gt;
+ * This can be used as a base class to derive custom {@link Job} type.
+ *
+ * @author Kohsuke Kawaguchi
+ */
+public abstract class ViewJob&lt;JobT extends ViewJob&lt;JobT,RunT&gt;, RunT extends Run&lt;JobT,RunT&gt;&gt;
+    extends Job&lt;JobT,RunT&gt; {
+
+<span class="nc" id="L50">    private static final Logger LOGGER = Logger.getLogger(ViewJob.class.getName());</span>
+
+    /**
+     * We occasionally update the list of {@link Run}s from a file system.
+     * The next scheduled update time.
+     */
+<span class="nc" id="L56">    private transient long nextUpdate = 0;</span>
+
+    /**
+     * All {@link Run}s. Copy-on-write semantics.
+     */
+<span class="nc" id="L61">    protected transient /*almost final*/ RunMap&lt;RunT&gt; runs = new RunMap&lt;RunT&gt;();</span>
+
+<span class="nc" id="L63">    private transient boolean notLoaded = true;</span>
+
+    /**
+     * If the reloading of runs are in progress (in another thread,
+     * set to true.)
+     */
+    private transient volatile boolean reloadingInProgress;
+
+    private static ReloadThread reloadThread;
+
+    static synchronized void interruptReloadThread() {
+<span class="nc bnc" id="L74" title="All 2 branches missed.">        if (reloadThread != null) {</span>
+<span class="nc" id="L75">            reloadThread.interrupt();</span>
+        }
+<span class="nc" id="L77">    }</span>
+
+    /**
+     * @deprecated as of 1.390
+     */
+    @Deprecated
+    protected ViewJob(Jenkins parent, String name) {
+<span class="nc" id="L84">        super(parent,name);</span>
+<span class="nc" id="L85">    }</span>
+
+    protected ViewJob(ItemGroup parent, String name) {
+<span class="nc" id="L88">        super(parent,name);</span>
+<span class="nc" id="L89">    }</span>
+
+    public boolean isBuildable() {
+<span class="nc" id="L92">        return false;</span>
+    }
+
+    @Override
+    public void onLoad(ItemGroup&lt;? extends Item&gt; parent, String name) throws IOException {
+<span class="nc" id="L97">        super.onLoad(parent, name);</span>
+<span class="nc" id="L98">        notLoaded = true;</span>
+<span class="nc" id="L99">    }</span>
+
+    protected SortedMap&lt;Integer,RunT&gt; _getRuns() {
+<span class="nc bnc" id="L102" title="All 4 branches missed.">        if(notLoaded || runs==null) {</span>
+            // if none is loaded yet, do so immediately.
+<span class="nc" id="L104">            synchronized(this) {</span>
+<span class="nc bnc" id="L105" title="All 2 branches missed.">                if(runs==null)</span>
+<span class="nc" id="L106">                    runs = new RunMap&lt;RunT&gt;();</span>
+<span class="nc bnc" id="L107" title="All 2 branches missed.">                if(notLoaded) {</span>
+<span class="nc" id="L108">                    notLoaded = false;</span>
+<span class="nc" id="L109">                    _reload();   </span>
+                }
+            }
+        }
+<span class="nc bnc" id="L113" title="All 2 branches missed.">        if(nextUpdate&lt;System.currentTimeMillis()) {</span>
+<span class="nc bnc" id="L114" title="All 2 branches missed.">            if(!reloadingInProgress) {</span>
+                // schedule a new reloading operation.
+                // we don't want to block the current thread,
+                // so reloading is done asynchronously.
+<span class="nc" id="L118">                reloadingInProgress = true;</span>
+                Set&lt;ViewJob&gt; reloadQueue;
+<span class="nc" id="L120">                synchronized (ViewJob.class) {</span>
+<span class="nc bnc" id="L121" title="All 2 branches missed.">                    if (reloadThread == null) {</span>
+<span class="nc" id="L122">                        reloadThread = new ReloadThread();</span>
+<span class="nc" id="L123">                        reloadThread.start();</span>
+                    }
+<span class="nc" id="L125">                    reloadQueue = reloadThread.reloadQueue;</span>
+                }
+<span class="nc" id="L127">                synchronized(reloadQueue) {</span>
+<span class="nc" id="L128">                    reloadQueue.add(this);</span>
+<span class="nc" id="L129">                    reloadQueue.notify();</span>
+                }
+            }
+        }
+<span class="nc" id="L133">        return runs;</span>
+    }
+
+    public void removeRun(RunT run) {
+<span class="nc bnc" id="L137" title="All 4 branches missed.">        if (runs != null &amp;&amp; !runs.remove(run)) {</span>
+<span class="nc" id="L138">            LOGGER.log(Level.WARNING, &quot;{0} did not contain {1} to begin with&quot;, new Object[] {this, run});</span>
+        }
+<span class="nc" id="L140">    }</span>
+
+    private void _reload() {
+        try {
+<span class="nc" id="L144">            reload();</span>
+<span class="nc" id="L145">        } finally {</span>
+<span class="nc" id="L146">            reloadingInProgress = false;</span>
+<span class="nc bnc" id="L147" title="All 4 branches missed.">            nextUpdate = reloadPeriodically ? System.currentTimeMillis()+1000*60 : Long.MAX_VALUE;</span>
+<span class="nc" id="L148">        }</span>
+<span class="nc" id="L149">    }</span>
+
+    /**
+     * Reloads the list of {@link Run}s. This operation can take a long time.
+     *
+     * &lt;p&gt;
+     * The loaded {@link Run}s should be set to {@link #runs}.
+     */
+    protected abstract void reload();
+
+    @Override
+    protected void submit( StaplerRequest req, StaplerResponse rsp ) throws IOException, ServletException, FormException {
+<span class="nc" id="L161">        super.submit(req,rsp);</span>
+        // make sure to reload to reflect this config change.
+<span class="nc" id="L163">        nextUpdate = 0;</span>
+<span class="nc" id="L164">    }</span>
+
+
+    /**
+     * Thread that reloads the {@link Run}s.
+     */
+    private static final class ReloadThread extends Thread {
+
+        /**
+         * {@link ExternalJob}s that need to be reloaded.
+         *
+         * This is a set, so no {@link ExternalJob}s are scheduled twice, yet
+         * it's order is predictable, avoiding starvation.
+         */
+<span class="nc" id="L178">        final Set&lt;ViewJob&gt; reloadQueue = new LinkedHashSet&lt;ViewJob&gt;();</span>
+
+<span class="nc" id="L180">        private ReloadThread() {</span>
+<span class="nc" id="L181">            setName(&quot;ViewJob reload thread&quot;);</span>
+<span class="nc" id="L182">        }</span>
+
+        private ViewJob getNext() throws InterruptedException {
+<span class="nc" id="L185">            synchronized(reloadQueue) {</span>
+                // reload operations might eat InterruptException,
+                // so check the status every so often
+<span class="nc bnc" id="L188" title="All 4 branches missed.">                while(reloadQueue.isEmpty() &amp;&amp; !terminating())</span>
+<span class="nc" id="L189">                    reloadQueue.wait(60*1000);</span>
+<span class="nc bnc" id="L190" title="All 2 branches missed.">                if(terminating())</span>
+<span class="nc" id="L191">                    throw new InterruptedException();   // terminate now</span>
+<span class="nc" id="L192">                ViewJob job = reloadQueue.iterator().next();</span>
+<span class="nc" id="L193">                reloadQueue.remove(job);</span>
+<span class="nc" id="L194">                return job;</span>
+            }
+        }
+
+        private boolean terminating() {
+<span class="nc" id="L199">            return Jenkins.getInstance().isTerminating();</span>
+        }
+
+        @Override
+        public void run() {
+<span class="nc bnc" id="L204" title="All 2 branches missed.">            while (!terminating()) {</span>
+                try {
+<span class="nc" id="L206">                    getNext()._reload();</span>
+<span class="nc" id="L207">                } catch (InterruptedException e) {</span>
+                    // treat this as a death signal
+<span class="nc" id="L209">                    return;</span>
+<span class="nc" id="L210">                } catch (Throwable t) {</span>
+                    // otherwise ignore any error
+<span class="nc" id="L212">                    t.printStackTrace();</span>
+                }
+            }
+<span class="nc" id="L215">        }</span>
+    }
+
+    // private static final Logger logger = Logger.getLogger(ViewJob.class.getName());
+
+    /**
+     * In the very old version of Hudson, an external job submission was just creating files on the file system,
+     * so we needed to periodically reload the jobs from a file system to pick up new records.
+     *
+     * &lt;p&gt;
+     * We then switched to submission via HTTP, so this reloading is no longer necessary, so only do this
+     * when explicitly requested.
+     * 
+     */
+<span class="nc" id="L229">    public static boolean reloadPeriodically = Boolean.getBoolean(ViewJob.class.getName()+&quot;.reloadPeriodically&quot;);</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

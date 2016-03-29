@@ -1,0 +1,872 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>UpdateSite.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.model</a> &gt; <span class="el_source">UpdateSite.java</span></div><h1>UpdateSite.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">/*</span>
+ * The MIT License
+ * 
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc., Kohsuke Kawaguchi, Yahoo! Inc., Seiji Sogabe,
+ *                          Andrew Bayer
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+
+package hudson.model;
+
+import hudson.PluginManager;
+import hudson.PluginWrapper;
+import hudson.Util;
+import hudson.lifecycle.Lifecycle;
+import hudson.model.UpdateCenter.UpdateCenterJob;
+import hudson.util.FormValidation;
+import hudson.util.FormValidation.Kind;
+import hudson.util.HttpResponses;
+import hudson.util.TextFile;
+import static hudson.util.TimeUnit2.*;
+import hudson.util.VersionNumber;
+import java.io.File;
+import java.io.IOException;
+import java.net.URI;
+import java.net.URL;
+import java.net.URLEncoder;
+import java.security.GeneralSecurityException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.concurrent.Callable;
+import java.util.concurrent.Future;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import javax.annotation.CheckForNull;
+import javax.annotation.Nonnull;
+import jenkins.model.Jenkins;
+import jenkins.model.DownloadSettings;
+import jenkins.util.JSONSignatureValidator;
+import net.sf.json.JSONException;
+import net.sf.json.JSONObject;
+import org.apache.commons.io.IOUtils;
+import org.apache.commons.lang.StringUtils;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
+import org.kohsuke.stapler.DataBoundConstructor;
+import org.kohsuke.stapler.HttpResponse;
+import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.export.Exported;
+import org.kohsuke.stapler.export.ExportedBean;
+import org.kohsuke.stapler.interceptor.RequirePOST;
+
+/**
+ * Source of the update center information, like &quot;http://jenkins-ci.org/update-center.json&quot;
+ *
+ * &lt;p&gt;
+ * Jenkins can have multiple {@link UpdateSite}s registered in the system, so that it can pick up plugins
+ * from different locations.
+ *
+ * @author Andrew Bayer
+ * @author Kohsuke Kawaguchi
+ * @since 1.333
+ */
+@ExportedBean
+<span class="nc bnc" id="L86" title="All 2 branches missed.">public class UpdateSite {</span>
+    /**
+     * What's the time stamp of data file?
+     * 0 means never.
+     */
+    private transient volatile long dataTimestamp;
+
+    /**
+     * When was the last time we asked a browser to check the data for us?
+     * 0 means never.
+     *
+     * &lt;p&gt;
+     * There's normally some delay between when we send HTML that includes the check code,
+     * until we get the data back, so this variable is used to avoid asking too many browseres
+     * all at once.
+     */
+    private transient volatile long lastAttempt;
+
+    /**
+     * If the attempt to fetch data fails, we progressively use longer time out before retrying,
+     * to avoid overloading the server.
+     */
+    private transient volatile long retryWindow;
+
+    /**
+     * lastModified time of the data file when it was last read.
+     */
+    private transient long dataLastReadFromFile;
+
+    /**
+     * Latest data as read from the data file.
+     */
+    private transient Data data;
+
+    /**
+     * ID string for this update source.
+     */
+    private final String id;
+
+    /**
+     * Path to &lt;tt&gt;update-center.json&lt;/tt&gt;, like &lt;tt&gt;http://jenkins-ci.org/update-center.json&lt;/tt&gt;.
+     */
+    private final String url;
+
+
+
+<span class="nc" id="L132">    public UpdateSite(String id, String url) {</span>
+<span class="nc" id="L133">        this.id = id;</span>
+<span class="nc" id="L134">        this.url = url;</span>
+<span class="nc" id="L135">    }</span>
+
+    /**
+     * Get ID string.
+     */
+    @Exported
+    public String getId() {
+<span class="nc" id="L142">        return id;</span>
+    }
+
+    @Exported
+    public long getDataTimestamp() {
+<span class="nc bnc" id="L147" title="All 4 branches missed.">        assert dataTimestamp &gt;= 0;</span>
+<span class="nc" id="L148">        return dataTimestamp;</span>
+    }
+
+    /**
+     * Update the data file from the given URL if the file
+     * does not exist, or is otherwise due for update.
+     * Accepted formats are JSONP or HTML with {@code postMessage}, not raw JSON.
+     * @param signatureCheck whether to enforce the signature (may be off only for testing!)
+     * @return null if no updates are necessary, or the future result
+     * @since 1.502
+     */
+    public @CheckForNull Future&lt;FormValidation&gt; updateDirectly(final boolean signatureCheck) {
+<span class="nc bnc" id="L160" title="All 4 branches missed.">        if (! getDataFile().exists() || isDue()) {</span>
+<span class="nc" id="L161">            return Jenkins.getInstance().getUpdateCenter().updateService.submit(new Callable&lt;FormValidation&gt;() {</span>
+                @Override public FormValidation call() throws Exception {
+<span class="nc" id="L163">                    return updateDirectlyNow(signatureCheck);</span>
+                }
+            });
+        } else {
+<span class="nc" id="L167">            return null;</span>
+        }
+    }
+
+    @Restricted(NoExternalUse.class)
+    public @Nonnull FormValidation updateDirectlyNow(boolean signatureCheck) throws IOException {
+<span class="nc" id="L173">        return updateData(DownloadService.loadJSON(new URL(getUrl() + &quot;?id=&quot; + URLEncoder.encode(getId(), &quot;UTF-8&quot;) + &quot;&amp;version=&quot; + URLEncoder.encode(Jenkins.VERSION, &quot;UTF-8&quot;))), signatureCheck);</span>
+    }
+    
+    /**
+     * This is the endpoint that receives the update center data file from the browser.
+     */
+    public FormValidation doPostBack(StaplerRequest req) throws IOException, GeneralSecurityException {
+<span class="nc" id="L180">        DownloadSettings.checkPostBackAccess();</span>
+<span class="nc" id="L181">        return updateData(IOUtils.toString(req.getInputStream(),&quot;UTF-8&quot;), true);</span>
+    }
+
+    private FormValidation updateData(String json, boolean signatureCheck)
+            throws IOException {
+
+<span class="nc" id="L187">        dataTimestamp = System.currentTimeMillis();</span>
+
+<span class="nc" id="L189">        JSONObject o = JSONObject.fromObject(json);</span>
+
+        try {
+<span class="nc" id="L192">            int v = o.getInt(&quot;updateCenterVersion&quot;);</span>
+<span class="nc bnc" id="L193" title="All 2 branches missed.">            if (v != 1) {</span>
+<span class="nc" id="L194">                throw new IllegalArgumentException(&quot;Unrecognized update center version: &quot; + v);</span>
+            }
+<span class="nc" id="L196">        } catch (JSONException x) {</span>
+<span class="nc" id="L197">            throw new IllegalArgumentException(&quot;Could not find (numeric) updateCenterVersion in &quot; + json, x);</span>
+        }
+
+<span class="nc bnc" id="L200" title="All 2 branches missed.">        if (signatureCheck) {</span>
+<span class="nc" id="L201">            FormValidation e = verifySignature(o);</span>
+<span class="nc bnc" id="L202" title="All 2 branches missed.">            if (e.kind!=Kind.OK) {</span>
+<span class="nc" id="L203">                LOGGER.severe(e.toString());</span>
+<span class="nc" id="L204">                return e;</span>
+            }
+        }
+
+<span class="nc" id="L208">        LOGGER.info(&quot;Obtained the latest update center data file for UpdateSource &quot; + id);</span>
+<span class="nc" id="L209">        retryWindow = 0;</span>
+<span class="nc" id="L210">        getDataFile().write(json);</span>
+<span class="nc" id="L211">        return FormValidation.ok();</span>
+    }
+
+    public FormValidation doVerifySignature() throws IOException {
+<span class="nc" id="L215">        return verifySignature(getJSONObject());</span>
+    }
+
+    /**
+     * Verifies the signature in the update center data file.
+     */
+    private FormValidation verifySignature(JSONObject o) throws IOException {
+<span class="nc" id="L222">        return getJsonSignatureValidator().verifySignature(o);</span>
+    }
+
+    /**
+     * Let sub-classes of UpdateSite provide their own signature validator.
+     * @return the signature validator.
+     */
+    @Nonnull
+    protected JSONSignatureValidator getJsonSignatureValidator() {
+<span class="nc" id="L231">        return new JSONSignatureValidator(&quot;update site '&quot;+id+&quot;'&quot;);</span>
+    }
+
+    /**
+     * Returns true if it's time for us to check for new version.
+     */
+    public boolean isDue() {
+<span class="nc bnc" id="L238" title="All 2 branches missed.">        if(neverUpdate)     return false;</span>
+<span class="nc bnc" id="L239" title="All 2 branches missed.">        if(dataTimestamp == 0)</span>
+<span class="nc" id="L240">            dataTimestamp = getDataFile().file.lastModified();</span>
+<span class="nc" id="L241">        long now = System.currentTimeMillis();</span>
+        
+<span class="nc" id="L243">        retryWindow = Math.max(retryWindow,SECONDS.toMillis(15));</span>
+        
+<span class="nc bnc" id="L245" title="All 4 branches missed.">        boolean due = now - dataTimestamp &gt; DAY &amp;&amp; now - lastAttempt &gt; retryWindow;</span>
+<span class="nc bnc" id="L246" title="All 2 branches missed.">        if(due) {</span>
+<span class="nc" id="L247">            lastAttempt = now;</span>
+<span class="nc" id="L248">            retryWindow = Math.min(retryWindow*2, HOURS.toMillis(1)); // exponential back off but at most 1 hour</span>
+        }
+<span class="nc" id="L250">        return due;</span>
+    }
+
+    /**
+     * Invalidates the cached data and force retrieval.
+     *
+     * @since 1.432
+     */
+    @RequirePOST
+    public HttpResponse doInvalidateData() {
+<span class="nc" id="L260">        Jenkins.getInstance().checkPermission(Jenkins.ADMINISTER);</span>
+<span class="nc" id="L261">        dataTimestamp = 0;</span>
+<span class="nc" id="L262">        return HttpResponses.ok();</span>
+    }
+
+    /**
+     * Loads the update center data, if any and if modified since last read.
+     *
+     * @return  null if no data is available.
+     */
+    public Data getData() {
+<span class="nc" id="L271">        TextFile df = getDataFile();</span>
+<span class="nc bnc" id="L272" title="All 4 branches missed.">        if (df.exists() &amp;&amp; dataLastReadFromFile != df.file.lastModified()) {</span>
+<span class="nc" id="L273">            JSONObject o = getJSONObject();</span>
+<span class="nc bnc" id="L274" title="All 2 branches missed.">            if (o!=null) {</span>
+<span class="nc" id="L275">                data = new Data(o);</span>
+<span class="nc" id="L276">                dataLastReadFromFile = df.file.lastModified();</span>
+<span class="nc" id="L277">            } else {</span>
+<span class="nc" id="L278">                data = null;</span>
+            }
+        }
+<span class="nc" id="L281">        return data;</span>
+    }
+
+    /**
+     * Gets the raw update center JSON data.
+     */
+    public JSONObject getJSONObject() {
+<span class="nc" id="L288">        TextFile df = getDataFile();</span>
+<span class="nc bnc" id="L289" title="All 2 branches missed.">        if(df.exists()) {</span>
+            try {
+<span class="nc" id="L291">                return JSONObject.fromObject(df.read());</span>
+<span class="nc" id="L292">            } catch (JSONException e) {</span>
+<span class="nc" id="L293">                LOGGER.log(Level.SEVERE,&quot;Failed to parse &quot;+df,e);</span>
+<span class="nc" id="L294">                df.delete(); // if we keep this file, it will cause repeated failures</span>
+<span class="nc" id="L295">                return null;</span>
+<span class="nc" id="L296">            } catch (IOException e) {</span>
+<span class="nc" id="L297">                LOGGER.log(Level.SEVERE,&quot;Failed to parse &quot;+df,e);</span>
+<span class="nc" id="L298">                df.delete(); // if we keep this file, it will cause repeated failures</span>
+<span class="nc" id="L299">                return null;</span>
+            }
+        } else {
+<span class="nc" id="L302">            return null;</span>
+        }
+    }
+
+    /**
+     * Returns a list of plugins that should be shown in the &quot;available&quot; tab.
+     * These are &quot;all plugins - installed plugins&quot;.
+     */
+    @Exported
+    public List&lt;Plugin&gt; getAvailables() {
+<span class="nc" id="L312">        List&lt;Plugin&gt; r = new ArrayList&lt;Plugin&gt;();</span>
+<span class="nc" id="L313">        Data data = getData();</span>
+<span class="nc bnc" id="L314" title="All 2 branches missed.">        if(data==null)     return Collections.emptyList();</span>
+<span class="nc bnc" id="L315" title="All 2 branches missed.">        for (Plugin p : data.plugins.values()) {</span>
+<span class="nc bnc" id="L316" title="All 2 branches missed.">            if(p.getInstalled()==null)</span>
+<span class="nc" id="L317">                r.add(p);</span>
+        }
+<span class="nc" id="L319">        return r;</span>
+    }
+
+    /**
+     * Gets the information about a specific plugin.
+     *
+     * @param artifactId
+     *      The short name of the plugin. Corresponds to {@link PluginWrapper#getShortName()}.
+     *
+     * @return
+     *      null if no such information is found.
+     */
+    public Plugin getPlugin(String artifactId) {
+<span class="nc" id="L332">        Data dt = getData();</span>
+<span class="nc bnc" id="L333" title="All 2 branches missed.">        if(dt==null)    return null;</span>
+<span class="nc" id="L334">        return dt.plugins.get(artifactId);</span>
+    }
+
+    public Api getApi() {
+<span class="nc" id="L338">        return new Api(this);</span>
+    }
+
+    /**
+     * Returns an &quot;always up&quot; server for Internet connectivity testing, or null if we are going to skip the test.
+     */
+    @Exported
+    public String getConnectionCheckUrl() {
+<span class="nc" id="L346">        Data dt = getData();</span>
+<span class="nc bnc" id="L347" title="All 2 branches missed.">        if(dt==null)    return &quot;http://www.google.com/&quot;;</span>
+<span class="nc" id="L348">        return dt.connectionCheckUrl;</span>
+    }
+
+    /**
+     * This is where we store the update center data.
+     */
+    private TextFile getDataFile() {
+<span class="nc" id="L355">        return new TextFile(new File(Jenkins.getInstance().getRootDir(),</span>
+<span class="nc" id="L356">                                     &quot;updates/&quot; + getId()+&quot;.json&quot;));</span>
+    }
+    
+    /**
+     * Returns the list of plugins that are updates to currently installed ones.
+     *
+     * @return
+     *      can be empty but never null.
+     */
+    @Exported
+    public List&lt;Plugin&gt; getUpdates() {
+<span class="nc" id="L367">        Data data = getData();</span>
+<span class="nc bnc" id="L368" title="All 2 branches missed.">        if(data==null)      return Collections.emptyList(); // fail to determine</span>
+        
+<span class="nc" id="L370">        List&lt;Plugin&gt; r = new ArrayList&lt;Plugin&gt;();</span>
+<span class="nc bnc" id="L371" title="All 2 branches missed.">        for (PluginWrapper pw : Jenkins.getInstance().getPluginManager().getPlugins()) {</span>
+<span class="nc" id="L372">            Plugin p = pw.getUpdateInfo();</span>
+<span class="nc bnc" id="L373" title="All 2 branches missed.">            if(p!=null) r.add(p);</span>
+        }
+        
+<span class="nc" id="L376">        return r;</span>
+    }
+    
+    /**
+     * Does any of the plugin has updates?
+     */
+    @Exported
+    public boolean hasUpdates() {
+<span class="nc" id="L384">        Data data = getData();</span>
+<span class="nc bnc" id="L385" title="All 2 branches missed.">        if(data==null)      return false;</span>
+        
+<span class="nc bnc" id="L387" title="All 2 branches missed.">        for (PluginWrapper pw : Jenkins.getInstance().getPluginManager().getPlugins()) {</span>
+<span class="nc bnc" id="L388" title="All 4 branches missed.">            if(!pw.isBundled() &amp;&amp; pw.getUpdateInfo()!=null)</span>
+                // do not advertize updates to bundled plugins, since we generally want users to get them
+                // as a part of jenkins.war updates. This also avoids unnecessary pinning of plugins. 
+<span class="nc" id="L391">                return true;</span>
+        }
+<span class="nc" id="L393">        return false;</span>
+    }
+    
+    
+    /**
+     * Exposed to get rid of hardcoding of the URL that serves up update-center.json
+     * in Javascript.
+     */
+    @Exported
+    public String getUrl() {
+<span class="nc" id="L403">        return url;</span>
+    }
+
+    /**
+     * Where to actually download the update center?
+     *
+     * @deprecated
+     *      Exposed only for UI.
+     */
+    @Deprecated
+    public String getDownloadUrl() {
+        /*
+            HACKISH:
+
+            Loading scripts in HTTP from HTTPS pages cause browsers to issue a warning dialog.
+            The elegant way to solve the problem is to always load update center from HTTPS,
+            but our backend mirroring scheme isn't ready for that. So this hack serves regular
+            traffic in HTTP server, and only use HTTPS update center for Jenkins in HTTPS.
+
+            We'll monitor the traffic to see if we can sustain this added traffic.
+         */
+<span class="nc bnc" id="L424" title="All 4 branches missed.">        if (url.equals(&quot;http://updates.jenkins-ci.org/update-center.json&quot;) &amp;&amp; Jenkins.getInstance().isRootUrlSecure())</span>
+<span class="nc" id="L425">            return &quot;https&quot;+url.substring(4);</span>
+<span class="nc" id="L426">        return url;</span>
+    }
+
+    /**
+     * Is this the legacy default update center site?
+     */
+    public boolean isLegacyDefault() {
+<span class="nc bnc" id="L433" title="All 6 branches missed.">        return id.equals(UpdateCenter.ID_DEFAULT) &amp;&amp; url.startsWith(&quot;http://hudson-ci.org/&quot;) || url.startsWith(&quot;http://updates.hudson-labs.org/&quot;);</span>
+    }
+
+    /**
+     * In-memory representation of the update center data.
+     */
+    public final class Data {
+        /**
+         * The {@link UpdateSite} ID.
+         */
+        public final String sourceId;
+
+        /**
+         * The latest jenkins.war.
+         */
+        public final Entry core;
+        /**
+         * Plugins in the repository, keyed by their artifact IDs.
+         */
+<span class="nc" id="L452">        public final Map&lt;String,Plugin&gt; plugins = new TreeMap&lt;String,Plugin&gt;(String.CASE_INSENSITIVE_ORDER);</span>
+
+        /**
+         * If this is non-null, Jenkins is going to check the connectivity to this URL to make sure
+         * the network connection is up. Null to skip the check.
+         */
+        public final String connectionCheckUrl;
+
+<span class="nc" id="L460">        Data(JSONObject o) {</span>
+<span class="nc" id="L461">            this.sourceId = (String)o.get(&quot;id&quot;);</span>
+<span class="nc" id="L462">            JSONObject c = o.optJSONObject(&quot;core&quot;);</span>
+<span class="nc bnc" id="L463" title="All 2 branches missed.">            if (c!=null) {</span>
+<span class="nc" id="L464">                core = new Entry(sourceId, c, url);</span>
+<span class="nc" id="L465">            } else {</span>
+<span class="nc" id="L466">                core = null;</span>
+            }
+<span class="nc bnc" id="L468" title="All 2 branches missed.">            for(Map.Entry&lt;String,JSONObject&gt; e : (Set&lt;Map.Entry&lt;String,JSONObject&gt;&gt;)o.getJSONObject(&quot;plugins&quot;).entrySet()) {</span>
+<span class="nc" id="L469">                plugins.put(e.getKey(),new Plugin(sourceId, e.getValue()));</span>
+            }
+
+<span class="nc" id="L472">            connectionCheckUrl = (String)o.get(&quot;connectionCheckUrl&quot;);</span>
+<span class="nc" id="L473">        }</span>
+
+        /**
+         * Is there a new version of the core?
+         */
+        public boolean hasCoreUpdates() {
+<span class="nc bnc" id="L479" title="All 4 branches missed.">            return core != null &amp;&amp; core.isNewerThan(Jenkins.VERSION);</span>
+        }
+
+        /**
+         * Do we support upgrade?
+         */
+        public boolean canUpgrade() {
+<span class="nc" id="L486">            return Lifecycle.get().canRewriteHudsonWar();</span>
+        }
+    }
+
+    @ExportedBean
+    public static class Entry {
+        /**
+         * {@link UpdateSite} ID.
+         */
+        @Exported
+        public final String sourceId;
+
+        /**
+         * Artifact ID.
+         */
+        @Exported
+        public final String name;
+        /**
+         * The version.
+         */
+        @Exported
+        public final String version;
+        /**
+         * Download URL.
+         */
+        @Exported
+        public final String url;
+
+
+        // non-private, non-final for test
+        @Restricted(NoExternalUse.class)
+        /* final */ String sha1;
+
+        public Entry(String sourceId, JSONObject o) {
+<span class="nc" id="L520">            this(sourceId, o, null);</span>
+<span class="nc" id="L521">        }</span>
+
+<span class="nc" id="L523">        Entry(String sourceId, JSONObject o, String baseURL) {</span>
+<span class="nc" id="L524">            this.sourceId = sourceId;</span>
+<span class="nc" id="L525">            this.name = o.getString(&quot;name&quot;);</span>
+<span class="nc" id="L526">            this.version = o.getString(&quot;version&quot;);</span>
+
+            // Trim this to prevent issues when the other end used Base64.encodeBase64String that added newlines
+            // to the end in old commons-codec. Not the case on updates.jenkins-ci.org, but let's be safe.
+<span class="nc" id="L530">            this.sha1 = Util.fixEmptyAndTrim(o.optString(&quot;sha1&quot;));</span>
+
+<span class="nc" id="L532">            String url = o.getString(&quot;url&quot;);</span>
+<span class="nc bnc" id="L533" title="All 2 branches missed.">            if (!URI.create(url).isAbsolute()) {</span>
+<span class="nc bnc" id="L534" title="All 2 branches missed.">                if (baseURL == null) {</span>
+<span class="nc" id="L535">                    throw new IllegalArgumentException(&quot;Cannot resolve &quot; + url + &quot; without a base URL&quot;);</span>
+                }
+<span class="nc" id="L537">                url = URI.create(baseURL).resolve(url).toString();</span>
+            }
+<span class="nc" id="L539">            this.url = url;</span>
+<span class="nc" id="L540">        }</span>
+
+        /**
+         * The base64 encoded binary SHA-1 checksum of the file.
+         * Can be null if not provided by the update site.
+         * @since TODO
+         */
+        // TODO @Exported assuming we want this in the API
+        public String getSha1() {
+<span class="nc" id="L549">            return sha1;</span>
+        }
+
+        /**
+         * Checks if the specified &quot;current version&quot; is older than the version of this entry.
+         *
+         * @param currentVersion
+         *      The string that represents the version number to be compared.
+         * @return
+         *      true if the version listed in this entry is newer.
+         *      false otherwise, including the situation where the strings couldn't be parsed as version numbers.
+         */
+        public boolean isNewerThan(String currentVersion) {
+            try {
+<span class="nc bnc" id="L563" title="All 2 branches missed.">                return new VersionNumber(currentVersion).compareTo(new VersionNumber(version)) &lt; 0;</span>
+<span class="nc" id="L564">            } catch (IllegalArgumentException e) {</span>
+                // couldn't parse as the version number.
+<span class="nc" id="L566">                return false;</span>
+            }
+        }
+
+        public Api getApi() {
+<span class="nc" id="L571">            return new Api(this);</span>
+        }
+
+    }
+
+    public final class Plugin extends Entry {
+        /**
+         * Optional URL to the Wiki page that discusses this plugin.
+         */
+        @Exported
+        public final String wiki;
+        /**
+         * Human readable title of the plugin, taken from Wiki page.
+         * Can be null.
+         *
+         * &lt;p&gt;
+         * beware of XSS vulnerability since this data comes from Wiki
+         */
+        @Exported
+        public final String title;
+        /**
+         * Optional excerpt string.
+         */
+        @Exported
+        public final String excerpt;
+        /**
+         * Optional version # from which this plugin release is configuration-compatible.
+         */
+        @Exported
+        public final String compatibleSinceVersion;
+        /**
+         * Version of Jenkins core this plugin was compiled against.
+         */
+        @Exported
+        public final String requiredCore;
+        /**
+         * Categories for grouping plugins, taken from labels assigned to wiki page.
+         * Can be null.
+         */
+        @Exported
+        public final String[] categories;
+
+        /**
+         * Dependencies of this plugin.
+         */
+        @Exported
+<span class="nc" id="L617">        public final Map&lt;String,String&gt; dependencies = new HashMap&lt;String,String&gt;();</span>
+        
+        /**
+         * Optional dependencies of this plugin.
+         */
+        @Exported
+<span class="nc" id="L623">        public final Map&lt;String,String&gt; optionalDependencies = new HashMap&lt;String,String&gt;();</span>
+
+        @DataBoundConstructor
+<span class="nc" id="L626">        public Plugin(String sourceId, JSONObject o) {</span>
+<span class="nc" id="L627">            super(sourceId, o, UpdateSite.this.url);</span>
+<span class="nc" id="L628">            this.wiki = get(o,&quot;wiki&quot;);</span>
+<span class="nc" id="L629">            this.title = get(o,&quot;title&quot;);</span>
+<span class="nc" id="L630">            this.excerpt = get(o,&quot;excerpt&quot;);</span>
+<span class="nc" id="L631">            this.compatibleSinceVersion = get(o,&quot;compatibleSinceVersion&quot;);</span>
+<span class="nc" id="L632">            this.requiredCore = get(o,&quot;requiredCore&quot;);</span>
+<span class="nc bnc" id="L633" title="All 2 branches missed.">            this.categories = o.has(&quot;labels&quot;) ? (String[])o.getJSONArray(&quot;labels&quot;).toArray(new String[0]) : null;</span>
+<span class="nc bnc" id="L634" title="All 2 branches missed.">            for(Object jo : o.getJSONArray(&quot;dependencies&quot;)) {</span>
+<span class="nc" id="L635">                JSONObject depObj = (JSONObject) jo;</span>
+                // Make sure there's a name attribute, that that name isn't maven-plugin - we ignore that one -
+                // and that the optional value isn't true.
+<span class="nc bnc" id="L638" title="All 2 branches missed.">                if (get(depObj,&quot;name&quot;)!=null</span>
+<span class="nc bnc" id="L639" title="All 2 branches missed.">                    &amp;&amp; !get(depObj,&quot;name&quot;).equals(&quot;maven-plugin&quot;)) {</span>
+<span class="nc bnc" id="L640" title="All 2 branches missed.">                    if (get(depObj, &quot;optional&quot;).equals(&quot;false&quot;)) {</span>
+<span class="nc" id="L641">                        dependencies.put(get(depObj, &quot;name&quot;), get(depObj, &quot;version&quot;));</span>
+<span class="nc" id="L642">                    } else {</span>
+<span class="nc" id="L643">                        optionalDependencies.put(get(depObj, &quot;name&quot;), get(depObj, &quot;version&quot;));</span>
+                    }
+                }
+                
+            }
+
+<span class="nc" id="L649">        }</span>
+
+        private String get(JSONObject o, String prop) {
+<span class="nc bnc" id="L652" title="All 2 branches missed.">            if(o.has(prop))</span>
+<span class="nc" id="L653">                return o.getString(prop);</span>
+            else
+<span class="nc" id="L655">                return null;</span>
+        }
+
+        public String getDisplayName() {
+            String displayName;
+<span class="nc bnc" id="L660" title="All 2 branches missed.">            if(title!=null)</span>
+<span class="nc" id="L661">                displayName = title;</span>
+            else
+<span class="nc" id="L663">                displayName = name;</span>
+<span class="nc" id="L664">            return StringUtils.removeStart(displayName, &quot;Jenkins &quot;);</span>
+        }
+
+        /**
+         * If some version of this plugin is currently installed, return {@link PluginWrapper}.
+         * Otherwise null.
+         */
+        @Exported
+        public PluginWrapper getInstalled() {
+<span class="nc" id="L673">            PluginManager pm = Jenkins.getInstance().getPluginManager();</span>
+<span class="nc" id="L674">            return pm.getPlugin(name);</span>
+        }
+
+        /**
+         * If the plugin is already installed, and the new version of the plugin has a &quot;compatibleSinceVersion&quot;
+         * value (i.e., it's only directly compatible with that version or later), this will check to
+         * see if the installed version is older than the compatible-since version. If it is older, it'll return false.
+         * If it's not older, or it's not installed, or it's installed but there's no compatibleSinceVersion
+         * specified, it'll return true.
+         */
+        @Exported
+        public boolean isCompatibleWithInstalledVersion() {
+<span class="nc" id="L686">            PluginWrapper installedVersion = getInstalled();</span>
+<span class="nc bnc" id="L687" title="All 2 branches missed.">            if (installedVersion != null) {</span>
+<span class="nc bnc" id="L688" title="All 2 branches missed.">                if (compatibleSinceVersion != null) {</span>
+<span class="nc" id="L689">                    if (new VersionNumber(installedVersion.getVersion())</span>
+<span class="nc bnc" id="L690" title="All 2 branches missed.">                            .isOlderThan(new VersionNumber(compatibleSinceVersion))) {</span>
+<span class="nc" id="L691">                        return false;</span>
+                    }
+                }
+            }
+<span class="nc" id="L695">            return true;</span>
+        }
+
+        /**
+         * Returns a list of dependent plugins which need to be installed or upgraded for this plugin to work.
+         */
+        @Exported
+        public List&lt;Plugin&gt; getNeededDependencies() {
+<span class="nc" id="L703">            List&lt;Plugin&gt; deps = new ArrayList&lt;Plugin&gt;();</span>
+
+<span class="nc bnc" id="L705" title="All 2 branches missed.">            for(Map.Entry&lt;String,String&gt; e : dependencies.entrySet()) {</span>
+<span class="nc" id="L706">                Plugin depPlugin = Jenkins.getInstance().getUpdateCenter().getPlugin(e.getKey());</span>
+<span class="nc bnc" id="L707" title="All 2 branches missed.">                if (depPlugin == null) {</span>
+<span class="nc" id="L708">                    LOGGER.log(Level.WARNING, &quot;Could not find dependency {0} of {1}&quot;, new Object[] {e.getKey(), name});</span>
+<span class="nc" id="L709">                    continue;</span>
+                }
+<span class="nc" id="L711">                VersionNumber requiredVersion = new VersionNumber(e.getValue());</span>
+                
+                // Is the plugin installed already? If not, add it.
+<span class="nc" id="L714">                PluginWrapper current = depPlugin.getInstalled();</span>
+
+<span class="nc bnc" id="L716" title="All 2 branches missed.">                if (current ==null) {</span>
+<span class="nc" id="L717">                    deps.add(depPlugin);</span>
+<span class="nc" id="L718">                }</span>
+                // If the dependency plugin is installed, is the version we depend on newer than
+                // what's installed? If so, upgrade.
+<span class="nc bnc" id="L721" title="All 2 branches missed.">                else if (current.isOlderThan(requiredVersion)) {</span>
+<span class="nc" id="L722">                    deps.add(depPlugin);</span>
+                }
+            }
+
+<span class="nc bnc" id="L726" title="All 2 branches missed.">            for(Map.Entry&lt;String,String&gt; e : optionalDependencies.entrySet()) {</span>
+<span class="nc" id="L727">                Plugin depPlugin = Jenkins.getInstance().getUpdateCenter().getPlugin(e.getKey());</span>
+<span class="nc bnc" id="L728" title="All 2 branches missed.">                if (depPlugin == null) {</span>
+<span class="nc" id="L729">                    continue;</span>
+                }
+<span class="nc" id="L731">                VersionNumber requiredVersion = new VersionNumber(e.getValue());</span>
+
+<span class="nc" id="L733">                PluginWrapper current = depPlugin.getInstalled();</span>
+
+                // If the optional dependency plugin is installed, is the version we depend on newer than
+                // what's installed? If so, upgrade.
+<span class="nc bnc" id="L737" title="All 4 branches missed.">                if (current != null &amp;&amp; current.isOlderThan(requiredVersion)) {</span>
+<span class="nc" id="L738">                    deps.add(depPlugin);</span>
+                }
+            }
+
+<span class="nc" id="L742">            return deps;</span>
+        }
+        
+        public boolean isForNewerHudson() {
+            try {
+<span class="nc bnc" id="L747" title="All 2 branches missed.">                return requiredCore!=null &amp;&amp; new VersionNumber(requiredCore).isNewerThan(</span>
+<span class="nc bnc" id="L748" title="All 2 branches missed.">                  new VersionNumber(Jenkins.VERSION.replaceFirst(&quot;SHOT *\\(private.*\\)&quot;, &quot;SHOT&quot;)));</span>
+<span class="nc" id="L749">            } catch (NumberFormatException nfe) {</span>
+<span class="nc" id="L750">                return true;  // If unable to parse version</span>
+            }
+        }
+
+        public VersionNumber getNeededDependenciesRequiredCore() {
+<span class="nc" id="L755">            VersionNumber versionNumber = null;</span>
+            try {
+<span class="nc bnc" id="L757" title="All 2 branches missed.">                versionNumber = requiredCore == null ? null : new VersionNumber(requiredCore);</span>
+<span class="nc" id="L758">            } catch (NumberFormatException nfe) {</span>
+                // unable to parse version
+            }
+<span class="nc bnc" id="L761" title="All 2 branches missed.">            for (Plugin p: getNeededDependencies()) {</span>
+<span class="nc" id="L762">                VersionNumber v = p.getNeededDependenciesRequiredCore();</span>
+<span class="nc bnc" id="L763" title="All 4 branches missed.">                if (versionNumber == null || v.isNewerThan(versionNumber)) versionNumber = v;</span>
+            }
+<span class="nc" id="L765">            return versionNumber;</span>
+        }
+
+        public boolean isNeededDependenciesForNewerJenkins() {
+<span class="nc bnc" id="L769" title="All 2 branches missed.">            for (Plugin p: getNeededDependencies()) {</span>
+<span class="nc bnc" id="L770" title="All 4 branches missed.">                if (p.isForNewerHudson() || p.isNeededDependenciesForNewerJenkins()) return true;</span>
+            }
+<span class="nc" id="L772">            return false;</span>
+        }
+
+        /**
+         * If at least some of the plugin's needed dependencies are already installed, and the new version of the
+         * needed dependencies plugin have a &quot;compatibleSinceVersion&quot;
+         * value (i.e., it's only directly compatible with that version or later), this will check to
+         * see if the installed version is older than the compatible-since version. If it is older, it'll return false.
+         * If it's not older, or it's not installed, or it's installed but there's no compatibleSinceVersion
+         * specified, it'll return true.
+         */
+        public boolean isNeededDependenciesCompatibleWithInstalledVersion() {
+<span class="nc bnc" id="L784" title="All 2 branches missed.">            for (Plugin p: getNeededDependencies()) {</span>
+<span class="nc bnc" id="L785" title="All 4 branches missed.">                if (!p.isCompatibleWithInstalledVersion() || !p.isNeededDependenciesCompatibleWithInstalledVersion())</span>
+<span class="nc" id="L786">                    return false;</span>
+            }
+<span class="nc" id="L788">            return true;</span>
+        }
+
+        /**
+         * @deprecated as of 1.326
+         *      Use {@link #deploy()}.
+         */
+        @Deprecated
+        public void install() {
+<span class="nc" id="L797">            deploy();</span>
+<span class="nc" id="L798">        }</span>
+
+        public Future&lt;UpdateCenterJob&gt; deploy() {
+<span class="nc" id="L801">            return deploy(false);</span>
+        }
+
+        /**
+         * Schedules the installation of this plugin.
+         *
+         * &lt;p&gt;
+         * This is mainly intended to be called from the UI. The actual installation work happens
+         * asynchronously in another thread.
+         *
+         * @param dynamicLoad
+         *      If true, the plugin will be dynamically loaded into this Jenkins. If false,
+         *      the plugin will only take effect after the reboot.
+         *      See {@link UpdateCenter#isRestartRequiredForCompletion()}
+         */
+        public Future&lt;UpdateCenterJob&gt; deploy(boolean dynamicLoad) {
+<span class="nc" id="L817">            Jenkins.getInstance().checkPermission(Jenkins.ADMINISTER);</span>
+<span class="nc" id="L818">            UpdateCenter uc = Jenkins.getInstance().getUpdateCenter();</span>
+<span class="nc bnc" id="L819" title="All 2 branches missed.">            for (Plugin dep : getNeededDependencies()) {</span>
+<span class="nc" id="L820">                UpdateCenter.InstallationJob job = uc.getJob(dep);</span>
+<span class="nc bnc" id="L821" title="All 4 branches missed.">                if (job == null || job.status instanceof UpdateCenter.DownloadJob.Failure) {</span>
+<span class="nc" id="L822">                    LOGGER.log(Level.WARNING, &quot;Adding dependent install of &quot; + dep.name + &quot; for plugin &quot; + name);</span>
+<span class="nc" id="L823">                    dep.deploy(dynamicLoad);</span>
+<span class="nc" id="L824">                } else {</span>
+<span class="nc" id="L825">                    LOGGER.log(Level.WARNING, &quot;Dependent install of &quot; + dep.name + &quot; for plugin &quot; + name + &quot; already added, skipping&quot;);</span>
+                }
+            }
+<span class="nc" id="L828">            return uc.addJob(uc.new InstallationJob(this, UpdateSite.this, Jenkins.getAuthentication(), dynamicLoad));</span>
+        }
+
+        /**
+         * Schedules the downgrade of this plugin.
+         */
+        public Future&lt;UpdateCenterJob&gt; deployBackup() {
+<span class="nc" id="L835">            Jenkins.getInstance().checkPermission(Jenkins.ADMINISTER);</span>
+<span class="nc" id="L836">            UpdateCenter uc = Jenkins.getInstance().getUpdateCenter();</span>
+<span class="nc" id="L837">            return uc.addJob(uc.new PluginDowngradeJob(this, UpdateSite.this, Jenkins.getAuthentication()));</span>
+        }
+        /**
+         * Making the installation web bound.
+         */
+        @RequirePOST
+        public HttpResponse doInstall() throws IOException {
+<span class="nc" id="L844">            deploy(false);</span>
+<span class="nc" id="L845">            return HttpResponses.redirectTo(&quot;../..&quot;);</span>
+        }
+
+        @RequirePOST
+        public HttpResponse doInstallNow() throws IOException {
+<span class="nc" id="L850">            deploy(true);</span>
+<span class="nc" id="L851">            return HttpResponses.redirectTo(&quot;../..&quot;);</span>
+        }
+
+        /**
+         * Performs the downgrade of the plugin.
+         */
+        @RequirePOST
+        public HttpResponse doDowngrade() throws IOException {
+<span class="nc" id="L859">            deployBackup();</span>
+<span class="nc" id="L860">            return HttpResponses.redirectTo(&quot;../..&quot;);</span>
+        }
+    }
+
+<span class="nc" id="L864">    private static final long DAY = DAYS.toMillis(1);</span>
+
+<span class="nc" id="L866">    private static final Logger LOGGER = Logger.getLogger(UpdateSite.class.getName());</span>
+
+    // The name uses UpdateCenter for compatibility reason.
+<span class="nc" id="L869">    public static boolean neverUpdate = Boolean.getBoolean(UpdateCenter.class.getName()+&quot;.never&quot;);</span>
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>

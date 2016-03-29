@@ -1,0 +1,189 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../../../.resources/report.css" type="text/css"/><link rel="shortcut icon" href="../../../.resources/report.gif" type="image/gif"/><title>ResourceController.java</title><link rel="stylesheet" href="../../../.resources/prettify.css" type="text/css"/><script type="text/javascript" src="../../../.resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../../../.sessions.html" class="el_session">Sessions</a></span><a href="../../../index.html" class="el_report">jenkins-core (22-mrt-2016 21:51:03)</a> &gt; <a href="../../index.html" class="el_group">jenkins-core</a> &gt; <a href="../index.html" class="el_bundle">src/main/java</a> &gt; <a href="index.source.html" class="el_package">hudson.model</a> &gt; <span class="el_source">ResourceController.java</span></div><h1>ResourceController.java</h1><pre class="source lang-java linenums"><span class="nc" id="L1">/*</span>
+ * The MIT License
+ *
+ * Copyright (c) 2004-2009, Sun Microsystems, Inc., Kohsuke Kawaguchi
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the &quot;Software&quot;), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package hudson.model;
+
+import hudson.util.AdaptedIterator;
+
+import java.util.Set;
+import java.util.Collection;
+import java.util.AbstractCollection;
+import java.util.Iterator;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CopyOnWriteArraySet;
+import javax.annotation.Nonnull;
+
+/**
+ * Controls mutual exclusion of {@link ResourceList}.
+ * @author Kohsuke Kawaguchi
+ */
+<span class="nc" id="L40">public class ResourceController {</span>
+    /**
+     * {@link ResourceList}s that are used by activities that are in progress.
+     */
+<span class="nc" id="L44">    private final Set&lt;ResourceActivity&gt; inProgress = new CopyOnWriteArraySet&lt;ResourceActivity&gt;();</span>
+
+    /**
+     * View of {@link #inProgress} that exposes its {@link ResourceList}.
+     */
+<span class="nc" id="L49">    private final Collection&lt;ResourceList&gt; resourceView = new AbstractCollection&lt;ResourceList&gt;() {</span>
+        public Iterator&lt;ResourceList&gt; iterator() {
+<span class="nc" id="L51">            return new AdaptedIterator&lt;ResourceActivity,ResourceList&gt;(inProgress.iterator()) {</span>
+                protected ResourceList adapt(ResourceActivity item) {
+<span class="nc" id="L53">                    return item.getResourceList();</span>
+                }
+            };
+        }
+
+        public int size() {
+<span class="nc" id="L59">            return inProgress.size();</span>
+        }
+    };
+
+    /**
+     * Union of all {@link Resource}s that are currently in use.
+     * Updated as a task starts/completes executing.
+     */
+<span class="nc" id="L67">    private ResourceList inUse = ResourceList.EMPTY;</span>
+
+    /**
+     * Performs the task that requires the given list of resources.
+     *
+     * &lt;p&gt;
+     * The execution is blocked until the resource is available.
+     *
+     * @throws InterruptedException
+     *      the thread can be interrupted while waiting for the available resources.
+     */
+    public void execute(@Nonnull Runnable task, final ResourceActivity activity ) throws InterruptedException {
+<span class="nc" id="L79">        final ResourceList resources = activity.getResourceList();</span>
+<span class="nc" id="L80">        _withLock(new Runnable() {</span>
+            @Override
+            public void run() {
+<span class="nc bnc" id="L83" title="All 2 branches missed.">                while(inUse.isCollidingWith(resources))</span>
+                    try {
+                        // TODO revalidate the resource list after re-acquiring lock, for now we just let the build fail
+<span class="nc" id="L86">                        _await();</span>
+<span class="nc" id="L87">                    } catch (InterruptedException e) {</span>
+<span class="nc" id="L88">                        throw new RuntimeException(e);</span>
+                    }
+
+                // we have a go
+<span class="nc" id="L92">                inProgress.add(activity);</span>
+<span class="nc" id="L93">                inUse = ResourceList.union(inUse,resources);</span>
+<span class="nc" id="L94">            }</span>
+        });
+
+        try {
+<span class="nc" id="L98">            task.run();</span>
+<span class="nc" id="L99">        } finally {</span>
+           // TODO if AsynchronousExecution, do that later
+<span class="nc" id="L101">            _withLock(new Runnable() {</span>
+                @Override
+                public void run() {
+<span class="nc" id="L104">                    inProgress.remove(activity);</span>
+<span class="nc" id="L105">                    inUse = ResourceList.union(resourceView);</span>
+<span class="nc" id="L106">                    _signalAll();</span>
+<span class="nc" id="L107">                }</span>
+            });
+<span class="nc" id="L109">        }</span>
+<span class="nc" id="L110">    }</span>
+
+    /**
+     * Checks if an activity that requires the given resource list
+     * can run immediately.
+     *
+     * &lt;p&gt;
+     * This method is really only useful as a hint, since
+     * another activity might acquire resources before the caller
+     * gets to call {@link #execute(Runnable, ResourceActivity)}.
+     */
+    public boolean canRun(final ResourceList resources) {
+        try {
+<span class="nc" id="L123">            return _withLock(new Callable&lt;Boolean&gt;() {</span>
+                @Override
+                public Boolean call() {
+<span class="nc bnc" id="L126" title="All 2 branches missed.">                    return !inUse.isCollidingWith(resources);</span>
+                }
+            });
+<span class="nc" id="L129">        } catch (Exception e) {</span>
+<span class="nc" id="L130">            throw new IllegalStateException(&quot;Inner callable does not throw exception&quot;);</span>
+        }
+    }
+
+    /**
+     * Of the resource in the given resource list, return the one that's
+     * currently in use.
+     *
+     * &lt;p&gt;
+     * If more than one such resource exists, one is chosen and returned.
+     * This method is used for reporting what's causing the blockage.
+     */
+    public Resource getMissingResource(final ResourceList resources) {
+        try {
+<span class="nc" id="L144">            return _withLock(new Callable&lt;Resource&gt;() {</span>
+                @Override
+                public Resource call() {
+<span class="nc" id="L147">                    return resources.getConflict(inUse);</span>
+                }
+            });
+<span class="nc" id="L150">        } catch (Exception e) {</span>
+<span class="nc" id="L151">            throw new IllegalStateException(&quot;Inner callable does not throw exception&quot;);</span>
+        }
+    }
+
+    /**
+     * Of the activities that are in progress, return one that's blocking
+     * the given activity, or null if it's not blocked (and thus the
+     * given activity can be executed immediately.)
+     */
+    public ResourceActivity getBlockingActivity(ResourceActivity activity) {
+<span class="nc" id="L161">        ResourceList res = activity.getResourceList();</span>
+<span class="nc bnc" id="L162" title="All 2 branches missed.">        for (ResourceActivity a : inProgress)</span>
+<span class="nc bnc" id="L163" title="All 2 branches missed.">            if(res.isCollidingWith(a.getResourceList()))</span>
+<span class="nc" id="L164">                return a;</span>
+<span class="nc" id="L165">        return null;</span>
+    }
+
+    protected void _await() throws InterruptedException {
+<span class="nc" id="L169">        wait();</span>
+<span class="nc" id="L170">    }</span>
+
+    protected void _signalAll() {
+<span class="nc" id="L173">        notifyAll();</span>
+<span class="nc" id="L174">    }</span>
+
+    protected void _withLock(Runnable runnable) {
+<span class="nc" id="L177">        synchronized (this) {</span>
+<span class="nc" id="L178">            runnable.run();</span>
+        }
+<span class="nc" id="L180">    }</span>
+
+    protected &lt;V&gt; V _withLock(java.util.concurrent.Callable&lt;V&gt; callable) throws Exception {
+<span class="nc" id="L183">        synchronized (this) {</span>
+<span class="nc" id="L184">            return callable.call();</span>
+        }
+    }
+}
+
+</pre><div class="footer"><span class="right">Created with <a href="http://www.eclemma.org/jacoco">JaCoCo</a> 0.7.6.201602180812</span>jenkins-core (22-mrt-2016 21:51:03)</div></body></html>
