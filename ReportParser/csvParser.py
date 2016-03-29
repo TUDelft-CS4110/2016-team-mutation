@@ -11,10 +11,11 @@ NO_COVERAGE = "NO_COVERAGE"
 # Branch coverage data
 MISSED = "MISSED"
 COVERED = "COVERED"
+# Counting
+MUTCOV = "MUTCOV"
+BRANCHCOV = "BRANCHCOV"
 
-def plotGraph(branchData, mutData):
-	
-
+def plotGraphPerOperator(branchData, mutData):
 	mutCovMap = {}
 	for mutOp in mutData:
 		branchCoverage = []
@@ -47,6 +48,37 @@ def plotGraph(branchData, mutData):
 		plt.clf()
 		plt.close()
 	return mutCovMap
+
+def plotOverallGraph(branchData, mutData):
+	branchCoverage = []
+	mutationCoverage = []
+	classNames = []
+	for className in branchData:
+		killed = 0
+		survived = 0
+		for mutOp in mutData:
+			if className in mutData[mutOp]:
+				killed += mutData[mutOp][className][KILLED]
+				survived += mutData[mutOp][className][SURVIVED]
+
+		if branchData[className][COVERED]+branchData[className][MISSED] > 0 and killed + survived > 0:
+			branchCov = 100*branchData[className][COVERED]/(branchData[className][COVERED]+branchData[className][MISSED])
+			branchCoverage.append(branchCov)
+			mutCov = 100 * killed / (killed + survived)
+			mutationCoverage.append(mutCov)
+			classNames.append(className)
+
+	plt.scatter(branchCoverage, mutationCoverage)
+	plt.xlabel('Branch Coverage')
+	plt.ylabel('Mutation Coverage')
+	plt.title('Branch vs Mutation per Class')
+	plt.show()
+	plt.cla()
+	plt.clf()
+	plt.close()
+
+	return (branchCoverage, mutationCoverage, classNames)
+
 
 def parseJacocoCSV(file, data):
 	if os.path.isfile(file):
@@ -92,7 +124,7 @@ def parsePitestCSV(file, mutData, branchData):
 			elif row[5] == SURVIVED :
 				mutData[row[2]][className][SURVIVED] += 1
 			elif row[5] == NO_COVERAGE:
-				mutData[row[2]][className][NO_COVERAGE] +=1 
+				mutData[row[2]][className][NO_COVERAGE] += 1 
 	else:
 		print("Pitest file or folder does not exist.")
 
@@ -105,8 +137,24 @@ else:
 	pitestfile = sys.argv[2]
 	parsePitestCSV(pitestfile, mutData, branchData)
 	parseJacocoCSV(jacocofile, branchData)
-	mutCovMap = plotGraph(branchData, mutData)
 
+	(branchCoverage, mutationCoverage, classNames) = plotOverallGraph(branchData, mutData)
+
+	print("BranchCov > 80 and MutationCov < 60")
+	for i, item in enumerate(branchCoverage):
+		if item > 80 and mutationCoverage[i] < 60:
+			print(classNames[i])
+
+	print("")
+
+	print("BranchCov > 80 and MutationCov > 80")
+	for i, item in enumerate(branchCoverage):
+		if item > 80 and mutationCoverage[i] > 80:
+			print(classNames[i])
+
+	print("")
+
+	mutCovMap = plotGraphPerOperator(branchData, mutData)
 	print("============================================")
 	print("Zero Mutation Coverage: number of operators")
 	print("============================================")
