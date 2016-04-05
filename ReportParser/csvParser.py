@@ -167,7 +167,7 @@ else:
 	parsePitestCSV(pitestfile, mutData, branchData)
 	parseJacocoCSV(jacocofile, branchData)
 
-	plotGraphPerClass(branchData, mutData)
+	#plotGraphPerClass(branchData, mutData)
 
 	(branchCoverage, mutationCoverage, classNames) = plotOverallGraph(branchData, mutData)
 
@@ -201,6 +201,21 @@ else:
 		if mutCovMap[className][100] >= 4:
 			print(className + ": " + str(mutCovMap[className][100]))
 
-	
+	print("============================================")
+	print("Average per mutation operator")
+	print("============================================")
+	for mutOp in mutData:
+		count = 0
+		totalBranchCov = 0
+		totalMutCov = 0
+		for className in mutData[mutOp]:
+			if mutData[mutOp][className][KILLED]+mutData[mutOp][className][SURVIVED] > 0 and branchData[className][COVERED]+branchData[className][MISSED] > 0:
+				totalBranchCov += 100*mutData[mutOp][className][KILLED]/(mutData[mutOp][className][KILLED]+mutData[mutOp][className][SURVIVED])
+				totalMutCov += 100*branchData[className][COVERED]/(branchData[className][COVERED]+branchData[className][MISSED])
+				count += 1
+		print(mutOp)
+		print("Average Branch Coverage: " + str(totalBranchCov/count))
+		print("Average Mutation Coverage: " + str(totalMutCov/count))
+		print("")
 
 
